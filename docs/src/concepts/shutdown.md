@@ -27,7 +27,7 @@ sequenceDiagram
 Work that was accepted before the drain keeps flowing through it. The messenger mux sends its records and its credit as active messages, so the gate lets through the handlers that serve accepted work:
 
 - The mux batch handlers (`_stream_batch`, and `_stream_batch.1` to `_stream_batch.15`, one for each lane), which carry the records and credit of open mux streams.
-- `_stream_cancel`, the detach, finalize and cancel handlers of SPSC anchors, and the detach and cancel handlers of MPSC anchors.
+- `_stream_cancel` and `_stream_stop`, the detach, finalize and cancel handlers of SPSC anchors, and the detach and cancel handlers of MPSC anchors.
 - The rendezvous handlers that pull a staged payload and end its lease (`_rv_acquire`, `_rv_pull`, `_rv_detach`, `_rv_release`, `_rv_lease_renew`). A record or response too large for one message is staged, and the receiver pulls it with these handlers. A draining owner answers the pull chunked, never by RDMA. `_rv_metadata` and `_rv_ref` start a new consumer, so the gate refuses them. A handle that an application staged itself can still be pulled with `get` during the drain.
 - The event handlers `_event_trigger`, `_event_trigger_request` and `_event_subscribe`. `_event_trigger` completes an awaiter of work that this node already accepted. `_event_trigger_request` completes an event that this node already created, and it acknowledges the requester. The requester sends it fire-and-forget, so a refusal would never reach the requester's wait. `_event_subscribe` answers at once for an event that is already complete, or records one subscriber for a pending event. None of the three starts new work.
 

@@ -116,7 +116,8 @@ async fn create_message_handler(
     // queued). Under `Timeout` it is what stops leftover queued work from
     // dispatching into an instance that has already declared itself dead.
     //
-    // It is not the only caller: the TCP, UDS, QUIC, gRPC, and UCX
+    // It is not the only caller: the final `Messenger` drop cancels it too
+    // (`shutdown_now`, no drain), and so do the TCP, UDS, QUIC, gRPC, and UCX
     // `Transport::shutdown` impls cancel this same shared token (ZMQ, NATS,
     // and the simulation transport tear down only their own private
     // machinery), so a direct `shutdown()` on one of those five on a live
@@ -378,9 +379,11 @@ async fn create_message_handler(
         }
     }
 
-    // Teardown reached with work still on the queue — only possible under
-    // `ShutdownPolicy::Timeout`, since `WaitForever` cannot cancel the token
-    // until the queue is empty. Abandoning those messages is what the timeout
+    // Teardown reached with work still on the queue. Three paths get here:
+    // `ShutdownPolicy::Timeout` (`WaitForever` cannot cancel the token until
+    // the queue is empty), the final `Messenger` drop (`shutdown_now` cancels
+    // the token with no drain), and the `break` above when the hub's
+    // `Messenger` upgrade fails. Abandoning those messages is what the timeout
     // buys; abandoning their in-flight guards is not. flume frees a buffered
     // item only once *both* ends of the channel are gone, and every transport
     // holds a sender clone for the instance's lifetime, so guards left parked
