@@ -80,14 +80,18 @@ async fn run_handler<H: ActiveMessageHandler + 'static>(
 ) {
     let message_id = ctx.message_id;
     let response_type = ctx.response_type;
-    let system = Arc::clone(&ctx.system);
+    // The backend, not the Messenger: the reply can wait on admission to a
+    // peer that stopped reading, and holding the Messenger there would keep
+    // its final drop, and so its transport teardown, from ever happening.
+    let backend = Arc::clone(ctx.system.backend());
+    let metrics = ctx.system.observability();
     let in_flight = ctx.in_flight.clone();
     trace!(target: "crate::messenger::dispatcher", handler = %handler.name(), "Handler task started");
     let outcome = AssertUnwindSafe(async { handler.handle(ctx).await })
         .catch_unwind()
         .await;
     if let Err(panic) = outcome {
-        if let Some(metrics) = system.observability().as_ref() {
+        if let Some(metrics) = metrics.as_ref() {
             metrics.record_dispatch_failure(failure);
         }
         let reason = panic
@@ -103,7 +107,7 @@ async fn run_handler<H: ActiveMessageHandler + 'static>(
             "Handler panicked"
         );
         fail_fast(
-            &system,
+            &backend,
             handler.name(),
             message_id,
             response_type,
@@ -120,7 +124,7 @@ async fn run_handler<H: ActiveMessageHandler + 'static>(
 /// so the caller's task tracking covers the reply; `in_flight` is held until
 /// the reply is sent.
 async fn fail_fast(
-    system: &Arc<Messenger>,
+    backend: &VeloBackend,
     handler: &str,
     message_id: ResponseId,
     response_type: ResponseType,
@@ -132,7 +136,7 @@ async fn fail_fast(
     }
     let _in_flight = in_flight;
     send_error_reply(
-        system.backend(),
+        backend,
         handler,
         message_id,
         format!("Handler failed: {reason}"),
@@ -431,12 +435,14 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
                 }
                 // `dispatch` is sync, so the reply needs its own task; the
                 // tracker keeps it from being untracked.
-                let system = system.clone();
+                // The backend, not the Messenger, for the reason `run_handler`
+                // gives.
+                let backend = Arc::clone(system.backend());
                 let handler_name = self.handler.name().to_string();
                 let in_flight = shed.ctx.in_flight;
                 system.tracker().clone().spawn(async move {
                     fail_fast(
-                        &system,
+                        &backend,
                         &handler_name,
                         message_id,
                         response_type,
@@ -687,6 +693,39 @@ mod tests {
         fn name(&self) -> &str {
             "_pending"
         }
+    }
+
+    /// A handler task must not keep the Messenger alive. Its reply can wait
+    /// on admission to a peer that stopped reading, for as long as the peer
+    /// stays stopped; holding the Messenger there would keep its final drop,
+    /// and so its transport teardown, from ever happening. `PendingHandler`
+    /// drops its context and then waits forever, as such a reply does.
+    #[tokio::test]
+    async fn a_handler_task_does_not_hold_the_messenger() {
+        let messenger = Messenger::builder().build().await.unwrap();
+        let weak = Arc::downgrade(&messenger);
+        let ctx = HandlerContext {
+            message_id: ResponseId::from_u128(1),
+            payload: Bytes::new(),
+            response_type: ResponseType::Unary,
+            headers: None,
+            system: Arc::clone(&messenger),
+            in_flight: None,
+        };
+        let task = tokio::spawn(run_handler(
+            Arc::new(PendingHandler),
+            ctx,
+            DispatchFailure::HandlerPanic,
+        ));
+        drop(messenger);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("a waiting handler task kept the Messenger alive");
+        task.abort();
     }
 
     /// A shed fire-and-forget message has no caller to tell, so the shed path

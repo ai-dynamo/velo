@@ -299,9 +299,20 @@ async fn create_message_handler(
                         let message_id = message.metadata.response_id;
                         let response_type = message.metadata.response_type;
                         let headers = message.metadata.headers.clone();
+                        // The resolve waits on the payload's owner, so the
+                        // task must not hold the Messenger across it: that
+                        // would keep its final drop, and teardown, from ever
+                        // happening. The hub upgrades it again afterwards.
+                        let backend = Arc::clone(system.backend());
+                        drop(system);
                         tokio::spawn(async move {
                             match resolver.resolve(&handle_str).await {
                                 Ok(resolved_payload) => {
+                                    // Gone: the instance is being torn down,
+                                    // and the message dies with its guard.
+                                    let Some(system) = hub.system() else {
+                                        return;
+                                    };
                                     let ctx = HandlerContext {
                                         message_id,
                                         payload: resolved_payload,
@@ -324,7 +335,7 @@ async fn create_message_handler(
                                             | crate::messenger::common::messages::ResponseType::Unary
                                     ) {
                                         send_error_reply(
-                                            system.backend(),
+                                            &backend,
                                             &handler_name,
                                             message_id,
                                             format!("Failed to resolve large payload: {e}"),
