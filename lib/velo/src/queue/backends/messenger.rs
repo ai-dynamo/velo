@@ -510,29 +510,32 @@ impl SenderBackend for RemoteMessengerSender {
     }
 
     fn try_send(&self, data: Bytes) -> Result<(), WorkQueueSendError> {
-        let messenger = Arc::clone(&self.messenger);
-        let target = self.target;
-        let queue = self.queue.clone();
-        let capacity = self.capacity;
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            // Built here so the task holds only the request: it can wait on a
+            // peer that stopped answering, and a task holding the Messenger
+            // there would keep its final drop, and so its teardown, from
+            // running.
+            let request = self
+                .messenger
+                .typed_unary::<QueueRpcResponse>(QUEUE_RPC_HANDLER)
+                .and_then(|builder| {
+                    builder.payload(QueueRpcRequest::Enqueue {
+                        queue: self.queue.clone(),
+                        data: data.to_vec(),
+                        capacity: self.capacity,
+                    })
+                });
+            let builder = match request {
+                Ok(builder) => builder,
+                Err(e) => {
+                    tracing::warn!("messenger queue try_send failed: {e}");
+                    return Ok(());
+                }
+            };
+            let target = self.target;
             handle.spawn(async move {
-                let response = messenger
-                    .typed_unary::<QueueRpcResponse>(QUEUE_RPC_HANDLER)
-                    .and_then(|builder| {
-                        builder.payload(QueueRpcRequest::Enqueue {
-                            queue,
-                            data: data.to_vec(),
-                            capacity,
-                        })
-                    });
-
-                match response {
-                    Ok(builder) => {
-                        if let Err(e) = builder.send_to(target).await {
-                            tracing::warn!("messenger queue try_send failed: {e}");
-                        }
-                    }
-                    Err(e) => tracing::warn!("messenger queue try_send failed: {e}"),
+                if let Err(e) = builder.send_to(target).await {
+                    tracing::warn!("messenger queue try_send failed: {e}");
                 }
             });
         } else {
@@ -690,5 +693,48 @@ impl ReceiverBackend for RemoteMessengerReceiver {
 
     fn try_recv(&self) -> Result<Option<Bytes>, WorkQueueRecvError> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `try_send` hands its RPC to a detached task, and that task can wait on a
+    /// peer that stopped answering for as long as the peer stays stopped. The
+    /// task must not hold the Messenger there, or its final drop, and so its
+    /// transport teardown, never runs.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_stalled_try_send_does_not_hold_the_messenger() {
+        let (messenger, peer_instance) = crate::tests::stalled_messenger().await;
+        let weak = Arc::downgrade(&messenger);
+        let backend = Arc::clone(messenger.backend());
+        let sender = RemoteMessengerSender {
+            messenger,
+            target: peer_instance,
+            queue: "q".to_string(),
+            capacity: None,
+        };
+        // The gate holds one frame: the first RPC is admitted and waits for an
+        // answer that never comes, the second waits on admission.
+        for _ in 0..2 {
+            sender.try_send(Bytes::from_static(b"item")).unwrap();
+        }
+        // Let both tasks reach their waits before the final drop.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(sender);
+        let gone = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while weak.upgrade().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        let still_alive = weak.upgrade().is_some();
+        backend.shutdown_now();
+        let _ = backend.request_teardown().await;
+        assert!(
+            gone.is_ok() && !still_alive,
+            "a try_send task waiting on a stalled peer kept the Messenger alive after its final drop"
+        );
     }
 }

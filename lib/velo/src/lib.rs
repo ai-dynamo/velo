@@ -2446,7 +2446,7 @@ mod tests {
     }
 
     /// A Messenger on a [`Stalling`] transport, with one registered peer.
-    async fn stalled_messenger() -> (Arc<Messenger>, crate::InstanceId) {
+    pub(crate) async fn stalled_messenger() -> (Arc<Messenger>, crate::InstanceId) {
         let (tx, rx) = flume::bounded(1);
         let transport = Arc::new(Stalling {
             gate: velo_ext::AdmissionGate::new(tx, tokio::runtime::Handle::current()),
