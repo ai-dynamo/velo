@@ -1333,3 +1333,37 @@ async fn retirement_accounts_for_late_sends_without_removing_the_successor() {
     assert_eq!(errors.error_count(), 2);
     assert!(connections.get(&key).unwrap().tx.same_channel(&next.tx));
 }
+
+// On a current-thread runtime, start can return before the listener task runs.
+// closed must release its pre-bound socket even in that schedule.
+#[tokio::test]
+async fn closed_releases_listener_before_returning() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let transport = TcpTransportBuilder::new()
+        .from_listener(listener)
+        .unwrap()
+        .build()
+        .unwrap();
+    let (adapter, _streams) = crate::transports::make_channels();
+    transport
+        .start(
+            crate::InstanceId::new_v4(),
+            adapter,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
+    // A close check before shutdown must neither wait nor stop the listener.
+    use futures::FutureExt;
+    assert!(transport.closed().now_or_never().is_some());
+    assert!(std::net::TcpStream::connect(address).is_ok());
+    transport.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::join!(transport.closed(), transport.closed());
+    })
+    .await
+    .expect("concurrent close calls must finish");
+    // No await between closed and this probe: the socket must already be gone.
+    assert!(std::net::TcpStream::connect(address).is_err());
+}

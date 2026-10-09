@@ -76,6 +76,7 @@ pub struct TcpTransport {
 
     // Optional pre-bound listener (used for tests to avoid port races)
     listener: Mutex<Option<std::net::TcpListener>>,
+    listener_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 
     // Cached local interfaces for endpoint selection
     local_interfaces: OnceLock<Vec<InterfaceEndpoint>>,
@@ -178,6 +179,7 @@ impl TcpTransport {
             channel_capacity,
             connect_timeout,
             listener: Mutex::new(listener),
+            listener_task: tokio::sync::Mutex::new(None),
             local_interfaces: OnceLock::new(),
             numa_hint,
             metrics: OnceLock::new(),
@@ -526,11 +528,11 @@ impl Transport for TcpTransport {
                 .socket_buffers(self.socket_buffers)
                 .build()?;
 
-            rt.spawn(async move {
+            *self.listener_task.lock().await = Some(rt.spawn(async move {
                 if let Err(e) = tcp_listener.serve().await {
                     error!("TCP listener error: {}", e);
                 }
-            });
+            }));
 
             info!("TCP transport started on {}", bind_addr);
 
@@ -554,6 +556,22 @@ impl Transport for TcpTransport {
         // Clear connections
         self.connections.clear();
         self.update_connection_gauge();
+    }
+
+    fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
+        Box::pin(async move {
+            if !self.cancel_token.is_cancelled() {
+                return;
+            }
+            // Keep the handle until the join finishes so concurrent callers
+            // cannot return while the listener still owns its socket.
+            let mut listener_task = self.listener_task.lock().await;
+            if let Some(task) = listener_task.as_mut() {
+                task.abort();
+                let _ = task.await;
+            }
+            *listener_task = None;
+        })
     }
 
     fn set_observability(
