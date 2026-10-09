@@ -1334,10 +1334,9 @@ async fn retirement_accounts_for_late_sends_without_removing_the_successor() {
     assert!(connections.get(&key).unwrap().tx.same_channel(&next.tx));
 }
 
-// On a current-thread runtime, start can return before the listener task runs.
-// closed must release its pre-bound socket even in that schedule.
-#[tokio::test]
-async fn closed_releases_listener_before_returning() {
+/// Start a transport on a pre-bound loopback listener. The caller keeps the
+/// streams alive for the test.
+async fn start_prebound() -> (TcpTransport, SocketAddr, crate::transports::DataStreams) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let transport = TcpTransportBuilder::new()
@@ -1345,7 +1344,7 @@ async fn closed_releases_listener_before_returning() {
         .unwrap()
         .build()
         .unwrap();
-    let (adapter, _streams) = crate::transports::make_channels();
+    let (adapter, streams) = crate::transports::make_channels();
     transport
         .start(
             crate::InstanceId::new_v4(),
@@ -1354,6 +1353,14 @@ async fn closed_releases_listener_before_returning() {
         )
         .await
         .unwrap();
+    (transport, address, streams)
+}
+
+// On a current-thread runtime, start can return before the listener task runs.
+// closed must release its pre-bound socket even in that schedule.
+#[tokio::test]
+async fn closed_releases_listener_before_returning() {
+    let (transport, address, _streams) = start_prebound().await;
     // A close check before shutdown must neither wait nor stop the listener.
     use futures::FutureExt;
     assert!(transport.closed().now_or_never().is_some());
@@ -1365,5 +1372,26 @@ async fn closed_releases_listener_before_returning() {
     .await
     .expect("concurrent close calls must finish");
     // No await between closed and this probe: the socket must already be gone.
+    assert!(std::net::TcpStream::connect(address).is_err());
+}
+
+/// `closed` must wait for the accept loop itself, in the usual schedule where
+/// that loop is already parked in `accept()` when shutdown starts.
+///
+/// `TcpListener::serve` spawns the accept loop and returns at once. A
+/// transport that spawns `serve()` and joins that handle joins a task that
+/// has already finished, while the loop it started still owns the socket, so
+/// a peer can connect after shutdown returns. The test above cannot see that
+/// mistake: on a current-thread runtime the spawned task never runs before
+/// shutdown, and dropping it closes the socket. The yields here let the
+/// accept loop start first.
+#[tokio::test]
+async fn closed_releases_running_listener() {
+    let (transport, address, _streams) = start_prebound().await;
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    transport.shutdown();
+    transport.closed().await;
     assert!(std::net::TcpStream::connect(address).is_err());
 }

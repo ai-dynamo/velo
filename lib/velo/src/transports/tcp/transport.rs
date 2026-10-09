@@ -36,6 +36,11 @@ use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
 mod builder;
 pub use builder::TcpTransportBuilder;
 
+/// How long `closed()` waits for the accept loop to drop its socket. The loop
+/// exits on its next poll after teardown, so this bound only matters when the
+/// runtime that runs it is not being driven.
+const LISTENER_CLOSE_WAIT: Duration = Duration::from_secs(1);
+
 /// One connection per peer and lane. Lane 0 is the only lane unless the
 /// builder asked for more.
 type LaneKey = (crate::InstanceId, u16);
@@ -76,7 +81,8 @@ pub struct TcpTransport {
 
     // Optional pre-bound listener (used for tests to avoid port races)
     listener: Mutex<Option<std::net::TcpListener>>,
-    listener_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    // The accept loop, so `closed()` can wait until its socket is gone.
+    listener_tasks: tokio_util::task::TaskTracker,
 
     // Cached local interfaces for endpoint selection
     local_interfaces: OnceLock<Vec<InterfaceEndpoint>>,
@@ -179,7 +185,7 @@ impl TcpTransport {
             channel_capacity,
             connect_timeout,
             listener: Mutex::new(listener),
-            listener_task: tokio::sync::Mutex::new(None),
+            listener_tasks: tokio_util::task::TaskTracker::new(),
             local_interfaces: OnceLock::new(),
             numa_hint,
             metrics: OnceLock::new(),
@@ -528,11 +534,16 @@ impl Transport for TcpTransport {
                 .socket_buffers(self.socket_buffers)
                 .build()?;
 
-            *self.listener_task.lock().await = Some(rt.spawn(async move {
-                if let Err(e) = tcp_listener.serve().await {
-                    error!("TCP listener error: {}", e);
-                }
-            }));
+            // Spawn the accept loop itself, not `serve()`: `serve()` spawns
+            // the loop and returns, so its handle says nothing about the socket.
+            self.listener_tasks.spawn_on(
+                async move {
+                    if let Err(e) = tcp_listener.run_server().await {
+                        error!("TCP listener error: {}", e);
+                    }
+                },
+                &rt,
+            );
 
             info!("TCP transport started on {}", bind_addr);
 
@@ -563,14 +574,18 @@ impl Transport for TcpTransport {
             if !self.cancel_token.is_cancelled() {
                 return;
             }
-            // Keep the handle until the join finishes so concurrent callers
-            // cannot return while the listener still owns its socket.
-            let mut listener_task = self.listener_task.lock().await;
-            if let Some(task) = listener_task.as_mut() {
-                task.abort();
-                let _ = task.await;
+            // `shutdown()` cancelled teardown, so the accept loop is exiting.
+            // Wait for it, so no peer can connect once this returns.
+            self.listener_tasks.close();
+            if tokio::time::timeout(LISTENER_CLOSE_WAIT, self.listener_tasks.wait())
+                .await
+                .is_err()
+            {
+                warn!(
+                    "TCP listener on {} did not stop within {:?}",
+                    self.bind_addr, LISTENER_CLOSE_WAIT
+                );
             }
-            *listener_task = None;
         })
     }
 

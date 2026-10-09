@@ -820,3 +820,39 @@ async fn retirement_reports_late_sends_and_preserves_successor() {
     assert_eq!(errors.error_count(), 2);
     assert!(connections.get(&key).unwrap().tx.same_channel(&next.tx));
 }
+
+/// `closed` must wait for the accept loop to stop, so no peer can connect and
+/// the socket file is gone when it returns.
+///
+/// The transport used to spawn the loop and drop its handle, so `closed`
+/// returned at once while the loop still owned the socket. The yields let the
+/// loop reach `accept()` first, as it has in any real shutdown.
+#[tokio::test]
+async fn closed_releases_running_listener() {
+    use crate::transports::transport::make_channels;
+
+    let dir = std::env::temp_dir().join(format!("uds-test-{}", crate::InstanceId::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let socket_path = dir.join("closed.sock");
+    let transport = UdsTransportBuilder::new()
+        .socket_path(&socket_path)
+        .build()
+        .unwrap();
+    let (adapter, _streams) = make_channels();
+    transport
+        .start(
+            crate::InstanceId::new_v4(),
+            adapter,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
+    for _ in 0..4 {
+        tokio::task::yield_now().await;
+    }
+    transport.shutdown();
+    transport.closed().await;
+    assert!(std::os::unix::net::UnixStream::connect(&socket_path).is_err());
+    assert!(!socket_path.exists());
+    std::fs::remove_dir_all(&dir).ok();
+}

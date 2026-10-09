@@ -32,6 +32,11 @@ use crate::transports::coalesce::{
 };
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
 
+/// How long `closed()` waits for the accept loop to drop its socket. The loop
+/// exits on its next poll after teardown, so this bound only matters when the
+/// runtime that runs it is not being driven.
+const LISTENER_CLOSE_WAIT: Duration = Duration::from_secs(1);
+
 /// UDS transport with lock-free concurrent access
 ///
 /// Mirrors `TcpTransport` but uses Unix domain sockets.
@@ -57,6 +62,9 @@ pub struct UdsTransport {
     // Connect timeout for outbound connections
     connect_timeout: Duration,
     metrics: OnceLock<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+
+    // The accept loop, so `closed()` can wait until its socket is gone.
+    listener_tasks: tokio_util::task::TaskTracker,
 
     // Listener read-buffer shrink threshold (bytes). Plumbed into UdsListener
     // at start() time. Resolved from env or default in new().
@@ -136,6 +144,7 @@ impl UdsTransport {
             channel_capacity,
             connect_timeout,
             metrics: OnceLock::new(),
+            listener_tasks: tokio_util::task::TaskTracker::new(),
             shrink_threshold: default_shrink_threshold(),
             dialed_ctx: OnceLock::new(),
         }
@@ -483,11 +492,14 @@ impl Transport for UdsTransport {
 
             let bound_listener = uds_listener.bind()?;
 
-            rt.spawn(async move {
-                if let Err(e) = bound_listener.serve().await {
-                    error!("UDS listener error: {}", e);
-                }
-            });
+            self.listener_tasks.spawn_on(
+                async move {
+                    if let Err(e) = bound_listener.serve().await {
+                        error!("UDS listener error: {}", e);
+                    }
+                },
+                &rt,
+            );
 
             info!("UDS transport started on {:?}", socket_path);
 
@@ -513,6 +525,27 @@ impl Transport for UdsTransport {
         // Clear connections
         self.connections.clear();
         self.update_connection_gauge();
+    }
+
+    fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
+        Box::pin(async move {
+            if !self.cancel_token.is_cancelled() {
+                return;
+            }
+            // `shutdown()` cancelled teardown, so the accept loop is exiting.
+            // Wait for it, so no peer can connect once this returns and the
+            // socket file is gone.
+            self.listener_tasks.close();
+            if tokio::time::timeout(LISTENER_CLOSE_WAIT, self.listener_tasks.wait())
+                .await
+                .is_err()
+            {
+                warn!(
+                    "UDS listener on {:?} did not stop within {:?}",
+                    self.socket_path, LISTENER_CLOSE_WAIT
+                );
+            }
+        })
     }
 
     fn set_observability(
