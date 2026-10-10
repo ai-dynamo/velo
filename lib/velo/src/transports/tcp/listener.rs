@@ -185,8 +185,9 @@ impl TcpListener {
             .context("Failed to build tokio runtime")
     }
 
-    /// Main server loop that accepts connections
-    async fn run_server(self) -> Result<()> {
+    /// Main server loop that accepts connections. It owns the listening
+    /// socket, so the socket closes when this returns.
+    pub(super) async fn run_server(self) -> Result<()> {
         // Use pre-bound listener if provided, otherwise bind to the address
         let listener = if let Some(std_listener) = self.listener {
             // Best effort for caller-provided listeners: they are already
@@ -230,6 +231,13 @@ impl TcpListener {
 
         loop {
             tokio::select! {
+                // Teardown first, so a steady stream of connects cannot delay
+                // the exit that `TcpTransport::closed` waits for.
+                biased;
+                _ = teardown_token.cancelled() => {
+                    info!("TCP listener shutting down (teardown)");
+                    break;
+                }
                 accept_result = listener.accept() => {
                     match accept_result {
                         Ok((stream, peer_addr)) => {
@@ -255,10 +263,6 @@ impl TcpListener {
                             error!("Failed to accept TCP connection: {}", e);
                         }
                     }
-                }
-                _ = teardown_token.cancelled() => {
-                    info!("TCP listener shutting down (teardown)");
-                    break;
                 }
             }
         }
