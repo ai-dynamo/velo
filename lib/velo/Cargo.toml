@@ -52,7 +52,10 @@ velo-ext = { workspace = true }
 
 anyhow = { workspace = true }
 async-stream = { workspace = true }
-bytes = { workspace = true }
+# `serde` makes `Bytes` a stream item type: `StreamAnchor<Bytes>` and
+# `StreamSender<Bytes>` carry already-serialized payloads (`send_bytes`,
+# `next_bytes`), and their typed `next` and `send` need the serde impls.
+bytes = { workspace = true, features = ["serde"] }
 dashmap = { workspace = true }
 derive_builder = { workspace = true }
 derive-getters = { workspace = true }
@@ -158,6 +161,10 @@ required-features = ["queue-messenger"]
 name = "queue_nats"
 path = "tests/queue/nats_integration.rs"
 required-features = ["nats-queue"]
+
+[[test]]
+name = "streaming_byte_items"
+path = "tests/streaming/byte_items.rs"
 
 [[test]]
 name = "streaming_cancel"

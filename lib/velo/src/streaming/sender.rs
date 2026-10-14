@@ -7,6 +7,8 @@
 //! It serializes typed items into [`StreamFrame`] via `rmp_serde`, pushes them through
 //! a [`flume::Sender<Vec<u8>>`], manages a background heartbeat task, and guarantees
 //! a [`StreamFrame::Dropped`] sentinel on abnormal exit via `impl Drop`.
+//! A `StreamSender<Bytes>` can also send bytes that are already serialized with
+//! [`send_bytes`](StreamSender::send_bytes), which writes the same frame without serde.
 //!
 //! # Lifecycle
 //!
@@ -26,12 +28,13 @@
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::streaming::anchor::AnchorEntry;
-use crate::streaming::frame::{SendError, StreamFrame};
+use crate::streaming::frame::{SendError, StreamFrame, encode_bytes_item};
 use crate::streaming::handle::StreamAnchorHandle;
 
 /// Cancellation state for a [`StreamSender`].
@@ -329,23 +332,7 @@ impl<T: Serialize> StreamSender<T> {
         }
         let bytes = rmp_serde::to_vec(&StreamFrame::Item(item))
             .map_err(|e| SendError::SerializationError(e.to_string()))?;
-        // Try non-blocking first so we can record producer-side backpressure
-        // before falling through to the awaited send. The connect-side channel
-        // is 4096 deep on the per-stream path and C+1 deep under the mux.
-        match self.tx.try_send(bytes) {
-            Ok(()) => Ok(()),
-            Err(flume::TrySendError::Full(b)) => {
-                if let Some(m) = self.metrics.as_ref() {
-                    m.record_producer_send_backpressure();
-                }
-                tokio::select! {
-                    biased;
-                    _ = self.cancel_token.cancelled() => Err(SendError::ChannelClosed),
-                    result = self.tx.send_async(b) => result.map_err(|_| SendError::ChannelClosed),
-                }
-            }
-            Err(flume::TrySendError::Disconnected(_)) => Err(SendError::ChannelClosed),
-        }
+        self.send_item_frame(bytes).await
     }
 
     /// Send a soft error through the channel.
@@ -446,6 +433,60 @@ impl<T: Serialize> StreamSender<T> {
         // Clean up sender registry entry
         self.sender_registry.senders.remove(&self.sender_stream_id);
         Ok(self.handle)
+    }
+}
+
+impl<T> StreamSender<T> {
+    /// Queue one encoded `Item` frame. [`send`](Self::send) and
+    /// [`send_bytes`](StreamSender::send_bytes) share it, so they agree on
+    /// backpressure, cancel, and a closed channel.
+    async fn send_item_frame(&self, bytes: Vec<u8>) -> Result<(), SendError> {
+        // Try non-blocking first so we can record producer-side backpressure
+        // before falling through to the awaited send. The connect-side channel
+        // is 4096 deep on the per-stream path and C+1 deep under the mux.
+        match self.tx.try_send(bytes) {
+            Ok(()) => Ok(()),
+            Err(flume::TrySendError::Full(b)) => {
+                if let Some(m) = self.metrics.as_ref() {
+                    m.record_producer_send_backpressure();
+                }
+                tokio::select! {
+                    biased;
+                    _ = self.cancel_token.cancelled() => Err(SendError::ChannelClosed),
+                    result = self.tx.send_async(b) => result.map_err(|_| SendError::ChannelClosed),
+                }
+            }
+            Err(flume::TrySendError::Disconnected(_)) => Err(SendError::ChannelClosed),
+        }
+    }
+}
+
+impl StreamSender<Bytes> {
+    /// Send bytes that are already serialized as one item, without serde.
+    ///
+    /// The frame is the one [`send`](Self::send) writes for
+    /// `Bytes::copy_from_slice(payload)`, so any `StreamAnchor<Bytes>` reads
+    /// it, through `next` or through
+    /// [`next_bytes`](crate::streaming::StreamAnchor::next_bytes). It is
+    /// built in one allocation of the exact size, with one copy of the
+    /// payload. `send` copies the payload once too, but serde grows the
+    /// buffer as it writes it.
+    ///
+    /// Use it when each item is a buffer the application already encoded,
+    /// such as a serialized response chunk. The consumer's `next_bytes` then
+    /// gets the payload with no copy.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`send`](Self::send), with the same rules for a cancel
+    /// and a full channel. [`SendError::SerializationError`] means the payload
+    /// is over `u32::MAX` bytes, the limit of a msgpack `bin`.
+    pub async fn send_bytes(&self, payload: impl AsRef<[u8]>) -> Result<(), SendError> {
+        if self.closed.is_closed() {
+            return Err(SendError::ChannelClosed);
+        }
+        let bytes = encode_bytes_item(payload.as_ref())?;
+        self.send_item_frame(bytes).await
     }
 }
 
@@ -615,6 +656,11 @@ mod tests {
 
     /// Create a test sender with a bounded(256) channel and a dummy handle.
     fn make_sender() -> (StreamSender<u32>, flume::Receiver<Vec<u8>>) {
+        make_sender_of()
+    }
+
+    /// [`make_sender`] for any item type.
+    fn make_sender_of<T: serde::Serialize>() -> (StreamSender<T>, flume::Receiver<Vec<u8>>) {
         let (tx, rx) = flume::bounded::<Vec<u8>>(256);
         let handle = StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 1);
         let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -1126,6 +1172,46 @@ mod tests {
         assert!(matches!(item, Err(SendError::ChannelClosed)));
         assert!(matches!(error, Err(SendError::ChannelClosed)));
         assert!(rx.is_full(), "the receiver stayed open and did not drain");
+    }
+
+    /// `send_bytes` is `send` with its own encoder. It must write the frame
+    /// `send` writes for a `Bytes` item, so either end of a stream can be
+    /// typed, and it must share `send`'s rules: a full channel waits, a
+    /// cancel wakes the wait, and a cancelled stream refuses at once.
+    #[tokio::test]
+    async fn send_bytes_writes_the_typed_frame_and_follows_the_send_rules() {
+        let (sender, rx) = make_sender_of::<bytes::Bytes>();
+        sender.send_bytes(b"chunk").await.unwrap();
+        sender
+            .send(bytes::Bytes::from_static(b"chunk"))
+            .await
+            .unwrap();
+        assert_eq!(rx.recv().unwrap(), rx.recv().unwrap());
+
+        for _ in 0..rx.capacity().unwrap() {
+            sender.send_bytes(b"x").await.unwrap();
+        }
+        let blocked = sender.send_bytes(b"late");
+        tokio::pin!(blocked);
+        assert!(futures::poll!(&mut blocked).is_pending());
+        sender.cancellation_token().cancel();
+        let blocked = tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("a blocked send_bytes did not wake after cancellation");
+        assert!(matches!(blocked, Err(SendError::ChannelClosed)));
+
+        rx.drain().for_each(drop);
+        for _ in 0..1000 {
+            if sender.closed.is_closed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(matches!(
+            sender.send_bytes(b"after cancel").await,
+            Err(SendError::ChannelClosed)
+        ));
+        assert!(rx.is_empty());
     }
 
     // -----------------------------------------------------------------------
