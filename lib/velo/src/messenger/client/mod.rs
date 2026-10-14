@@ -240,6 +240,17 @@ impl ActiveMessageClient {
         self.peer_registry.register_peer(instance_id);
     }
 
+    /// Forget a peer and its cached handler list.
+    pub(crate) fn unregister_peer(&self, instance_id: InstanceId) {
+        self.peer_registry.unregister_peer(instance_id);
+    }
+
+    /// Whether the peer registry has an entry for `instance_id`.
+    #[cfg(test)]
+    pub(crate) fn knows_peer(&self, instance_id: InstanceId) -> bool {
+        self.peer_registry.contains(instance_id)
+    }
+
     /// Record a peer's handlers as a handshake would, so a test can take the
     /// direct send path to a peer that never answers a handshake.
     #[cfg(all(test, feature = "queue-messenger"))]

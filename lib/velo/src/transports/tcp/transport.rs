@@ -117,6 +117,10 @@ pub struct TcpTransport {
 struct ConnectionHandle {
     tx: flume::Sender<SendTask>,
     gate: AdmissionGate<SendTask>,
+    /// Stops this connection's writer. A child of the transport's token.
+    /// The writer holds a sender of its own channel, so dropping the handle
+    /// alone does not end it.
+    cancel: CancellationToken,
 }
 
 impl ConnectionHandle {
@@ -125,6 +129,13 @@ impl ConnectionHandle {
     /// successor.
     fn retire(&self) {
         self.gate.fail_all(AdmissionError::ConnectionReplaced);
+    }
+
+    /// Close the connection on purpose: fail what waits in the gate and stop
+    /// the writer, which closes the socket and fails what it has not written.
+    fn close(&self) {
+        self.gate.fail_all(AdmissionError::ChannelClosed);
+        self.cancel.cancel();
     }
 }
 
@@ -290,6 +301,7 @@ impl TcpTransport {
         let handle = ConnectionHandle {
             gate: AdmissionGate::new(tx.clone(), rt.clone()),
             tx,
+            cancel: self.cancel_token.child_token(),
         };
 
         rt.spawn(connection_writer_task(
@@ -297,7 +309,7 @@ impl TcpTransport {
             key,
             rx,
             handle.tx.clone(),
-            self.writer_context(),
+            self.writer_context(handle.cancel.clone()),
         ));
 
         debug!(
@@ -307,11 +319,12 @@ impl TcpTransport {
         Ok(handle)
     }
 
-    /// What each connection writer gets from the transport.
-    fn writer_context(&self) -> WriterTaskContext {
+    /// What each connection writer gets from the transport. `cancel` is the
+    /// connection's own token.
+    fn writer_context(&self, cancel: CancellationToken) -> WriterTaskContext {
         WriterTaskContext {
             connections: Arc::clone(&self.connections),
-            cancel_token: self.cancel_token.clone(),
+            cancel_token: cancel,
             connect_timeout: self.connect_timeout,
             reader_ctx: self.dialed_ctx.get().cloned(),
             metrics: self.metrics.get().cloned(),
@@ -416,6 +429,20 @@ impl Transport for TcpTransport {
         debug!("Registered peer {} at {}", peer_info.instance_id(), addr);
 
         Ok(())
+    }
+
+    /// Removes the address first, so a send that races this cannot dial a
+    /// new connection, then closes the connection of each lane.
+    fn unregister(&self, instance_id: crate::InstanceId) {
+        self.peers.remove(&instance_id);
+        for lane in 0..self.lanes.get() {
+            if let Some((_, handle)) = self.connections.remove(&(instance_id, lane)) {
+                handle.close();
+            }
+        }
+        self.update_peer_gauge();
+        self.update_connection_gauge();
+        debug!("Unregistered peer {}", instance_id);
     }
 
     fn lanes(&self, _target: crate::InstanceId) -> NonZeroU16 {
@@ -653,6 +680,7 @@ impl Transport for TcpTransport {
 /// Per-connection configuration handed to [`connection_writer_task`].
 struct WriterTaskContext {
     connections: Arc<DashMap<LaneKey, ConnectionHandle>>,
+    /// The connection's token: shutdown and unregister both cancel it.
     cancel_token: CancellationToken,
     connect_timeout: Duration,
     reader_ctx: Option<DialedReaderContext>,
@@ -834,6 +862,20 @@ fn parse_tcp_endpoint(endpoint: &[u8]) -> Result<SocketAddr> {
     addrs
         .next()
         .ok_or_else(|| anyhow::anyhow!("no addresses resolved"))
+}
+
+#[cfg(test)]
+impl TcpTransport {
+    /// Whether `target` is registered, for tests outside this module.
+    pub(crate) fn knows_peer(&self, target: crate::InstanceId) -> bool {
+        self.peers.contains_key(&target)
+    }
+
+    /// Whether this transport holds a dialed connection to `target` on
+    /// `lane`, for tests outside this module.
+    pub(crate) fn has_lane_connection(&self, target: crate::InstanceId, lane: u16) -> bool {
+        self.connections.contains_key(&(target, lane))
+    }
 }
 
 // `#[path]` keeps the tests beside their siblings as `tcp/tests.rs`, not

@@ -218,6 +218,7 @@ fn replacing_a_dead_connection_does_not_deadlock() {
         ConnectionHandle {
             gate: AdmissionGate::new(tx.clone(), rt.handle().clone()),
             tx,
+            cancel: tokio_util::sync::CancellationToken::new(),
         },
     );
 
@@ -254,6 +255,7 @@ async fn retirement_reports_late_sends_and_preserves_successor() {
                     tokio::runtime::Handle::current(),
                 ),
                 tx,
+                cancel: tokio_util::sync::CancellationToken::new(),
             },
             rx,
         )

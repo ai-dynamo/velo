@@ -87,6 +87,8 @@ pub struct UdsTransport {
 struct ConnectionHandle {
     tx: flume::Sender<SendTask>,
     gate: AdmissionGate<SendTask>,
+    /// Stops this connection's writer, as in the TCP transport.
+    cancel: CancellationToken,
 }
 
 impl ConnectionHandle {
@@ -95,6 +97,12 @@ impl ConnectionHandle {
     /// successor.
     fn retire(&self) {
         self.gate.fail_all(AdmissionError::ConnectionReplaced);
+    }
+
+    /// Close the connection on purpose, as in the TCP transport.
+    fn close(&self) {
+        self.gate.fail_all(AdmissionError::ChannelClosed);
+        self.cancel.cancel();
     }
 }
 
@@ -245,6 +253,7 @@ impl UdsTransport {
         let handle = ConnectionHandle {
             gate: AdmissionGate::new(tx.clone(), rt.clone()),
             tx,
+            cancel: self.cancel_token.child_token(),
         };
 
         debug!("Created new UDS connection to {} ({:?})", instance_id, path);
@@ -255,7 +264,7 @@ impl UdsTransport {
             handle.tx.clone(),
             WriterTaskContext {
                 connections: Arc::clone(&self.connections),
-                cancel_token: self.cancel_token.clone(),
+                cancel_token: handle.cancel.clone(),
                 connect_timeout: self.connect_timeout,
                 reader_ctx: self.dialed_ctx.get().cloned(),
                 metrics: self.metrics.get().cloned(),
@@ -373,6 +382,18 @@ impl Transport for UdsTransport {
         debug!("Registered peer {} at {:?}", peer_info.instance_id(), path);
 
         Ok(())
+    }
+
+    /// Removes the path first, so a racing send cannot dial again, then
+    /// closes the connection.
+    fn unregister(&self, instance_id: crate::InstanceId) {
+        self.peers.remove(&instance_id);
+        if let Some((_, handle)) = self.connections.remove(&instance_id) {
+            handle.close();
+        }
+        self.update_peer_gauge();
+        self.update_connection_gauge();
+        debug!("Unregistered peer {}", instance_id);
     }
 
     #[inline]
@@ -603,6 +624,7 @@ impl Transport for UdsTransport {
 /// Per-connection configuration handed to [`connection_writer_task`].
 struct WriterTaskContext {
     connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
+    /// The connection's token: shutdown and unregister both cancel it.
     cancel_token: CancellationToken,
     connect_timeout: Duration,
     reader_ctx: Option<DialedReaderContext>,

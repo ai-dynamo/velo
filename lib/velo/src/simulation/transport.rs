@@ -72,6 +72,10 @@ impl Transport for SimTransport {
         Ok(())
     }
 
+    fn unregister(&self, instance_id: InstanceId) {
+        self.peers.remove(&instance_id);
+    }
+
     /// Admission is always immediate.
     ///
     /// The fabric's queue is unbounded and its ordering is decided by the
@@ -216,8 +220,12 @@ mod tests {
         let other = SimTransport::new(fabric).unwrap();
         let peer_addr = other.address();
         let peer_info = PeerInfo::new(InstanceId::new_v4(), peer_addr);
+        let peer = peer_info.instance_id();
 
         assert!(transport.register(peer_info).is_ok());
+        assert!(transport.peers.contains_key(&peer));
+        transport.unregister(peer);
+        assert!(!transport.peers.contains_key(&peer));
     }
 
     #[test]

@@ -303,6 +303,20 @@ pub trait Transport: Send + Sync {
     /// Register a remote peer, extracting its endpoint from [`PeerInfo`].
     fn register(&self, peer_info: PeerInfo) -> Result<(), TransportError>;
 
+    /// Forget a peer that [`register`](Transport::register) added.
+    ///
+    /// Drop everything kept for `instance_id`, and close its connections.
+    /// After this, a send to it fails as a send to a peer never registered
+    /// does, and a later `register` starts fresh. Frames still queued for
+    /// the peer may fail. Other peers must not be affected.
+    ///
+    /// The runtime calls this on every transport, also on one that never
+    /// registered the peer, so it must be cheap and idempotent. The default
+    /// does nothing, which is right only for a transport that keeps no state
+    /// per peer. Without it, a process whose peers restart (each restart is
+    /// a new instance id) keeps the state of every peer it ever saw.
+    fn unregister(&self, _instance_id: InstanceId) {}
+
     /// Send an active message to the remote instance.
     ///
     /// The frame is taken unconditionally: implementations must not hand it

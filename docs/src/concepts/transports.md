@@ -27,6 +27,8 @@ The `http` feature exists, but the HTTP messenger transport is not built at this
 
 Velo registers each peer with every transport that the peer and the local instance both support. For each peer, Velo selects a primary transport: the compatible transport with the highest priority. Messages to that peer go on the primary transport.
 
+`Velo::unregister_peer` undoes this. It removes the peer's routes, and then each transport drops the peer's address and closes its connections. See [Forget a peer](discovery.md#forget-a-peer). Dropping a connection's map entry does not close it: the writer task holds a sender of its own channel, so it would wait for frames forever. So TCP, UDS, QUIC, and gRPC give each connection its own cancel token, a child of the transport's token. UCX closes the endpoint on its progress thread, at the next point in the loop where closing one is safe. ZMQ closes the DEALER socket on its sender thread. NATS keeps no connection per peer.
+
 A `WorkerAddress` is a MessagePack map from `TransportKey` to endpoint bytes. Each transport adds its own entry, and a peer reads the entries for the transports that it has.
 
 ## The transport contract
@@ -37,6 +39,7 @@ Every transport implements the `Transport` trait from `velo-ext`. The runtime re
 - **Order holds per lane.** `lanes(target)` tells how many ordered channels the transport keeps to a peer. The default is 1. `send_message_on_lane` keeps order within one lane only, and `send_message` sends on lane 0. A lane never fails over to another lane's connection, because that would reorder it. The messenger sends its own traffic on lane 0, because ordered handlers need the messages of one peer on one lane. QUIC and TCP implement lanes. The other transports keep one lane.
 - **Inbound frames go to four streams**: message, response, event, and shutdown. The `TransportAdapter` routes each frame to its stream.
 - **Admission owns the in-flight count.** Each inbound `MessageType::Message` goes through `TransportAdapter::admit_message`. See [Shutdown and drain](shutdown.md) for why a transport must not check `is_draining()` itself.
+- **Unregister forgets a peer.** `unregister(instance_id)` drops what the transport keeps for the peer and closes its connections. The runtime calls it on every transport, also on one that never registered the peer, so it must be cheap and idempotent. The default does nothing, which is right only for a transport with no per-peer state.
 - **Metrics use one handle.** The runtime gives each transport an observability handle through `set_observability`. In-tree and out-of-tree transports write the same `velo_transport_*` series.
 
 ## Coalescing writer
