@@ -94,12 +94,13 @@ All settings are fields of `MuxConfig`. Always build it with `..Default::default
 | `initial_credit` | 32 | Data credit C per slot. Each slot buffer holds C+1 records. Zero is refused at build time. |
 | `slot_byte_budget` | 1 MiB | Bytes one slot can hold in flight, and the cap on its withheld queue. Zero means the default. |
 | `peer_byte_budget` | 8 MiB | Bytes all slots of one peer, on all its lanes, can hold in flight on the receive side. |
-| `credit_sweep_interval` | 200 ms | Period of the whole-table credit walk, the batcher eviction check, and the check that closes expired accept windows. An unclaimed bind is reclaimed up to one interval after its 60 s window. Zero is refused at build time. |
+| `credit_sweep_interval` | 200 ms | Period of the whole-table credit walk, the batcher eviction check, and the check that closes expired accept windows. An unclaimed bind is reclaimed up to one interval after its window closes. Zero is refused at build time. |
 | `drain_visit_floor` | 2 ms | Shortest gap between two doorbell visits to the same (peer, lane). Zero turns the floor off. Values above 1 hour are clamped. |
 | `batcher_idle_ttl` | 60 s | How long a batcher with no slots stays alive before eviction. |
 | `flush_policy` | `Auto` with `on_admission: true` | When a batcher writes. See [Select a flush policy](#select-a-flush-policy). |
 | `async_open_ack` | `false` | Whether a slot open returns before the transport admits its `OpenSlot`. |
 | `reply_linger` | 1 ms | How long a credit reply waits for other records to share its batch. Zero writes each reply at once. |
+| `prebind_accept_timeout` | `Some(60 s)` | How long a zero-RTT pre-bind waits for its worker to open the ticket. `None` means no limit: the pre-bind lasts until its anchor is dropped or cancelled. Attach binds always wait 60 s. See [Use zero-RTT stream setup](#use-zero-rtt-stream-setup). |
 
 ## Change the credit window
 
@@ -172,7 +173,22 @@ let sender = match envelope.ticket {
 
 A ticket sender observes `stop_token()` and `cancellation_token()` through the mux's slot lifecycle. Stop leaves the stream open for final output. Cancel or consumer drop wakes an idle producer and ends delivery; it does not need a later send.
 
-The ticket stays valid for the 60-second accept window. After the window, the consumer reaps the bind and sees `SenderDropped`.
+The ticket stays valid for `prebind_accept_timeout`, 60 s by default. After the window, the consumer reaps the bind and sees `SenderDropped`. The window starts when the consumer makes the ticket, so it includes the time the request waits in the producer's queue.
+
+If a producer can hold a request for longer than that, for example while its workers are busy with long generations, set `prebind_accept_timeout: None` on the consumer:
+
+```rust
+let velo = Velo::builder()
+    .messenger_mux(MuxConfig {
+        prebind_accept_timeout: None,
+        ..Default::default()
+    })?
+    // ...
+    .build()
+    .await?;
+```
+
+The pre-bind then never expires. Velo releases it only when the anchor is dropped or cancelled, so drop or cancel the anchor when the request ends: on a client disconnect, on a request timeout, and when the producer the ticket went to is lost. A fixed window cannot tell a busy producer from a dead one.
 
 ## Roll back
 

@@ -1157,6 +1157,12 @@ impl Velo {
     ///
     /// Must be called from a runtime context: it spawns the stream watchdog,
     /// exactly as the attach handler does for a mux bind.
+    ///
+    /// The ticket stays valid for
+    /// [`MuxConfig::prebind_accept_timeout`](crate::streaming::MuxConfig::prebind_accept_timeout),
+    /// 60 s by default. After that the anchor sees `SenderDropped`. With
+    /// `None` the ticket stays valid until the anchor is dropped or cancelled,
+    /// and the caller owns that.
     pub fn prebind_anchor(
         &self,
         handle: StreamAnchorHandle,

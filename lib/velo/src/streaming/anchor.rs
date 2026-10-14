@@ -203,9 +203,11 @@ pub(crate) struct AnchorEntry {
 /// every one of them drops this. What it does depends on whether an `OpenSlot`
 /// has claimed the bind:
 ///
-/// - **Unclaimed** — release the bind. The 60 s accept window would collect it
-///   eventually and stays as the backstop, but a request that dies before its
-///   first token knows a minute sooner than that timer does.
+/// - **Unclaimed** — release the bind. The pre-bind accept window, 60 s by
+///   default, would collect it eventually and stays as the backstop, but a
+///   request that dies before its first token knows sooner than that timer
+///   does. With `MuxConfig::prebind_accept_timeout` set to `None` there is no
+///   timer, and this is the only release.
 /// - **Claimed** — tell the peer to abandon its egress slot. Without this a
 ///   producer that is not sending never learns its consumer is gone: the
 ///   ingress fault carrying that news rides on the next record to arrive, and
@@ -1356,13 +1358,18 @@ impl AnchorManager {
     /// Must be called from a runtime context: it spawns the stream watchdog,
     /// exactly as the attach handler does for a mux bind.
     ///
-    /// The ticket may sit in a request envelope for up to the mux's 60 s
-    /// accept window before its worker opens it: heartbeat detection does not
-    /// start until an `OpenSlot` claims the bind, so nothing shorter can reap
-    /// it, and the configured `unattached_timeout` does not apply here either
-    /// — it stays paused for the whole pre-bind phase, same as at attach. A
-    /// worker that may be queued longer than that needs a longer-lived
-    /// rendezvous than this call provides.
+    /// The ticket may sit in a request envelope for up to the mux's pre-bind
+    /// accept window,
+    /// [`MuxConfig::prebind_accept_timeout`](crate::streaming::MuxConfig::prebind_accept_timeout)
+    /// (60 s by default), before its worker opens it. When the window closes,
+    /// the bind is reclaimed and the anchor sees `SenderDropped`. Heartbeat
+    /// detection does not start until an `OpenSlot` claims the bind, so
+    /// nothing shorter can reap it, and the configured `unattached_timeout`
+    /// does not apply here either — it stays paused for the whole pre-bind
+    /// phase, same as at attach. For a worker that may queue a request longer
+    /// than any fixed window, set that field to `None`: the pre-bind then
+    /// waits until its anchor is dropped or cancelled, so the caller must do
+    /// one of those when the request ends or its worker is lost.
     ///
     /// The ticket names the mux lane with the least load on this node: its
     /// live slots from every peer, plus its pre-binds not yet claimed,
@@ -1417,9 +1424,9 @@ impl AnchorManager {
         }
 
         // Fail fast on the common "not pre-bindable" case before minting a
-        // session id or registering a bind: `mux.bind_on_lane` queues a 60 s
-        // accept-window deadline, and a bind registered for nothing holds its
-        // buffer until that deadline passes. This is a plain read, not a lock the mutate-and-check
+        // session id or registering a bind: a bind registered for nothing
+        // costs a buffer, a lane count and a deadline until it is given back.
+        // This is a plain read, not a lock the mutate-and-check
         // below still has to redo -- an entry can change between the two, and
         // that race is the same bounded one every other caller of this check
         // already accepts (see the `Entry::Occupied` arm below).
@@ -1462,7 +1469,12 @@ impl AnchorManager {
         // only when mux shutdown cleared it after the bind, which is the same
         // case, a moment later.
         let bound = mux
-            .bind_on_lane(local_id, routing_session_id, lane)
+            .bind_on_lane(
+                local_id,
+                routing_session_id,
+                lane,
+                crate::streaming::messenger_mux::BindKind::PreBind,
+            )
             .ok()
             .and_then(
                 |receiver| match mux.take_drain_signal(local_id, routing_session_id) {
@@ -1563,7 +1575,7 @@ impl AnchorManager {
         let Some((ticket, frame_tx, heartbeat_interval, prebound, feed, replaced)) = prepared
         else {
             // Nothing took ownership of the bind, so give it straight back
-            // rather than leaving the accept window to find it in a minute.
+            // rather than leaving it to an accept window that may be off.
             mux.release_bind(local_id, routing_session_id);
             tracing::debug!(
                 %handle,
@@ -2482,8 +2494,8 @@ impl AnchorManager {
                     // on another worker. This one is on ours and writes
                     // straight into the anchor's channel, so that slot has no
                     // sender and never will: releasing it here is what keeps
-                    // the accept window from holding a bind for a minute that
-                    // nothing can claim.
+                    // a bind nothing can claim from waiting out the pre-bind
+                    // accept window, or waiting forever when it is off.
                     //
                     // The guard above is a best-effort read: `prebind_is_claimed`
                     // resolves through an unlocked `OnceLock` the mux ingress
