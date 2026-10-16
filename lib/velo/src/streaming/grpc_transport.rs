@@ -416,6 +416,10 @@ impl FrameTransport for GrpcFrameTransport {
         Ok(())
     }
 
+    fn unregister(&self, instance_id: velo_ext::InstanceId) {
+        self.peers.remove(&instance_id.worker_id());
+    }
+
     fn bind(
         &self,
         anchor_id: u64,
@@ -881,6 +885,22 @@ mod tests {
             msg.contains("has no") && msg.contains("streaming endpoint entry"),
             "got: {msg}"
         );
+    }
+
+    /// `unregister` drops the cached address, as in the TCP frame transport.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unregister_forgets_the_peers_address() {
+        let server = GrpcFrameTransport::default_new().await.unwrap();
+        let client = GrpcFrameTransport::default_new().await.unwrap();
+        let (server_worker, server_peer) = fresh_peer(server.address());
+        client.register(&server_peer).unwrap();
+        client.unregister(server_peer.instance_id());
+        let err = client.connect(server_worker, 1, 1).await.unwrap_err();
+        assert!(format!("{err}").contains("not registered"), "{err}");
+
+        client.register(&server_peer).unwrap();
+        let _rx = server.bind(1, 1).await.unwrap();
+        client.connect(server_worker, 1, 1).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]

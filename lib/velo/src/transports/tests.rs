@@ -42,6 +42,8 @@ struct MockTransport {
     /// The saturating mode's gate and its receiver. The receiver is kept alive
     /// so the channel stays open, and draining it releases queued admissions.
     queue: OnceLock<(AdmissionGate<()>, flume::Receiver<()>)>,
+    /// Every peer `unregister` was called with, in order.
+    unregistered: std::sync::Mutex<Vec<InstanceId>>,
 }
 
 impl MockTransport {
@@ -72,6 +74,7 @@ impl MockTransport {
             last_lane: AtomicUsize::new(usize::MAX),
             saturating: false,
             queue: OnceLock::new(),
+            unregistered: Default::default(),
         })
     }
 
@@ -102,6 +105,7 @@ impl MockTransport {
             last_lane: AtomicUsize::new(usize::MAX),
             saturating: true,
             queue: OnceLock::new(),
+            unregistered: Default::default(),
         })
     }
 
@@ -131,6 +135,9 @@ impl Transport for MockTransport {
         } else {
             Err(TransportError::NoEndpoint)
         }
+    }
+    fn unregister(&self, instance_id: InstanceId) {
+        self.unregistered.lock().unwrap().push(instance_id);
     }
     fn lanes(&self, _target: InstanceId) -> std::num::NonZeroU16 {
         std::num::NonZeroU16::new(4).unwrap()
@@ -505,6 +512,70 @@ async fn test_consumer_hook_does_not_suppress_backend_bookkeeping() {
         1,
         "the backend's on_error must still run for the failed frame"
     );
+}
+
+/// `unregister_peer` drops the peer's routes and worker mapping, and asks
+/// every transport to forget it, also one that refused it at registration:
+/// that transport is not in the routes, but it can still hold the peer from
+/// an earlier registration that it accepted. Other peers keep their routes,
+/// and a second call changes nothing.
+#[tokio::test]
+async fn unregister_peer_drops_routes_and_tells_every_transport() {
+    let tcp = MockTransport::new("tcp", true);
+    let refuses = MockTransport::new("http", false);
+    let (backend, _streams) = VeloBackend::new(
+        vec![
+            tcp.clone() as Arc<dyn Transport>,
+            refuses.clone() as Arc<dyn Transport>,
+        ],
+        None,
+    )
+    .await
+    .unwrap();
+
+    let gone = make_peer_info(&["tcp", "http"]);
+    let stays = make_peer_info(&["tcp", "http"]);
+    let (gone_id, stays_id) = (gone.instance_id(), stays.instance_id());
+    backend.register_peer(gone).unwrap();
+    backend.register_peer(stays).unwrap();
+
+    backend.unregister_peer(gone_id);
+    assert!(!backend.is_registered(gone_id));
+    assert!(backend.alternative_transport_keys(gone_id).is_none());
+    assert!(
+        backend
+            .try_translate_worker_id(gone_id.worker_id())
+            .is_err()
+    );
+    for transport in [&tcp, &refuses] {
+        assert_eq!(*transport.unregistered.lock().unwrap(), vec![gone_id]);
+    }
+    let send = |target| {
+        backend.send_message(
+            target,
+            Bytes::new(),
+            Bytes::new(),
+            MessageType::Message,
+            Arc::new(NoopErrorHandler),
+        )
+    };
+    let err = send(gone_id).unwrap_err();
+    assert!(matches!(
+        err.downcast_ref::<VeloBackendError>(),
+        Some(VeloBackendError::InstanceNotRegistered(id)) if *id == gone_id
+    ));
+
+    assert!(backend.is_registered(stays_id));
+    assert_eq!(
+        backend
+            .try_translate_worker_id(stays_id.worker_id())
+            .unwrap(),
+        stays_id
+    );
+    assert!(send(stays_id).is_ok());
+
+    backend.unregister_peer(gone_id);
+    assert!(backend.is_registered(stays_id));
 }
 
 #[tokio::test]

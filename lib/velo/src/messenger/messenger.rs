@@ -521,6 +521,18 @@ impl Messenger {
         Ok(())
     }
 
+    /// Forget a peer that [`register_peer`](Self::register_peer) added.
+    ///
+    /// Drops it from every transport, closes its connections, and forgets
+    /// its handler list. See [`crate::Velo::unregister_peer`] for when to
+    /// call it.
+    pub fn unregister_peer(&self, instance_id: InstanceId) {
+        // Backend first, so a new send fails at once instead of starting a
+        // handshake to a peer that is going away.
+        self.backend.unregister_peer(instance_id);
+        self.client.unregister_peer(instance_id);
+    }
+
     /// Discover a peer by instance_id and register it for communication.
     pub async fn discover_and_register_peer(&self, instance_id: InstanceId) -> Result<()> {
         tracing::debug!(
@@ -577,7 +589,8 @@ impl Messenger {
     /// mints it with `InstanceId::new_v4()` and nothing can pin it, so a
     /// restarted peer arrives with an unknown id and is handshaken afresh.
     /// Letting callers reuse an id across restarts would need the cached list
-    /// dropped when the peer's address changes.
+    /// dropped when the peer's address changes. The list is kept until
+    /// [`unregister_peer`](Self::unregister_peer) drops it.
     pub async fn wait_for_handler(
         &self,
         instance_id: InstanceId,

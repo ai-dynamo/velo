@@ -72,6 +72,7 @@ fn make_handle(capacity: usize) -> (ConnectionHandle, flume::Receiver<SendTask>)
     let handle = ConnectionHandle {
         gate: AdmissionGate::new(tx.clone(), tokio::runtime::Handle::current()),
         tx,
+        cancel: CancellationToken::new(),
     };
     (handle, rx)
 }

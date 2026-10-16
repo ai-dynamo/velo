@@ -31,7 +31,7 @@
 use anyhow::Result;
 use futures::future::BoxFuture;
 
-use crate::id::{PeerInfo, TransportKey, WorkerAddress, WorkerId};
+use crate::id::{InstanceId, PeerInfo, TransportKey, WorkerAddress, WorkerId};
 
 /// Transport abstraction for frame-level ordered delivery.
 ///
@@ -93,6 +93,15 @@ pub trait FrameTransport: Send + Sync {
         Ok(())
     }
 
+    /// Forget a peer that [`register`](Self::register) cached.
+    ///
+    /// Mirrors [`crate::Transport::unregister`]: drop what is kept for the
+    /// peer, so that a later `register` starts fresh. Streams already
+    /// connected to it may fail. The runtime calls this also for a peer
+    /// that was never registered here, so it must be cheap and idempotent.
+    /// The default does nothing, for a transport with no per-peer state.
+    fn unregister(&self, _instance_id: InstanceId) {}
+
     /// Bind a receive endpoint for the given anchor.
     ///
     /// - `anchor_id`: identifies which anchor this binding is for.
@@ -135,7 +144,6 @@ pub trait FrameTransport: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::id::InstanceId;
     use futures::FutureExt;
 
     /// Compile-time proof that [`FrameTransport`] is object-safe.
@@ -178,5 +186,8 @@ mod tests {
         let transport = DefaultRegisterTransport;
         let peer = PeerInfo::new(InstanceId::new_v4(), WorkerAddress::empty());
         assert!(transport.register(&peer).is_ok());
+        // The default `unregister` accepts a known and an unknown peer.
+        transport.unregister(peer.instance_id());
+        transport.unregister(InstanceId::new_v4());
     }
 }

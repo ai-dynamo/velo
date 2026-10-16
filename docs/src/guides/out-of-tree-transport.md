@@ -27,6 +27,7 @@ velo-ext = "0.5"
 6. Store the handle that `set_observability` gives you. Record each inbound frame as you route it.
 7. On the `Admitted` arm, and only there, record the frame as inbound `message`.
 8. In `shutdown`, stop your tasks and threads. The runtime calls it at most once, with its Tokio runtime handle entered, on a dedicated thread, so you may block there, for example to join a thread. Two cases run it on the caller instead. Any failure while the transports start (another transport fails to start, a duplicate key, an address that cannot be merged) or a build that is cancelled then runs it on the building task. A thread that cannot be created runs it on whatever dropped or shut down the instance. After the final owner is dropped, the runtime may already be gone, so a task that `shutdown` spawns may never run. If `shutdown` panics, the runtime still calls the other transports' hooks, and then the shutdown call panics.
+9. If your transport keeps state for each peer, override `unregister` to drop it and close the peer's connections. It must be cheap and idempotent. See [Peer routing](../concepts/transports.md#peer-routing).
 
 Step 7 matters because the inbound queue depth is a difference between two counters. If your transport admits a frame and does not record it, the depth goes negative. See [Observability](../operations/observability.md).
 
@@ -53,4 +54,4 @@ impl Transport for MyTransport {
 
 New trait methods in `velo-ext` always have a default implementation, so a new release does not break your implementation. A change to an existing signature is a breaking release. See [Versioning](../development/versioning.md).
 
-A transport with one ordered channel to each peer keeps the defaults of `lanes` and `send_message_on_lane`. Override both only if your transport keeps several ordered channels to one peer. The two methods need `velo-ext = "0.5.4"` or later.
+A transport with one ordered channel to each peer keeps the defaults of `lanes` and `send_message_on_lane`. Override both only if your transport keeps several ordered channels to one peer. The two methods need `velo-ext = "0.5.4"` or later. `unregister` needs `velo-ext = "0.5.6"` or later.

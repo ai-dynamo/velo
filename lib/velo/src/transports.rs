@@ -671,6 +671,28 @@ impl VeloBackend {
         Ok(())
     }
 
+    /// Forget a peer that [`register_peer`](Self::register_peer) added.
+    ///
+    /// Drops the peer's routes, then has every transport drop its state for
+    /// the peer and close its connections (see [`Transport::unregister`]).
+    /// A send to it then fails with [`VeloBackendError::InstanceNotRegistered`].
+    /// Idempotent; other peers are not affected.
+    pub fn unregister_peer(&self, instance_id: InstanceId) {
+        // Routes first, so a new send fails here and does not reach a
+        // transport that is closing the peer's connections.
+        self.primary_transport.remove(&instance_id);
+        self.alternative_transports.remove(&instance_id);
+        self.workers
+            .remove_if(&instance_id.worker_id(), |_, id| *id == instance_id);
+        // Every transport, not only the routes: a re-registration that one
+        // transport refused leaves that transport out of the routes, but it
+        // can still hold the peer from before.
+        for transport in self.transports.values() {
+            transport.unregister(instance_id);
+        }
+        tracing::debug!(peer = %instance_id, "Unregistered peer");
+    }
+
     /// Get the available transports.
     pub fn available_transports(&self) -> Vec<TransportKey> {
         self.transports.keys().cloned().collect()

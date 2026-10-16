@@ -49,6 +49,17 @@ impl PeerRegistry {
         self.peers.entry(instance_id).or_insert_with(PeerState::new);
     }
 
+    /// Forget a peer and its cached handler list.
+    pub fn unregister_peer(&self, instance_id: InstanceId) {
+        self.peers.remove(&instance_id);
+    }
+
+    /// Whether the peer has an entry, with or without handler information.
+    #[cfg(test)]
+    pub fn contains(&self, instance_id: InstanceId) -> bool {
+        self.peers.contains_key(&instance_id)
+    }
+
     /// Check if we have handler information for a peer.
     pub fn has_handler_info(&self, instance_id: InstanceId) -> bool {
         self.peers
@@ -106,6 +117,14 @@ mod tests {
         assert_eq!(handlers.len(), 2);
         assert!(handlers.contains(&"handler1".to_string()));
         assert!(handlers.contains(&"handler2".to_string()));
+
+        // Unregistering drops the cached list, so a later registration of
+        // the same id handshakes again instead of trusting a stale list.
+        registry.unregister_peer(instance_id);
+        assert!(!registry.contains(instance_id));
+        assert!(!registry.handler_exists(instance_id, "handler1"));
+        registry.register_peer(instance_id);
+        assert!(!registry.has_handler_info(instance_id));
     }
 
     #[test]

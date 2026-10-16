@@ -101,6 +101,8 @@ impl OutboundTask {
 pub(crate) enum SenderCommand {
     /// Deliver a message to a peer.
     Send(OutboundTask),
+    /// Close the DEALER socket of a peer that was unregistered.
+    Forget(crate::InstanceId),
     /// Gracefully shut down the sender thread.
     Shutdown,
 }
@@ -205,6 +207,18 @@ impl Transport for ZmqTransport {
         );
 
         Ok(())
+    }
+
+    /// The DEALER socket lives on the sender thread, so the close goes there
+    /// as a command. It rides the peer's gate, behind the frames already
+    /// queued for the peer. A peer with no gate never sent, so it has no
+    /// socket to close.
+    fn unregister(&self, instance_id: crate::InstanceId) {
+        self.peers.remove(&instance_id);
+        if let Some((_, gate)) = self.gates.remove(&instance_id) {
+            let _ = gate.send(SenderCommand::Forget(instance_id));
+        }
+        self.update_peer_gauge();
     }
 
     #[inline]
@@ -521,6 +535,11 @@ fn run_sender(cfg: SenderConfig) {
         };
         let task = match cmd {
             SenderCommand::Send(task) => task,
+            SenderCommand::Forget(target) => {
+                // Dropping the socket closes it, after its linger period.
+                dealer_sockets.remove(&target);
+                continue;
+            }
             SenderCommand::Shutdown => {
                 debug!("ZMQ sender received shutdown signal");
                 break;
@@ -892,6 +911,69 @@ mod tests {
         worker.join().unwrap();
         assert_eq!(reply.unwrap().last().unwrap(), b"reply");
         stopped.expect("full queue lost the sender stop request");
+    }
+
+    /// `Forget` closes the peer's DEALER socket on the sender thread.
+    ///
+    /// The socket lives in the sender thread's map, so removing the peer's
+    /// address does not close it: a later frame would still go out on it.
+    /// After `Forget`, a frame to the peer finds no socket and, with the
+    /// address gone, cannot open one.
+    #[test]
+    fn forget_closes_the_peers_dealer_socket() {
+        struct Errors(flume::Sender<String>);
+        impl TransportErrorHandler for Errors {
+            fn on_error(&self, _: Bytes, _: Bytes, error: String) {
+                let _ = self.0.send(error);
+            }
+        }
+        let ctx = Arc::new(zmq::Context::new());
+        let router = ctx.socket(zmq::ROUTER).unwrap();
+        router.bind("tcp://127.0.0.1:*").unwrap();
+        router.set_rcvtimeo(2000).unwrap();
+        let target = crate::InstanceId::new_v4();
+        let peers = Arc::new(DashMap::new());
+        peers.insert(target, router.get_last_endpoint().unwrap().unwrap());
+        let (errors_tx, errors) = flume::unbounded();
+        let frame = |payload: &'static [u8]| {
+            SenderCommand::Send(OutboundTask {
+                target,
+                msg_type: MessageType::Event,
+                header: Bytes::new(),
+                payload: Bytes::from_static(payload),
+                on_error: Arc::new(Errors(errors_tx.clone())),
+            })
+        };
+        let (tx, rx) = flume::unbounded();
+        let (ready_tx, _ready) = std::sync::mpsc::sync_channel(1);
+        let worker = std::thread::spawn({
+            let (ctx, peers) = (ctx.clone(), peers.clone());
+            move || {
+                run_sender(SenderConfig {
+                    ctx,
+                    rx,
+                    stop: Arc::new(AtomicBool::new(false)),
+                    peers,
+                    identity: b"sender".to_vec(),
+                    sndhwm: 1000,
+                    linger_ms: 0,
+                    ready_tx,
+                })
+            }
+        });
+
+        tx.send(frame(b"first")).unwrap();
+        assert_eq!(router.recv_multipart(0).unwrap().last().unwrap(), b"first");
+        peers.remove(&target);
+        tx.send(SenderCommand::Forget(target)).unwrap();
+        tx.send(frame(b"second")).unwrap();
+        let error = errors
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the frame went out on the forgotten socket");
+        assert!(error.contains("not registered"), "{error}");
+
+        tx.send(SenderCommand::Shutdown).unwrap();
+        worker.join().unwrap();
     }
 
     /// Frames queued before a stop are still sent, but only within one shared
