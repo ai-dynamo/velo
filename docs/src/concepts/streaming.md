@@ -89,6 +89,8 @@ sender.finalize()?;
 - If no mux is installed, `None` is the normal result, and Velo records nothing.
 - For all other causes, Velo logs at debug level and counts `outcome="error"` under `velo_streaming_anchor_operations_total{operation="prebind"}`. These causes are an MPSC anchor, the handle of another node, an anchor that is already attached or pre-bound, and an anchor that was removed. Call `prebind_anchor` only on SPSC anchors that this node created.
 
-Call `prebind_anchor` from a runtime context, because it starts tasks. A ticket that the worker never opens does not stay forever. After a 60 s accept window, the bind is reclaimed and the anchor sees `SenderDropped`. `velo_streaming_unclaimed_bind_reaped_total` counts these tickets.
+Call `prebind_anchor` from a runtime context, because it starts tasks. By default, a ticket that the worker never opens does not stay forever. After the pre-bind accept window, `MuxConfig::prebind_accept_timeout` (60 s by default), the bind is reclaimed and the anchor sees `SenderDropped`. `velo_streaming_unclaimed_bind_reaped_total` counts these tickets.
+
+If a worker can queue a request for longer than any fixed window, set `prebind_accept_timeout` to `None`. The pre-bind then stays until its anchor is dropped or cancelled, so your code must end the anchor when the request ends or its worker is lost. With a fixed window, a busy worker that opens its ticket late looks the same as a dead one.
 
 Ticket senders support `stop_token()` and `cancellation_token()` through messenger mux version 2. The existing slot-open exchange carries the stream session identity; no extra stream registration is needed. A peer epoch and slot generation reject stale lifecycle signals. Applications that require this lifecycle must require `messenger-mux-v2`; legacy attach fallback does not establish that capability.

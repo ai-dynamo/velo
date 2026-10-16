@@ -2025,6 +2025,264 @@ async fn an_unclaimed_prebind_closes_at_its_accept_window_and_not_before() {
     );
 }
 
+/// A configured pre-bind window is the one an unclaimed pre-bind lives out,
+/// not the fixed 60 s an attach bind gets.
+///
+/// Same two edges as the default-window test above, at 5 s: just short of the
+/// window the anchor is still there, and one sweep interval past it the bind
+/// is reclaimed and the consumer sees `SenderDropped`.
+#[tokio::test]
+async fn an_unclaimed_prebind_closes_at_its_configured_window() {
+    const WINDOW: Duration = Duration::from_secs(5);
+
+    tokio::time::pause();
+    let config = MuxConfig {
+        prebind_accept_timeout: Some(WINDOW),
+        ..test_config()
+    };
+    let sweep = config.credit_sweep_interval;
+    let node = prebinding_node(config, None).await;
+    let mut anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let (_, local_id) = handle.unpack();
+    node.manager
+        .prebind_anchor(handle)
+        .expect("a mux is installed, so a ticket is minted");
+
+    tokio::time::sleep(WINDOW - Duration::from_millis(500)).await;
+    assert!(
+        node.manager.registry.contains_key(&local_id),
+        "the configured window has not closed yet"
+    );
+
+    tokio::time::sleep(Duration::from_millis(500) + sweep * 2).await;
+    assert!(
+        !node.manager.registry.contains_key(&local_id),
+        "one sweep past the configured window, the anchor must be reaped"
+    );
+    let next = tokio::time::timeout(Duration::from_millis(50), anchor.next())
+        .await
+        .expect("the bind is closed; the consumer must not block");
+    assert!(
+        matches!(
+            next,
+            Some(Err(crate::streaming::StreamError::SenderDropped))
+        ),
+        "expected SenderDropped, got {next:?}"
+    );
+}
+
+/// Attach binds and pre-binds expire on their own windows, whatever order
+/// they were made in.
+///
+/// The sweep pops each deadline queue from the front only, which is correct
+/// only while every entry in one queue has the same timeout. A pre-bind window
+/// longer than the attach window, in a queue shared with attach binds, would
+/// sit at the front and hold back every attach bind made after it: those
+/// would outlive their 60 s by up to the difference. So the two kinds keep
+/// separate queues, and a pre-bind with its window off queues nothing at all,
+/// or the queue would grow by one entry per pre-bind for the life of the
+/// process.
+#[tokio::test(flavor = "multi_thread")]
+async fn attach_binds_and_prebinds_expire_on_their_own_windows() {
+    const PREBIND_WINDOW: Duration = Duration::from_secs(90);
+
+    let bind = |mux: &MessengerMuxTransport, anchor_id, kind| {
+        mux.bind_on_lane(
+            anchor_id,
+            1,
+            LaneReservation::uncounted(LaneIndex::ZERO),
+            kind,
+        )
+        .expect("bind")
+    };
+
+    let windowed = prebinding_node(
+        MuxConfig {
+            prebind_accept_timeout: Some(PREBIND_WINDOW),
+            ..test_config()
+        },
+        None,
+    )
+    .await;
+    let start = tokio::time::Instant::now();
+    // The longer window first, so a shared queue would put it at the front.
+    let prebind = bind(&windowed.mux, 1, BindKind::PreBind);
+    let attach = bind(&windowed.mux, 2, BindKind::Attach);
+    assert_eq!(windowed.mux.queued_bind_deadlines(), 2);
+
+    windowed
+        .mux
+        .core
+        .expire_binds(start + ACCEPT_TIMEOUT + Duration::from_secs(1));
+    assert!(
+        attach.is_disconnected(),
+        "the attach bind's 60 s window has closed"
+    );
+    assert!(
+        !prebind.is_disconnected(),
+        "the pre-bind's 90 s window has not"
+    );
+
+    windowed
+        .mux
+        .core
+        .expire_binds(start + PREBIND_WINDOW + Duration::from_secs(1));
+    assert!(
+        prebind.is_disconnected(),
+        "the pre-bind's window has closed"
+    );
+    assert_eq!(windowed.mux.pending_binds(), 0);
+    assert_eq!(windowed.mux.queued_bind_deadlines(), 0);
+
+    let unlimited = prebinding_node(
+        MuxConfig {
+            prebind_accept_timeout: None,
+            ..test_config()
+        },
+        None,
+    )
+    .await;
+    let start = tokio::time::Instant::now();
+    let prebind = bind(&unlimited.mux, 1, BindKind::PreBind);
+    let attach = bind(&unlimited.mux, 2, BindKind::Attach);
+    assert_eq!(
+        unlimited.mux.queued_bind_deadlines(),
+        1,
+        "only the attach bind has a deadline"
+    );
+
+    unlimited
+        .mux
+        .core
+        .expire_binds(start + Duration::from_secs(24 * 3600));
+    assert!(attach.is_disconnected(), "the attach window stays 60 s");
+    assert!(
+        !prebind.is_disconnected(),
+        "a pre-bind with no window never expires"
+    );
+    assert_eq!(unlimited.mux.pending_binds(), 1);
+}
+
+/// With `prebind_accept_timeout: None`, an unclaimed pre-bind outlives the
+/// 60 s window and still opens and streams when its worker gets to it.
+///
+/// This is the case the setting exists for. A worker whose pool is busy with
+/// long generations can hold a request for minutes before it calls
+/// `open_anchor_stream`. Under the fixed window the bind was reaped first, the
+/// anchor saw `SenderDropped`, and the caller read a busy worker as a dead
+/// one. Nothing else may reap the bind in the meantime: heartbeat detection
+/// waits for the `OpenSlot`, and the unattached timer is paused while the
+/// anchor is pre-bound.
+///
+/// The clock is paused for the wait and resumed for the stream. The stream
+/// crosses real loopback sockets, and a paused clock jumps ahead whenever the
+/// runtime is idle and waiting for them.
+#[tokio::test]
+async fn without_a_prebind_window_a_late_worker_still_opens_its_ticket() {
+    tokio::time::pause();
+    let config = MuxConfig {
+        prebind_accept_timeout: None,
+        ..test_config()
+    };
+    let sweep = config.credit_sweep_interval;
+    let pair = mux_pair(config).await;
+    let manager_on = |worker: WorkerId, mux: &Arc<MessengerMuxTransport>| {
+        let manager = AnchorManagerBuilder::default()
+            .worker_id(worker)
+            .transport(Arc::clone(mux) as Arc<dyn crate::streaming::transport::FrameTransport>)
+            .build()
+            .expect("anchor manager");
+        manager.install_mux(Arc::clone(mux)).expect("install mux");
+        manager
+    };
+    let consumer = manager_on(pair.consumer_worker, &pair.consumer);
+    let producer = manager_on(pair.producer_worker, &pair.producer);
+
+    let mut anchor = consumer.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let (_, local_id) = handle.unpack();
+    let ticket = consumer.prebind_anchor(handle).expect("ticket");
+    assert_eq!(
+        pair.consumer.queued_bind_deadlines(),
+        0,
+        "with no window, the pre-bind queues no deadline"
+    );
+
+    tokio::time::sleep(ACCEPT_TIMEOUT + Duration::from_secs(5) + sweep * 2).await;
+    assert!(
+        consumer.registry.contains_key(&local_id),
+        "past the default window, the pre-bound anchor must still be registered"
+    );
+    assert_eq!(pair.consumer.pending_binds(), 1, "and its bind still there");
+
+    tokio::time::resume();
+    let sender = producer
+        .open_anchor_stream::<u32>(handle, ticket)
+        .await
+        .expect("the late worker opens its ticket");
+    sender.send(7).await.expect("send");
+    sender.finalize().expect("finalize");
+    let (first, second) = tokio::time::timeout(RECV_TIMEOUT, async {
+        (anchor.next().await, anchor.next().await)
+    })
+    .await
+    .expect("the stream must deliver");
+    assert!(
+        matches!(first, Some(Ok(StreamFrame::Item(7)))),
+        "expected the item, got {first:?}"
+    );
+    assert!(
+        matches!(second, Some(Ok(StreamFrame::Finalized))),
+        "expected Finalized, got {second:?}"
+    );
+}
+
+/// With `prebind_accept_timeout: None`, dropping or cancelling an unclaimed
+/// pre-bound anchor gives its bind and drain signal back at once.
+///
+/// With the window off, the anchor's end is the only release a pre-bind has:
+/// the sweep has no deadline to find, and heartbeat detection waits for an
+/// `OpenSlot` that will not come. A caller that turns the window off owns
+/// liveness through its anchors, so both ways an anchor ends must release. A
+/// path that missed it would leak a bind, a drain signal and a lane count per
+/// abandoned request for the life of the process.
+///
+/// No `.await` sits between the end of the anchor and the assertions, so no
+/// timer, sweep or task can be what released the bind.
+#[tokio::test(flavor = "multi_thread")]
+async fn without_a_prebind_window_drop_and_cancel_release_the_bind() {
+    let config = MuxConfig {
+        prebind_accept_timeout: None,
+        ..test_config()
+    };
+    let node = prebinding_node(config, None).await;
+    for cancel in [false, true] {
+        let anchor = node.manager.create_anchor::<u32>();
+        node.manager
+            .prebind_anchor(anchor.handle())
+            .expect("a mux is installed, so a ticket is minted");
+        assert_eq!(node.mux.pending_binds(), 1);
+        assert_eq!(node.mux.queued_bind_deadlines(), 0);
+
+        let kept = if cancel {
+            anchor.controller().cancel();
+            Some(anchor)
+        } else {
+            drop(anchor);
+            None
+        };
+
+        assert_eq!(
+            node.mux.pending_binds(),
+            0,
+            "the anchor ended unclaimed (cancel: {cancel}), so its bind must go with it"
+        );
+        assert_eq!(node.mux.parked_drains(), 0);
+        drop(kept);
+    }
+}
+
 /// Arming an unattached timeout on a pre-bound anchor stores it without
 /// starting it.
 ///

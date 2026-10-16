@@ -21,6 +21,8 @@ Call `Velo::unregister_peer` when a peer leaves. A restarted peer has a new inst
 
 Batched streams give each stream a window of 32 records in flight by default. A larger window lets a saturated consumer node queue a new stream's first record behind every other stream's backlog. See [Change the credit window](docs/src/guides/tune-batched-streaming.md#change-the-credit-window).
 
+A prebound ticket waits 60 s by default for its worker to open it. If a worker can queue a request for longer, set `MuxConfig::prebind_accept_timeout` to `None`. The pre-bind then lasts until its anchor is dropped or cancelled, so your code must end the anchor when the request ends. The field is new in Velo 0.20; a `MuxConfig` built without `..Default::default()` must set it. See [Use zero-RTT stream setup](docs/src/guides/tune-batched-streaming.md#use-zero-rtt-stream-setup).
+
 ## Crates
 
 | Crate | For | Contents |

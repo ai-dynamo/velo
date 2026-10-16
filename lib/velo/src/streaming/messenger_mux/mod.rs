@@ -98,6 +98,7 @@
 //! periodic cost for a worse per-record one. See "Credit return" in
 //! `docs/src/development/batched-streaming-design.md`.
 
+mod accept_window;
 mod config;
 pub(crate) mod flow_control;
 pub(crate) mod ingress;
@@ -114,7 +115,6 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -124,6 +124,7 @@ use dashmap::DashMap;
 use futures::future::BoxFuture;
 use velo_ext::{TransportKey, WorkerAddress, WorkerId};
 
+use self::accept_window::BindDeadlines;
 use self::flow_control::NegotiatedLimits;
 use self::ingress::IngressRegistry;
 use self::lane_choice::LaneLoad;
@@ -132,6 +133,7 @@ use crate::messenger::{Context, Handler, Messenger};
 use crate::observability::{MuxMetricsHandle, VeloMetrics};
 use crate::streaming::transport::FrameTransport;
 
+pub(crate) use self::accept_window::BindKind;
 pub use self::config::{AutoFlush, FlushPolicy, MuxConfig};
 pub(crate) use self::lane::{LaneIndex, PeerLane, is_batch_handler};
 pub(crate) use self::lane_choice::LaneReservation;
@@ -148,25 +150,25 @@ pub(crate) use self::lane_choice::LaneReservation;
 /// re-deriving the one value negotiation is keyed on.
 pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
 
-/// How long a bind waits for the `OpenSlot` that claims it.
+/// How long an attach bind waits for the `OpenSlot` that claims it.
 ///
 /// Deliberately the same 60 s the TCP transport gives a pending session, and
 /// deliberately measuring the same thing: "time until a batch bearing this
-/// `OpenSlot` arrives". That sentence holds without qualification for the
-/// attach path's bind: a sender has already asked by
-/// the time the bind exists, so the window is one response leg plus one batch
-/// leg, and `OpenSlot` is eager precisely so it cannot quietly become "time
-/// until the producer produces its first token" there.
+/// `OpenSlot` arrives". A sender has already asked by the time an attach bind
+/// exists, so the window is one response leg plus one batch leg, and
+/// `OpenSlot` is eager precisely so it cannot quietly become "time until the
+/// producer produces its first token".
 ///
-/// It does not hold for the zero-RTT pre-bind (`AnchorManager::prebind_anchor`),
-/// where the same clock starts before any sender has asked at all: the window
-/// there is envelope transit plus however long the ticket sits in a request
-/// envelope before its worker calls `open_anchor_stream`, which can be exactly
-/// the producer-side wait the paragraph above rules out for `bind`. See
-/// `AnchorManager::prebind_anchor`'s doc for that bound. An attach that adopts
-/// an existing pre-bind does not restart this timer either way — adoption
-/// takes over the bind the pre-bind already registered rather than binding
-/// again, so it inherits whatever is left of the 60 s, not a fresh one.
+/// A zero-RTT pre-bind (`AnchorManager::prebind_anchor`) waits
+/// [`MuxConfig::prebind_accept_timeout`] instead, 60 s by default. Its clock
+/// starts before any sender has asked, so its window also covers however long
+/// the ticket sits in a request queue before its worker calls
+/// `open_anchor_stream`, which is the producer-side wait ruled out above. That
+/// wait belongs to the application, so the application sets the window, or
+/// turns it off. An attach that adopts an existing pre-bind does not restart
+/// the timer: adoption takes over the bind the pre-bind already registered
+/// rather than binding again, so it keeps what is left of the pre-bind's
+/// window.
 const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Attempts `connect` makes before giving up on a batcher that keeps retiring
@@ -237,17 +239,15 @@ struct MuxCore {
     /// `bind` returns. Take-once: whoever collects it owns it, and the bind
     /// expiry that already exists drops any that was never collected.
     drains: DashMap<(u64, u64), Arc<ingress::DrainSignal>>,
-    /// Accept-window deadlines, one per bind, oldest first.
-    ///
-    /// Every bind gets the same `ACCEPT_TIMEOUT`, so pushing at bind time keeps
-    /// the queue in deadline order and the sweep only ever pops its front. A
-    /// bind claimed or released early stays queued and costs a failed lookup
-    /// when its deadline comes; that is cheaper than finding and removing it.
-    /// It used to be one timer task per bind, which nothing but shutdown
-    /// cancelled: a claimed bind's task lived out the full minute, so a
-    /// frontend opening 2,000 streams a second carried about 120,000 idle
-    /// tasks.
-    bind_deadlines: std::sync::Mutex<VecDeque<(tokio::time::Instant, (u64, u64))>>,
+    /// Accept-window deadlines of attach binds, each [`ACCEPT_TIMEOUT`].
+    attach_deadlines: BindDeadlines,
+    /// Accept-window deadlines of pre-binds, each
+    /// [`MuxConfig::prebind_accept_timeout`]. A queue of its own, because that
+    /// timeout can differ from [`ACCEPT_TIMEOUT`] and a queue stays in
+    /// deadline order only while its entries share one timeout. `None` when
+    /// the window is off: a pre-bind then has no deadline, and only its
+    /// anchor's drop or cancel releases it.
+    prebind_deadlines: Option<BindDeadlines>,
     /// A barrier handed to every batcher this core spawns, installed by the
     /// tests that need one held mid-wake. See [`peer_batcher::test_hooks`].
     #[cfg(test)]
@@ -336,6 +336,7 @@ impl MessengerMuxTransport {
             ..config
         };
         let (drain_tx, drain_rx) = drain_wake_lane();
+        let prebind_deadlines = config.prebind_accept_timeout.map(BindDeadlines::new);
         let tasks = crate::streaming::tasks::StreamTasks::new(messenger.runtime().clone());
         let core = Arc::new(MuxCore {
             messenger: Arc::clone(&messenger),
@@ -351,7 +352,8 @@ impl MessengerMuxTransport {
             drain_tx,
             drain_rx,
             drains: DashMap::new(),
-            bind_deadlines: std::sync::Mutex::default(),
+            attach_deadlines: BindDeadlines::new(ACCEPT_TIMEOUT),
+            prebind_deadlines,
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -568,22 +570,10 @@ impl MuxCore {
     /// Runs on the sweep tick, so a window closes up to one
     /// `credit_sweep_interval` late -- 200 ms on a 60 s window by default.
     fn expire_binds(&self, now: tokio::time::Instant) {
-        let due: Vec<(u64, u64)> = {
-            let mut deadlines = self
-                .bind_deadlines
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let ready = deadlines.partition_point(|(deadline, _)| *deadline <= now);
-            let due = deadlines.drain(..ready).map(|(_, key)| key).collect();
-            // A burst of binds leaves the queue's capacity behind it. Give it
-            // back only once the queue is nearly empty: the shrink copies what
-            // is left while holding the lock every bind takes, so shrinking a
-            // queue still tens of thousands deep would stall new streams.
-            if deadlines.len() <= 1024 && deadlines.capacity() > 8192 {
-                deadlines.shrink_to(2048);
-            }
-            due
-        };
+        let mut due = self.attach_deadlines.take_due(now);
+        if let Some(prebinds) = &self.prebind_deadlines {
+            due.extend(prebinds.take_due(now));
+        }
         for (anchor_id, session_id) in due {
             // Whether or not the bind was still there, drop any drain signal
             // no attach collected. Without this an attach that failed between
@@ -632,7 +622,7 @@ impl MuxCore {
 }
 
 /// Register the receive buffer for one `(anchor_id, session_id)` and open the
-/// accept window on it.
+/// accept window `kind` gives it.
 ///
 /// The body [`FrameTransport::bind`] and
 /// [`MessengerMuxTransport::bind_on_lane`] share. `bind` is async because the trait
@@ -645,6 +635,7 @@ fn open_bind(
     anchor_id: u64,
     session_id: u64,
     lane: LaneReservation,
+    kind: BindKind,
 ) -> Result<flume::Receiver<Vec<u8>>> {
     anyhow::ensure!(!core.tasks.is_stopped(), "messenger mux shut down");
     // `C + 1`: `C` data credits plus the one reserved terminal credit.
@@ -666,17 +657,15 @@ fn open_bind(
 
     // A deadline, not a task: the sweep expires it (`MuxCore::expire_binds`).
     // Nothing here may pin the core either, which a task holding a strong
-    // handle would, for the full window after the last owner dropped it.
-    // The clock is read under the lock, so pushes land in deadline order.
-    let mut deadlines = core
-        .bind_deadlines
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    deadlines.push_back((
-        tokio::time::Instant::now() + ACCEPT_TIMEOUT,
-        (anchor_id, session_id),
-    ));
-    drop(deadlines);
+    // handle would, for the full window after the last owner dropped it. A
+    // pre-bind with its window off gets no deadline: its anchor releases it.
+    let deadlines = match kind {
+        BindKind::Attach => Some(&core.attach_deadlines),
+        BindKind::PreBind => core.prebind_deadlines.as_ref(),
+    };
+    if let Some(deadlines) = deadlines {
+        deadlines.push((anchor_id, session_id));
+    }
 
     Ok(frame_rx)
 }
@@ -702,7 +691,7 @@ impl FrameTransport for MessengerMuxTransport {
         // Lane 0, as `connect` below: the bare trait names no peer and carries
         // no lane to the sender. Counted, so the next choice sees it.
         let lane = core.lane_load.reserve_on(None, LaneIndex::ZERO);
-        Box::pin(async move { open_bind(&core, anchor_id, session_id, lane) })
+        Box::pin(async move { open_bind(&core, anchor_id, session_id, lane, BindKind::Attach) })
     }
 
     /// Opens a slot at *this node's* limits.
@@ -742,17 +731,20 @@ impl MessengerMuxTransport {
     /// the receiver *now*, while registering a request, and has no sender yet
     /// to ask.
     ///
-    /// Nothing about the resulting bind is special. A peer's `OpenSlot` claims
-    /// it by the same `(anchor_id, session_id)` lookup, the accept window runs
-    /// the same 60 s, and [`release_bind`](Self::release_bind) is what an owner
-    /// that gives up before then calls.
+    /// The resulting bind differs only in its accept window, which `kind`
+    /// picks: the fixed [`ACCEPT_TIMEOUT`] for an attach, and
+    /// [`MuxConfig::prebind_accept_timeout`] for a pre-bind. A peer's
+    /// `OpenSlot` claims either by the same `(anchor_id, session_id)` lookup,
+    /// and [`release_bind`](Self::release_bind) is what an owner that gives up
+    /// first calls.
     pub(crate) fn bind_on_lane(
         &self,
         anchor_id: u64,
         session_id: u64,
         lane: LaneReservation,
+        kind: BindKind,
     ) -> Result<flume::Receiver<Vec<u8>>> {
-        let receiver = open_bind(&self.core, anchor_id, session_id, lane)?;
+        let receiver = open_bind(&self.core, anchor_id, session_id, lane, kind)?;
         #[cfg(test)]
         if let Some(hook) = self.core.bind_hook.get() {
             hook(anchor_id);
@@ -765,9 +757,11 @@ impl MessengerMuxTransport {
     ///
     /// The accept window does the same thing when it expires, and stays as the
     /// backstop. This is for the owner that already knows: a pre-bound anchor
-    /// whose request died before its first token knows a minute earlier than
-    /// the timer does, and at the rate a frontend registers requests that
-    /// minute is thousands of leaked binds.
+    /// whose request died before its first token knows up to a minute earlier
+    /// than the timer does, and at the rate a frontend registers requests that
+    /// minute is thousands of leaked binds. With
+    /// [`MuxConfig::prebind_accept_timeout`] off there is no timer, and this is
+    /// the only way a pre-bind nobody claimed goes back.
     ///
     /// Idempotent: a bind already claimed or already released is not there to
     /// remove, and removing nothing is the right answer for both.
@@ -817,6 +811,18 @@ impl MessengerMuxTransport {
     #[cfg(test)]
     pub(crate) fn parked_drains(&self) -> usize {
         self.core.drains.len()
+    }
+
+    /// Accept-window deadlines queued, of both kinds, whether or not their
+    /// bind is still there.
+    #[cfg(test)]
+    pub(crate) fn queued_bind_deadlines(&self) -> usize {
+        self.core.attach_deadlines.len()
+            + self
+                .core
+                .prebind_deadlines
+                .as_ref()
+                .map_or(0, BindDeadlines::len)
     }
 
     /// Live receive-side slots for one (peer, lane).

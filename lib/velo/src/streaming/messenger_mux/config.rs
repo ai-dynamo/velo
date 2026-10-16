@@ -208,7 +208,7 @@ pub struct MuxConfig {
     /// `docs/src/operations/response-plane-performance.md`.
     ///
     /// The same tick closes expired accept windows, so an unclaimed bind is
-    /// reclaimed up to one interval after its 60 s window: a long interval
+    /// reclaimed up to one interval after its window closes: a long interval
     /// delays the `SenderDropped` an abandoned ticket's anchor is owed by as
     /// much.
     ///
@@ -408,6 +408,29 @@ pub struct MuxConfig {
     ///
     /// Defaults to 1 ms.
     pub reply_linger: Duration,
+    /// How long a zero-RTT pre-bind waits for the `OpenSlot` that claims it.
+    ///
+    /// **Defaults to `Some(60 s)`**, the window every pre-bind had before this
+    /// field. The clock starts when
+    /// [`prebind_anchor`](crate::streaming::AnchorManager::prebind_anchor)
+    /// makes the ticket, before any sender exists, so the window also covers
+    /// the time the ticket waits in a request queue before its worker calls
+    /// `open_anchor_stream`. When it closes, the bind is reclaimed and the
+    /// anchor sees `StreamError::SenderDropped`, up to one
+    /// [`credit_sweep_interval`](Self::credit_sweep_interval) late. An attach
+    /// that adopts the pre-bind keeps what is left of this window.
+    ///
+    /// `None` means a pre-bind never expires. It is released only when its
+    /// anchor is dropped or cancelled, so the caller must own liveness: a
+    /// request that ends, a client that goes away, or a worker that is lost
+    /// must drop or cancel the anchor. Nothing else in Velo reaps it, because
+    /// heartbeat detection starts only once the `OpenSlot` arrives. Use it
+    /// when a worker may queue a request for longer than any fixed window. A
+    /// fixed window then reads a busy worker as a dead one.
+    ///
+    /// Attach binds do not use this field. Their sender has already asked, so
+    /// their window is one round trip, and it stays a fixed 60 s.
+    pub prebind_accept_timeout: Option<Duration>,
 }
 
 impl Default for MuxConfig {
@@ -424,6 +447,7 @@ impl Default for MuxConfig {
             flush_policy: FlushPolicy::Auto(AutoFlush::default()),
             async_open_ack: false,
             reply_linger: Duration::from_millis(1),
+            prebind_accept_timeout: Some(Duration::from_secs(60)),
         }
     }
 }
