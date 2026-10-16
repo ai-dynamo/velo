@@ -481,10 +481,11 @@ pub(crate) struct WorkerShared {
     /// recv contexts), so `Disconnected` is unreachable, and a full ring can
     /// drop a `try_send(Cmd::Shutdown)`.
     pub shutdown_requested: Arc<AtomicBool>,
-    /// Bumped by every `register()`. The progress thread revalidates its
-    /// cached endpoints against the peers map when this moves, so a
-    /// re-registered peer (new incarnation) gets a fresh endpoint instead of
-    /// AMs on the stale one.
+    /// Bumped by every `register()` and `unregister()`. The progress thread
+    /// revalidates its cached endpoints against the peers map when this
+    /// moves, so a re-registered peer (new incarnation) gets a fresh endpoint
+    /// instead of AMs on the stale one, and an unregistered peer's endpoint
+    /// is closed.
     pub reg_epoch: Arc<AtomicU64>,
     /// Regions currently held by `ucp_mem_map`. Maintained by the progress
     /// thread only; readable from anywhere as a gauge. The
@@ -2216,10 +2217,16 @@ impl WorkerState {
             .collect();
         for peer in stale {
             if let Some(entry) = self.eps.remove(&peer) {
-                debug!("ucx: dropping stale endpoint to re-registered peer {peer}");
+                debug!("ucx: dropping stale endpoint to re-registered or unregistered peer {peer}");
                 // The old incarnation is gone (or replaced); FORCE completes
                 // its in-flight ops with CANCELED, driving our callbacks.
                 self.close_ep(entry, true);
+                // The endpoint's error handler can mark an unregistered
+                // peer failed until the close above. No handler runs after
+                // it, so clearing here leaves no entry behind.
+                if !self.shared.peers.contains_key(&peer) {
+                    self.shared.failed_peers.remove(&peer);
+                }
             }
         }
     }

@@ -497,6 +497,29 @@ impl Transport for UcxTransport {
         Ok(())
     }
 
+    /// The endpoint lives on the progress thread, which may close it only at
+    /// a safe point in its loop (see `revalidate_eps`). So this drops the
+    /// peer's blob and gate here, and bumps `reg_epoch`: the next pass finds
+    /// the endpoint's peer gone and closes it.
+    fn unregister(&self, instance_id: InstanceId) {
+        let known = self.shared.peers.remove(&instance_id).is_some();
+        self.shared.failed_peers.remove(&instance_id);
+        if let Some((_, handle)) = self.connections.remove(&instance_id) {
+            // The forwarder task ends once the last clone of the handle is
+            // dropped.
+            handle.gate.fail_all(AdmissionError::ChannelClosed);
+        }
+        if known {
+            self.shared.reg_epoch.fetch_add(1, Ordering::AcqRel);
+            self.shared.doorbell.ring();
+        }
+        if let Some(m) = self.shared.metrics.get() {
+            m.set_registered_peers(self.shared.peers.len());
+            m.set_active_connections(self.connections.len());
+        }
+        debug!("ucx: unregistered peer {instance_id}");
+    }
+
     fn send_message(
         &self,
         instance_id: InstanceId,

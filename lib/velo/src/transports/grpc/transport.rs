@@ -93,6 +93,8 @@ pub struct GrpcTransport {
 struct ConnectionHandle {
     tx: flume::Sender<SendTask>,
     gate: AdmissionGate<SendTask>,
+    /// Stops this stream's writer, as in the TCP transport.
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 impl ConnectionHandle {
@@ -100,6 +102,12 @@ impl ConnectionHandle {
     /// stream that no longer exists, so none of them may ride the successor.
     fn retire(&self) {
         self.gate.fail_all(AdmissionError::ConnectionReplaced);
+    }
+
+    /// Close the stream on purpose, as in the TCP transport.
+    fn close(&self) {
+        self.gate.fail_all(AdmissionError::ChannelClosed);
+        self.cancel.cancel();
     }
 }
 
@@ -202,9 +210,10 @@ impl GrpcTransport {
         let handle = ConnectionHandle {
             gate: AdmissionGate::new(tx.clone(), rt.clone()),
             tx,
+            cancel: self.cancel_token.child_token(),
         };
 
-        let cancel = self.cancel_token.clone();
+        let cancel = handle.cancel.clone();
         let conns = Arc::clone(&self.connections);
         let connect_timeout = self.connect_timeout;
         let channel_capacity = self.channel_capacity;
@@ -319,6 +328,18 @@ impl Transport for GrpcTransport {
         debug!("Registered peer {} at {}", peer_info.instance_id(), addr);
 
         Ok(())
+    }
+
+    /// Removes the address first, so a racing send cannot dial again, then
+    /// closes the stream.
+    fn unregister(&self, instance_id: crate::InstanceId) {
+        self.peers.remove(&instance_id);
+        if let Some((_, handle)) = self.connections.remove(&instance_id) {
+            handle.close();
+        }
+        self.update_peer_gauge();
+        self.update_connection_gauge();
+        debug!("Unregistered peer {}", instance_id);
     }
 
     #[inline]

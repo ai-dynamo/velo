@@ -2392,6 +2392,68 @@ async fn idle_endpoint_closes_and_the_next_send_wires_up_again() {
     assert_rma_balanced(&b);
 }
 
+/// `unregister` forgets one peer, closes its endpoint, and leaves another
+/// peer alone.
+///
+/// The endpoint lives on the progress thread, which may close one only at a
+/// safe point of its loop (see `run_loop`), so `unregister` cannot close it in
+/// place. It removes the peer's blob and bumps `reg_epoch`, the signal a
+/// re-registration sends. The next pass finds the endpoint's peer gone and
+/// closes it. A send to the peer then fails before the wire, as one to a peer
+/// never registered does, and registering again wires up a new endpoint.
+#[tokio::test(flavor = "multi_thread")]
+async fn unregister_closes_the_endpoint_and_leaves_others_alone() {
+    let a = start_node().await;
+    let gone = start_node().await;
+    let stays = start_node().await;
+    cross_register(&a, &gone);
+    cross_register(&a, &stays);
+    let errs = CountingErrors::new();
+    ping_message(&a, &gone, &errs).await;
+    ping_message(&a, &stays, &errs).await;
+    assert_eq!(eps_open(&a), 2);
+
+    a.transport.unregister(gone.instance_id);
+    assert!(!a.transport.shared.peers.contains_key(&gone.instance_id));
+    assert!(!a.transport.connections.contains_key(&gone.instance_id));
+    assert!(
+        wait_until(T, || eps_open(&a) == 1).await,
+        "the endpoint to the unregistered peer stayed open"
+    );
+
+    let failed = CountingErrors::new();
+    let out = a.transport.send_message(
+        gone.instance_id,
+        Bytes::from_static(b"h"),
+        Bytes::from_static(b"p"),
+        MessageType::Message,
+        failed.clone(),
+    );
+    assert!(matches!(out, SendOutcome::Admitted));
+    assert!(
+        failed.wait_for_error(T).await,
+        "a send to an unregistered peer must fail before the wire"
+    );
+    assert!(!a.transport.connections.contains_key(&gone.instance_id));
+
+    ping_message(&a, &stays, &errs).await;
+    assert_eq!(eps_open(&a), 1, "the other peer keeps its endpoint");
+
+    // A second call is a no-op, and registering again starts fresh.
+    a.transport.unregister(gone.instance_id);
+    a.transport
+        .register(PeerInfo::new(gone.instance_id, gone.transport.address()))
+        .unwrap();
+    ping_message(&a, &gone, &errs).await;
+    assert_eq!(eps_open(&a), 2);
+    assert_eq!(errs.count(), 0);
+    assert!(a.transport.shared.failed_peers.is_empty());
+
+    a.transport.shutdown();
+    gone.transport.shutdown();
+    stays.transport.shutdown();
+}
+
 /// The time `ucp_ep_create` takes is not idle time.
 ///
 /// That call is not always fast. A worker's first `ucp_ep_create` took

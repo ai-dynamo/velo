@@ -144,11 +144,20 @@ impl PeerEntry {
 struct ConnectionHandle {
     tx: flume::Sender<SendTask>,
     gate: AdmissionGate<SendTask>,
+    /// Stops this connection's writer, as in the TCP transport.
+    cancel: CancellationToken,
 }
 
 impl ConnectionHandle {
     fn retire(&self) {
         self.gate.fail_all(AdmissionError::ConnectionReplaced);
+    }
+
+    /// Close the connection on purpose. The writer finishes its stream, as
+    /// at shutdown, then closes the connection.
+    fn close(&self) {
+        self.gate.fail_all(AdmissionError::ChannelClosed);
+        self.cancel.cancel();
     }
 }
 
@@ -255,6 +264,7 @@ impl QuicTransport {
         let handle = ConnectionHandle {
             gate: AdmissionGate::new(tx.clone(), rt.clone()),
             tx,
+            cancel: self.cancel_token.child_token(),
         };
 
         self.writers.spawn_on(
@@ -267,7 +277,7 @@ impl QuicTransport {
                     addr,
                     client_config,
                     connections: Arc::clone(&self.connections),
-                    cancel_token: self.cancel_token.clone(),
+                    cancel_token: handle.cancel.clone(),
                     connect_timeout: self.connect_timeout,
                     reader_ctx: self.dialed_ctx.get().cloned(),
                     metrics: self.metrics.get().cloned(),
@@ -415,6 +425,20 @@ impl Transport for QuicTransport {
             addr
         );
         Ok(())
+    }
+
+    /// Removes the peer first, so a racing send cannot dial again, then
+    /// closes the connection of each lane.
+    fn unregister(&self, instance_id: crate::InstanceId) {
+        self.peers.remove(&instance_id);
+        for lane in 0..self.lanes.get() {
+            if let Some((_, handle)) = self.connections.remove(&(instance_id, lane)) {
+                handle.close();
+            }
+        }
+        self.update_peer_gauge();
+        self.update_connection_gauge();
+        debug!("QUIC: unregistered peer {instance_id}");
     }
 
     fn lanes(&self, _target: crate::InstanceId) -> std::num::NonZeroU16 {
@@ -662,6 +686,7 @@ struct WriterTaskContext {
     addr: SocketAddr,
     client_config: quinn::ClientConfig,
     connections: Arc<DashMap<LaneKey, ConnectionHandle>>,
+    /// The connection's token: shutdown and unregister both cancel it.
     cancel_token: CancellationToken,
     connect_timeout: Duration,
     reader_ctx: Option<DialedReaderContext>,
