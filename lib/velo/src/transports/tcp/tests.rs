@@ -85,6 +85,7 @@ fn make_handle(capacity: usize) -> (ConnectionHandle, flume::Receiver<SendTask>)
     let handle = ConnectionHandle {
         gate: AdmissionGate::new(tx.clone(), tokio::runtime::Handle::current()),
         tx,
+        cancel: CancellationToken::new(),
     };
     (handle, rx)
 }
@@ -911,7 +912,7 @@ async fn dial_sizes_the_socket_or_leaves_it_to_the_kernel() {
             .socket_buffers(setting)
             .build()
             .unwrap();
-        let ctx = transport.writer_context();
+        let ctx = transport.writer_context(CancellationToken::new());
         let (dialed, _accepted) = tokio::join!(super::dial(addr, &ctx), listener.accept());
         let dialed = dialed.unwrap().expect("not cancelled");
         assert_eq!(recv_and_send(&dialed), expected, "{setting:?}");
@@ -1297,6 +1298,81 @@ async fn shutdown_closes_every_lane() {
         FRAMES,
         "{delivered} delivered + {failed} failed != {FRAMES} sent"
     );
+}
+
+/// `unregister` forgets one peer and closes every lane's connection to it.
+///
+/// A worker registers each frontend it serves, and a restarted frontend has a
+/// new instance id. Without this, the worker keeps an address and a
+/// connection for every frontend it ever saw. Dropping a connection's map
+/// entry is not enough to close it: its writer holds a sender of its own
+/// channel, so it would wait for frames forever. Each connection therefore
+/// has its own cancel token.
+///
+/// After `unregister`, the peer sees each connection end, and a send to the
+/// peer fails as one to a peer never registered: the address is gone, so the
+/// send cannot dial a new connection. Another peer keeps its connection, and
+/// registering the forgotten peer again dials a new one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unregister_closes_the_peers_lanes_and_leaves_others_alone() {
+    const LANES: u16 = 2;
+    let (transport, gone, gone_id) = laned_pair(LANES).await;
+    let stays = RawPeer::start().await;
+    let stays_id = stays.info.instance_id();
+    transport.register(stays.info.clone()).unwrap();
+    let errors = Arc::new(TrackingErrorHandler::new());
+    let send = |target: crate::InstanceId, lane: u16, header: &'static [u8]| {
+        let _ = transport.send_message_on_lane(
+            target,
+            lane,
+            Bytes::from_static(header),
+            Bytes::new(),
+            MessageType::Event,
+            errors.clone(),
+        );
+    };
+    for lane in 0..LANES {
+        send(gone_id, lane, b"before");
+        assert!(gone.next().await.1.is_some());
+    }
+    send(stays_id, 0, b"before");
+    assert!(stays.next().await.1.is_some());
+
+    transport.unregister(gone_id);
+    assert!(!transport.peers.contains_key(&gone_id));
+    for lane in 0..LANES {
+        assert!(!transport.connections.contains_key(&(gone_id, lane)));
+    }
+    let mut ended = std::collections::HashSet::new();
+    while ended.len() < usize::from(LANES) {
+        let (connection, frame) = gone.next().await;
+        assert!(frame.is_none(), "nothing was sent after unregister");
+        ended.insert(connection);
+    }
+
+    send(gone_id, 0, b"after");
+    assert_eq!(errors.error_count(), 1);
+    let reason = errors.reasons.lock().unwrap()[0].clone();
+    assert!(reason.contains("not registered"), "{reason}");
+    assert!(
+        !transport.connections.contains_key(&(gone_id, 0)),
+        "a send to a forgotten peer dialed it"
+    );
+
+    send(stays_id, 0, b"other");
+    let (connection, frame) = stays.next().await;
+    assert_eq!(connection, 0, "the other peer keeps its connection");
+    assert_eq!(frame.unwrap().1, Bytes::from_static(b"other"));
+
+    // A second call is a no-op, and registering again starts fresh.
+    transport.unregister(gone_id);
+    transport.register(gone.info.clone()).unwrap();
+    send(gone_id, 0, b"again");
+    let (connection, frame) = gone.next().await;
+    assert_eq!(connection, usize::from(LANES), "a new connection");
+    assert_eq!(frame.unwrap().1, Bytes::from_static(b"again"));
+    assert_eq!(errors.error_count(), 1);
+    transport.shutdown();
 }
 
 /// A sender can retain an old epoch while its writer retires. Its accepted

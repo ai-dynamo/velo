@@ -123,7 +123,7 @@ Removed, measured on the rig rather than in a profile: each bind used to spawn o
 
 These costs are counted from source, not measured:
 
-- **The per-record copy.** Ingress copies each record body into a `Vec` (one allocation and one `memcpy`, estimated at 35 to 55 ns). Removing it needs `Bytes` from the slot buffer through to the consumer. On the microbenchmark below, `memcpy` was 0.5% of frontend CPU.
+- **The per-record copy.** Ingress copies each record body into a `Vec` (one allocation and one `memcpy`, estimated at 35 to 55 ns). Removing it needs `Bytes` from the slot buffer through to the consumer, and it is not done (see [Batched streaming design](../development/batched-streaming-design.md#ingress-copies-each-record-out-of-its-batch)). On the microbenchmark below, `memcpy` was 0.5% of frontend CPU. A typed `Bytes` consumer copies each payload a second time, in serde. [Byte items](../concepts/streaming.md#byte-items) remove that second copy.
 - **Wakes.** `flume` fires a waker only for a parked receiver, so k records for one slot in one batch already cost one wake. With the direct feed, a record makes one hop, from the slot buffer to the consumer.
 
 ### The reader pump leaves the mux data path

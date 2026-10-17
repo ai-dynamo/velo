@@ -1038,6 +1038,27 @@ impl Velo {
         self.messenger.register_peer(peer_info)
     }
 
+    /// Forget a peer that [`register_peer`](Self::register_peer) added.
+    ///
+    /// A long-lived node whose peers come and go calls this when a peer
+    /// leaves. A restarted peer has a new instance id, so without it the
+    /// node keeps the state of every peer it ever served. This drops the
+    /// peer from every messenger transport and from the streaming
+    /// transport, closes the connections to it, and forgets its handler
+    /// list. Then a send to it fails as a send to a peer never registered
+    /// does, and a later `register_peer`, with the same or a new id, starts
+    /// fresh. Other peers are not affected.
+    ///
+    /// Synchronous, cheap, and idempotent. Unregister only an idle peer: a
+    /// send, stream, or handshake in flight to it may fail, and one that
+    /// finishes after this call can register the peer again. A `_hello`
+    /// from the peer registers it again too. The messenger mux keeps small
+    /// per-peer receive tables that this does not drop.
+    pub fn unregister_peer(&self, instance_id: InstanceId) {
+        self.stream_transport.unregister(instance_id);
+        self.messenger.unregister_peer(instance_id);
+    }
+
     /// Discover a peer by instance_id and register it for communication.
     ///
     /// Resolves the [`PeerInfo`] through the configured [`PeerDiscovery`]
@@ -1081,8 +1102,8 @@ impl Velo {
     /// returns a timeout error if the handler has not appeared. It is
     /// therefore not a reachability probe: once a handler is known, a later
     /// call does not check that the peer is still there. The cached list is
-    /// kept for the process's life, which is safe because an instance id names
-    /// one process, and a restarted peer has a new one.
+    /// kept until [`Self::unregister_peer`], which is safe because an instance
+    /// id names one process, and a restarted peer has a new one.
     pub async fn wait_for_handler(
         &self,
         instance_id: InstanceId,
@@ -1919,6 +1940,114 @@ mod tests {
                 frame_transport.shutdown().await;
             }
             client.shutdown(ShutdownPolicy::WaitForever).await;
+        }
+    }
+
+    /// `unregister_peer` forgets a peer everywhere the runtime keeps it, and
+    /// leaves other peers alone.
+    ///
+    /// A worker registers each frontend it serves, and a restarted frontend
+    /// comes back with a new instance id. Unless the worker forgets the old
+    /// one, it stays in the backend routes, the handler cache, the transport's
+    /// peer and connection maps, and, in default mode, the stream transport's
+    /// address cache. After `unregister_peer` none of them holds the peer, a
+    /// unary to it fails as one to a peer never registered, a unary to another
+    /// peer still works, and registering the peer again handshakes and dials
+    /// afresh. Both modes run, because only default mode has a stream
+    /// transport that caches peers.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unregister_peer_forgets_the_peer_and_leaves_others_alone() {
+        use crate::transports::tcp::{TcpTransport, TcpTransportBuilder};
+
+        async fn node(mux_only: bool) -> (Arc<Velo>, Arc<TcpTransport>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let tcp = Arc::new(
+                TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            );
+            let builder = Velo::builder().add_transport(tcp.clone());
+            let builder = if mux_only {
+                builder.mux_only()
+            } else {
+                builder.stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
+            };
+            let node = builder.build().await.unwrap();
+            node.register_handler(
+                Handler::unary_handler("echo", |ctx| Ok(Some(ctx.payload))).build(),
+            )
+            .unwrap();
+            (node, tcp)
+        }
+
+        async fn echo(from: &Velo, to: InstanceId) -> Result<bytes::Bytes> {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                from.unary("echo")?
+                    .raw_payload(bytes::Bytes::from_static(b"hi"))
+                    .instance(to)
+                    .send(),
+            )
+            .await?
+        }
+
+        /// The stream transport's address cache, or `None` in mux-only mode.
+        fn stream_knows(node: &Velo, peer: InstanceId) -> Option<bool> {
+            match &node.stream_owner.transport {
+                Some(OwnedStreamTransport::Tcp(transport)) => {
+                    Some(transport.knows_peer(peer.worker_id()))
+                }
+                #[cfg(feature = "grpc")]
+                Some(OwnedStreamTransport::Grpc(_)) => unreachable!(),
+                None => None,
+            }
+        }
+
+        for mux_only in [false, true] {
+            let (worker, worker_tcp) = node(mux_only).await;
+            let (gone, _) = node(mux_only).await;
+            let (stays, _) = node(mux_only).await;
+            for frontend in [&gone, &stays] {
+                worker.register_peer(frontend.peer_info()).unwrap();
+                frontend.register_peer(worker.peer_info()).unwrap();
+                echo(&worker, frontend.instance_id()).await.unwrap();
+            }
+            let gone_id = gone.instance_id();
+            let backend = worker.messenger().backend();
+            let client = worker.messenger().client();
+            assert!(worker_tcp.has_lane_connection(gone_id, 0));
+            assert!(client.has_handler_info(gone_id));
+            assert_eq!(stream_knows(&worker, gone_id), (!mux_only).then_some(true));
+
+            worker.unregister_peer(gone_id);
+            assert!(!backend.is_registered(gone_id));
+            assert!(
+                backend
+                    .try_translate_worker_id(gone_id.worker_id())
+                    .is_err()
+            );
+            assert!(!client.knows_peer(gone_id));
+            assert!(!worker_tcp.knows_peer(gone_id));
+            assert!(!worker_tcp.has_lane_connection(gone_id, 0));
+            assert_eq!(stream_knows(&worker, gone_id), (!mux_only).then_some(false));
+            let err = echo(&worker, gone_id).await.unwrap_err();
+            assert!(format!("{err:#}").contains("not registered"), "{err:#}");
+
+            echo(&worker, stays.instance_id()).await.unwrap();
+            assert!(worker_tcp.has_lane_connection(stays.instance_id(), 0));
+
+            // A second call is a no-op, and registering again starts fresh.
+            worker.unregister_peer(gone_id);
+            worker.register_peer(gone.peer_info()).unwrap();
+            assert!(!client.has_handler_info(gone_id));
+            echo(&worker, gone_id).await.unwrap();
+            assert!(worker_tcp.has_lane_connection(gone_id, 0));
+
+            for node in [worker, gone, stays] {
+                node.shutdown(ShutdownPolicy::WaitForever).await;
+            }
         }
     }
 

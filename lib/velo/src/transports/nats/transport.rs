@@ -203,6 +203,14 @@ impl Transport for NatsTransport {
         Ok(())
     }
 
+    /// NATS keeps no connection per peer, only its subject and its gate.
+    /// Frames already in the gate still go out: the gate's driver holds it.
+    fn unregister(&self, instance_id: InstanceId) {
+        self.peers.remove(&instance_id);
+        self.gates.remove(&instance_id);
+        self.update_peer_gauge();
+    }
+
     #[inline]
     fn send_message(
         &self,

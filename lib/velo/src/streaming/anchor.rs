@@ -25,13 +25,14 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use crate::observability::{HandlerOutcome, StreamingOp, VeloMetrics};
+use bytes::Bytes;
 use dashmap::DashMap;
 use derive_builder::Builder;
 use futures::Stream;
 use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 
-use crate::streaming::frame::{StreamError, StreamFrame};
+use crate::streaming::frame::{StreamError, StreamFrame, decode_bytes_frame};
 use crate::streaming::handle::StreamAnchorHandle;
 
 /// Grouped handles needed by anchor constructors and background tasks to
@@ -537,6 +538,11 @@ impl StreamController {
 ///
 /// Use [`StreamExt::next()`](futures::StreamExt::next) for async iteration.
 ///
+/// A `StreamAnchor<Bytes>` can also be read with
+/// [`next_bytes`](StreamAnchor::next_bytes) or
+/// [`poll_next_bytes`](StreamAnchor::poll_next_bytes). They give the same
+/// frames, with each item a slice of the received buffer instead of a copy.
+///
 /// # Example
 ///
 /// ```rust,no_run
@@ -801,22 +807,29 @@ impl<T> Drop for StreamAnchor<T> {
     }
 }
 
-impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
-    type Item = Result<StreamFrame<T>, StreamError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-        if this.terminated {
+impl<T> StreamAnchor<T> {
+    /// Read frames until one is for the consumer, and act on it.
+    ///
+    /// `decode` turns a frame's bytes into a [`StreamFrame`]. The typed
+    /// [`Stream`] impl and [`poll_next_bytes`](StreamAnchor::poll_next_bytes)
+    /// differ only there, so a heartbeat, a sentinel, or an undecodable frame
+    /// does the same thing to the stream on both.
+    fn poll_decoded<U>(
+        &mut self,
+        cx: &mut Context<'_>,
+        decode: impl Fn(Vec<u8>) -> Result<StreamFrame<U>, rmp_serde::decode::Error>,
+    ) -> Poll<Option<Result<StreamFrame<U>, StreamError>>> {
+        if self.terminated {
             return Poll::Ready(None);
         }
         loop {
-            match this.poll_frame(cx) {
+            match self.poll_frame(cx) {
                 Poll::Ready(Some(bytes)) => {
                     #[cfg(test)]
-                    if let Some(hook) = this.after_frame_hook.as_mut() {
+                    if let Some(hook) = self.after_frame_hook.as_mut() {
                         hook();
                     }
-                    match rmp_serde::from_slice::<StreamFrame<T>>(&bytes) {
+                    match decode(bytes) {
                         Ok(StreamFrame::Heartbeat) => continue, // filter heartbeats
                         Ok(StreamFrame::Item(data)) => {
                             return Poll::Ready(Some(Ok(StreamFrame::Item(data))));
@@ -826,19 +839,19 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             return Poll::Ready(Some(Err(StreamError::SenderError(msg))));
                         }
                         Ok(StreamFrame::Finalized) => {
-                            this.terminated = true;
+                            self.terminated = true;
                             // A terminal read off the slot buffer was applied
                             // in the same step that retires the slot, so there
                             // is nothing left to close. Saying so now saves the
                             // close its lock trip when the consumer gets here
                             // before that step's release lands.
-                            if this.from_feed
-                                && let Some((feed, _)) = &this.feed
+                            if self.from_feed
+                                && let Some((feed, _)) = &self.feed
                             {
                                 feed.drain.mark_released();
                             }
                             // Anchor is permanently closed.
-                            this.retire();
+                            self.retire();
                             return Poll::Ready(Some(Ok(StreamFrame::Finalized)));
                         }
                         Ok(StreamFrame::Detached) => {
@@ -846,20 +859,20 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             // enqueueing Detached. Reading that old sentinel
                             // must not change a later attachment. A direct feed
                             // is retired here only while it is still current.
-                            let from_feed = this.from_feed;
-                            let ended_feed = this
+                            let from_feed = self.from_feed;
+                            let ended_feed = self
                                 .feed
                                 .as_ref()
                                 .filter(|_| from_feed)
                                 .map(|(feed, _)| Arc::clone(feed));
                             let released_prebind = ended_feed.and_then(|feed| {
-                                this.registry.get_mut(&this.local_id).and_then(|mut entry| {
+                                self.registry.get_mut(&self.local_id).and_then(|mut entry| {
                                     if !entry.retire_ended_feed(&feed) {
                                         return None;
                                     }
                                     entry.attachment = false;
                                     let released = entry.prebind.take();
-                                    entry.restart_unattached_timeout(&this.registry, this.local_id);
+                                    entry.restart_unattached_timeout(&self.registry, self.local_id);
                                     released
                                 })
                             });
@@ -867,19 +880,19 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                             return Poll::Ready(Some(Ok(StreamFrame::Detached)));
                         }
                         Ok(StreamFrame::Dropped) => {
-                            this.terminated = true;
+                            self.terminated = true;
                             // Sender dropped without an explicit close.
-                            this.retire();
+                            self.retire();
                             return Poll::Ready(Some(Err(StreamError::SenderDropped)));
                         }
                         Ok(StreamFrame::TransportError(msg)) => {
-                            this.terminated = true;
-                            this.retire();
+                            self.terminated = true;
+                            self.retire();
                             return Poll::Ready(Some(Err(StreamError::TransportError(msg))));
                         }
                         Err(e) => {
-                            this.terminated = true;
-                            this.retire();
+                            self.terminated = true;
+                            self.retire();
                             return Poll::Ready(Some(Err(StreamError::DeserializationError(
                                 e.to_string(),
                             ))));
@@ -887,13 +900,61 @@ impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
                     }
                 }
                 Poll::Ready(None) => {
-                    this.terminated = true;
-                    this.retire();
+                    self.terminated = true;
+                    self.retire();
                     return Poll::Ready(None);
                 }
                 Poll::Pending => return Poll::Pending,
             }
         }
+    }
+}
+
+impl<T: DeserializeOwned> Stream for StreamAnchor<T> {
+    type Item = Result<StreamFrame<T>, StreamError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.get_mut()
+            .poll_decoded(cx, |bytes| rmp_serde::from_slice::<StreamFrame<T>>(&bytes))
+    }
+}
+
+impl StreamAnchor<Bytes> {
+    /// Poll for the next frame, with each item a view into the buffer it
+    /// arrived in rather than a copy.
+    ///
+    /// This reads the same frames as [`Stream::poll_next`], and handles every
+    /// frame but `Item` in the same code: heartbeats are skipped, and
+    /// `SenderError`, `Detached`, `Finalized`, `Dropped`, `TransportError` and
+    /// an undecodable frame give the same results and end the stream the same
+    /// way. The two can be mixed on one anchor.
+    ///
+    /// The difference is the item. `poll_next` decodes it with serde, and
+    /// `Bytes`' `Deserialize` copies the payload into a new buffer. Here an
+    /// item sent as msgpack `bin` (by [`StreamSender::send_bytes`], or by
+    /// `send` on a `StreamSender<Bytes>`) is a slice of the received frame:
+    /// no copy, and no allocation for a frame from the mux. Any other item
+    /// form falls back to serde, so the result is always what `poll_next`
+    /// would give.
+    ///
+    /// A kept item keeps its frame buffer alive: the item plus at most 11
+    /// bytes of frame header.
+    ///
+    /// [`StreamSender::send_bytes`]: crate::streaming::StreamSender::send_bytes
+    pub fn poll_next_bytes(
+        &mut self,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<StreamFrame<Bytes>, StreamError>>> {
+        self.poll_decoded(cx, decode_bytes_frame)
+    }
+
+    /// The next frame, read as [`poll_next_bytes`](Self::poll_next_bytes)
+    /// reads it.
+    ///
+    /// The byte counterpart of [`StreamExt::next`](futures::StreamExt::next),
+    /// and cancel safe in the same way: dropping the future loses no frame.
+    pub async fn next_bytes(&mut self) -> Option<Result<StreamFrame<Bytes>, StreamError>> {
+        std::future::poll_fn(|cx| self.poll_next_bytes(cx)).await
     }
 }
 

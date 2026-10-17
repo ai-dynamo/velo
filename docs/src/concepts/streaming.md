@@ -42,6 +42,44 @@ The consumer can request graceful stop with `anchor.controller().request_stop()`
 
 The consumer can cancel the stream with `anchor.cancel()` or a cloned `StreamController`. Cancel triggers both producer tokens and ends delivery. Dropping the consumer also cancels. Stop and cancel made before attach or ticket open are retained; the producer observes them when it opens, even if it sends no data. Transport failure remains a stream error.
 
+## Byte items
+
+Some streams carry items that the application has already serialized, such as response chunks. For these, use `Bytes` as the item type, send with `send_bytes`, and read with `next_bytes`. Inside a hand-written `Stream`, use `poll_next_bytes`.
+
+```rust,ignore
+use bytes::Bytes;
+use velo::StreamFrame;
+
+// Producer.
+let sender = node_a.open_anchor_stream::<Bytes>(handle, ticket).await?;
+sender.send_bytes(&chunk).await?;
+sender.finalize()?;
+
+// Consumer of `node_b.create_anchor::<Bytes>()`.
+while let Some(frame) = anchor.next_bytes().await {
+    match frame? {
+        StreamFrame::Item(chunk) => write(chunk),
+        StreamFrame::Finalized => break,
+        _ => {}
+    }
+}
+```
+
+`send_bytes` writes the frame by hand, and the frame is the same as the one `send` writes for a `Bytes` item. So each end can use either form. `next_bytes` handles every frame other than an item in the same code as `next`, so heartbeats, errors, `Detached` and the end of the stream behave the same.
+
+The difference is the copies of each payload. Over the mux:
+
+| Form | Producer | Consumer |
+|---|---|---|
+| `send` and `next` | serde writes the frame into a buffer that grows as it writes (1 copy), then the batcher copies it into the batch (1 copy) | the ingress copies the record out of the batch (1 copy), then the `Deserialize` of `Bytes` copies the payload into a new buffer (1 copy) |
+| `send_bytes` and `next_bytes` | one allocation of the exact size (1 copy), then the batch (1 copy) | the ingress copy (1 copy); the item is a slice of that buffer, with no allocation |
+
+These counts are from the source, not measured. On the same worker, there is no batch and no ingress, so `send_bytes` and `next_bytes` make one copy in total.
+
+A kept item keeps its frame buffer in memory. The frame is the item plus at most 11 bytes.
+
+Why separate methods: `next` cannot skip serde for `Bytes` alone. Rust has no specialization, and a type check at run time needs `T: 'static` on the `Stream` impl of `StreamAnchor`, which is a breaking change. A marker item type would still go through serde on the producer. Why the mux still copies each record out of its batch is in [Batched streaming design](../development/batched-streaming-design.md#ingress-copies-each-record-out-of-its-batch).
+
 ## Many producers (MPSC)
 
 `create_mpsc_anchor` makes an anchor that accepts many producers. Each producer gets a `SenderId` when it attaches, and each frame carries the `SenderId` of its producer. `Detached` and `Dropped` from one producer do not end the stream. The consumer ends the stream: it cancels, drops the anchor, or lets the unattached timeout fire after all producers leave. A producer cannot finalize an MPSC anchor.

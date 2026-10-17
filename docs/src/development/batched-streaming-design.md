@@ -119,6 +119,17 @@ The batcher instead drains every inlet, with or without credit, into a per-slot 
 
 The first version killed the slot at the budget instead of pausing. That killed every producer faster than one credit round trip, including producers whose consumer was draining. A 10,000-record stream of 1 KiB records over loopback died after 1,128 records.
 
+### Ingress copies each record out of its batch
+
+The ingress gets each batch as one `Bytes`, and each record knows its range in it. It still copies every record body into its own `Vec` for the slot buffer. Handing the consumer `payload.slice(range)` instead would remove that copy, and with [byte items](../concepts/streaming.md#byte-items) the consumer would then copy nothing. It is not done, for two reasons:
+
+- **The byte budgets would stop bounding memory.** A slice keeps its whole batch in memory. A batch holds records of many streams, so a consumer that keeps one 100 B token keeps up to the batch size, and many slow consumers keep many batches. The slot and peer budgets count record bytes, so they would no longer bound what the node holds. Slicing only a record that fills most of its batch would bound this, but it is a second policy to keep correct.
+- **`velo-ext` fixes the slot buffer type.** The mux implements `FrameTransport::bind`, which returns `flume::Receiver<Vec<u8>>`. A slot buffer of `Bytes` needs the trait path to keep its own `Vec` channel, and it ripples through the attach and pre-bind paths, the direct feed, the MPSC pump and the anchor.
+
+The producer side has the same limit. Its frame goes through the slot inlet, the `flume::Sender<Vec<u8>>` that `FrameTransport::connect` returns, so it is built once and copied into the batch once. Writing it straight into the batch needs another inlet type for the mux and a `StreamSender` that knows which transport it has.
+
+The cost of the ingress copy is estimated at 35 to 55 ns per record, in [Response plane performance](../operations/response-plane-performance.md).
+
 ### Control is coalesced state, bounded by allocation
 
 Credit returns, closes and singleton resolutions reach the batcher as per-slot state, not as messages. A queue is unbounded exactly when a flush parks on admission, which is when the peer returns the most credit.
