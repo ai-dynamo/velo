@@ -1180,6 +1180,10 @@ macro_rules! impl_dispatch_mode_setters {
             /// finished on a tracked task, as a spawned handler's would be;
             /// drain tracking and panic handling are unchanged.
             ///
+            /// This is not the `DispatchMode::Inline` that predates 0.19:
+            /// that mode still spawned a task per message; this one runs the
+            /// handler on the receive loop.
+            ///
             /// Ordering is preserved, not created, exactly as with
             /// [`Self::ordered`]: the receive loop is one task, so inline
             /// execution follows dequeue order, which a multi-transport peer
