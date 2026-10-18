@@ -335,6 +335,9 @@ pub(crate) enum DispatchFailure {
     /// An ordered handler panicked. The panic was caught so the lane survives,
     /// but the message was not handled.
     OrderedHandlerPanic,
+    /// An inline handler panicked. The panic was caught so the receive loop
+    /// survives, but the message was not handled.
+    InlineHandlerPanic,
     /// A spawned handler panicked before it could complete its response.
     HandlerPanic,
 }
@@ -354,6 +357,7 @@ impl DispatchFailure {
             Self::ResponseSendTypedUnary => ("response_send", "typed_unary"),
             Self::OrderedLaneShed => ("dispatch", "ordered_lane_shed"),
             Self::OrderedHandlerPanic => ("dispatch", "ordered_handler_panic"),
+            Self::InlineHandlerPanic => ("dispatch", "inline_handler_panic"),
             Self::HandlerPanic => ("dispatch", "handler_panic"),
         }
     }

@@ -223,6 +223,79 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispa
     }
 }
 
+/// Dispatcher implementation that runs a synchronous handler on the receive
+/// loop itself.
+///
+/// The receive loop is one task, so messages are handled in dequeue order
+/// with no per-message spawn and no lane queue — the strictest ordering the
+/// messenger offers, bought with the loop's availability: the handler runs
+/// with every other inbound message queued behind it. That is why the
+/// builders refuse an async handler for this mode, and why its callers are
+/// expected to bound in-flight volume themselves (a negotiated command
+/// window, say) rather than rely on queue depth to absorb bursts.
+pub(crate) struct InlineDispatcher<H: ActiveMessageHandler> {
+    handler: Arc<H>,
+    /// The rendezvous-ordering caveat is worth saying once per handler, not
+    /// once per message — same reason as [`OrderedDispatcher`]'s.
+    rendezvous_warning: std::sync::Once,
+}
+
+impl<H: ActiveMessageHandler> InlineDispatcher<H> {
+    pub fn new(handler: H) -> Self {
+        Self {
+            handler: Arc::new(handler),
+            rendezvous_warning: std::sync::Once::new(),
+        }
+    }
+}
+
+impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for InlineDispatcher<H> {
+    fn name(&self) -> &str {
+        self.handler.name()
+    }
+
+    fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>) {
+        // The same caveat OrderedDispatcher carries: rendezvous payloads
+        // resolve in a detached task before dispatching, so two staged
+        // messages from one sender can reach this loop out of order, and
+        // inline execution cannot restore that.
+        if call
+            .headers
+            .as_ref()
+            .is_some_and(|h| h.contains_key(crate::messenger::large_payload::RV_HEADER_KEY))
+        {
+            self.rendezvous_warning.call_once(|| {
+                warn!(
+                    target: "crate::messenger::dispatcher",
+                    handler = %self.handler.name(),
+                    "Rendezvous (large-payload) messages resolve out-of-band and are not \
+                     ordered relative to each other, even on an inline handler"
+                );
+            });
+        }
+
+        let handler = Arc::clone(&self.handler);
+        let ctx = call.into_context(Arc::clone(system));
+        let mut invocation = Box::pin(async move {
+            run_handler(&*handler, ctx, DispatchFailure::InlineHandlerPanic).await;
+        });
+
+        // A synchronous handler's invocation is ready on its first poll
+        // unless its reply could not be admitted at once; the reply send then
+        // finishes on a tracked task, exactly as a spawned handler's would.
+        // What the continuation holds at that point is what the handler
+        // adapter's future holds across the send — the backend and the drain
+        // guard, the Messenger clone having been consumed by the handler
+        // body — so a reply parked on a stalled peer's admission cannot keep
+        // the instance alive, and the teardown token still releases it.
+        let waker = futures::task::noop_waker();
+        let mut cx = std::task::Context::from_waker(&waker);
+        if std::future::Future::poll(invocation.as_mut(), &mut cx).is_pending() {
+            system.tracker().clone().spawn(invocation);
+        }
+    }
+}
+
 /// Dispatcher implementation that serialises handler execution on per-key
 /// ordering lanes.
 ///
@@ -713,7 +786,7 @@ mod tests {
             )
         };
 
-        for mode in ["spawn", "ordered"] {
+        for mode in ["spawn", "ordered", "inline"] {
             for during_construction in [true, false] {
                 let name = format!("_panic_{mode}_{during_construction}");
                 let handler = PanickingHandler {
@@ -722,7 +795,8 @@ mod tests {
                 };
                 let dispatcher: Arc<dyn ActiveMessageDispatcher> = match mode {
                     "spawn" => Arc::new(SpawnedDispatcher::new(handler)),
-                    _ => Arc::new(OrderedDispatcher::new(handler, OrderedConfig::global())),
+                    "ordered" => Arc::new(OrderedDispatcher::new(handler, OrderedConfig::global())),
+                    _ => Arc::new(InlineDispatcher::new(handler)),
                 };
                 messenger
                     .register_streaming_handler(Handler { dispatcher })
@@ -741,6 +815,7 @@ mod tests {
         }
         assert_eq!(panics("handler_panic"), 2.0);
         assert_eq!(panics("ordered_handler_panic"), 2.0);
+        assert_eq!(panics("inline_handler_panic"), 2.0);
         messenger
             .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
             .await;
@@ -833,5 +908,194 @@ mod tests {
             tasks,
             "a shed fire-and-forget message started a task"
         );
+    }
+
+    /// An inline handler has already run when `dispatch` returns — no task,
+    /// no queue. The runtime is single-threaded and the handler never yields,
+    /// so a spawned continuation would still be counted by the tracker when it
+    /// is read, the same reading `shedding_fire_and_forget_spawns_no_reply_task`
+    /// makes.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_inline_handler_runs_on_the_callers_task() {
+        let messenger = Messenger::builder().build().await.unwrap();
+        let handled = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = Arc::clone(&handled);
+        let handler = crate::messenger::Handler::am_handler("count", move |_ctx| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            Ok(())
+        })
+        .inline()
+        .build();
+        let dispatcher = handler.dispatcher;
+
+        let call = |n: u128| InboundCall {
+            message_id: ResponseId::from_u128(n),
+            payload: Bytes::new(),
+            response_type: ResponseType::FireAndForget,
+            headers: None,
+            in_flight: None,
+        };
+        let tasks = messenger.tracker().len();
+        for n in 0..5u128 {
+            dispatcher.dispatch(call(n), &messenger);
+            assert_eq!(
+                handled.load(std::sync::atomic::Ordering::Acquire) as u128,
+                n + 1,
+                "the handler must have finished before dispatch returned"
+            );
+        }
+        assert_eq!(
+            messenger.tracker().len(),
+            tasks,
+            "an inline dispatch that completed inline started no task"
+        );
+    }
+
+    /// A transport whose send channel is full until `release` is called, so a
+    /// reply send pends and an inline handler's continuation has to move to a
+    /// tracked task.
+    struct GatedTransport {
+        address: velo_ext::WorkerAddress,
+        gate: crate::transports::AdmissionGate<(Bytes, Bytes)>,
+        rx: flume::Receiver<(Bytes, Bytes)>,
+    }
+
+    impl GatedTransport {
+        fn new() -> Arc<Self> {
+            let key = velo_ext::TransportKey::from("gated");
+            let mut address = crate::transports::address::WorkerAddressBuilder::new();
+            address
+                .add_entry(key.as_str(), Bytes::from_static(b"gated://local"))
+                .expect("address entry");
+            let (tx, rx) = flume::bounded(1);
+            let gate = crate::transports::AdmissionGate::new(tx, tokio::runtime::Handle::current());
+            // Fill the one slot, so a send queues instead of admitting.
+            assert!(gate.send((Bytes::new(), Bytes::new())).is_admitted());
+            Arc::new(Self {
+                address: address.build().expect("address"),
+                gate,
+                rx,
+            })
+        }
+
+        /// Make room, so the queued reply is admitted and enqueued.
+        fn release(&self) {
+            self.rx.try_recv().expect("the filler frame to release");
+        }
+    }
+
+    impl crate::transports::Transport for GatedTransport {
+        fn key(&self) -> velo_ext::TransportKey {
+            velo_ext::TransportKey::from("gated")
+        }
+
+        fn address(&self) -> velo_ext::WorkerAddress {
+            self.address.clone()
+        }
+
+        fn register(
+            &self,
+            _peer_info: velo_ext::PeerInfo,
+        ) -> Result<(), crate::transports::TransportError> {
+            Ok(())
+        }
+
+        fn send_message(
+            &self,
+            _instance_id: velo_ext::InstanceId,
+            header: Bytes,
+            payload: Bytes,
+            _message_type: crate::transports::MessageType,
+            _on_error: Arc<dyn crate::transports::TransportErrorHandler>,
+        ) -> crate::transports::SendOutcome {
+            self.gate.send((header, payload))
+        }
+
+        fn start(
+            &self,
+            _instance_id: velo_ext::InstanceId,
+            _channels: crate::transports::TransportAdapter,
+            _rt: tokio::runtime::Handle,
+        ) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn shutdown(&self) {}
+
+        fn check_health(
+            &self,
+            _instance_id: velo_ext::InstanceId,
+            _timeout: Duration,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<(), crate::transports::HealthCheckError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// A unary reply that cannot be admitted at once finishes on a tracked
+    /// task: the handler still ran inline, and the continuation holds the
+    /// backend and the drain guard — not the Messenger, which the handler body
+    /// already consumed — so a reply parked on a stalled peer's admission does
+    /// not keep the instance alive.
+    #[tokio::test(flavor = "current_thread")]
+    async fn an_inline_reply_that_cannot_be_admitted_finishes_on_a_tracked_task() {
+        let transport = GatedTransport::new();
+        let messenger = Messenger::builder()
+            .add_transport(transport.clone())
+            .build()
+            .await
+            .unwrap();
+        let peer = velo_ext::InstanceId::new_v4();
+        messenger
+            .register_peer(velo_ext::PeerInfo::new(peer, transport.address()))
+            .unwrap();
+        let handler = crate::messenger::Handler::unary_handler("echo", |ctx| Ok(Some(ctx.payload)))
+            .inline()
+            .build();
+        let dispatcher = handler.dispatcher;
+
+        // The handler runs inline: the reply send is what pends.
+        let tasks = messenger.tracker().len();
+        dispatcher.dispatch(
+            InboundCall {
+                message_id: ResponseId::from_u128(u128::from(peer.worker_id().as_u64())),
+                payload: Bytes::from_static(b"ping"),
+                response_type: ResponseType::Unary,
+                headers: None,
+                in_flight: None,
+            },
+            &messenger,
+        );
+        assert_eq!(
+            messenger.tracker().len(),
+            tasks + 1,
+            "the unadmitted reply must finish on a tracked task"
+        );
+        assert!(
+            transport.rx.try_recv().is_err(),
+            "the reply is queued behind the full channel, not on the wire"
+        );
+
+        // The parked continuation holds no Messenger: dropping it must free it
+        // even while the reply is still waiting.
+        let weak = Arc::downgrade(&messenger);
+        drop(messenger);
+        assert!(
+            weak.upgrade().is_none(),
+            "a reply parked on admission must not keep the Messenger alive"
+        );
+
+        // Once the peer's channel has room, the reply completes without it.
+        transport.release();
+        let (_, payload) = tokio::time::timeout(Duration::from_secs(2), transport.rx.recv_async())
+            .await
+            .expect("the queued reply is admitted once the channel has room")
+            .expect("the channel is held open by the gate");
+        assert_eq!(payload, Bytes::from_static(b"ping"));
     }
 }

@@ -44,8 +44,8 @@ use crate::messenger::common::events::{EventType, Outcome, encode_event_header};
 use crate::messenger::common::messages::ResponseType;
 use crate::messenger::common::responses::{ResponseId, encode_response_header};
 use crate::messenger::server::dispatcher::{
-    ActiveMessageDispatcher, ActiveMessageHandler, HandlerContext, OrderedDispatcher,
-    SpawnedDispatcher,
+    ActiveMessageDispatcher, ActiveMessageHandler, HandlerContext, InlineDispatcher,
+    OrderedDispatcher, SpawnedDispatcher,
 };
 use crate::transports::{MessageType, SendOutcome, VeloBackend};
 use derive_getters::Dissolve;
@@ -186,6 +186,22 @@ pub enum OverflowPolicy {
     /// Drop the message and, for `AckNack`/`Unary`, send an error response so
     /// the caller fails fast instead of waiting for its own timeout.
     Reject,
+}
+
+/// How a registered handler is dispatched.
+///
+/// Crate-private: callers choose with the builder setters — `.spawn()`,
+/// `.ordered()`/`.ordered_with()`, `.inline()` — not by naming the mode.
+#[derive(Debug, Clone, Default)]
+pub(crate) enum DispatchMode {
+    /// One spawned task per message. Default.
+    #[default]
+    Spawned,
+    /// Per-key ordering lanes; see [`OrderedConfig`].
+    Ordered(OrderedConfig),
+    /// Run a synchronous handler on the receive loop itself; see the
+    /// builders' `inline()`.
+    Inline,
 }
 
 /// Tuning for ordered handler dispatch.
@@ -1119,7 +1135,7 @@ macro_rules! impl_dispatch_mode_setters {
         impl<E $(, $generic)*> $ty<E $(, $generic)*> {
             /// Run the handler on a task spawned per message. Default.
             pub fn spawn(mut self) -> Self {
-                self.ordered = None;
+                self.mode = DispatchMode::Spawned;
                 self
             }
 
@@ -1148,7 +1164,28 @@ macro_rules! impl_dispatch_mode_setters {
 
             /// Ordered dispatch with explicit configuration.
             pub fn ordered_with(mut self, config: OrderedConfig) -> Self {
-                self.ordered = Some(config);
+                self.mode = DispatchMode::Ordered(config);
+                self
+            }
+
+            /// Handle each message on the receive loop itself, in dequeue
+            /// order, with no per-message task.
+            ///
+            /// Only for a synchronous handler that never blocks: it runs with
+            /// every other inbound message queued behind it, and `build`
+            /// refuses an async one. The mode exists for traffic whose
+            /// in-flight volume the application already bounds — a negotiated
+            /// command window, say — so the loop is never stalled waiting for
+            /// room to answer. A reply that cannot be admitted at once is
+            /// finished on a tracked task, as a spawned handler's would be;
+            /// drain tracking and panic handling are unchanged.
+            ///
+            /// Ordering is preserved, not created, exactly as with
+            /// [`Self::ordered`]: the receive loop is one task, so inline
+            /// execution follows dequeue order, which a multi-transport peer
+            /// or a reconnect can already have scrambled upstream.
+            pub fn inline(mut self) -> Self {
+                self.mode = DispatchMode::Inline;
                 self
             }
 
@@ -1158,11 +1195,12 @@ macro_rules! impl_dispatch_mode_setters {
             /// Ignored (with a warning) in any other mode. `0` is rejected
             /// immediately because it would park every lane forever.
             pub fn max_concurrent(mut self, limit: usize) -> Self {
-                match self.ordered.take() {
-                    Some(config) => {
-                        self.ordered = Some(config.with_max_concurrent(Some(limit)));
+                match std::mem::take(&mut self.mode) {
+                    DispatchMode::Ordered(config) => {
+                        self.mode = DispatchMode::Ordered(config.with_max_concurrent(Some(limit)));
                     }
-                    None => {
+                    other => {
+                        self.mode = other;
                         tracing::warn!(
                             target: "crate::messenger::handlers",
                             handler = %self.name,
@@ -1180,18 +1218,30 @@ macro_rules! impl_dispatch_mode_setters {
 /// An ordering configuration selects lanes; no configuration selects one task per message.
 fn make_dispatcher<H: ActiveMessageHandler + 'static>(
     adapter: H,
-    ordered: Option<OrderedConfig>,
+    mode: DispatchMode,
 ) -> Arc<dyn ActiveMessageDispatcher> {
-    match ordered {
-        Some(config) => Arc::new(OrderedDispatcher::new(adapter, config)),
-        None => Arc::new(SpawnedDispatcher::new(adapter)),
+    match mode {
+        DispatchMode::Spawned => Arc::new(SpawnedDispatcher::new(adapter)),
+        DispatchMode::Ordered(config) => Arc::new(OrderedDispatcher::new(adapter, config)),
+        DispatchMode::Inline => Arc::new(InlineDispatcher::new(adapter)),
     }
+}
+
+/// Inline dispatch runs the handler on the receive loop, so it cannot drive
+/// an async handler: the future would park on its first await and cost the
+/// very spawn the mode exists to avoid.
+fn assert_inline_is_sync(is_async: bool, mode: &DispatchMode) {
+    assert!(
+        !(is_async && matches!(mode, DispatchMode::Inline)),
+        "inline dispatch requires a synchronous handler (am_handler/unary_handler/typed_unary), \
+         not the *_async form"
+    );
 }
 
 pub struct AmHandlerBuilder<E> {
     executor: E,
     name: String,
-    ordered: Option<OrderedConfig>,
+    mode: DispatchMode,
 }
 
 impl<E> AmHandlerBuilder<E>
@@ -1202,13 +1252,14 @@ where
         Self {
             executor,
             name,
-            ordered: None,
+            mode: DispatchMode::Spawned,
         }
     }
 
     pub fn build(self) -> Handler {
+        assert_inline_is_sync(self.executor.is_async(), &self.mode);
         let adapter = AmExecutorAdapter::new(self.executor, self.name);
-        let dispatcher = make_dispatcher(adapter, self.ordered);
+        let dispatcher = make_dispatcher(adapter, self.mode);
         Handler { dispatcher }
     }
 }
@@ -1218,7 +1269,7 @@ impl_dispatch_mode_setters!(AmHandlerBuilder);
 pub struct UnaryHandlerBuilder<E> {
     executor: E,
     name: String,
-    ordered: Option<OrderedConfig>,
+    mode: DispatchMode,
 }
 
 impl<E> UnaryHandlerBuilder<E>
@@ -1229,13 +1280,14 @@ where
         Self {
             executor,
             name,
-            ordered: None,
+            mode: DispatchMode::Spawned,
         }
     }
 
     pub fn build(self) -> Handler {
+        assert_inline_is_sync(self.executor.is_async(), &self.mode);
         let adapter = UnaryExecutorAdapter::new(self.executor, self.name);
-        let dispatcher = make_dispatcher(adapter, self.ordered);
+        let dispatcher = make_dispatcher(adapter, self.mode);
         Handler { dispatcher }
     }
 }
@@ -1245,7 +1297,7 @@ impl_dispatch_mode_setters!(UnaryHandlerBuilder);
 pub struct TypedUnaryHandlerBuilder<E, I, O> {
     executor: E,
     name: String,
-    ordered: Option<OrderedConfig>,
+    mode: DispatchMode,
     _phantom: PhantomData<fn(I) -> O>,
 }
 
@@ -1259,14 +1311,15 @@ where
         Self {
             executor,
             name,
-            ordered: None,
+            mode: DispatchMode::Spawned,
             _phantom: PhantomData,
         }
     }
 
     pub fn build(self) -> Handler {
+        assert_inline_is_sync(self.executor.is_async(), &self.mode);
         let adapter = TypedUnaryExecutorAdapter::new(self.executor, self.name);
-        let dispatcher = make_dispatcher(adapter, self.ordered);
+        let dispatcher = make_dispatcher(adapter, self.mode);
         Handler { dispatcher }
     }
 }
@@ -1461,7 +1514,9 @@ mod tests {
     #[test]
     fn test_ordered_defaults_to_per_sender_lanes() {
         let builder = am_handler("defaults", |_ctx| Ok(())).ordered();
-        let config = builder.ordered.expect("ordered config");
+        let DispatchMode::Ordered(config) = builder.mode else {
+            panic!("ordered config")
+        };
         assert_eq!(config.key, OrderingKey::Sender);
         assert_eq!(config.idle_lane_ttl, Some(Duration::from_secs(30)));
         assert_eq!(config.max_concurrent, None, "unbounded unless asked");
@@ -1469,25 +1524,25 @@ mod tests {
         assert_eq!(config.overflow, OverflowPolicy::Warn);
 
         let builder = am_handler("global", |_ctx| Ok(())).ordered_global();
-        assert_eq!(
-            builder.ordered.expect("ordered config").key,
-            OrderingKey::Global
-        );
+        let DispatchMode::Ordered(config) = builder.mode else {
+            panic!("ordered config")
+        };
+        assert_eq!(config.key, OrderingKey::Global);
     }
 
     #[test]
     fn test_dispatch_mode_last_call_wins() {
         // `.ordered()` after `.spawn()` wins...
         let builder = am_handler("a", |_ctx| Ok(())).spawn().ordered();
-        assert!(builder.ordered.is_some());
+        assert!(matches!(builder.mode, DispatchMode::Ordered(_)));
 
-        // ...and `.spawn()` after `.ordered()` wins, clearing the config so a
+        // ...and `.spawn()` after `.ordered()` wins, dropping the config so a
         // stale `max_concurrent` cannot leak into a non-ordered handler.
         let builder = am_handler("b", |_ctx| Ok(()))
             .ordered()
             .max_concurrent(8)
             .spawn();
-        assert!(builder.ordered.is_none());
+        assert!(matches!(builder.mode, DispatchMode::Spawned));
     }
 
     #[test]
@@ -1495,15 +1550,54 @@ mod tests {
         let builder = am_handler("limited", |_ctx| Ok(()))
             .ordered()
             .max_concurrent(32);
-        assert_eq!(
-            builder.ordered.expect("ordered config").max_concurrent,
-            Some(32)
-        );
+        let DispatchMode::Ordered(config) = builder.mode else {
+            panic!("ordered config")
+        };
+        assert_eq!(config.max_concurrent, Some(32));
 
         // Outside ordered mode there is no lane to limit, so this warns and is
         // otherwise a no-op rather than silently switching modes.
         let builder = am_handler("unlimited", |_ctx| Ok(())).max_concurrent(32);
-        assert!(builder.ordered.is_none());
+        assert!(matches!(builder.mode, DispatchMode::Spawned));
+    }
+
+    #[test]
+    fn test_inline_dispatch_builds_on_every_sync_builder() {
+        // The dispatch-mode setters come from a macro, so this pins that all
+        // three builders actually got `inline()` and that `build()` accepts
+        // the mode for a synchronous handler.
+        let handler = am_handler("am_inline", |_ctx| Ok(())).inline().build();
+        assert_eq!(handler.name(), "am_inline");
+
+        let handler = unary_handler("unary_inline", |_ctx| Ok(None))
+            .inline()
+            .build();
+        assert_eq!(handler.name(), "unary_inline");
+
+        let handler = typed_unary("typed_inline", |ctx: TypedContext<PingRequest>| {
+            Ok(PingResponse {
+                echo: ctx.input.message,
+            })
+        })
+        .inline()
+        .build();
+        assert_eq!(handler.name(), "typed_inline");
+
+        // Last call still wins across the inline boundary.
+        let builder = am_handler("a", |_ctx| Ok(())).ordered().inline();
+        assert!(matches!(builder.mode, DispatchMode::Inline));
+        let builder = am_handler("b", |_ctx| Ok(())).inline().spawn();
+        assert!(matches!(builder.mode, DispatchMode::Spawned));
+    }
+
+    #[test]
+    #[should_panic(expected = "inline dispatch requires a synchronous handler")]
+    fn test_inline_rejects_an_async_handler() {
+        // An async handler's future would park on its first await and cost
+        // the spawn inline mode exists to avoid, so `build` says so instead.
+        let _ = am_handler_async("am_inline_async", |_ctx| async move { Ok(()) })
+            .inline()
+            .build();
     }
 
     #[test]
