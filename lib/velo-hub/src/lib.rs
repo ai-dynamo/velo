@@ -8,4 +8,6 @@
 
 #![deny(missing_docs)]
 
+pub mod protocol;
+
 pub use velo;
