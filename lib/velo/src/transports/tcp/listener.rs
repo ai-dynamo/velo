@@ -18,7 +18,7 @@ use tokio_util::codec::Framed;
 use tracing::{debug, error, info, warn};
 
 use crate::observability::TransportRejection;
-use crate::transports::ingress::{Routed, route_frame};
+use crate::transports::ingress::{RouteFrameContext, Routed, route_frame};
 
 use velo_ext::{
     MessageType, SenderIdentity, ShutdownState, TransportAdapter, TransportErrorHandler,
@@ -370,10 +370,12 @@ impl TcpListener {
                                 header,
                                 payload,
                                 sender,
-                                &adapter,
-                                &error_handler,
-                                &transport_key,
-                                metrics.as_ref(),
+                                RouteFrameContext {
+                                    adapter: &adapter,
+                                    error_handler: &error_handler,
+                                    transport_key: &transport_key,
+                                    metrics: metrics.as_ref(),
+                                },
                             )
                             .await
                             {

@@ -520,7 +520,7 @@ impl ResponseManager {
     ) {
         self.inner
             .expected_peer
-            .insert(response_id.slot_index(), target);
+            .insert(response_id.slot_index(), (response_id.as_u128(), target));
     }
 
     /// [`complete_outcome`](Self::complete_outcome) with a provenance check:
@@ -537,25 +537,38 @@ impl ResponseManager {
         outcome: Result<Option<Bytes>, String>,
         sender: velo_ext::SenderIdentity,
     ) -> bool {
-        if let Some(expected) = self.inner.expected_peer.get(&response_id.slot_index()) {
-            let expected = *expected;
-            if sender.instance_id() == Some(expected) {
-                self.inner.expected_peer.remove(&response_id.slot_index());
-            } else {
-                if let Some(metrics) = self.inner.observability.as_ref() {
-                    metrics.record_dispatch_failure(
-                        crate::observability::DispatchFailure::ResponseProvenanceMismatch,
-                    );
-                }
-                tracing::warn!(
-                    target: "crate::messenger::responses",
-                    response_id = %response_id,
-                    "Dropping a completion from the wrong or no connection identity"
-                );
-                return false;
-            }
+        let Some(entry) = self.inner.expected_peer.get(&response_id.slot_index()) else {
+            // No expectation recorded (a store-and-forward target, or a send
+            // from before the check): complete unchecked, as before.
+            return self.inner.complete_outcome(response_id, outcome);
+        };
+        let (expected_id, expected) = *entry;
+        drop(entry);
+        if expected_id != response_id.as_u128() {
+            // A stale-generation frame: the expectation belongs to the live
+            // send. It stays; the slot's own generation check answers this.
+            return self.inner.complete_outcome(response_id, outcome);
         }
-        self.inner.complete_outcome(response_id, outcome)
+        if sender.instance_id() != Some(expected) {
+            if let Some(metrics) = self.inner.observability.as_ref() {
+                metrics.record_dispatch_failure(
+                    crate::observability::DispatchFailure::ResponseProvenanceMismatch,
+                );
+            }
+            tracing::warn!(
+                target: "crate::messenger::responses",
+                response_id = %response_id,
+                "Dropping a completion from the wrong or no connection identity"
+            );
+            return false;
+        }
+        // Remove only on an accepted completion: a stale answer from the
+        // right peer must not clear the live expectation.
+        let completed = self.inner.complete_outcome(response_id, outcome);
+        if completed {
+            self.inner.expected_peer.remove(&response_id.slot_index());
+        }
+        completed
     }
 
     pub fn complete_outcome(
@@ -575,9 +588,11 @@ struct ResponseManagerInner {
     worker_id: WorkerId,
     /// Which instance may complete each live slot, recorded at send time when
     /// the target's transport attributes its connections. Keyed by slot
-    /// index: a response id encodes its slot, and the check needs no second
-    /// lookup. An entry is removed when the slot completes or recycles.
-    expected_peer: dashmap::DashMap<usize, velo_ext::InstanceId>,
+    /// index so recycling can forget it; the value carries the full response
+    /// id so a stale-generation frame from the right peer is not mistaken
+    /// for the live send's answer. An entry is removed when its own send
+    /// completes or the slot recycles.
+    expected_peer: dashmap::DashMap<usize, (u128, velo_ext::InstanceId)>,
     arena: Arc<SlotArena<Option<Bytes>, String>>,
     // Capacity gate. Holds `capacity` permits; one is consumed per outstanding
     // awaiter and released when the awaiter drops. The semaphore is the
@@ -1079,6 +1094,54 @@ mod tests {
         assert_eq!(
             awaiter.recv().await.expect("completed"),
             Some(Bytes::from_static(b"legacy"))
+        );
+    }
+
+    /// A delayed answer from the right peer for a RECYCLED generation must
+    /// not clear the live send's expectation: the check binds the full
+    /// response id, and only an accepted completion removes it. Regression
+    /// test for the generation hole: stale-match-then-rogue must still drop.
+    #[tokio::test]
+    async fn a_stale_generation_reply_cannot_clear_the_live_expectation() {
+        let rm = ResponseManager::with_capacity(7, 1, None);
+        let target = velo_ext::InstanceId::new_v4();
+
+        let stale_id = {
+            let awaiter = rm.register_outcome().expect("slot");
+            let id = awaiter.response_id();
+            rm.expect_response_from(id, target);
+            id
+            // awaiter drops here, recycling the slot
+        };
+        let mut awaiter = rm.register_outcome().expect("the slot recycles");
+        let id = awaiter.response_id();
+        assert_ne!(id, stale_id, "the recycled slot has a new generation");
+        rm.expect_response_from(id, target);
+
+        // The stale answer from the right peer is generation-rejected and
+        // must not clear the live expectation.
+        assert!(!rm.complete_outcome_attributed(
+            stale_id,
+            Ok(Some(Bytes::from_static(b"stale"))),
+            velo_ext::SenderIdentity::AnnouncedPeer(target),
+        ));
+        // A rogue frame for the live send is still dropped...
+        let rogue = velo_ext::InstanceId::new_v4();
+        assert!(!rm.complete_outcome_attributed(
+            id,
+            Ok(Some(Bytes::from_static(b"rogue"))),
+            velo_ext::SenderIdentity::AnnouncedPeer(rogue),
+        ));
+        assert!(awaiter.recv().now_or_never().is_none());
+        // ...and the genuine reply completes.
+        assert!(rm.complete_outcome_attributed(
+            id,
+            Ok(Some(Bytes::from_static(b"real"))),
+            velo_ext::SenderIdentity::AnnouncedPeer(target),
+        ));
+        assert_eq!(
+            awaiter.recv().await.expect("completed"),
+            Some(Bytes::from_static(b"real"))
         );
     }
 

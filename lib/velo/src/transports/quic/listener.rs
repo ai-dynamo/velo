@@ -139,10 +139,12 @@ async fn serve_stream(
                     payload,
                     // The QUIC accept side does not yet learn who dialed.
                     velo_ext::SenderIdentity::Unattributed,
-                    &ctx.adapter,
-                    &ctx.error_handler,
-                    &ctx.transport_key,
-                    ctx.metrics.as_ref(),
+                    crate::transports::ingress::RouteFrameContext {
+                        adapter: &ctx.adapter,
+                        error_handler: &ctx.error_handler,
+                        transport_key: &ctx.transport_key,
+                        metrics: ctx.metrics.as_ref(),
+                    },
                 )
                 .await
                 {

@@ -672,25 +672,9 @@ async fn connection_writer_task(
     tx: flume::Sender<SendTask>,
     ctx: WriterTaskContext,
 ) -> Result<()> {
-    let WriterTaskContext {
-        connections,
-        cancel_token,
-        connect_timeout,
-        own_instance,
-        reader_ctx,
-        metrics,
-    } = ctx;
-    let result = connection_writer_inner(
-        &path,
-        instance_id,
-        &rx,
-        &cancel_token,
-        connect_timeout,
-        own_instance,
-        reader_ctx,
-        metrics.clone(),
-    )
-    .await;
+    let connections = Arc::clone(&ctx.connections);
+    let metrics = ctx.metrics.clone();
+    let result = connection_writer_inner(&path, instance_id, &rx, &ctx).await;
 
     retire_connection(instance_id, tx, rx, &connections).await;
     if let Some(metrics) = metrics.as_ref() {
@@ -725,12 +709,13 @@ async fn connection_writer_inner(
     path: &Path,
     instance_id: crate::InstanceId,
     rx: &flume::Receiver<SendTask>,
-    cancel_token: &CancellationToken,
-    connect_timeout: Duration,
-    own_instance: Option<crate::InstanceId>,
-    reader_ctx: Option<DialedReaderContext>,
-    metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+    ctx: &WriterTaskContext,
 ) -> Result<()> {
+    let cancel_token = &ctx.cancel_token;
+    let connect_timeout = ctx.connect_timeout;
+    let own_instance = ctx.own_instance;
+    let reader_ctx = ctx.reader_ctx.clone();
+    let metrics = ctx.metrics.clone();
     debug!("Connecting to UDS {:?}", path);
 
     let stream = tokio::select! {

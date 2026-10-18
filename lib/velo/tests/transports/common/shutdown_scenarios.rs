@@ -37,7 +37,7 @@ pub async fn drain_accepts_responses<C: ShutdownTestClient>() {
     )
     .await;
 
-    let (header, payload) = timeout(
+    let (header, payload, _) = timeout(
         Duration::from_secs(2),
         handle.streams.response_stream.recv_async(),
     )
@@ -57,7 +57,7 @@ pub async fn drain_accepts_events<C: ShutdownTestClient>() {
 
     C::connect_and_send_frame(&handle, MessageType::Event, b"evt-header", b"evt-payload").await;
 
-    let (header, payload) = timeout(
+    let (header, payload, _) = timeout(
         Duration::from_secs(2),
         handle.streams.event_stream.recv_async(),
     )
@@ -77,7 +77,7 @@ pub async fn new_connection_during_drain<C: ShutdownTestClient>() {
 
     C::connect_and_send_frame(&handle, MessageType::Response, b"new-resp", b"new-payload").await;
 
-    let (header, payload) = timeout(
+    let (header, payload, _) = timeout(
         Duration::from_secs(2),
         handle.streams.response_stream.recv_async(),
     )
@@ -272,7 +272,7 @@ where
         MessageType::Response,
     );
 
-    let (header, payload) = timeout(
+    let (header, payload, _) = timeout(
         Duration::from_secs(2),
         handle_b.streams.response_stream.recv_async(),
     )
@@ -315,7 +315,7 @@ where
 
     // B's listener echoes the header back in a ShuttingDown frame; A must
     // surface it as a correlation entry on its shutdown stream.
-    let (header, payload) = timeout(
+    let (header, payload, _) = timeout(
         Duration::from_secs(2),
         handle_a.streams.shutdown_stream.recv_async(),
     )

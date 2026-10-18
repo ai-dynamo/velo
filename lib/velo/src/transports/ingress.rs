@@ -94,16 +94,29 @@ fn record_inbound_frame(
 /// message that is merely *queued* is already work `wait_for_drain` can see.
 /// Every other frame type — responses, acks, events, and drain echoes from a
 /// peer — must keep flowing while this side drains and is sent directly.
+/// Everything route_frame needs beyond the frame itself. The listeners carry
+/// these in their own connection contexts; bundling them keeps the signature
+/// under the argument ceiling.
+pub(crate) struct RouteFrameContext<'a> {
+    pub adapter: &'a TransportAdapter,
+    pub error_handler: &'a Arc<dyn TransportErrorHandler>,
+    pub transport_key: &'a str,
+    pub metrics: Option<&'a Arc<dyn velo_ext::TransportObservability>>,
+}
+
 pub(crate) async fn route_frame(
     msg_type: MessageType,
     header: Bytes,
     payload: Bytes,
     sender: SenderIdentity,
-    adapter: &TransportAdapter,
-    error_handler: &Arc<dyn TransportErrorHandler>,
-    transport_key: &str,
-    metrics: Option<&Arc<dyn velo_ext::TransportObservability>>,
+    ctx: RouteFrameContext<'_>,
 ) -> Result<Routed> {
+    let RouteFrameContext {
+        adapter,
+        error_handler,
+        transport_key,
+        metrics,
+    } = ctx;
     let frame_bytes = header.len() + payload.len();
 
     let stream = match msg_type {
@@ -223,10 +236,12 @@ pub(crate) async fn run_dialed_reader<R>(
                             header,
                             payload,
                             sender,
-                            &ctx.adapter,
-                            &ctx.error_handler,
-                            &ctx.transport_key,
-                            metrics.as_ref(),
+                            RouteFrameContext {
+                                adapter: &ctx.adapter,
+                                error_handler: &ctx.error_handler,
+                                transport_key: &ctx.transport_key,
+                                metrics: metrics.as_ref(),
+                            },
                         )
                         .await
                         {
@@ -328,10 +343,12 @@ mod tests {
             Bytes::from_static(b"drain-header"),
             Bytes::from_static(b"drain-payload"),
             SenderIdentity::Unattributed,
-            &adapter,
-            &error_handler,
-            "test",
-            None,
+            RouteFrameContext {
+                adapter: &adapter,
+                error_handler: &error_handler,
+                transport_key: "test",
+                metrics: None,
+            },
         )
         .await
         .expect("a drain rejection is not a routing failure");
@@ -371,10 +388,12 @@ mod tests {
             Bytes::from_static(b"orphan-header"),
             Bytes::from_static(b"orphan-payload"),
             SenderIdentity::Unattributed,
-            &adapter,
-            &error_handler,
-            "test",
-            None,
+            RouteFrameContext {
+                adapter: &adapter,
+                error_handler: &error_handler,
+                transport_key: "test",
+                metrics: None,
+            },
         )
         .await
         .expect_err("an undeliverable Message must surface as a routing failure");
