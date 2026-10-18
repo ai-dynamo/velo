@@ -750,7 +750,7 @@ async fn a_reserved_lane_carries_no_stream_in_either_direction() {
     })
     .await;
     assert_eq!(consumer_mux.live_ingress_slots(on_reserved), 0);
-    stream_through(sender, anchor).await;
+    stream_through(sender, drain_first(anchor).await).await;
 
     // Unkeyed: six attaches spread over the three placement lanes only.
     let streams = attach_all(&consumer, &producer, 6).await;
