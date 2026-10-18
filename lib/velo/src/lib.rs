@@ -73,6 +73,7 @@ pub use crate::streaming::{
 // Rendezvous
 pub use crate::rendezvous::{
     DataHandle, DataMetadata, RegisterOptions, RendezvousManager, RendezvousWrite, StageMode,
+    TransparentStaging,
 };
 
 // RDMA registration. Gated exactly as `transports::ucx` is: these types are the
@@ -270,6 +271,8 @@ pub struct VeloBuilder {
     metrics: Option<Arc<VeloMetrics>>,
     /// Whether the built-in `_rv_*` rendezvous handlers are registered.
     install_rendezvous_handlers: bool,
+    /// How large outbound payloads are handled.
+    large_payload_staging: TransparentStaging,
     /// The concrete UCX transport, kept beside the type-erased one so the
     /// registration layer can reach its RMA endpoint. `Arc<dyn Transport>`
     /// cannot be downcast, and adding an RDMA accessor to the `velo-ext` trait
@@ -291,6 +294,7 @@ impl VeloBuilder {
             mux_only: false,
             metrics: None,
             install_rendezvous_handlers: true,
+            large_payload_staging: TransparentStaging::AboveDefault,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             ucx_transport: None,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -387,6 +391,25 @@ impl VeloBuilder {
         }
         self.mux_config = Some(config);
         Ok(self)
+    }
+
+    /// How the messenger handles an outbound payload above the eager size.
+    ///
+    /// The default ([`TransparentStaging::AboveDefault`]) stages payloads over
+    /// 256 KiB and replaces them with a rendezvous handle, transparent to the
+    /// receiving handler. [`TransparentStaging::Above`] moves that threshold.
+    /// [`TransparentStaging::Disabled`] never stages: a payload over the
+    /// transport's frame ceiling fails at the writer's encode, and an inbound
+    /// staged handle gets an error reply rather than a hidden pull.
+    ///
+    /// The rendezvous handlers a peer needs to resolve a staged payload are
+    /// independent of this choice: a node that stages payloads its peers
+    /// cannot pull fails those sends at the receiver. Pair `Disabled` (or a
+    /// threshold above your largest supported frame) with
+    /// [`install_rendezvous_handlers`](Self::install_rendezvous_handlers)`(false)`.
+    pub fn large_payload_staging(mut self, staging: TransparentStaging) -> Self {
+        self.large_payload_staging = staging;
+        self
     }
 
     /// Whether to register the built-in `_rv_*` rendezvous handlers at build.
@@ -538,14 +561,21 @@ impl VeloBuilder {
             rendezvous_manager.register_handlers(Arc::clone(&messenger))?;
         }
 
-        // Enable transparent large payload support
-        let stager = Arc::new(crate::rendezvous::RendezvousStager::new(Arc::clone(
-            &rendezvous_manager,
-        )));
-        let resolver = Arc::new(crate::rendezvous::RendezvousResolver::new(Arc::clone(
-            &rendezvous_manager,
-        )));
-        messenger.set_large_payload_support(stager, resolver);
+        // Enable transparent large payload support unless disabled. The
+        // resolver is the stager's pair: a node that never stages still
+        // resolves peers' staged payloads, and a node with no resolver
+        // answers an inbound staged handle with an error reply.
+        if self.large_payload_staging != TransparentStaging::Disabled {
+            let stager = crate::rendezvous::RendezvousStager::new(Arc::clone(&rendezvous_manager));
+            let stager = match self.large_payload_staging {
+                TransparentStaging::Above(threshold) => stager.with_threshold(threshold),
+                _ => stager,
+            };
+            let resolver = Arc::new(crate::rendezvous::RendezvousResolver::new(Arc::clone(
+                &rendezvous_manager,
+            )));
+            messenger.set_large_payload_support(Arc::new(stager), resolver);
+        }
 
         // Build the RDMA registration layer, if a UCX transport was
         // added through `add_ucx_transport`.

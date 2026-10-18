@@ -605,3 +605,99 @@ async fn test_rendezvous_opt_out_with_a_guarded_route() {
             .await;
     }
 }
+// ---------------------------------------------------------------------------
+// Staging mode: raised threshold keeps large frames eager; Disabled never
+// stages and over-ceiling sends fail at the writer's encode
+// ---------------------------------------------------------------------------
+
+/// A payload over the default 256 KiB threshold but under the raised one
+/// rides eager: with no `_rv_*` handlers installed anywhere, a staged send
+/// could not resolve, so this round trip proves the frame went out whole.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_raised_threshold_keeps_a_large_payload_eager() {
+    let opts = || {
+        Velo::builder()
+            .add_transport(new_tcp_transport())
+            .install_rendezvous_handlers(false)
+            .large_payload_staging(TransparentStaging::Above(2 * 1024 * 1024))
+    };
+    let server = opts().build().await.unwrap();
+    server
+        .register_handler(Handler::unary_handler("echo", |ctx| Ok(Some(ctx.payload))).build())
+        .unwrap();
+    let client = opts().build().await.unwrap();
+    client.register_peer(server.peer_info()).unwrap();
+    server.register_peer(client.peer_info()).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let payload = Bytes::from(
+        (0..1536 * 1024)
+            .map(|i| (i % 251) as u8)
+            .collect::<Vec<u8>>(),
+    );
+    let echoed = tokio::time::timeout(
+        Duration::from_secs(10),
+        client
+            .unary("echo")
+            .unwrap()
+            .raw_payload(payload.clone())
+            .instance(server.instance_id())
+            .send(),
+    )
+    .await
+    .expect("the send resolves")
+    .expect("the eager frame is served with no pull routes anywhere");
+    assert_eq!(echoed, payload, "the payload must arrive byte-identical");
+
+    client
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(1)))
+        .await;
+    server
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(1)))
+        .await;
+}
+
+/// With staging disabled, a payload over the transport's 16 MiB frame ceiling
+/// fails the send at the writer's encode — before anything is staged or
+/// written — and the error reaches the caller.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_disabled_staging_rejects_over_ceiling_at_send() {
+    let server = node(true).await;
+    server
+        .register_handler(Handler::unary_handler("echo", |ctx| Ok(Some(ctx.payload))).build())
+        .unwrap();
+    let client = Velo::builder()
+        .add_transport(new_tcp_transport())
+        .large_payload_staging(TransparentStaging::Disabled)
+        .build()
+        .await
+        .unwrap();
+    client.register_peer(server.peer_info()).unwrap();
+    server.register_peer(client.peer_info()).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let over_ceiling = Bytes::from(vec![0x5A; 16 * 1024 * 1024 + 1]);
+    let err = tokio::time::timeout(
+        Duration::from_secs(10),
+        client
+            .unary("echo")
+            .unwrap()
+            .raw_payload(over_ceiling)
+            .instance(server.instance_id())
+            .send(),
+    )
+    .await
+    .expect("the failure resolves rather than timing out")
+    .expect_err("an over-ceiling payload cannot be sent with staging disabled");
+    assert!(
+        err.to_string().contains("exceeds maximum"),
+        "unexpected error: {err}"
+    );
+
+    client
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(1)))
+        .await;
+    server
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(1)))
+        .await;
+}

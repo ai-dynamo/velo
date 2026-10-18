@@ -88,7 +88,7 @@ pub mod write;
 pub use handle::DataHandle;
 pub use protocol::DataMetadata;
 pub use store::{RegisterOptions, StageMode};
-pub use transparent::{RendezvousResolver, RendezvousStager};
+pub use transparent::{RendezvousResolver, RendezvousStager, TransparentStaging};
 pub use write::RendezvousWrite;
 
 use std::sync::{Arc, OnceLock, Weak};

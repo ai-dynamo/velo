@@ -19,6 +19,26 @@ use futures::future::BoxFuture;
 
 use crate::RendezvousManager;
 
+/// How a node handles an outbound payload above the eager size.
+///
+/// Set with
+/// [`VeloBuilder::large_payload_staging`](crate::VeloBuilder::large_payload_staging).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum TransparentStaging {
+    /// Payloads over 256 KiB are staged and replaced by a rendezvous handle.
+    /// The upstream default.
+    #[default]
+    AboveDefault,
+    /// Stage payloads over this many bytes.
+    Above(usize),
+    /// Never stage. Every outbound payload rides its frame eager — one over
+    /// the transport's frame ceiling fails at the writer's encode — and no
+    /// resolver is installed, so an inbound staged handle gets an error
+    /// reply instead of a hidden pull.
+    Disabled,
+}
+
 /// Default threshold for auto-staging large payloads (256 KiB).
 ///
 /// Sits inside D11's ordering invariant, `rdma_min_bytes <= this <
