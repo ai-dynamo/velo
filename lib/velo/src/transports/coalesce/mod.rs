@@ -128,7 +128,7 @@ pub(crate) struct FrameTally([u64; MESSAGE_TYPE_SLOTS]);
 /// writer. `tally_has_one_slot_per_message_type` is what fails first — it
 /// walks every byte [`MessageType::from_u8`] accepts, not just the ones below
 /// this bound.
-pub(crate) const MESSAGE_TYPE_SLOTS: usize = MessageType::ShuttingDown as usize + 1;
+pub(crate) const MESSAGE_TYPE_SLOTS: usize = MessageType::Identify as usize + 1;
 
 impl Default for FrameTally {
     fn default() -> Self {

@@ -72,7 +72,14 @@ impl prometheus::core::Collector for ActiveAnchorsGauge {
 }
 
 const TRANSPORT_DIRECTIONS: [&str; 2] = ["inbound", "outbound"];
-const TRANSPORT_MESSAGE_TYPES: [&str; 5] = ["message", "response", "ack", "event", "shutting_down"];
+const TRANSPORT_MESSAGE_TYPES: [&str; 6] = [
+    "message",
+    "response",
+    "ack",
+    "event",
+    "shutting_down",
+    "identify",
+];
 const HANDLER_RESPONSE_TYPES: [&str; 3] = ["fire_and_forget", "ack_nack", "unary"];
 const HANDLER_OUTCOMES: [&str; 2] = ["success", "error"];
 
