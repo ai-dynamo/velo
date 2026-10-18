@@ -18,7 +18,7 @@ use velo::Velo;
 use velo::streaming::MuxConfig;
 
 /// A node on the default, or, with `mux`, one that sets the mux config in code.
-async fn node(mux: Option<MuxConfig>) -> Arc<Velo> {
+async fn node(mux: Option<MuxConfig>) -> Velo {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let transport = Arc::new(
         velo::transports::tcp::TcpTransportBuilder::new()

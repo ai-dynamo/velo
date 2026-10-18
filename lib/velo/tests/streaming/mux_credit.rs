@@ -74,7 +74,7 @@ fn tcp_transport() -> Arc<velo::transports::tcp::TcpTransport> {
 }
 
 struct Node {
-    velo: Arc<Velo>,
+    velo: Velo,
     registry: Registry,
 }
 

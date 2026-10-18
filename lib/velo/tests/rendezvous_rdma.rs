@@ -68,7 +68,7 @@ const T: Duration = Duration::from_secs(20);
 
 /// One velo instance with a UCX transport and its own metrics registry.
 struct Node {
-    velo: Arc<Velo>,
+    velo: Velo,
     registry: Registry,
 }
 
@@ -1370,7 +1370,7 @@ async fn shutdown_waits_for_a_live_transfer_before_unmapping_its_arena() {
 
     // Abandoned while the transfer is running: the detached task still holds
     // its destination inside the consumer's arena.
-    let consumer = Arc::clone(&pair.consumer.velo);
+    let consumer = pair.consumer.velo.clone();
     let getter = tokio::spawn(async move { consumer.get_pinned(handle).await });
     wait_until(
         "the transfer reached the backend",

@@ -31,7 +31,7 @@ const ITEMS: u32 = 200;
 const LANE: u16 = 3;
 
 struct Node {
-    velo: Arc<Velo>,
+    velo: Velo,
     quic: Arc<QuicTransport>,
 }
 
