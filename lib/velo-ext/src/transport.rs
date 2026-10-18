@@ -917,9 +917,9 @@ pub struct DataStreams {
 
 type DataStreamTuple = (
     flume::Receiver<InboundMessage>,
-    flume::Receiver<(Bytes, Bytes)>,
-    flume::Receiver<(Bytes, Bytes)>,
-    flume::Receiver<(Bytes, Bytes)>,
+    flume::Receiver<(Bytes, Bytes, SenderIdentity)>,
+    flume::Receiver<(Bytes, Bytes, SenderIdentity)>,
+    flume::Receiver<(Bytes, Bytes, SenderIdentity)>,
 );
 
 impl DataStreams {
