@@ -1077,8 +1077,13 @@ mod tests {
             tasks + 1,
             "the unadmitted reply must finish on a tracked task"
         );
-        assert!(
-            transport.rx.try_recv().is_err(),
+        // Let the continuation run; it must park on the full channel. The one
+        // buffered frame is the filler the transport was built with: were the
+        // reply admitted instead of queued, the channel would hold two.
+        tokio::task::yield_now().await;
+        assert_eq!(
+            transport.rx.len(),
+            1,
             "the reply is queued behind the full channel, not on the wire"
         );
 
