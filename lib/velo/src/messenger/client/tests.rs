@@ -190,6 +190,7 @@ struct CappedTransport {
     peers: std::sync::Mutex<std::collections::HashSet<InstanceId>>,
     accepted: std::sync::Mutex<Vec<(bytes::Bytes, bytes::Bytes)>>,
     rejected: std::sync::Mutex<Vec<String>>,
+    lanes_used: std::sync::Mutex<Vec<u16>>,
 }
 
 impl CappedTransport {
@@ -211,6 +212,7 @@ impl CappedTransport {
             peers: std::sync::Mutex::new(std::collections::HashSet::new()),
             accepted: std::sync::Mutex::new(Vec::new()),
             rejected: std::sync::Mutex::new(Vec::new()),
+            lanes_used: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -257,6 +259,19 @@ impl crate::transports::Transport for CappedTransport {
 
     fn lanes(&self, _target: InstanceId) -> std::num::NonZeroU16 {
         self.lanes
+    }
+
+    fn send_message_on_lane(
+        &self,
+        instance_id: InstanceId,
+        lane: u16,
+        header: bytes::Bytes,
+        payload: bytes::Bytes,
+        message_type: crate::transports::MessageType,
+        on_error: Arc<dyn TransportErrorHandler>,
+    ) -> SendOutcome {
+        self.lanes_used.lock().unwrap().push(lane);
+        self.send_message(instance_id, header, payload, message_type, on_error)
     }
 
     fn send_message(
@@ -376,6 +391,55 @@ async fn a_lane_past_the_peers_lane_count_fails_the_send() {
     assert!(
         transport.accepted.lock().unwrap().is_empty(),
         "a send refused for its lane must not reach the wire"
+    );
+}
+
+/// An acknowledged send (`am_sync`) rides the lane it was given — the
+/// transport sees lane 1, not a modulo remap — and a lane past the peer's
+/// count fails on the result instead of moving to another connection.
+#[tokio::test]
+async fn an_am_sync_send_uses_the_requested_lane_and_rejects_an_invalid_one() {
+    let transport = CappedTransport::with_lanes(usize::MAX, std::num::NonZeroU16::new(2).unwrap());
+    let messenger = Messenger::builder()
+        .add_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+    let target = InstanceId::new_v4();
+    messenger
+        .register_peer(velo_ext::PeerInfo::new(target, transport.address()))
+        .expect("register peer");
+    // The handler is known, so the sends take the direct path.
+    messenger
+        .client()
+        .peer_registry
+        .update_handlers(target, vec!["sync_handler".to_string()]);
+
+    let mut ok = messenger
+        .am_sync("sync_handler")
+        .expect("builder")
+        .lane(1)
+        .instance(target)
+        .send();
+    tokio::time::timeout(Duration::from_secs(2), ok.admitted())
+        .await
+        .expect("admission resolves")
+        .expect("lane 1 of 2 is admitted");
+    assert_eq!(*transport.lanes_used.lock().unwrap(), vec![1]);
+
+    let error = messenger
+        .am_sync("sync_handler")
+        .expect("builder")
+        .lane(2)
+        .instance(target)
+        .send()
+        .await
+        .expect_err("lane 2 of 2 cannot be sent on");
+    assert!(error.to_string().contains("lane 2"), "got: {error}");
+    assert_eq!(
+        transport.lanes_used.lock().unwrap().len(),
+        1,
+        "a rejected lane must not reach the wire"
     );
 }
 

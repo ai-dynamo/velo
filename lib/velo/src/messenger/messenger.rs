@@ -281,6 +281,20 @@ impl Messenger {
         self.client.peer_info()
     }
 
+    /// How many ordered lanes the transport to `target` keeps.
+    ///
+    /// This is the count a caller validates an explicit
+    /// [`lane`](crate::messenger::client::builders::AmSendBuilder::lane)
+    /// against, and the range a reserved-lane convention lives in: with
+    /// `MuxConfig::reserved_lanes` set, the top lanes carry no streams, so a
+    /// protocol reserving one lane addresses it as `lanes(target) - 1`.
+    ///
+    /// Returns an error if the peer has not been registered
+    /// ([`crate::transports::VeloBackendError::InstanceNotRegistered`]).
+    pub fn lanes(&self, target: InstanceId) -> Result<std::num::NonZeroU16> {
+        self.backend.lanes(target)
+    }
+
     /// The exact [`PeerInfo`] a registered peer presented at registration,
     /// retained verbatim. `None` for a peer that is not (or is no longer)
     /// registered.

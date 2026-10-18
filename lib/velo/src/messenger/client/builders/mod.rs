@@ -155,6 +155,18 @@ impl AmSyncBuilder {
         self
     }
 
+    /// Send on transport lane `lane` instead of lane 0.
+    ///
+    /// The ack still returns on the responder's reply path, not this lane;
+    /// the causality a caller gets is "the handler ran", because the ack is
+    /// sent after the handler resolves. The lane is validated against the
+    /// peer's transport lane count when the send resolves its target; see
+    /// [`AmSendBuilder::lane`].
+    pub fn lane(mut self, lane: u16) -> Self {
+        self.inner = self.inner.lane(lane);
+        self
+    }
+
     /// Await a free response slot if the arena is at capacity (default:
     /// fail fast with `ResponseRegistrationError::Exhausted`).
     pub fn await_capacity(mut self) -> Self {
