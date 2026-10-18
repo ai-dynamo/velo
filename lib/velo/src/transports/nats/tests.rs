@@ -49,7 +49,7 @@ fn test_route_frame_response_routes_during_drain() {
         result.is_ok(),
         "Response frame must be routed even during drain"
     );
-    let (header, payload) = result.unwrap();
+    let (header, payload, _) = result.unwrap();
     assert_eq!(&header[..], b"hdr");
     assert_eq!(&payload[..], b"pay");
 }

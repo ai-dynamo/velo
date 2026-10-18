@@ -951,13 +951,20 @@ mod tests {
                         Err(flume::SendError((header, payload)))
                     }
                 },
-                MessageType::Response => adapter.response_stream.send((header, payload, sender)),
-                MessageType::ShuttingDown => {
-                    adapter.shutdown_stream.send((header, payload, sender))
-                }
-                MessageType::Ack | MessageType::Event => {
-                    adapter.event_stream.send((header, payload, sender))
-                }
+                // The error path hands the frame to `on_error`, which takes
+                // the header and payload only.
+                MessageType::Response => adapter
+                    .response_stream
+                    .send((header, payload, sender))
+                    .map_err(|e| flume::SendError((e.0.0, e.0.1))),
+                MessageType::ShuttingDown => adapter
+                    .shutdown_stream
+                    .send((header, payload, sender))
+                    .map_err(|e| flume::SendError((e.0.0, e.0.1))),
+                MessageType::Ack | MessageType::Event => adapter
+                    .event_stream
+                    .send((header, payload, sender))
+                    .map_err(|e| flume::SendError((e.0.0, e.0.1))),
             };
 
             if let Err(err) = send_result {

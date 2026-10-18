@@ -102,7 +102,7 @@ async fn a_peer_with_another_certificate_is_refused() {
         MessageType::Event,
         errors.clone(),
     );
-    let (_, payload) = tokio::time::timeout(
+    let (_, payload, _) = tokio::time::timeout(
         Duration::from_secs(5),
         server_streams.event_stream.recv_async(),
     )
@@ -182,7 +182,7 @@ async fn a_flood_of_small_frames_arrives_in_order() {
 
     let received = tokio::time::timeout(Duration::from_secs(60), async {
         for expected in 0..FRAMES {
-            let (header, _) = server_streams.event_stream.recv_async().await.unwrap();
+            let (header, _, _) = server_streams.event_stream.recv_async().await.unwrap();
             let got = u32::from_le_bytes(header[..4].try_into().unwrap());
             assert_eq!(got, expected, "frames arrive in send order");
         }
@@ -232,7 +232,7 @@ async fn large_frames_round_trip(max_mtu: Option<u16>) {
             MessageType::Event,
             errors.clone(),
         );
-        let (h, p) =
+        let (h, p, _) =
             tokio::time::timeout(Duration::from_secs(5), b_streams.event_stream.recv_async())
                 .await
                 .unwrap_or_else(|_| panic!("request {i} stalled (max_mtu {max_mtu:?})"))
@@ -1120,7 +1120,7 @@ async fn each_lane_is_its_own_connection_and_keeps_its_own_order() {
     let mut next = vec![0u32; usize::from(LANES)];
     tokio::time::timeout(Duration::from_secs(60), async {
         for _ in 0..FRAMES * u32::from(LANES) {
-            let (header, _) = server_streams.event_stream.recv_async().await.unwrap();
+            let (header, _, _) = server_streams.event_stream.recv_async().await.unwrap();
             let lane = u16::from_le_bytes(header[..2].try_into().unwrap());
             let seq = u32::from_le_bytes(header[2..6].try_into().unwrap());
             assert_eq!(seq, next[usize::from(lane)], "lane {lane} out of order");
@@ -1272,7 +1272,7 @@ async fn closed_waits_for_every_lane() {
     let mut delivered = 0;
     tokio::time::timeout(Duration::from_secs(10), async {
         while per_lane[1..].contains(&0) {
-            let (header, _) = server_streams.response_stream.recv_async().await.unwrap();
+            let (header, _, _) = server_streams.response_stream.recv_async().await.unwrap();
             per_lane[usize::from(u16::from_be_bytes([header[0], header[1]]))] += 1;
             delivered += 1;
         }
@@ -1289,7 +1289,7 @@ async fn closed_waits_for_every_lane() {
         );
     }
 
-    while let Ok(Ok((header, _))) = tokio::time::timeout(
+    while let Ok(Ok((header, _, _))) = tokio::time::timeout(
         Duration::from_secs(3),
         server_streams.response_stream.recv_async(),
     )

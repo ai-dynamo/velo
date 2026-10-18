@@ -435,7 +435,7 @@ mod tests {
             "a drain rejection is not an undeliverable frame"
         );
 
-        let (header, _) = streams
+        let (header, _, _) = streams
             .shutdown_stream
             .try_recv()
             .expect("the reader must keep going past a drain-rejected Message");

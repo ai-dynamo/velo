@@ -766,7 +766,12 @@ mod tests {
         let response_id = awaiter.response_id();
 
         let header = encode_event_header(EventType::Ack(response_id, Outcome::Ok));
-        tx.send((header, Bytes::from("ok"))).expect("send frame");
+        tx.send((
+            header,
+            Bytes::from("ok"),
+            velo_ext::SenderIdentity::Unattributed,
+        ))
+        .expect("send frame");
         drop(tx);
 
         let result = timeout(Duration::from_millis(200), awaiter.recv()).await;
@@ -795,7 +800,8 @@ mod tests {
             payload: Bytes::new(),
         }
         .encode()?;
-        tx.send((header, Bytes::new())).expect("send frame");
+        tx.send((header, Bytes::new(), velo_ext::SenderIdentity::Unattributed))
+            .expect("send frame");
         drop(tx);
 
         let err = timeout(Duration::from_secs(1), awaiter.recv())

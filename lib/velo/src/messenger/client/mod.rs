@@ -9,6 +9,7 @@ mod peer_registry;
 #[cfg(test)]
 mod tests;
 
+use crate::messenger::common::responses::ResponseId;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -342,7 +343,10 @@ impl ActiveMessageClient {
         }
         let _provisional = ProvisionalPeer(&self.backend, target);
         self.backend.register_peer(provisional)?;
-        let response = self.exchange_hello(target).await?;
+        // The provisional exchange must not record an expectation: the
+        // answer arrives announced with the peer's real identity, which is
+        // what we are here to learn.
+        let response = self.exchange_hello(target, false).await?;
         let peer = response.peer_info.ok_or_else(|| {
             anyhow::anyhow!(
                 "peer's _hello response has no peer_info; endpoint connect is unsupported"
@@ -360,7 +364,7 @@ impl ActiveMessageClient {
 
     /// Perform handshake with a peer to exchange handler information.
     async fn handshake_with_peer(&self, target: InstanceId) -> Result<()> {
-        let response = self.exchange_hello(target).await?;
+        let response = self.exchange_hello(target, true).await?;
         self.peer_registry
             .update_handlers(target, response.handlers);
         Ok(())
@@ -369,6 +373,7 @@ impl ActiveMessageClient {
     async fn exchange_hello(
         &self,
         target: InstanceId,
+        expect_attributed_reply: bool,
     ) -> Result<crate::messenger::server::system_handlers::HandlersResponse> {
         use crate::messenger::server::system_handlers::{HandlersResponse, HelloRequest};
 
@@ -390,10 +395,15 @@ impl ActiveMessageClient {
         let payload = serde_json::to_vec(&request)
             .map_err(|e| anyhow::anyhow!("Failed to serialize _hello request: {}", e))?;
 
-        // Register response and send message
+        // Register response and send message. The expectation binds the
+        // answer to the target's connection identity where the target is a
+        // registered peer; `connect`'s provisional exchange skips it because
+        // the peer's identity is exactly what the answer teaches us.
         let mut outcome = self.register_outcome()?;
         let response_id = outcome.response_id();
-        self.expect_response_from(response_id, target);
+        if expect_attributed_reply {
+            self.expect_response_from(response_id, target);
+        }
 
         let message = crate::messenger::common::ActiveMessage {
             metadata: crate::messenger::common::messages::MessageMetadata::new_unary(

@@ -1031,7 +1031,7 @@ mod tests {
     /// wait continues until the genuine reply lands.
     #[tokio::test]
     async fn an_attributed_completion_must_match_the_expected_peer() {
-        let rm = ResponseManager::new(WorkerId::from_u64(7));
+        let rm = ResponseManager::new(7);
         let mut awaiter = rm.register_outcome().expect("slot");
         let id = awaiter.response_id();
         let target = velo_ext::InstanceId::new_v4();
@@ -1068,7 +1068,7 @@ mod tests {
     /// completes unchecked, as every send did before it.
     #[tokio::test]
     async fn an_unattributed_completion_without_an_expectation_still_completes() {
-        let rm = ResponseManager::new(WorkerId::from_u64(7));
+        let rm = ResponseManager::new(7);
         let mut awaiter = rm.register_outcome().expect("slot");
         let id = awaiter.response_id();
         assert!(rm.complete_outcome_attributed(
@@ -1086,7 +1086,7 @@ mod tests {
     /// leave a stale one for the slot's next generation.
     #[tokio::test]
     async fn a_recycled_slot_forgets_its_expected_peer() {
-        let rm = ResponseManager::with_capacity(WorkerId::from_u64(7), 1, None);
+        let rm = ResponseManager::with_capacity(7, 1, None);
         let id = {
             let awaiter = rm.register_outcome().expect("slot");
             let id = awaiter.response_id();
