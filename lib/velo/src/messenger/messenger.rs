@@ -902,6 +902,9 @@ mod tests {
                 // the only path that acquires the in-flight guard, and a
                 // message queued without one would be invisible to the
                 // target's `wait_for_drain`.
+                // Identify is a connection-open record the transport reader
+                // consumes; nothing ever loops it back.
+                MessageType::Identify => Err(flume::SendError((header, payload))),
                 MessageType::Message => match adapter.admit_message(header, payload) {
                     velo_ext::AdmitOutcome::Admitted => Ok(()),
                     velo_ext::AdmitOutcome::Draining { header, payload } => {

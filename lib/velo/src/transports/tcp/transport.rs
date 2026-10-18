@@ -25,7 +25,9 @@ use crate::transports::utils::interfaces::{
     InterfaceEndpoint, InterfaceFilter, parse_endpoints, resolve_advertise_endpoints,
     select_best_endpoint,
 };
-use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
+use velo_ext::{
+    MessageType, PeerInfo, SenderIdentity, Transport, TransportAdapter, TransportKey, WorkerAddress,
+};
 
 use super::framing::{DEFAULT_MAX_FRAME_SIZE, TcpFrameCodec};
 use super::listener::TcpListener;

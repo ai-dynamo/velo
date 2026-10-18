@@ -87,6 +87,9 @@ impl VeloStreaming for VeloStreamingService {
 
                 // Route to the appropriate adapter channel.
                 let sender = match msg_type {
+                    // Identify is a connection-open record only the TCP/UDS
+                    // wire carries; nothing arrives here under it.
+                    MessageType::Identify => continue,
                     // Message frames go through the drain gate. `admit_message`
                     // acquires the in-flight guard *before* it re-reads the
                     // draining flag, so a message that is merely queued is

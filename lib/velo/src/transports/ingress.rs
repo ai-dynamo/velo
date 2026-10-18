@@ -192,15 +192,15 @@ pub(crate) struct DialedReaderContext {
 /// per-connection reply plumbing here, so a drain rejection is dropped after
 /// recording it, and the peer waits out its own timeout; the alternative,
 /// letting it in ungated, would put uncounted work on the inbound queue.
+/// `sender` is what frames arriving on this socket may be attributed to:
+/// the peer we dialed ([`SenderIdentity::DialedPeer`]) where the transport
+/// knows it, [`SenderIdentity::Unattributed`] where it does not.
 pub(crate) async fn run_dialed_reader<R>(
     read_half: R,
     ctx: DialedReaderContext,
     metrics: Option<Arc<dyn velo_ext::TransportObservability>>,
     conn_cancel: CancellationToken,
     peer: String,
-    /// What frames arriving on this socket may be attributed to: the peer we
-    /// dialed ([`SenderIdentity::DialedPeer`]) where the transport knows it,
-    /// [`SenderIdentity::Unattributed`] where it does not.
     sender: SenderIdentity,
 ) where
     R: AsyncRead + Unpin,
@@ -326,6 +326,7 @@ mod tests {
             MessageType::Message,
             Bytes::from_static(b"drain-header"),
             Bytes::from_static(b"drain-payload"),
+            SenderIdentity::Unattributed,
             &adapter,
             &error_handler,
             "test",
@@ -368,6 +369,7 @@ mod tests {
             MessageType::Message,
             Bytes::from_static(b"orphan-header"),
             Bytes::from_static(b"orphan-payload"),
+            SenderIdentity::Unattributed,
             &adapter,
             &error_handler,
             "test",

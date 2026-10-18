@@ -741,6 +741,9 @@ fn route_frame(
             .shutdown_stream
             .try_send((header, body))
             .map_err(|_| ()),
+        // Identify is a TCP/UDS connection-open record; it never appears on a
+        // NATS subject.
+        MessageType::Identify => Err(()),
     };
 
     match result {

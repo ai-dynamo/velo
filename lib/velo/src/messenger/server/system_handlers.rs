@@ -29,6 +29,9 @@ pub struct HandlersResponse {
 /// Create the _hello system handler.
 fn create_hello_handler() -> Handler {
     Handler::typed_unary_async("_hello", |ctx: TypedContext<HelloRequest>| async move {
+        // Read the identity before `ctx.input` is partially moved out:
+        // a method borrow would come after the move and not compile.
+        let sender = ctx.sender_identity();
         let peer_info = ctx.input.peer_info;
 
         // A connection that announced an identity cannot register a different
@@ -37,7 +40,7 @@ fn create_hello_handler() -> Handler {
         // identification, or a store-and-forward transport) registers as
         // before — callers that need the binding must check
         // `sender_identity()` on their own handlers and fail closed there.
-        if let Some(announced) = ctx.sender_identity().instance_id()
+        if let Some(announced) = sender.instance_id()
             && announced != peer_info.instance_id()
         {
             anyhow::bail!(

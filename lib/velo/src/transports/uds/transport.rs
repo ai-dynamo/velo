@@ -22,7 +22,9 @@ use crate::transports::transport::{
     AdmissionError, AdmissionGate, HealthCheckError, SendOutcome, ShutdownState, TransportError,
     TransportErrorHandler,
 };
-use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
+use velo_ext::{
+    MessageType, PeerInfo, SenderIdentity, Transport, TransportAdapter, TransportKey, WorkerAddress,
+};
 
 use crate::transports::tcp::framing::{DEFAULT_MAX_FRAME_SIZE, TcpFrameCodec};
 

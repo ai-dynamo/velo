@@ -617,6 +617,9 @@ async fn connection_writer_inner(
                             TcpFrameCodec::parse_message_type_from_preamble(&framed_data.preamble)
                         {
                             let sender = match msg_type {
+                                // Identify is a TCP/UDS connection-open record;
+                                // it never appears on a gRPC stream.
+                                MessageType::Identify => continue,
                                 MessageType::Response => &adapter.response_stream,
                                 MessageType::ShuttingDown => &adapter.shutdown_stream,
                                 MessageType::Ack | MessageType::Event => &adapter.event_stream,

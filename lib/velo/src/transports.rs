@@ -882,6 +882,7 @@ pub(crate) fn message_type_label(message_type: MessageType) -> &'static str {
         MessageType::Ack => "ack",
         MessageType::Event => "event",
         MessageType::ShuttingDown => "shutting_down",
+        MessageType::Identify => "identify",
     }
 }
 
