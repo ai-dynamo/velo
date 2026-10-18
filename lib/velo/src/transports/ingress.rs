@@ -96,6 +96,7 @@ pub(crate) async fn route_frame(
     msg_type: MessageType,
     header: Bytes,
     payload: Bytes,
+    sender: SenderIdentity,
     adapter: &TransportAdapter,
     error_handler: &Arc<dyn TransportErrorHandler>,
     transport_key: &str,
@@ -103,9 +104,9 @@ pub(crate) async fn route_frame(
 ) -> Result<Routed> {
     let frame_bytes = header.len() + payload.len();
 
-    let sender = match msg_type {
+    let stream = match msg_type {
         MessageType::Message => {
-            return match adapter.admit_message(header, payload) {
+            return match adapter.admit_message_from(header, payload, sender) {
                 AdmitOutcome::Admitted => {
                     record_inbound_frame(metrics, transport_key, msg_type, frame_bytes);
                     Ok(Routed::Delivered)
@@ -134,12 +135,17 @@ pub(crate) async fn route_frame(
             // request-format, not response-format.
             &adapter.shutdown_stream
         }
+        MessageType::Identify => {
+            // The reader consumes the connection-open Identify before routing
+            // begins; one reaching this function is a protocol violation.
+            return Err(anyhow::anyhow!("Identify frame past connection open"));
+        }
     };
 
     record_inbound_frame(metrics, transport_key, msg_type, frame_bytes);
 
     // Try to send with ownership transfer (zero-copy)
-    match sender.send_async((header, payload)).await {
+    match stream.send_async((header, payload)).await {
         Ok(_) => Ok(Routed::Delivered),
         Err(e) => {
             if let Some(metrics) = metrics {

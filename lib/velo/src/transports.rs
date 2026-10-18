@@ -135,6 +135,11 @@ pub struct VeloBackend {
     primary_transport: DashMap<InstanceId, Arc<dyn Transport>>,
     alternative_transports: DashMap<InstanceId, Vec<TransportKey>>,
     workers: DashMap<WorkerId, InstanceId>,
+    /// The exact `PeerInfo` each registered peer presented, retained verbatim
+    /// from registration (a `_hello`'s peer_info, an endpoint-connect
+    /// response, or an explicit `register_peer`) so a handler can read the
+    /// identity its peer announced without the transport rewriting it.
+    peer_infos: DashMap<InstanceId, PeerInfo>,
     shutdown_state: ShutdownState,
     teardown: OnceLock<teardown::Completion>,
     teardown_outcome: teardown::Outcome,
@@ -280,6 +285,7 @@ impl VeloBackend {
                 primary_transport: DashMap::new(),
                 alternative_transports: DashMap::new(),
                 workers: DashMap::new(),
+                peer_infos: DashMap::new(),
                 shutdown_state,
                 teardown: OnceLock::new(),
                 teardown_outcome: Default::default(),
@@ -681,8 +687,18 @@ impl VeloBackend {
         self.alternative_transports
             .insert(instance_id, alternative_transport_keys);
         self.workers.insert(instance_id.worker_id(), instance_id);
+        self.peer_infos.insert(instance_id, peer);
 
         Ok(())
+    }
+
+    /// The exact `PeerInfo` a registered peer presented, if it is registered.
+    ///
+    /// Verbatim from registration — the `_hello` exchange, an endpoint-connect
+    /// response, or an explicit [`register_peer`](Self::register_peer) — so a
+    /// handler binding work to a peer hashes what the peer actually sent.
+    pub fn registered_peer_info(&self, instance_id: InstanceId) -> Option<PeerInfo> {
+        self.peer_infos.get(&instance_id).map(|entry| entry.clone())
     }
 
     /// Forget a peer that [`register_peer`](Self::register_peer) added.
@@ -698,6 +714,7 @@ impl VeloBackend {
         self.alternative_transports.remove(&instance_id);
         self.workers
             .remove_if(&instance_id.worker_id(), |_, id| *id == instance_id);
+        self.peer_infos.remove(&instance_id);
         // Every transport, not only the routes: a re-registration that one
         // transport refused leaves that transport out of the routes, but it
         // can still hold the peer from before.
