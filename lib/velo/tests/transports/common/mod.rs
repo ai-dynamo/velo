@@ -224,6 +224,7 @@ impl<T: Transport> TestTransportHandle<T> {
         timeout(timeout_duration, self.streams.response_stream.recv_async())
             .await
             .map_err(|_| anyhow::anyhow!("Timeout waiting for response"))?
+            .map(|(h, p, _)| (h, p))
             .map_err(|e| anyhow::anyhow!("Channel error: {}", e))
     }
 
@@ -232,6 +233,7 @@ impl<T: Transport> TestTransportHandle<T> {
         timeout(timeout_duration, self.streams.event_stream.recv_async())
             .await
             .map_err(|_| anyhow::anyhow!("Timeout waiting for event"))?
+            .map(|(h, p, _)| (h, p))
             .map_err(|e| anyhow::anyhow!("Channel error: {}", e))
     }
 
