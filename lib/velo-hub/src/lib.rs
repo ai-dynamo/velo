@@ -9,5 +9,9 @@
 #![deny(missing_docs)]
 
 pub mod protocol;
+#[cfg(feature = "server")]
+pub mod store;
 
+#[cfg(feature = "server")]
+pub use axum;
 pub use velo;
