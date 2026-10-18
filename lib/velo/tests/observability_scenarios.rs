@@ -72,8 +72,8 @@ fn new_zmq_transport() -> Arc<velo::transports::zmq::ZmqTransport> {
 // ---------------------------------------------------------------------------
 
 struct VeloPair {
-    server: Arc<Velo>,
-    client: Arc<Velo>,
+    server: Velo,
+    client: Velo,
     server_reg: Registry,
     client_reg: Registry,
 }

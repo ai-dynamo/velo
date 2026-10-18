@@ -88,8 +88,8 @@ pub async fn run_r1_inline(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let pair = build_pair(ctx.transport, ctx.stream_transport, "soak-rv-r1").await?;
     let started = Instant::now();
     let cycles = ctx.tier.budget().rendezvous_cycles;
-    let owner = Arc::clone(&pair.server.velo);
-    let consumer = Arc::clone(&pair.client.velo);
+    let owner = pair.server.velo.clone();
+    let consumer = pair.client.velo.clone();
 
     for i in 0..cycles {
         let payload = make_payload(64, i as u32);
@@ -133,8 +133,8 @@ pub async fn run_r2_chunked(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let oracle = Oracle::arc();
     let pair = build_pair(ctx.transport, ctx.stream_transport, "soak-rv-r2").await?;
     let started = Instant::now();
-    let owner = Arc::clone(&pair.server.velo);
-    let consumer = Arc::clone(&pair.client.velo);
+    let owner = pair.server.velo.clone();
+    let consumer = pair.client.velo.clone();
 
     // Cap iterations so we don't run for hours on the largest size.
     let max = ctx.tier.budget().rendezvous_max_bytes;
@@ -178,8 +178,8 @@ pub async fn run_r3_refcount(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let pair = build_pair(ctx.transport, ctx.stream_transport, "soak-rv-r3").await?;
     let started = Instant::now();
 
-    let owner = Arc::clone(&pair.server.velo);
-    let consumer = Arc::clone(&pair.client.velo);
+    let owner = pair.server.velo.clone();
+    let consumer = pair.client.velo.clone();
 
     // Small pool of long-lived handles. Each iteration: ref + get + release on
     // a randomly-picked one. Asserts the runtime never drops a slot while
@@ -247,8 +247,8 @@ pub async fn run_r4_gauge(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let pair = build_pair(ctx.transport, ctx.stream_transport, "soak-rv-r4").await?;
     let started = Instant::now();
 
-    let owner = Arc::clone(&pair.server.velo);
-    let consumer = Arc::clone(&pair.client.velo);
+    let owner = pair.server.velo.clone();
+    let consumer = pair.client.velo.clone();
 
     // The owner-side gauge update is broken on the AM-driven release path
     // (see file-level docs). Until that's fixed we can't strictly assert
@@ -289,7 +289,7 @@ pub async fn run_f1r_consumer_drop(ctx: &ScenarioCtx) -> Result<ScenarioReport> 
     let pair = build_pair(ctx.transport, ctx.stream_transport, "soak-rv-f1r").await?;
     let started = Instant::now();
 
-    let owner = Arc::clone(&pair.server.velo);
+    let owner = pair.server.velo.clone();
     // Stage a large payload to force chunked path so the pull straddles
     // multiple AMs — gives us a window to drop the consumer mid-flight.
     let payload = make_payload(
@@ -300,7 +300,7 @@ pub async fn run_f1r_consumer_drop(ctx: &ScenarioCtx) -> Result<ScenarioReport> 
     oracle.inc_sent();
 
     // Run pull on the consumer in a task; drop the consumer Velo Arc mid-way.
-    let consumer_velo = Arc::clone(&pair.client.velo);
+    let consumer_velo = pair.client.velo.clone();
     let pull_task: tokio::task::JoinHandle<Result<usize>> = tokio::spawn(async move {
         let (data, lease) = consumer_velo.get(h).await?;
         let _ = consumer_velo.release(h, lease).await;
@@ -347,8 +347,8 @@ pub async fn run_f2r_owner_death(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let pair = build_pair(ctx.transport, ctx.stream_transport, "soak-rv-f2r").await?;
     let started = Instant::now();
 
-    let owner = Arc::clone(&pair.server.velo);
-    let consumer_velo: Arc<Velo> = Arc::clone(&pair.client.velo);
+    let owner = pair.server.velo.clone();
+    let consumer_velo: Velo = pair.client.velo.clone();
     let payload = make_payload(64 * 1024, 7);
     let h = owner.register_data(payload);
     oracle.inc_sent();

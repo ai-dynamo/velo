@@ -131,7 +131,7 @@ struct CellResult {
 // ---------------------------------------------------------------------------
 
 async fn run_sequential(
-    velo: &Arc<Velo>,
+    velo: &Velo,
     target: InstanceId,
     payload: Bytes,
     count: u64,
@@ -176,7 +176,7 @@ async fn run_sequential(
 // ---------------------------------------------------------------------------
 
 async fn run_concurrent(
-    velo: Arc<Velo>,
+    velo: Velo,
     target: InstanceId,
     payload: Bytes,
     count: u64,
@@ -191,7 +191,7 @@ async fn run_concurrent(
             {
                 return Err(e);
             }
-            let v = Arc::clone(&velo);
+            let v = velo.clone();
             let p = payload.clone();
             set.spawn(async move {
                 v.unary("echo")?
@@ -218,7 +218,7 @@ async fn run_concurrent(
                 _ => {}
             }
         }
-        let v = Arc::clone(&velo);
+        let v = velo.clone();
         let p = payload.clone();
         set.spawn(async move {
             let t = Instant::now();
@@ -258,7 +258,7 @@ async fn run_concurrent(
 // Pipeline (fire-and-forget)
 // ---------------------------------------------------------------------------
 
-async fn set_target(velo: &Arc<Velo>, target: InstanceId, count: u64) -> Result<()> {
+async fn set_target(velo: &Velo, target: InstanceId, count: u64) -> Result<()> {
     let payload = Bytes::from(rmp_serde::to_vec(&count)?);
     velo.unary("set_target")?
         .raw_payload(payload)
@@ -269,7 +269,7 @@ async fn set_target(velo: &Arc<Velo>, target: InstanceId, count: u64) -> Result<
 }
 
 async fn run_pipeline(
-    velo: &Arc<Velo>,
+    velo: &Velo,
     target: InstanceId,
     payload: Bytes,
     count: u64,
@@ -331,7 +331,7 @@ struct StreamRequest {
 /// Open `streams` anchors, have the server fill each with `items` items, and
 /// wait for every terminal.
 async fn stream_round(
-    velo: &Arc<Velo>,
+    velo: &Velo,
     target: InstanceId,
     item_bytes: usize,
     items: u64,
@@ -373,7 +373,7 @@ async fn stream_round(
 }
 
 async fn run_stream(
-    velo: &Arc<Velo>,
+    velo: &Velo,
     target: InstanceId,
     item_bytes: usize,
     count: u64,
@@ -414,7 +414,7 @@ async fn run_stream(
 // ---------------------------------------------------------------------------
 
 async fn wait_done(
-    velo: &Arc<Velo>,
+    velo: &Velo,
     target: InstanceId,
     done: &Done,
     limit: Duration,
@@ -618,7 +618,7 @@ fn run_both(args: Args) -> Result<()> {
 }
 
 /// Build the server and register its handlers.
-async fn serve(transport_type: TransportType, done_tx: flume::Sender<()>) -> Result<Arc<Velo>> {
+async fn serve(transport_type: TransportType, done_tx: flume::Sender<()>) -> Result<Velo> {
     let transport = new_transport(transport_type, "throughput").await?;
     let velo = Velo::builder().add_transport(transport).build().await?;
 
@@ -703,7 +703,7 @@ async fn stream_items(velo: &Velo, request: StreamRequest) -> Result<()> {
 /// A file left over from an earlier run names a server that is gone, and the
 /// new server removes it only when it starts. So a failed `echo` means "read
 /// the file again", not "give up", until the deadline.
-async fn reach_server_from_file(velo: &Arc<Velo>, path: &std::path::Path) -> Result<InstanceId> {
+async fn reach_server_from_file(velo: &Velo, path: &std::path::Path) -> Result<InstanceId> {
     let deadline = Instant::now() + Duration::from_secs(120);
     let mut tried: Option<InstanceId> = None;
     loop {
@@ -772,7 +772,7 @@ async fn run_client(args: &Args, peer: PeerSource, done: Done) -> Result<Vec<Cel
                     format_payload(size)
                 );
                 all_results.push(
-                    run_concurrent(Arc::clone(&velo), target, payload.clone(), args.count, c)
+                    run_concurrent(velo.clone(), target, payload.clone(), args.count, c)
                         .await?,
                 );
             }

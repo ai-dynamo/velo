@@ -74,7 +74,7 @@ fn tcp_transport() -> Arc<velo::transports::tcp::TcpTransport> {
 
 /// One node plus the registry its own collectors were installed into.
 struct Node {
-    velo: Arc<Velo>,
+    velo: Velo,
     registry: Registry,
 }
 

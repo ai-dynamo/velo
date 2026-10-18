@@ -345,9 +345,15 @@ async fn a_batcher_dropped_by_stop_sending_leaves_slots_to_shutdown() {
 #[tokio::test]
 async fn velo_joins_mux_tasks_before_transport_teardown() {
     let velo = crate::Velo::builder().build().await.unwrap();
-    let mux = velo.anchor_manager.mux_handle().unwrap().upgrade().unwrap();
+    let mux = velo
+        .inner
+        .anchor_manager
+        .mux_handle()
+        .unwrap()
+        .upgrade()
+        .unwrap();
     let stopped = mux.core.tasks.cancellation_token();
-    let state = velo.messenger.backend().shutdown_state();
+    let state = velo.inner.messenger.backend().shutdown_state();
     let teardown = state.teardown_token();
     let accepted = state.acquire();
     let (exiting, exit_started) = tokio::sync::oneshot::channel();

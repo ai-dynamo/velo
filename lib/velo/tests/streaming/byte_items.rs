@@ -41,7 +41,7 @@ fn payloads() -> Vec<Bytes> {
         .collect()
 }
 
-async fn node() -> Arc<Velo> {
+async fn node() -> Velo {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
     let transport = TcpTransportBuilder::new()
         .from_listener(listener)
@@ -58,7 +58,7 @@ async fn node() -> Arc<Velo> {
 }
 
 /// Two cross-registered nodes: `consumer` owns the anchors, `producer` sends.
-async fn pair() -> (Arc<Velo>, Arc<Velo>) {
+async fn pair() -> (Velo, Velo) {
     let consumer = node().await;
     let producer = node().await;
     consumer

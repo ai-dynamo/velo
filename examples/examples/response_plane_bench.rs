@@ -196,7 +196,7 @@ struct Request {
 
 /// A velo node plus the registry its counters live in.
 struct Node {
-    velo: Arc<Velo>,
+    velo: Velo,
     registry: Registry,
 }
 
