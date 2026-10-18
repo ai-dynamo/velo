@@ -998,7 +998,11 @@ mod tests {
             },
             &messenger,
         );
-        let (identity, retained) = seen.lock().unwrap().expect("the handler ran inline");
+        let (identity, retained) = seen
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("the handler ran inline");
         assert_eq!(identity, velo_ext::SenderIdentity::AnnouncedPeer(peer));
         assert_eq!(retained, Some(peer_info));
     }

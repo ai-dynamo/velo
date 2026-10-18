@@ -187,6 +187,9 @@ pub(crate) fn run_listener(cfg: ListenerConfig) {
 
             // Route to appropriate adapter stream
             let sender = match msg_type {
+                // Identify is a TCP/UDS connection-open record; it never
+                // appears on a ZMQ multipart frame.
+                MessageType::Identify => continue,
                 // Message frames go through the drain gate. `admit_message`
                 // acquires the in-flight guard *before* it re-reads the
                 // draining flag, so a message that is merely queued is already
