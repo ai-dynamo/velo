@@ -111,6 +111,7 @@ pub(crate) struct ActiveMessageClient {
     peer_registry: Arc<PeerRegistry>,
     discovery: Option<Arc<dyn PeerDiscovery>>,
     handshake_timeout: Duration,
+    advertised_peer_info: std::sync::OnceLock<velo_ext::PeerInfo>,
     observability: Option<Arc<VeloMetrics>>,
     /// Late-bound large payload stager for transparent rendezvous.
     pub(crate) large_payload_stager:
@@ -132,6 +133,7 @@ impl ActiveMessageClient {
             peer_registry: Arc::new(PeerRegistry::new()),
             discovery,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
+            advertised_peer_info: std::sync::OnceLock::new(),
             observability,
             large_payload_stager: Arc::new(std::sync::OnceLock::new()),
         }
@@ -289,8 +291,61 @@ impl ActiveMessageClient {
         self.peer_registry.handler_exists(target, handler)
     }
 
-    /// Perform handshake with a peer to exchange handler information
+    pub(crate) fn peer_info(&self) -> velo_ext::PeerInfo {
+        self.advertised_peer_info
+            .get()
+            .cloned()
+            .unwrap_or_else(|| self.backend.peer_info())
+    }
+
+    pub(crate) fn advertise_peer_info(&self, peer: velo_ext::PeerInfo) {
+        let _ = self.advertised_peer_info.set(peer);
+    }
+
+    pub(crate) async fn connect(
+        &self,
+        address: velo_ext::WorkerAddress,
+    ) -> Result<velo_ext::PeerInfo> {
+        let provisional = velo_ext::PeerInfo::new(InstanceId::new_v4(), address);
+        let target = provisional.instance_id();
+        // Even partial registration and a dropped connect future must close the
+        // temporary connection. The resolved peer gets its own routing entry.
+        struct ProvisionalPeer<'a>(&'a VeloBackend, InstanceId);
+        impl Drop for ProvisionalPeer<'_> {
+            fn drop(&mut self) {
+                self.0.unregister_peer(self.1);
+            }
+        }
+        let _provisional = ProvisionalPeer(&self.backend, target);
+        self.backend.register_peer(provisional)?;
+        let response = self.exchange_hello(target).await?;
+        let peer = response.peer_info.ok_or_else(|| {
+            anyhow::anyhow!(
+                "peer's _hello response has no peer_info; endpoint connect is unsupported"
+            )
+        })?;
+        anyhow::ensure!(
+            peer.instance_id() != target,
+            "peer returned the provisional identity"
+        );
+        self.backend.register_peer(peer.clone())?;
+        self.peer_registry
+            .update_handlers(peer.instance_id(), response.handlers);
+        Ok(peer)
+    }
+
+    /// Perform handshake with a peer to exchange handler information.
     async fn handshake_with_peer(&self, target: InstanceId) -> Result<()> {
+        let response = self.exchange_hello(target).await?;
+        self.peer_registry
+            .update_handlers(target, response.handlers);
+        Ok(())
+    }
+
+    async fn exchange_hello(
+        &self,
+        target: InstanceId,
+    ) -> Result<crate::messenger::server::system_handlers::HandlersResponse> {
         use crate::messenger::server::system_handlers::{HandlersResponse, HelloRequest};
 
         tracing::debug!(
@@ -304,7 +359,7 @@ impl ActiveMessageClient {
 
         // Send _hello with our peer info
         let request = HelloRequest {
-            peer_info: self.backend.peer_info(),
+            peer_info: self.peer_info(),
         };
 
         // Serialize request
@@ -358,10 +413,6 @@ impl ActiveMessageClient {
         let response: HandlersResponse = serde_json::from_slice(&response_bytes)
             .map_err(|e| anyhow::anyhow!("Failed to deserialize _hello response: {}", e))?;
 
-        // Update peer registry with handler list
-        self.peer_registry
-            .update_handlers(target, response.handlers.clone());
-
         tracing::debug!(
             target: "crate::messenger::client",
             target_instance = %target,
@@ -372,7 +423,7 @@ impl ActiveMessageClient {
             metrics.record_client_resolution(ClientResolution::HandshakeSuccess);
         }
 
-        Ok(())
+        Ok(response)
     }
 
     /// Ensure a peer is ready for communication (performs handshake if needed)

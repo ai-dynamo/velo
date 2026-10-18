@@ -186,6 +186,7 @@ struct CappedTransport {
     key: velo_ext::TransportKey,
     address: velo_ext::WorkerAddress,
     capacity: usize,
+    peers: std::sync::Mutex<std::collections::HashSet<InstanceId>>,
     accepted: std::sync::Mutex<Vec<(bytes::Bytes, bytes::Bytes)>>,
     rejected: std::sync::Mutex<Vec<String>>,
 }
@@ -201,6 +202,7 @@ impl CappedTransport {
             key,
             address: address.build().expect("address"),
             capacity,
+            peers: std::sync::Mutex::new(std::collections::HashSet::new()),
             accepted: std::sync::Mutex::new(Vec::new()),
             rejected: std::sync::Mutex::new(Vec::new()),
         })
@@ -237,9 +239,14 @@ impl crate::transports::Transport for CappedTransport {
 
     fn register(
         &self,
-        _peer_info: velo_ext::PeerInfo,
+        peer_info: velo_ext::PeerInfo,
     ) -> Result<(), crate::transports::TransportError> {
+        self.peers.lock().unwrap().insert(peer_info.instance_id());
         Ok(())
+    }
+
+    fn unregister(&self, instance_id: InstanceId) {
+        self.peers.lock().unwrap().remove(&instance_id);
     }
 
     fn send_message(
@@ -294,6 +301,35 @@ impl crate::transports::Transport for CappedTransport {
     > {
         Box::pin(async { Ok(()) })
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn endpoint_connect_releases_provisional_peer_on_timeout_and_send_error() {
+    for capacity in [usize::MAX, 0] {
+        let transport = CappedTransport::new(capacity);
+        let messenger = Messenger::builder()
+            .add_transport(transport.clone())
+            .build()
+            .await
+            .unwrap();
+        assert!(messenger.connect(transport.address()).await.is_err());
+        assert!(transport.peers.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn endpoint_connect_releases_provisional_peer_when_cancelled() {
+    let transport = CappedTransport::new(usize::MAX);
+    let messenger = Messenger::builder()
+        .add_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+    let mut connect = Box::pin(messenger.connect(transport.address()));
+    assert!(futures::poll!(&mut connect).is_pending());
+    assert_eq!(transport.peers.lock().unwrap().len(), 1);
+    drop(connect);
+    assert!(transport.peers.lock().unwrap().is_empty());
 }
 
 /// A messenger whose only transport reports `capacity`, plus a peer registered

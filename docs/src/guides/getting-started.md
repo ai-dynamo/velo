@@ -80,6 +80,29 @@ async fn main() -> anyhow::Result<()> {
 }
 ```
 
+## Connect by endpoint
+
+When a launcher supplies a TCP address or Unix socket path, it need not also
+supply the peer's instance id:
+
+```rust,ignore
+let peer = node_a.connect(velo::Endpoint::Tcp(address)).await?;
+// On Unix: node_a.connect(velo::Endpoint::Uds(socket_path)).await?
+let response = node_a.unary("echo")?
+    .instance(peer.instance_id())
+    .send().await?;
+```
+
+Both nodes must have the matching default transport key (`tcp` or `uds`). The
+`_hello` exchange registers both peers and returns the responder's advertised
+messenger and streaming endpoints. Temporary routing state is removed even if
+connect fails or its future is dropped. The exchange uses the messenger's
+30-second handshake deadline; callers may wrap it in a shorter timeout.
+
+The identity is self-reported, not authenticated. Applications must perform
+their own admission checks before trusting a peer. A peer without endpoint
+connect support is rejected when its reply has no peer information.
+
 ## Next steps
 
 - Read [Messaging](../concepts/messaging.md) for the four request patterns and the handler options.

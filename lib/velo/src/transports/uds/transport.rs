@@ -132,6 +132,19 @@ impl SendTask {
 }
 
 impl UdsTransport {
+    /// Encode a known Unix socket endpoint for discovery-free registration.
+    /// Non-UTF-8 paths are rejected rather than silently changed.
+    pub fn worker_address(path: &Path) -> Result<WorkerAddress> {
+        let path = path.to_str().context("UDS endpoint path is not UTF-8")?;
+        anyhow::ensure!(
+            !path.is_empty() && !path.contains('\0'),
+            "invalid UDS endpoint path"
+        );
+        let mut builder = crate::transports::address::WorkerAddressBuilder::new();
+        builder.add_entry("uds", format!("uds://{path}").into_bytes())?;
+        Ok(builder.build()?)
+    }
+
     /// Create a new UDS transport
     pub fn new(
         socket_path: PathBuf,

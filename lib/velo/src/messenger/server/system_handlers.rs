@@ -21,6 +21,9 @@ pub struct HelloRequest {
 pub struct HandlersResponse {
     /// List of available handler names
     pub handlers: Vec<String>,
+    /// Self-reported responder address and identity, present for `_hello`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_info: Option<PeerInfo>,
 }
 
 /// Create the _hello system handler.
@@ -45,7 +48,10 @@ fn create_hello_handler() -> Handler {
             "Completed _hello handshake"
         );
 
-        Ok(HandlersResponse { handlers })
+        Ok(HandlersResponse {
+            handlers,
+            peer_info: Some(ctx.msg.peer_info()),
+        })
     })
     .spawn()
     .build()
@@ -62,7 +68,10 @@ fn create_list_handlers_handler() -> Handler {
             "Responding to _list_handlers query"
         );
 
-        Ok(HandlersResponse { handlers })
+        Ok(HandlersResponse {
+            handlers,
+            peer_info: None,
+        })
     })
     .spawn()
     .build()
@@ -122,6 +131,7 @@ mod tests {
                 "handler2".to_string(),
                 "_system".to_string(),
             ],
+            peer_info: None,
         };
 
         let json = serde_json::to_string(&response).unwrap();

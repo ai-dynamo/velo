@@ -169,6 +169,20 @@ impl SendTask {
 }
 
 impl TcpTransport {
+    /// Encode a known TCP endpoint for discovery-free registration.
+    pub fn worker_address(address: SocketAddr) -> Result<WorkerAddress> {
+        let endpoints = vec![InterfaceEndpoint {
+            name: String::new(),
+            ip: address.ip().to_string(),
+            port: address.port(),
+            prefix_len: if address.is_ipv4() { 32 } else { 128 },
+            numa_node: None,
+        }];
+        let mut builder = crate::transports::address::WorkerAddressBuilder::new();
+        builder.add_entry("tcp", rmp_serde::to_vec(&endpoints)?)?;
+        Ok(builder.build()?)
+    }
+
     /// Create a new TCP transport bound to `bind_addr` with the given transport key.
     ///
     /// An optional pre-bound `listener` can be provided (useful for tests binding

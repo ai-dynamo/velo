@@ -42,6 +42,8 @@ pub struct Messenger {
     /// Names of the handlers the drain gate lets through. See
     /// [`register_drain_exempt_handler`](Self::register_drain_exempt_handler).
     drain_exempt: DrainExemptNames,
+    peer_stream_transport:
+        std::sync::OnceLock<std::sync::Weak<dyn crate::streaming::FrameTransport>>,
 }
 
 impl Drop for Messenger {
@@ -245,6 +247,7 @@ impl Messenger {
             tracker,
             large_payload_resolver,
             drain_exempt,
+            peer_stream_transport: std::sync::OnceLock::new(),
         });
 
         // 7. Register event and system handlers BEFORE unblocking the message
@@ -275,7 +278,22 @@ impl Messenger {
 
     /// Get the peer information for this Messenger instance.
     pub fn peer_info(&self) -> PeerInfo {
+        self.client.peer_info()
+    }
+
+    pub(crate) fn transport_peer_info(&self) -> PeerInfo {
         self.backend.peer_info()
+    }
+
+    pub(crate) fn advertise_peer_info(
+        &self,
+        peer: PeerInfo,
+        stream_transport: &Arc<dyn crate::streaming::FrameTransport>,
+    ) {
+        let _ = self
+            .peer_stream_transport
+            .set(Arc::downgrade(stream_transport));
+        self.client.advertise_peer_info(peer);
     }
 
     /// Get the backend (internal use for sending responses)
@@ -508,9 +526,25 @@ impl Messenger {
             .effective_eager_payload(target, handler_name, headers)
     }
 
+    /// Exchange `_hello` with a known address and register the reported peer.
+    /// The peer identity is self-reported, not authenticated.
+    pub async fn connect(&self, address: velo_ext::WorkerAddress) -> Result<PeerInfo> {
+        self.client.connect(address).await
+    }
+
     /// Connect to a peer by registering their peer information.
     pub fn register_peer(&self, peer_info: PeerInfo) -> Result<()> {
         let instance_id = peer_info.instance_id();
+        if let Some(transport) = self.peer_stream_transport.get().and_then(|t| t.upgrade()) {
+            let key = transport.key();
+            if peer_info
+                .worker_address()
+                .get_entry(key.as_str())?
+                .is_some()
+            {
+                transport.register(&peer_info)?;
+            }
+        }
 
         // Register with backend (registers with transports)
         self.backend.register_peer(peer_info)?;

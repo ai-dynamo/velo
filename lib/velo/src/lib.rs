@@ -17,6 +17,8 @@ use anyhow::Result;
 
 // ── Subsystem modules (each was previously a sibling crate) ────────────────
 pub mod discovery;
+mod endpoint;
+pub use endpoint::Endpoint;
 #[cfg(feature = "services")]
 pub mod events;
 pub mod messenger;
@@ -571,7 +573,7 @@ impl VeloBuilder {
         };
 
         // Assemble Velo
-        Ok(Arc::new(Velo {
+        let velo = Arc::new(Velo {
             messenger,
             stream_owner: Arc::new(StreamOwner {
                 manager: Arc::clone(&anchor_manager),
@@ -586,7 +588,10 @@ impl VeloBuilder {
                 lock: tokio::sync::Mutex::new(()),
                 done: std::sync::atomic::AtomicBool::new(false),
             }),
-        }))
+        });
+        velo.messenger
+            .advertise_peer_info(velo.peer_info(), &velo.stream_transport);
+        Ok(velo)
     }
 }
 
@@ -917,7 +922,7 @@ impl Velo {
     /// In [`VeloBuilder::mux_only`] mode the primary stream transport is the
     /// mux, which uses the messenger endpoints and adds no streaming endpoint.
     pub fn peer_info(&self) -> PeerInfo {
-        let messenger_peer = self.messenger.peer_info();
+        let messenger_peer = self.messenger.transport_peer_info();
         let stream_addr = self.stream_transport.address();
         // Empty streaming address (a transport that opens no listener of its
         // own, e.g. the messenger mux) → no merge needed.
@@ -1003,6 +1008,17 @@ impl Velo {
     /// Register a handler on this instance.
     pub fn register_handler(&self, handler: Handler) -> Result<()> {
         self.messenger.register_handler(handler)
+    }
+
+    /// Connect to a known endpoint without discovery or a pre-shared identity.
+    ///
+    /// Exchanges peer information through `_hello` and registers the peer for
+    /// messaging and streaming. The identity is self-reported, not authenticated.
+    /// Temporary routing state is removed on success, error, or cancellation.
+    pub async fn connect(&self, endpoint: Endpoint) -> Result<PeerInfo> {
+        let peer = self.messenger.connect(endpoint.worker_address()?).await?;
+        self.register_peer(peer.clone())?;
+        Ok(peer)
     }
 
     /// Connect to a peer by registering their peer information.

@@ -19,6 +19,8 @@ Velo 0.19 gives Velo and Messenger explicit drop lifetimes, removes value-level 
 
 Use `Velo::shutdown(policy)` to close resources and join owned tasks while Tokio keeps running. The instance and its handles stay valid after shutdown, and shutdown does not release them from memory. Accepted requests remain counted until their replies are submitted, including error replies. See [Shutdown and drain](docs/src/concepts/shutdown.md).
 
+Use `Velo::connect(Endpoint::Tcp(address))` or, on Unix, `Endpoint::Uds(path)` when only a peer's endpoint is known. It exchanges peer information without a discovery service; the returned identity is self-reported, not authenticated. See [Connect by endpoint](docs/src/guides/getting-started.md#connect-by-endpoint).
+
 Call `Velo::unregister_peer` when a peer leaves. A restarted peer has a new instance id, so without the call a long-lived node keeps state and connections for every peer it ever served. See [Forget a peer](docs/src/concepts/discovery.md#forget-a-peer).
 
 Batched streams give each stream a window of 32 records in flight by default. A larger window lets a saturated consumer node queue a new stream's first record behind every other stream's backlog. See [Change the credit window](docs/src/guides/tune-batched-streaming.md#change-the-credit-window).
