@@ -843,9 +843,11 @@ mod tests {
         /// This transport's own adapter, for tests that feed it frames
         /// directly. Not the shared registry: another test clears that.
         adapter: OnceLock<TransportAdapter>,
-        /// This node's own instance id, set in `start()`; loopback deliveries
-        /// attribute themselves with it, as a dialed connection would.
-        own_instance: OnceLock<InstanceId>,
+        /// This node's own instance id; loopback deliveries attribute
+        /// themselves with it, as a dialed connection would. Replaced at
+        /// `start()`: a transport can be reused by a restarted messenger,
+        /// and a stale announcement must not outlive the old instance.
+        own_instance: Mutex<Option<InstanceId>>,
     }
 
     impl InMemoryTransport {
@@ -857,7 +859,7 @@ mod tests {
                 endpoint,
                 peers: Mutex::new(HashMap::new()),
                 adapter: OnceLock::new(),
-                own_instance: OnceLock::new(),
+                own_instance: Mutex::new(None),
             })
         }
     }
@@ -922,10 +924,7 @@ mod tests {
             // Loopback deliveries attribute themselves with the sending
             // instance, the in-process equivalent of a dialed connection's
             // announcement, so response completion can be checked against it.
-            let sender = self
-                .own_instance
-                .get()
-                .copied()
+            let sender = (*self.own_instance.lock().expect("own instance poisoned"))
                 .map_or(velo_ext::SenderIdentity::Unattributed, |id| {
                     velo_ext::SenderIdentity::AnnouncedPeer(id)
                 });
@@ -983,7 +982,7 @@ mod tests {
             _rt: tokio::runtime::Handle,
         ) -> BoxFuture<'_, anyhow::Result<()>> {
             let endpoint = self.endpoint.clone();
-            let _ = self.own_instance.set(instance_id);
+            *self.own_instance.lock().expect("own instance poisoned") = Some(instance_id);
             let _ = self.adapter.set(channels.clone());
             Box::pin(async move {
                 test_transport_registry()
