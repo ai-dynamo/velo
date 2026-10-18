@@ -564,15 +564,11 @@ impl ResponseManager {
         }
         // Remove only on an accepted completion, and only this send's own
         // entry: the wake can let the awaiter's owner recycle the slot and a
-        // new send re-expect it before this removal runs, so the removal is
-        // conditional on the stored id still being the one we completed.
+        // new send re-expect it before this removal runs.
         let completed = self.inner.complete_outcome(response_id, outcome);
         if completed {
             self.inner
-                .expected_peer
-                .remove_if(&response_id.slot_index(), |_, (expected_id, _)| {
-                    *expected_id == response_id.as_u128()
-                });
+                .forget_expected_peer(response_id.slot_index(), response_id);
         }
         completed
     }
@@ -661,6 +657,18 @@ impl ResponseManagerInner {
             .expect("arena and semaphore permits must stay in sync");
         inner.mark_pending();
         ResponseAwaiter::new(Arc::clone(&inner), slot, index, generation, permit)
+    }
+
+    /// Remove a completed send's expectation — only if the entry still names
+    /// that send's full id. A completion's wake can let the caller recycle
+    /// the slot and a new send re-expect it before this cleanup runs, so the
+    /// removal is conditional; a late cleanup of an older generation is a
+    /// no-op.
+    fn forget_expected_peer(&self, slot_index: usize, response_id: ResponseId) {
+        self.expected_peer
+            .remove_if(&slot_index, |_, (expected_id, _)| {
+                *expected_id == response_id.as_u128()
+            });
     }
 
     fn recycle_slot(&self, index: usize, permit: OwnedSemaphorePermit) {
@@ -1153,35 +1161,35 @@ mod tests {
 
     /// The accepted-completion cleanup must not remove a NEWER send's
     /// expectation for the same slot: the wake of the first completion lets
-    /// the caller recycle and re-expect before the cleanup runs, so the
-    /// removal is conditional on the stored id being the completed one.
-    /// What is pinned here is the boundary that makes the interleave
-    /// unreachable: after a fresh expectation is installed, a stale
-    /// conditional removal is a no-op.
+    /// the caller recycle and re-expect before the cleanup runs. This calls
+    /// the production cleanup directly, late, as that interleave would.
     #[tokio::test]
     async fn a_newer_expectation_survives_the_older_completions_cleanup() {
         let rm = ResponseManager::with_capacity(7, 1, None);
         let target = velo_ext::InstanceId::new_v4();
 
-        let mut first = rm.register_outcome().expect("slot");
+        let first = rm.register_outcome().expect("slot");
         let first_id = first.response_id();
         rm.expect_response_from(first_id, target);
-        // Accepted completion of the first send: its expectation goes.
+        // The first send's accepted completion removes its own expectation.
         assert!(rm.complete_outcome_attributed(
             first_id,
             Ok(Some(Bytes::from_static(b"first"))),
             velo_ext::SenderIdentity::AnnouncedPeer(target),
         ));
-        first.recv().await.expect("completed").expect("ok");
+        drop(first);
 
-        // Recycle and re-expect under a new generation.
+        // The slot recycles and a new send installs its expectation.
         let mut second = rm.register_outcome().expect("recycled slot");
         let second_id = second.response_id();
         assert_ne!(second_id, first_id);
         rm.expect_response_from(second_id, target);
 
-        // If the first completion's cleanup were unconditional and late, the
-        // second expectation would be gone; it must still guard.
+        // The first completion's cleanup runs only now (the interleave): it
+        // must not remove the newer send's expectation.
+        rm.inner
+            .forget_expected_peer(first_id.slot_index(), first_id);
+
         let rogue = velo_ext::InstanceId::new_v4();
         assert!(!rm.complete_outcome_attributed(
             second_id,

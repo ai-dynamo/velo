@@ -120,7 +120,7 @@ pub async fn graceful_shutdown_lifecycle<C: ShutdownTestClient>() {
 
     // Verify responses still flow
     C::connect_and_send_frame(&handle, MessageType::Response, b"still-ok", b"data").await;
-    let (header, _) = timeout(
+    let (header, _, _) = timeout(
         Duration::from_secs(2),
         handle.streams.response_stream.recv_async(),
     )
@@ -418,7 +418,7 @@ where
         );
     }
     // Tear down once frames are flowing, so it lands mid-stream.
-    let (first, _) = timeout(
+    let (first, _, _) = timeout(
         Duration::from_secs(5),
         handle_b.streams.response_stream.recv_async(),
     )
@@ -429,7 +429,7 @@ where
     handle_a.streams.shutdown_state.teardown_token().cancel();
     handle_a.transport.shutdown();
 
-    while let Ok(Ok((header, _))) = timeout(
+    while let Ok(Ok((header, _, _))) = timeout(
         Duration::from_secs(3),
         handle_b.streams.response_stream.recv_async(),
     )
