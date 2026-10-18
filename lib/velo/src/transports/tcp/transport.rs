@@ -27,7 +27,7 @@ use crate::transports::utils::interfaces::{
 };
 use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
-use super::framing::DEFAULT_MAX_FRAME_SIZE;
+use super::framing::{DEFAULT_MAX_FRAME_SIZE, TcpFrameCodec};
 use super::listener::TcpListener;
 use super::writer::TcpWriterObserver;
 use crate::transports::coalesce::{EgressMetrics, run_coalescing_writer};
@@ -65,6 +65,10 @@ pub struct TcpTransport {
     // Ordered channels to each peer, each its own connection, dialed on the
     // first send on that lane. Set by the builder; `new()` gives 1.
     lanes: NonZeroU16,
+
+    // This node's own instance id, set in `start()` — announced on every
+    // dialed connection so the acceptor can attribute its frames.
+    own_instance: OnceLock<crate::InstanceId>,
 
     // Runtime handle for spawning tasks
     runtime: OnceLock<tokio::runtime::Handle>,
@@ -204,6 +208,7 @@ impl TcpTransport {
             peers: Arc::new(DashMap::new()),
             connections: Arc::new(DashMap::new()),
             lanes: NonZeroU16::MIN,
+            own_instance: OnceLock::new(),
             runtime: OnceLock::new(),
             cancel_token: CancellationToken::new(),
             shutdown_state: OnceLock::new(),
@@ -340,6 +345,7 @@ impl TcpTransport {
             connections: Arc::clone(&self.connections),
             cancel_token: cancel,
             connect_timeout: self.connect_timeout,
+            own_instance: self.own_instance.get().copied(),
             reader_ctx: self.dialed_ctx.get().cloned(),
             metrics: self.metrics.get().cloned(),
             socket_buffers: self.socket_buffers,
@@ -520,13 +526,14 @@ impl Transport for TcpTransport {
 
     fn start(
         &self,
-        _instance_id: crate::InstanceId,
+        instance_id: crate::InstanceId,
         channels: TransportAdapter,
         rt: tokio::runtime::Handle,
     ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
         // Dialed-reader context first: send paths gate on `runtime`, so
         // setting this before `runtime` guarantees every connection writer
-        // sees it.
+        // sees it. The own-instance store orders the same way.
+        let _ = self.own_instance.set(instance_id);
         self.dialed_ctx
             .set(DialedReaderContext {
                 adapter: channels.clone(),
@@ -697,6 +704,8 @@ struct WriterTaskContext {
     /// The connection's token: shutdown and unregister both cancel it.
     cancel_token: CancellationToken,
     connect_timeout: Duration,
+    /// Announced at connection open. `None` only before `start()`.
+    own_instance: Option<crate::InstanceId>,
     reader_ctx: Option<DialedReaderContext>,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
     socket_buffers: Option<usize>,
@@ -815,8 +824,25 @@ async fn connection_writer_inner(
             metrics.clone(),
             conn_cancel.clone(),
             format!("{} lane {} ({})", instance_id, lane, addr),
+            SenderIdentity::DialedPeer(instance_id),
         ))
     });
+
+    // Announce who we are before any data frame: the acceptor attributes
+    // every frame on this connection to the announcement. A peer built
+    // before connection identification sends nothing and reads as
+    // `Unattributed`; one that predates the Identify frame type cannot decode
+    // it and drops the connection — identified peers are not wire-compatible
+    // with older acceptors.
+    if let Some(own_instance) = ctx.own_instance {
+        TcpFrameCodec::encode_frame(
+            &mut write_half,
+            MessageType::Identify,
+            own_instance.as_bytes(),
+            b"",
+        )
+        .await?;
+    }
 
     // Coalescing writer: several queued messages become one `write_all`. See
     // `crate::transports::coalesce` for why that is wire-compatible with an

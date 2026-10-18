@@ -28,7 +28,9 @@ use tokio_util::codec::FramedRead;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-use velo_ext::{AdmitOutcome, MessageType, TransportAdapter, TransportErrorHandler};
+use velo_ext::{
+    AdmitOutcome, MessageType, SenderIdentity, TransportAdapter, TransportErrorHandler,
+};
 
 use crate::observability::{Direction, TransportRejection};
 
@@ -196,6 +198,10 @@ pub(crate) async fn run_dialed_reader<R>(
     metrics: Option<Arc<dyn velo_ext::TransportObservability>>,
     conn_cancel: CancellationToken,
     peer: String,
+    /// What frames arriving on this socket may be attributed to: the peer we
+    /// dialed ([`SenderIdentity::DialedPeer`]) where the transport knows it,
+    /// [`SenderIdentity::Unattributed`] where it does not.
+    sender: SenderIdentity,
 ) where
     R: AsyncRead + Unpin,
 {
@@ -215,6 +221,7 @@ pub(crate) async fn run_dialed_reader<R>(
                             msg_type,
                             header,
                             payload,
+                            sender,
                             &ctx.adapter,
                             &ctx.error_handler,
                             &ctx.transport_key,
@@ -407,6 +414,7 @@ mod tests {
             None,
             conn_cancel.clone(),
             "peer".to_string(),
+            SenderIdentity::Unattributed,
         )
         .await;
 

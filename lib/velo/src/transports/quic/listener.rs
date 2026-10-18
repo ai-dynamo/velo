@@ -137,6 +137,8 @@ async fn serve_stream(
                     msg_type,
                     header,
                     payload,
+                    // The QUIC accept side does not yet learn who dialed.
+                    velo_ext::SenderIdentity::Unattributed,
                     &ctx.adapter,
                     &ctx.error_handler,
                     &ctx.transport_key,

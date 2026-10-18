@@ -776,6 +776,9 @@ async fn connection_writer_inner(
             metrics.clone(),
             conn_cancel.clone(),
             format!("{peer_name} ({})", addr),
+            // QUIC does not announce at connection open yet; the dialed
+            // reader cannot attribute frames to the peer we called.
+            velo_ext::SenderIdentity::Unattributed,
         ))
     });
 

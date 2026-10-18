@@ -24,7 +24,7 @@ use crate::transports::transport::{
 };
 use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey, WorkerAddress};
 
-use crate::transports::tcp::framing::DEFAULT_MAX_FRAME_SIZE;
+use crate::transports::tcp::framing::{DEFAULT_MAX_FRAME_SIZE, TcpFrameCodec};
 
 use super::listener::{UdsListener, default_shrink_threshold};
 use crate::transports::coalesce::{
@@ -48,6 +48,10 @@ pub struct UdsTransport {
     // Shared mutable state with DashMap (lock-free)
     peers: Arc<DashMap<crate::InstanceId, PathBuf>>,
     connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
+
+    // This node's own instance id, set in `start()` — announced on every
+    // dialed connection so the acceptor can attribute its frames.
+    own_instance: OnceLock<crate::InstanceId>,
 
     // Runtime handle for spawning tasks
     runtime: OnceLock<tokio::runtime::Handle>,
@@ -159,6 +163,7 @@ impl UdsTransport {
             local_address,
             peers: Arc::new(DashMap::new()),
             connections: Arc::new(DashMap::new()),
+            own_instance: OnceLock::new(),
             runtime: OnceLock::new(),
             cancel_token: CancellationToken::new(),
             shutdown_state: OnceLock::new(),
@@ -279,6 +284,7 @@ impl UdsTransport {
                 connections: Arc::clone(&self.connections),
                 cancel_token: handle.cancel.clone(),
                 connect_timeout: self.connect_timeout,
+                own_instance: self.own_instance.get().copied(),
                 reader_ctx: self.dialed_ctx.get().cloned(),
                 metrics: self.metrics.get().cloned(),
             },
@@ -446,13 +452,14 @@ impl Transport for UdsTransport {
 
     fn start(
         &self,
-        _instance_id: crate::InstanceId,
+        instance_id: crate::InstanceId,
         channels: TransportAdapter,
         rt: tokio::runtime::Handle,
     ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
         // Dialed-reader context first: send paths gate on `runtime`, so
         // setting this before `runtime` guarantees every connection writer
-        // sees it.
+        // sees it. The own-instance store orders the same way.
+        let _ = self.own_instance.set(instance_id);
         self.dialed_ctx
             .set(DialedReaderContext {
                 adapter: channels.clone(),
@@ -640,6 +647,8 @@ struct WriterTaskContext {
     /// The connection's token: shutdown and unregister both cancel it.
     cancel_token: CancellationToken,
     connect_timeout: Duration,
+    /// Announced at connection open. `None` only before `start()`.
+    own_instance: Option<crate::InstanceId>,
     reader_ctx: Option<DialedReaderContext>,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
 }
@@ -659,6 +668,7 @@ async fn connection_writer_task(
         connections,
         cancel_token,
         connect_timeout,
+        own_instance,
         reader_ctx,
         metrics,
     } = ctx;
@@ -668,6 +678,7 @@ async fn connection_writer_task(
         &rx,
         &cancel_token,
         connect_timeout,
+        own_instance,
         reader_ctx,
         metrics.clone(),
     )
@@ -708,6 +719,7 @@ async fn connection_writer_inner(
     rx: &flume::Receiver<SendTask>,
     cancel_token: &CancellationToken,
     connect_timeout: Duration,
+    own_instance: Option<crate::InstanceId>,
     reader_ctx: Option<DialedReaderContext>,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
 ) -> Result<()> {
@@ -739,6 +751,23 @@ async fn connection_writer_inner(
     // so the writer stops instead of pushing frames at a dead socket, and the
     // transport-level `cancel_token` still stops both through propagation.
     let (read_half, mut write_half) = stream.into_split();
+
+    // Announce who we are before any data frame: the acceptor attributes
+    // every frame on this connection to the announcement. A peer built
+    // before connection identification sends nothing and reads as
+    // `Unattributed`; one that predates the Identify frame type cannot decode
+    // it and drops the connection — identified peers are not wire-compatible
+    // with older acceptors.
+    if let Some(own_instance) = own_instance {
+        TcpFrameCodec::encode_frame(
+            &mut write_half,
+            MessageType::Identify,
+            own_instance.as_bytes(),
+            b"",
+        )
+        .await?;
+    }
+
     let conn_cancel = cancel_token.child_token();
     let reader = reader_ctx.map(|ctx| {
         tokio::spawn(run_dialed_reader(
@@ -747,6 +776,7 @@ async fn connection_writer_inner(
             metrics.clone(),
             conn_cancel.clone(),
             format!("{} ({:?})", instance_id, path),
+            SenderIdentity::DialedPeer(instance_id),
         ))
     });
 

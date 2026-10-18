@@ -319,6 +319,10 @@ pub struct Context {
     pub headers: Option<std::collections::HashMap<String, String>>,
     /// The messenger API
     pub msg: Arc<crate::Messenger>,
+    /// Who the transport says the sender is. Private so construction stays
+    /// with the messenger: read it with [`sender_identity`](Self::sender_identity)
+    /// and [`sender_peer_info`](Self::sender_peer_info).
+    sender: velo_ext::SenderIdentity,
 }
 
 /// Context passed to typed handlers (already deserialized input)
@@ -332,6 +336,8 @@ pub struct TypedContext<I> {
     pub headers: Option<std::collections::HashMap<String, String>>,
     /// The messenger API
     pub msg: Arc<crate::Messenger>,
+    /// See [`Context::sender`].
+    sender: velo_ext::SenderIdentity,
 }
 
 /// Emits the sender-provenance accessors shared by [`Context`] and
@@ -366,6 +372,33 @@ macro_rules! impl_sender_accessors {
                     .backend()
                     .try_translate_worker_id(self.sender_worker_id())
                     .ok()
+            }
+
+            /// Who the transport says the sender is, sourced from the
+            /// connection the message arrived on — never from the message's
+            /// own claims. A guard that needs an identity must fail closed on
+            /// [`velo_ext::SenderIdentity::Unattributed`].
+            ///
+            /// Not cryptographic attestation: see the variant docs. For
+            /// canonicalization (hashing, admission keys), use
+            /// [`SenderIdentity::instance_id`](velo_ext::SenderIdentity::instance_id)
+            /// — the two attributed variants differ by which end of the
+            /// connection observed them.
+            pub fn sender_identity(&self) -> velo_ext::SenderIdentity {
+                self.sender
+            }
+
+            /// The exact [`velo_ext::PeerInfo`] the sender registered,
+            /// retained verbatim from its `_hello` (or explicit
+            /// registration), when the connection is attributed and the peer
+            /// is still registered. `None` for
+            /// [`Unattributed`](velo_ext::SenderIdentity::Unattributed) or an
+            /// unregistered identity — never an answer rebuilt from the
+            /// message's claims.
+            pub fn sender_peer_info(&self) -> Option<velo_ext::PeerInfo> {
+                self.sender
+                    .instance_id()
+                    .and_then(|id| self.msg.registered_peer_info(id))
             }
         }
     };
@@ -511,6 +544,7 @@ where
             payload: ctx.payload,
             headers: ctx.headers.clone(),
             msg: ctx.system.clone(),
+            sender: ctx.sender,
         };
 
         let executor = self.executor.clone();
@@ -655,6 +689,7 @@ where
             payload: ctx.payload,
             headers: ctx.headers.clone(),
             msg: ctx.system.clone(),
+            sender: ctx.sender,
         };
 
         let executor = self.executor.clone();
@@ -790,6 +825,7 @@ where
         let request_bytes = ctx.payload.len();
         let payload = ctx.payload;
         let system = ctx.system.clone();
+        let sender = ctx.sender;
         let msg_id = crate::messenger::common::MessageId::new(ctx.message_id);
         let headers = ctx.headers.clone();
         #[cfg(feature = "distributed-tracing")]
@@ -871,6 +907,7 @@ where
                 input,
                 headers: headers.clone(),
                 msg: system,
+                sender,
             };
 
             let result = executor.execute(typed_ctx).await;

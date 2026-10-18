@@ -251,13 +251,13 @@ async fn create_message_handler(
         // (`TransportAdapter::admit_message`) and travelled with the frame, so
         // this message has been counted work since before it was queued.
         // Taking ownership of it *before* decoding means a decode failure
-        // releases it on the spot instead of leaking it.
-        let InboundMessage {
-            header,
-            payload,
-            guard,
-            ..
-        } = inbound;
+        // releases it on the spot instead of leaking it. The sender identity
+        // is read through its accessor: the field is private to velo-ext, so
+        // no struct pattern can reach it from here.
+        let sender = inbound.sender();
+        let header = inbound.header;
+        let payload = inbound.payload;
+        let guard = inbound.guard;
         // Held until the handler future (response send included) completes, so
         // phase 2's wait_for_drain covers accepted-but-unfinished work.
         let in_flight = Some(Arc::new(guard));
@@ -321,6 +321,7 @@ async fn create_message_handler(
                             headers,
                             handle_str,
                             in_flight,
+                            sender,
                             backend,
                         });
                         continue;
@@ -360,6 +361,7 @@ async fn create_message_handler(
                     response_type: message.metadata.response_type,
                     headers: message.metadata.headers,
                     in_flight,
+                    sender,
                 };
 
                 // Direct dispatch - inline, no channel hop! The Messenger is
@@ -418,6 +420,9 @@ struct ResolveJob {
     headers: Option<std::collections::HashMap<String, String>>,
     handle_str: String,
     in_flight: Option<Arc<velo_ext::InFlightGuard>>,
+    /// The connection-sourced sender identity, carried across the detached
+    /// resolve so a rendezvous message keeps the attribution it arrived with.
+    sender: velo_ext::SenderIdentity,
     backend: Arc<VeloBackend>,
 }
 
@@ -452,6 +457,7 @@ async fn resolve_and_dispatch(job: ResolveJob) {
         headers,
         handle_str,
         in_flight,
+        sender,
         backend,
     } = job;
     match resolver.resolve(&handle_str).await {
@@ -467,6 +473,7 @@ async fn resolve_and_dispatch(job: ResolveJob) {
                 response_type,
                 headers,
                 in_flight,
+                sender,
             };
             hub.dispatch_message(&handler_name, call, &system);
         }
@@ -680,6 +687,7 @@ mod tests {
             headers: None,
             handle_str: "1".to_string(),
             in_flight: None,
+            sender: velo_ext::SenderIdentity::Unattributed,
             backend: Arc::clone(&backend),
         });
         tokio::task::yield_now().await;

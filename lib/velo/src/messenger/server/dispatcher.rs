@@ -48,6 +48,11 @@ pub(crate) struct HandlerContext {
     /// `ShutdownState::wait_for_drain` waits on. `Arc` so the derived `Clone`
     /// counts a message once, not once per context clone.
     pub in_flight: Option<Arc<velo_ext::InFlightGuard>>,
+
+    /// Who the transport says the sender is, sourced from the connection the
+    /// message arrived on — never from the frame's own claims. See
+    /// [`velo_ext::SenderIdentity`].
+    pub sender: velo_ext::SenderIdentity,
 }
 
 /// A decoded inbound message, before it is bound to the Messenger.
@@ -64,6 +69,8 @@ pub(crate) struct InboundCall {
     pub headers: Option<std::collections::HashMap<String, String>>,
     /// See [`HandlerContext::in_flight`].
     pub in_flight: Option<Arc<velo_ext::InFlightGuard>>,
+    /// See [`HandlerContext::sender`].
+    pub sender: velo_ext::SenderIdentity,
 }
 
 impl InboundCall {
@@ -76,6 +83,7 @@ impl InboundCall {
             headers: self.headers,
             system,
             in_flight: self.in_flight,
+            sender: self.sender,
         }
     }
 }
@@ -851,6 +859,7 @@ mod tests {
             headers: None,
             system: Arc::clone(&messenger),
             in_flight: None,
+            sender: velo_ext::SenderIdentity::Unattributed,
         };
         let task = tokio::spawn(async move {
             run_handler(&PendingHandler, ctx, DispatchFailure::HandlerPanic).await;
@@ -897,6 +906,7 @@ mod tests {
             response_type: ResponseType::FireAndForget,
             headers: None,
             in_flight: None,
+            sender: velo_ext::SenderIdentity::Unattributed,
         };
 
         dispatcher.dispatch(call(1), &messenger);
@@ -935,6 +945,7 @@ mod tests {
             response_type: ResponseType::FireAndForget,
             headers: None,
             in_flight: None,
+            sender: velo_ext::SenderIdentity::Unattributed,
         };
         let tasks = messenger.tracker().len();
         for n in 0..5u128 {
@@ -1069,6 +1080,7 @@ mod tests {
                 response_type: ResponseType::Unary,
                 headers: None,
                 in_flight: None,
+                sender: velo_ext::SenderIdentity::Unattributed,
             },
             &messenger,
         );

@@ -19,7 +19,9 @@ use tracing::{debug, error, info, warn};
 use crate::observability::TransportRejection;
 use crate::transports::ingress::{Routed, route_frame};
 
-use velo_ext::{MessageType, ShutdownState, TransportAdapter, TransportErrorHandler};
+use velo_ext::{
+    MessageType, SenderIdentity, ShutdownState, TransportAdapter, TransportErrorHandler,
+};
 
 use crate::transports::tcp::TcpFrameCodec;
 use crate::transports::tcp::framing::{maybe_shrink_read_buffer, parse_shrink_threshold};
@@ -119,6 +121,12 @@ impl UdsListener {
 
         debug!("Configuring UDS connection");
 
+        // Who opened this connection, learned from its Identify frame — the
+        // first frame a current peer sends on a socket it dialed. Frames
+        // before it route as Unattributed, which is also what a peer built
+        // before connection identification produces for its whole session.
+        let mut announced: Option<crate::InstanceId> = None;
+
         // Create framed stream with zero-copy codec (same as TCP)
         let mut framed = Framed::new(stream, TcpFrameCodec::new());
         let teardown_token = shutdown_state.teardown_token().clone();
@@ -137,6 +145,29 @@ impl UdsListener {
                     match frame_result {
                         Some(Ok((msg_type, header, payload))) => {
                             let frame_size = header.len() + payload.len();
+                            if msg_type == MessageType::Identify {
+                                // One identity per connection, set at open.
+                                // A second one — or one whose header is not a
+                                // bare 16-byte instance id — is a protocol
+                                // violation, so the connection dies.
+                                let parsed: Option<crate::InstanceId> = <&[u8; 16]>::try_from(
+                                    header.as_ref(),
+                                )
+                                .ok()
+                                .map(|bytes| crate::InstanceId::from(uuid::Uuid::from_bytes(*bytes)));
+                                match (announced, parsed) {
+                                    (None, Some(id)) => announced = Some(id),
+                                    _ => {
+                                        warn!("Identify frame violation; closing UDS connection");
+                                        break;
+                                    }
+                                }
+                                continue;
+                            }
+                            let sender = announced.map_or(
+                                SenderIdentity::Unattributed,
+                                SenderIdentity::AnnouncedPeer,
+                            );
                             // `route_frame` owns the drain gate for Message
                             // frames: it acquires the in-flight guard before
                             // re-reading the flag, so an admitted message is
@@ -146,6 +177,7 @@ impl UdsListener {
                                 msg_type,
                                 header,
                                 payload,
+                                sender,
                                 &adapter,
                                 &error_handler,
                                 &transport_key,

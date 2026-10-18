@@ -281,6 +281,18 @@ impl Messenger {
         self.client.peer_info()
     }
 
+    /// The exact [`PeerInfo`] a registered peer presented at registration,
+    /// retained verbatim. `None` for a peer that is not (or is no longer)
+    /// registered.
+    ///
+    /// This is the lookup a handler's
+    /// [`sender_peer_info`](crate::messenger::handlers::Context::sender_peer_info)
+    /// uses: it answers with what the peer sent, never a locally rebuilt
+    /// record.
+    pub fn registered_peer_info(&self, instance_id: InstanceId) -> Option<PeerInfo> {
+        self.backend.registered_peer_info(instance_id)
+    }
+
     pub(crate) fn transport_peer_info(&self) -> PeerInfo {
         self.backend.peer_info()
     }

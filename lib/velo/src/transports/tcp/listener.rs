@@ -20,7 +20,9 @@ use tracing::{debug, error, info, warn};
 use crate::observability::TransportRejection;
 use crate::transports::ingress::{Routed, route_frame};
 
-use velo_ext::{MessageType, ShutdownState, TransportAdapter, TransportErrorHandler};
+use velo_ext::{
+    MessageType, SenderIdentity, ShutdownState, TransportAdapter, TransportErrorHandler,
+};
 
 use super::framing::{TcpFrameCodec, maybe_shrink_read_buffer, parse_shrink_threshold};
 
@@ -306,6 +308,12 @@ impl TcpListener {
             warn!("Failed to set TCP keepalive on {}: {}", peer_addr, e);
         }
 
+        // Who opened this connection, learned from its Identify frame — the
+        // first frame a current peer sends on a socket it dialed. Frames
+        // before it route as Unattributed, which is also what a peer built
+        // before connection identification produces for its whole session.
+        let mut announced: Option<crate::InstanceId> = None;
+
         // Create framed stream with zero-copy codec
         let mut framed = Framed::new(stream, TcpFrameCodec::new());
         // Built once per connection: the token is node-wide, so a future
@@ -328,6 +336,29 @@ impl TcpListener {
                     match frame_result {
                         Some(Ok((msg_type, header, payload))) => {
                             let frame_size = header.len() + payload.len();
+                            if msg_type == MessageType::Identify {
+                                // One identity per connection, set at open.
+                                // A second one — or one whose header is not a
+                                // bare 16-byte instance id — is a protocol
+                                // violation, so the connection dies.
+                                let parsed: Option<crate::InstanceId> = <&[u8; 16]>::try_from(
+                                    header.as_ref(),
+                                )
+                                .ok()
+                                .map(|bytes| crate::InstanceId::from(uuid::Uuid::from_bytes(*bytes)));
+                                match (announced, parsed) {
+                                    (None, Some(id)) => announced = Some(id),
+                                    _ => {
+                                        warn!("Identify frame violation from {peer_addr}; closing");
+                                        break;
+                                    }
+                                }
+                                continue;
+                            }
+                            let sender = announced.map_or(
+                                SenderIdentity::Unattributed,
+                                SenderIdentity::AnnouncedPeer,
+                            );
                             // Route frame to appropriate stream based on type.
                             // `route_frame` owns the drain gate for Message
                             // frames — it acquires the in-flight guard before
@@ -338,6 +369,7 @@ impl TcpListener {
                                 msg_type,
                                 header,
                                 payload,
+                                sender,
                                 &adapter,
                                 &error_handler,
                                 &transport_key,

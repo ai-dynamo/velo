@@ -31,6 +31,21 @@ fn create_hello_handler() -> Handler {
     Handler::typed_unary_async("_hello", |ctx: TypedContext<HelloRequest>| async move {
         let peer_info = ctx.input.peer_info;
 
+        // A connection that announced an identity cannot register a different
+        // one: the announcement, not the payload, owns the claim. An
+        // unattributed connection (a peer built before connection
+        // identification, or a store-and-forward transport) registers as
+        // before — callers that need the binding must check
+        // `sender_identity()` on their own handlers and fail closed there.
+        if let Some(announced) = ctx.sender_identity().instance_id()
+            && announced != peer_info.instance_id()
+        {
+            anyhow::bail!(
+                "_hello from a connection announced as {announced} claimed {}",
+                peer_info.instance_id()
+            );
+        }
+
         tracing::debug!(
             target: "crate::messenger::system",
             instance_id = %peer_info.instance_id(),
