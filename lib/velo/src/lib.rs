@@ -191,6 +191,24 @@ pub struct Velo {
     inner: Arc<VeloInner>,
 }
 
+/// A reference to a [`Velo`] that does not keep it alive.
+///
+/// A handler lives in its own instance's registry. A handler that holds a
+/// `Velo` clone makes the instance hold itself, so its final drop never runs
+/// and streaming is never cancelled. Hold a `WeakVelo` there instead, and
+/// [`upgrade`](Self::upgrade) it on each call.
+#[derive(Clone)]
+pub struct WeakVelo {
+    inner: std::sync::Weak<VeloInner>,
+}
+
+impl WeakVelo {
+    /// The instance, if a [`Velo`] clone of it is still alive.
+    pub fn upgrade(&self) -> Option<Velo> {
+        self.inner.upgrade().map(|inner| Velo { inner })
+    }
+}
+
 /// The state every [`Velo`] clone shares. One `Arc` around it makes a clone a
 /// single increment and makes the final drop of the last clone the one place
 /// the streaming services are cancelled.
@@ -674,6 +692,14 @@ impl Velo {
     /// Create a builder for configuring Velo.
     pub fn builder() -> VeloBuilder {
         VeloBuilder::new()
+    }
+
+    /// A [`WeakVelo`] for this instance. Use it where a strong clone would
+    /// make the instance keep itself alive, such as in its own handlers.
+    pub fn downgrade(&self) -> WeakVelo {
+        WeakVelo {
+            inner: Arc::downgrade(&self.inner),
+        }
     }
 
     /// Get the underlying messenger.
@@ -1736,6 +1762,39 @@ mod tests {
         assert!(clone.list_local_handlers().iter().any(|n| n == "shared"));
 
         velo.shutdown(ShutdownPolicy::WaitForever).await;
+    }
+
+    /// A handler lives in its own instance's registry. If it held a `Velo`
+    /// clone, the instance would hold itself, its final drop would never run,
+    /// and streaming would never be cancelled. A `WeakVelo` is how a handler
+    /// reaches its own instance without that cycle: it upgrades while a clone
+    /// is alive, and stops upgrading once the last clone drops.
+    #[tokio::test]
+    async fn weak_velo_in_a_handler_does_not_keep_the_instance_alive() {
+        let velo = tcp_stream_node(None).await;
+        let weak = velo.downgrade();
+        let captured = weak.clone();
+        velo.register_handler(
+            Handler::unary_handler("self_ref", move |ctx| {
+                let _velo = captured
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("instance is gone"))?;
+                Ok(Some(ctx.payload))
+            })
+            .build(),
+        )
+        .unwrap();
+
+        let upgraded = weak.upgrade().expect("a live clone must upgrade");
+        assert!(Arc::ptr_eq(&upgraded.inner, &velo.inner));
+        drop(upgraded);
+
+        velo.shutdown(ShutdownPolicy::WaitForever).await;
+        drop(velo);
+        assert!(
+            weak.upgrade().is_none(),
+            "a handler holding a WeakVelo kept the instance alive"
+        );
     }
 
     /// Shutdown through one clone is shutdown of the instance, and it runs
