@@ -364,6 +364,8 @@ impl Transport for LoopbackTransport {
             MessageType::ShuttingDown => {
                 let _ = adapter.shutdown_stream.send((header, payload));
             }
+            // This test transport is a loopback shim; it never announces.
+            MessageType::Identify => {}
         }
         SendOutcome::Admitted
     }
