@@ -574,6 +574,13 @@ pub enum MessageType {
     /// Sent back to a peer when we are draining and cannot accept new messages.
     /// The original request header is echoed back for correlation.
     ShuttingDown = 4,
+    /// The first frame on a dialed connection, announcing the dialing node's
+    /// `InstanceId`. Consumed by the transport's reader; never routed to the
+    /// adapter. A peer built before identification sends none, so its
+    /// connections attribute as [`SenderIdentity::Unattributed`]. A peer built
+    /// before this variant cannot decode it and drops the connection —
+    /// identify-capable nodes are not wire-compatible with older acceptors.
+    Identify = 5,
 }
 
 impl MessageType {
@@ -585,6 +592,7 @@ impl MessageType {
             2 => Some(MessageType::Ack),
             3 => Some(MessageType::Event),
             4 => Some(MessageType::ShuttingDown),
+            5 => Some(MessageType::Identify),
             _ => None,
         }
     }
@@ -592,6 +600,56 @@ impl MessageType {
     /// Convert MessageType to u8
     pub fn as_u8(self) -> u8 {
         self as u8
+    }
+}
+
+/// Who the transport says a message's sender is, and how it knows.
+///
+/// This is sourced from the *connection* the frame arrived on, never from the
+/// frame: a message cannot out-claim its connection. It is a different input
+/// than the envelope's sender worker id (bit-packed into the response id the
+/// sender minted), which is a per-message, self-reported claim.
+///
+/// No variant is cryptographic attestation. `AnnouncedPeer` is what the peer
+/// asserted when it opened the connection — one identity for the life of the
+/// connection, so a frame cannot claim a different sender than its connection
+/// announced, and a registration the peer presents over it can be checked
+/// against the announcement. `DialedPeer` is the strongest binding velo
+/// offers: the connection is one this node opened to the peer's registered
+/// address, and on QUIC the peer's certificate fingerprint was pinned by its
+/// registered `WorkerAddress` entry.
+///
+/// The enum is `#[non_exhaustive]`: transports that learn more about a
+/// connection (a kernel credential, a mutual TLS peer) get their own variant
+/// rather than overloading these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SenderIdentity {
+    /// The transport cannot say: store-and-forward backends, out-of-tree
+    /// transports that predate this API, or an accepted connection whose peer
+    /// announced nothing (it predates connection identification). A guard
+    /// that needs an identity must fail closed on this variant.
+    Unattributed,
+    /// The connection is one this node dialed to the peer's registered
+    /// address.
+    DialedPeer(InstanceId),
+    /// The connection is one the peer dialed to us, and it announced this
+    /// identity at open.
+    AnnouncedPeer(InstanceId),
+}
+
+impl SenderIdentity {
+    /// The identity itself, regardless of which side of the connection
+    /// learned it. `None` for [`Unattributed`](Self::Unattributed).
+    ///
+    /// Both ends of one connection see the same peer, one as `DialedPeer` and
+    /// the other as `AnnouncedPeer`; canonicalization (hashing, admission
+    /// keys) must use this, not the variant.
+    pub fn instance_id(&self) -> Option<InstanceId> {
+        match self {
+            Self::Unattributed => None,
+            Self::DialedPeer(id) | Self::AnnouncedPeer(id) => Some(*id),
+        }
     }
 }
 
@@ -625,6 +683,11 @@ pub struct InboundMessage {
     /// Keeps the instance's in-flight count non-zero for as long as this
     /// message exists, queued or in a handler.
     pub guard: InFlightGuard,
+    /// Who the transport says the sender is. Private so construction stays
+    /// with [`TransportAdapter`]: the identity is only as trustworthy as its
+    /// source, so it must come from the admitting transport, not from
+    /// wherever the message later surfaces.
+    sender: SenderIdentity,
 }
 
 impl InboundMessage {
@@ -634,13 +697,26 @@ impl InboundMessage {
     /// item to feed a receiver, or a harness that stands in for the runtime.
     /// It is not a way onto the inbound queue: the channel's sender is
     /// private, so producers still go through
-    /// [`TransportAdapter::admit_message`].
+    /// [`TransportAdapter::admit_message`]. Fabricated messages are
+    /// [`SenderIdentity::Unattributed`].
     pub fn new(header: Bytes, payload: Bytes, guard: InFlightGuard) -> Self {
         Self {
             header,
             payload,
             guard,
+            sender: SenderIdentity::Unattributed,
         }
+    }
+
+    /// The connection-sourced sender identity. See [`SenderIdentity`].
+    pub fn sender(&self) -> SenderIdentity {
+        self.sender
+    }
+
+    /// Set the sender identity; used by [`TransportAdapter::admit_message_from`].
+    pub(crate) fn with_sender(mut self, sender: SenderIdentity) -> Self {
+        self.sender = sender;
+        self
     }
 }
 
@@ -746,6 +822,18 @@ impl TransportAdapter {
     /// never blocks, and callers on non-async threads (a ZMQ listener thread,
     /// a UCX active-message callback) can use it unchanged.
     pub fn admit_message(&self, header: Bytes, payload: Bytes) -> AdmitOutcome {
+        self.admit_message_from(header, payload, SenderIdentity::Unattributed)
+    }
+
+    /// [`admit_message`](Self::admit_message) with the sender identity the
+    /// connection the frame arrived on is known by. The drain-gate semantics
+    /// are identical; only the attribution differs.
+    pub fn admit_message_from(
+        &self,
+        header: Bytes,
+        payload: Bytes,
+        sender: SenderIdentity,
+    ) -> AdmitOutcome {
         let guard = self.shutdown_state.acquire();
 
         if self.shutdown_state.is_draining_for_admission()
@@ -757,7 +845,7 @@ impl TransportAdapter {
 
         match self
             .message_stream
-            .send(InboundMessage::new(header, payload, guard))
+            .send(InboundMessage::new(header, payload, guard).with_sender(sender))
         {
             Ok(()) => AdmitOutcome::Admitted,
             Err(flume::SendError(InboundMessage {
@@ -988,11 +1076,11 @@ mod tests {
 
     #[test]
     fn test_message_type_roundtrip() {
-        for v in 0..=4 {
+        for v in 0..=5 {
             let mt = MessageType::from_u8(v).unwrap();
             assert_eq!(mt.as_u8(), v);
         }
-        assert_eq!(MessageType::from_u8(5), None);
+        assert_eq!(MessageType::from_u8(6), None);
     }
 
     #[test]
@@ -1114,6 +1202,35 @@ mod tests {
 
     /// Admission during drain rejects and hands the frame back, and the guard
     /// it acquired to close the check-then-act race is released again.
+    /// `admit_message_from` stamps the connection's identity onto the queued
+    /// message; the plain `admit_message` leaves it `Unattributed`, which is
+    /// what out-of-tree transports that predate the API produce.
+    #[tokio::test]
+    async fn admit_message_from_carries_the_sender_identity() {
+        let (adapter, streams) = make_channels();
+        let peer = InstanceId::new_v4();
+
+        assert!(matches!(
+            adapter.admit_message_from(
+                Bytes::from_static(b"h"),
+                Bytes::from_static(b"p"),
+                SenderIdentity::AnnouncedPeer(peer),
+            ),
+            AdmitOutcome::Admitted
+        ));
+        assert!(matches!(
+            adapter.admit_message(Bytes::from_static(b"h2"), Bytes::from_static(b"p2")),
+            AdmitOutcome::Admitted
+        ));
+
+        let first = streams.message_stream.recv_async().await.expect("queued");
+        let second = streams.message_stream.recv_async().await.expect("queued");
+        assert_eq!(first.sender(), SenderIdentity::AnnouncedPeer(peer));
+        assert_eq!(first.sender().instance_id(), Some(peer));
+        assert_eq!(second.sender(), SenderIdentity::Unattributed);
+        assert_eq!(second.sender().instance_id(), None);
+    }
+
     #[tokio::test]
     async fn admit_message_rejects_during_drain() {
         let (adapter, streams) = make_channels();

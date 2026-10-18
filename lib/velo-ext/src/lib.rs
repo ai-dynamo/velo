@@ -35,6 +35,6 @@ pub use observability::{Direction, TransportObservability, TransportRejection};
 pub use streaming::FrameTransport;
 pub use transport::{
     AdmitOutcome, DataStreams, DrainExemption, HealthCheckError, InFlightGuard, InboundMessage,
-    MessageType, ShutdownPolicy, ShutdownState, Transport, TransportAdapter, TransportError,
-    TransportErrorHandler, make_channels,
+    MessageType, SenderIdentity, ShutdownPolicy, ShutdownState, Transport, TransportAdapter,
+    TransportError, TransportErrorHandler, make_channels,
 };
