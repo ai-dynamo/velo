@@ -478,3 +478,130 @@ async fn a_draining_owner_serves_get_but_refuses_a_new_consumer() {
     assert_eq!(data.len(), 1024 * 1024);
     pair.consumer.release(handle, lease).await.unwrap();
 }
+// ---------------------------------------------------------------------------
+// Opt-out: a node can withhold the built-in `_rv_*` pull routes entirely
+// ---------------------------------------------------------------------------
+
+/// Build one node, with the built-in pull routes installed or withheld.
+async fn node(install_rendezvous_handlers: bool) -> Arc<Velo> {
+    Velo::builder()
+        .add_transport(new_tcp_transport())
+        .install_rendezvous_handlers(install_rendezvous_handlers)
+        .build()
+        .await
+        .unwrap()
+}
+
+/// The default path is covered by every test above. This one proves the
+/// opt-out: with the routes withheld, a remote pull fails as an unknown
+/// handler, while local register/get keep working.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rendezvous_opt_out_rejects_bare_pulls_but_serves_locally() {
+    let owner = node(false).await;
+    let consumer = node(true).await;
+    consumer.register_peer(owner.peer_info()).unwrap();
+    owner.register_peer(consumer.peer_info()).unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let payload = Bytes::from_static(b"staged");
+    let handle = owner.register_data(payload.clone());
+
+    // Local get on the owner: no handlers needed.
+    let (local, lease) = owner.get(handle).await.unwrap();
+    assert_eq!(local, payload);
+    owner.release(handle, lease).await.unwrap();
+
+    // A remote pull has no `_rv_acquire` to answer it.
+    let err = consumer
+        .get(handle)
+        .await
+        .expect_err("no pull routes installed");
+    assert!(
+        err.to_string().contains("_rv_acquire"),
+        "unexpected error: {err}"
+    );
+
+    owner
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(1)))
+        .await;
+    consumer
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(1)))
+        .await;
+}
+
+/// A host that withholds the built-in routes can still serve staged bytes
+/// through its own guarded route: the handler checks the caller's
+/// connection-announced identity and reads the local store. The policy in
+/// this handler belongs to the host; velo only withholds the unguarded
+/// routes.
+#[tokio::test(flavor = "multi_thread")]
+async fn test_rendezvous_opt_out_with_a_guarded_route() {
+    let owner = node(false).await;
+    let admitted = node(true).await;
+    let intruder = node(true).await;
+    for peer in [&admitted, &intruder] {
+        peer.register_peer(owner.peer_info()).unwrap();
+        owner.register_peer(peer.peer_info()).unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let payload = Bytes::from_static(b"admitted bytes");
+    let handle = owner.register_data(payload.clone());
+    let local_id = handle.unpack().1;
+
+    let allowed = admitted.instance_id();
+    let store = Arc::clone(owner.rendezvous_manager().data_store());
+    owner
+        .messenger()
+        .register_streaming_handler(
+            Handler::unary_handler("_guarded_pull", move |ctx| {
+                if ctx.sender_identity().instance_id() != Some(allowed) {
+                    return Err(anyhow::anyhow!("not admitted"));
+                }
+                let bytes = store
+                    .get_data(local_id)
+                    .ok_or_else(|| anyhow::anyhow!("staged data is gone"))?;
+                Ok(Some(bytes))
+            })
+            .build(),
+        )
+        .unwrap();
+
+    // The admitted caller reads the staged bytes through the guarded route.
+    let got = tokio::time::timeout(
+        Duration::from_secs(5),
+        admitted
+            .messenger()
+            .unary_streaming("_guarded_pull")
+            .raw_payload(Bytes::new())
+            .instance(owner.instance_id())
+            .send(),
+    )
+    .await
+    .expect("the call resolves")
+    .expect("the guard admits it");
+    assert_eq!(got, payload);
+
+    // A different caller is rejected by the guard.
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        intruder
+            .messenger()
+            .unary_streaming("_guarded_pull")
+            .raw_payload(Bytes::new())
+            .instance(owner.instance_id())
+            .send(),
+    )
+    .await
+    .expect("the call resolves")
+    .expect_err("the guard must reject a non-admitted caller");
+    assert!(
+        err.to_string().contains("not admitted"),
+        "unexpected: {err}"
+    );
+
+    for node in [owner, admitted, intruder] {
+        node.shutdown(ShutdownPolicy::Timeout(Duration::from_secs(1)))
+            .await;
+    }
+}

@@ -268,6 +268,8 @@ pub struct VeloBuilder {
     mux_config: Option<crate::streaming::MuxConfig>,
     mux_only: bool,
     metrics: Option<Arc<VeloMetrics>>,
+    /// Whether the built-in `_rv_*` rendezvous handlers are registered.
+    install_rendezvous_handlers: bool,
     /// The concrete UCX transport, kept beside the type-erased one so the
     /// registration layer can reach its RMA endpoint. `Arc<dyn Transport>`
     /// cannot be downcast, and adding an RDMA accessor to the `velo-ext` trait
@@ -288,6 +290,7 @@ impl VeloBuilder {
             mux_config: None,
             mux_only: false,
             metrics: None,
+            install_rendezvous_handlers: true,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             ucx_transport: None,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -384,6 +387,22 @@ impl VeloBuilder {
         }
         self.mux_config = Some(config);
         Ok(self)
+    }
+
+    /// Whether to register the built-in `_rv_*` rendezvous handlers at build.
+    ///
+    /// The default (`true`) is the upstream behavior: any peer holding a
+    /// staged [`DataHandle`](crate::DataHandle) can pull it — the handle is a
+    /// bearer capability, and the built-in handlers perform no admission
+    /// check. With `false`, no `_rv_*` route is registered at all: local
+    /// `register_data`/`get` still work, and a remote pull fails as an
+    /// unknown handler. A deployment that needs admitted pull routes then
+    /// registers its own handlers over
+    /// [`RendezvousManager::data_store`](crate::rendezvous::RendezvousManager::data_store),
+    /// where its admission policy lives.
+    pub fn install_rendezvous_handlers(mut self, install: bool) -> Self {
+        self.install_rendezvous_handlers = install;
+        self
     }
 
     /// Use only the messenger mux for remote streams, with no extra listener.
@@ -515,7 +534,9 @@ impl VeloBuilder {
             Some(m) => crate::rendezvous::RendezvousManager::with_metrics(worker_id, Arc::clone(m)),
             None => crate::rendezvous::RendezvousManager::new(worker_id),
         });
-        rendezvous_manager.register_handlers(Arc::clone(&messenger))?;
+        if self.install_rendezvous_handlers {
+            rendezvous_manager.register_handlers(Arc::clone(&messenger))?;
+        }
 
         // Enable transparent large payload support
         let stager = Arc::new(crate::rendezvous::RendezvousStager::new(Arc::clone(
