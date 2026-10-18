@@ -963,6 +963,46 @@ mod tests {
         );
     }
 
+    /// The connection-sourced identity travels with the message into the
+    /// handler, and `sender_peer_info` answers with the exact record the peer
+    /// registered — here, retained from an explicit registration.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_dispatch_carries_the_connection_sourced_sender_identity() {
+        let transport = GatedTransport::new();
+        let messenger = Messenger::builder()
+            .add_transport(transport.clone())
+            .build()
+            .await
+            .unwrap();
+        let peer = velo_ext::InstanceId::new_v4();
+        let peer_info = velo_ext::PeerInfo::new(peer, transport.address());
+        messenger.register_peer(peer_info.clone()).unwrap();
+
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let recorded = Arc::clone(&seen);
+        let handler = crate::messenger::Handler::am_handler("who", move |ctx| {
+            *recorded.lock().unwrap() = Some((ctx.sender_identity(), ctx.sender_peer_info()));
+            Ok(())
+        })
+        .inline()
+        .build();
+        let dispatcher = handler.dispatcher;
+        dispatcher.dispatch(
+            InboundCall {
+                message_id: ResponseId::from_u128(u128::from(peer.worker_id().as_u64())),
+                payload: Bytes::new(),
+                response_type: ResponseType::FireAndForget,
+                headers: None,
+                in_flight: None,
+                sender: velo_ext::SenderIdentity::AnnouncedPeer(peer),
+            },
+            &messenger,
+        );
+        let (identity, retained) = seen.lock().unwrap().expect("the handler ran inline");
+        assert_eq!(identity, velo_ext::SenderIdentity::AnnouncedPeer(peer));
+        assert_eq!(retained, Some(peer_info));
+    }
+
     /// A transport whose send channel is full until `release` is called, so a
     /// reply send pends and an inline handler's continuation has to move to a
     /// tracked task.
