@@ -1,0 +1,65 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "velo-hub"
+version.workspace = true
+edition.workspace = true
+description = "A hub for velo applications: peer discovery, registration, and pluggable extensions"
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+# Not published until a real port (kvbm's indexer and p2p as extensions)
+# passes kvbm's lifecycle suite against this API, and the store trait has an
+# etcd sketch that compiles against it. A published API frozen before that
+# proof is the risk this gate exists for.
+publish = false
+
+[features]
+default = []
+# The hub server: store, registration, extensions, HTTP routes (axum).
+server = [
+    "dep:anyhow",
+    "dep:axum",
+    "dep:futures",
+    "dep:parking_lot",
+    "dep:sha2",
+    "dep:thiserror",
+    "dep:tokio",
+    "dep:tokio-util",
+    "dep:tracing",
+]
+# The hub client (reqwest). The client itself lands in a later milestone;
+# the feature exists now so `protocol` is proven to build without `server`.
+client = []
+# The store conformance suite and a fault-injecting store, for backends and
+# tests outside this crate.
+test-support = ["server"]
+
+[dependencies]
+velo = { workspace = true }
+
+# protocol: serde types only, built under every feature.
+http = { version = "1" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }
+
+# server
+anyhow = { workspace = true, optional = true }
+axum = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
+parking_lot = { workspace = true, optional = true }
+sha2 = { version = "0.10", optional = true }
+thiserror = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tokio-util = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+rmp-serde = { workspace = true }
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
+tracing-subscriber = { workspace = true }

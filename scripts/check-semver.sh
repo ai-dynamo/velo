@@ -13,6 +13,52 @@ set -euo pipefail
 BASE_REF="${BASE_REF:-origin/main}"
 SEMVER_INDEX_URL="${SEMVER_INDEX_URL:-https://index.crates.io}"
 
+# ── Version sync: the velo requirement tracks the workspace version ─────────
+# velo-hub takes the workspace version and requires velo through
+# [workspace.dependencies] with a caret. Its public API names velo types, so
+# moving it to another velo minor is a breaking change cargo-semver-checks
+# cannot see. Lockstep closes that only if the requirement's major.minor is
+# the workspace version's. This runs before the semver:skip escape hatch and
+# before the "nothing changed" exits: the label skips the API check, not this
+# invariant, and a change outside lib/ can still break it.
+section_line() {
+    # The first line in [$1] that starts with $2.
+    awk -v section="[$1]" -v key="$2" '
+        /^\[/ { in_section = ($0 == section) }
+        in_section && index($0, key) == 1 { print; exit }
+    ' Cargo.toml
+}
+check_velo_requirement() {
+    local ws_line dep_line ws_version requirement
+    ws_line=$(section_line workspace.package 'version')
+    ws_version=$(printf '%s\n' "$ws_line" | sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p')
+    # `velo ` or `velo=`, never `velo-ext`.
+    dep_line=$(section_line workspace.dependencies 'velo ')
+    [[ -n "$dep_line" ]] || dep_line=$(section_line workspace.dependencies 'velo=')
+    if [[ -z "$dep_line" ]]; then
+        return 0
+    fi
+    requirement=$(printf '%s\n' "$dep_line" | sed -n 's/.*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p')
+    if [[ -z "$requirement" || -z "$ws_version" ]]; then
+        echo "::error::could not read the velo requirement ('${requirement}') or the workspace version ('${ws_version}') from Cargo.toml"
+        exit 1
+    fi
+    requirement="${requirement#^}"
+    if [[ ! "$requirement" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+        echo "::error::the velo requirement in [workspace.dependencies] must be a caret requirement such as \"${ws_version}\", found \"${requirement}\""
+        exit 1
+    fi
+    local req_mm ws_mm
+    req_mm=$(printf '%s\n' "$requirement" | cut -d. -f1-2)
+    ws_mm=$(printf '%s\n' "${ws_version%%[-+]*}" | cut -d. -f1-2)
+    if [[ "$req_mm" != "$ws_mm" ]]; then
+        echo "::error::the velo requirement ${requirement} in [workspace.dependencies] does not match the workspace version ${ws_version} (major.minor ${req_mm} vs ${ws_mm}); bump it with the workspace version"
+        exit 1
+    fi
+    echo "velo requirement ${requirement} tracks workspace version ${ws_version}."
+}
+check_velo_requirement
+
 # ── Escape hatch: semver:skip label ──────────────────────────────────────────
 if [[ "${SEMVER_SKIP:-false}" == "true" ]]; then
     echo "::notice::Semver check skipped via semver:skip label"

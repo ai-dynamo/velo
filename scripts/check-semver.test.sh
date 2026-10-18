@@ -164,6 +164,11 @@ resolver = "3"
 version = "${root_version}"
 edition = "2024"
 EOF
+    # VELO_REQ adds the workspace velo requirement velo-hub inherits.
+    if [[ -n "${VELO_REQ:-}" ]]; then
+        printf '\n[workspace.dependencies]\nvelo-ext = { path = "lib/velo-ext", version = "=%s" }\nvelo = { path = "lib/velo", version = "%s", default-features = false }\n' \
+            "$literal_version" "$VELO_REQ" >> Cargo.toml
+    fi
 
     mkdir -p lib/velo/src lib/velo-ext/src
     if [[ "${INLINE_WS:-0}" == "1" ]]; then
@@ -481,6 +486,48 @@ if [[ "$(cat "$TMP_ROOT/o.exit")" == "0" ]] \
     ok=0
 fi
 report "(o) a pre-release is not the baseline" "$ok" "$out"
+
+# ── (p) a velo requirement on another minor fails, even under semver:skip ───
+# velo-hub's API names velo types, so its velo requirement must move with the
+# workspace version. The label skips the API check, not this invariant.
+reset_index
+publish velo 0.10.0
+publish velo-ext 0.5.0
+VELO_REQ=0.10.0 SEMVER_SKIP=true run_case p 0.10.0 0.5.0 0.11.0 0.5.0
+out=$(cat "$TMP_ROOT/p.out")
+ok=1
+if [[ "$(cat "$TMP_ROOT/p.exit")" == "1" ]] \
+    && echo "$out" | grep -qF 'does not match the workspace version 0.11.0'; then
+    ok=0
+fi
+report "(p) a velo requirement on another minor fails, even with semver:skip" "$ok" "$out"
+
+# ── (q) a velo requirement on the workspace minor passes ────────────────────
+reset_index
+publish velo 0.10.0
+publish velo-ext 0.5.0
+VELO_REQ=0.11.0 CARGO_SEMVER_EXIT=0 run_case q 0.10.0 0.5.0 0.11.0 0.5.0
+out=$(cat "$TMP_ROOT/q.out")
+ok=1
+if [[ "$(cat "$TMP_ROOT/q.exit")" == "0" ]] \
+    && echo "$out" | grep -qF 'velo requirement 0.11.0 tracks workspace version 0.11.0'; then
+    ok=0
+fi
+report "(q) a velo requirement on the workspace minor passes" "$ok" "$out"
+
+# ── (r) an exact velo requirement fails ─────────────────────────────────────
+# `=` would hold every velo-hub user on one velo patch.
+reset_index
+publish velo 0.10.0
+publish velo-ext 0.5.0
+VELO_REQ==0.11.0 run_case r 0.10.0 0.5.0 0.11.0 0.5.0
+out=$(cat "$TMP_ROOT/r.out")
+ok=1
+if [[ "$(cat "$TMP_ROOT/r.exit")" == "1" ]] \
+    && echo "$out" | grep -qF 'must be a caret requirement'; then
+    ok=0
+fi
+report "(r) an exact velo requirement fails" "$ok" "$out"
 
 echo ""
 
