@@ -8,9 +8,14 @@
 
 #![deny(missing_docs)]
 
+#[cfg(feature = "server")]
+mod hub;
 pub mod protocol;
 #[cfg(feature = "server")]
 pub mod store;
+
+#[cfg(feature = "server")]
+pub use hub::*;
 
 #[cfg(feature = "server")]
 pub use axum;
