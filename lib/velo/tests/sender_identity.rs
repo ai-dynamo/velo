@@ -73,7 +73,7 @@ async fn a_message_carries_its_connections_identity() {
     .expect("the send succeeds");
     assert_eq!(echoed, Bytes::from_static(b"ok"));
 
-    let (identity, peer_info) = seen.lock().unwrap().expect("the handler ran");
+    let (identity, peer_info) = seen.lock().unwrap().clone().expect("the handler ran");
     assert_eq!(
         identity.instance_id(),
         Some(client.instance_id()),
