@@ -497,8 +497,18 @@ fn configure_socket(stream: &TcpStream) {
     ) {
         tracing::warn!("Failed to set TCP keepalive: {}", e);
     }
-    if let Err(e) = sock.set_tcp_user_timeout(Some(Duration::from_secs(30))) {
-        tracing::warn!("Failed to set TCP_USER_TIMEOUT: {}", e);
+    // `set_tcp_user_timeout` exists only where the kernel has
+    // TCP_USER_TIMEOUT; socket2 gates the method to these targets.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "fuchsia",
+        target_os = "linux",
+        target_os = "cygwin",
+    ))]
+    {
+        if let Err(e) = sock.set_tcp_user_timeout(Some(Duration::from_secs(30))) {
+            tracing::warn!("Failed to set TCP_USER_TIMEOUT: {}", e);
+        }
     }
 }
 

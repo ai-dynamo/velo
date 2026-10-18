@@ -139,8 +139,9 @@ fn discover_interfaces() -> Result<Vec<NetworkInterface>> {
 
 /// Read the NUMA node for a network interface from sysfs.
 ///
-/// Returns `None` if the file doesn't exist (e.g. virtual interfaces, non-Linux)
-/// or contains -1.
+/// Returns `None` if the file doesn't exist (for example, for a virtual
+/// interface) or contains -1.
+#[cfg(target_os = "linux")]
 fn read_nic_numa_node(iface_name: &str) -> Option<i32> {
     let path = format!("/sys/class/net/{}/device/numa_node", iface_name);
     let content = std::fs::read_to_string(path).ok()?;
