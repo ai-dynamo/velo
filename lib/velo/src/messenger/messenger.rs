@@ -528,7 +528,11 @@ impl Messenger {
     /// [`Messenger`] sends through. It says nothing about an alternative
     /// transport reached by some other route, which may have a different
     /// limit.
-    pub(crate) fn effective_eager_payload(
+    ///
+    /// Public so an encoder with a hard wire ceiling (a credit lane's
+    /// eager-only frames, say) can split its variants against the number the
+    /// send path will actually honour — headers included.
+    pub fn effective_eager_payload(
         &self,
         target: InstanceId,
         handler_name: &str,
