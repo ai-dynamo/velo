@@ -17,6 +17,8 @@ Streams of bytes that the application already serialized can skip msgpack on bot
 
 Velo 0.19 gives Velo and Messenger explicit drop lifetimes, removes value-level Messenger cloning, and removes duplicate dispatch and cancellation APIs. See [Migrate ownership, dispatch, and cancellation](docs/src/guides/migrate-dispatch-and-cancellation.md).
 
+Velo 0.21 makes `Velo` a handle. `VeloBuilder::build()` returns `Velo`, not `Arc<Velo>`. To share it, clone it. See [Migrate to the Velo handle](docs/src/guides/migrate-velo-handle.md).
+
 Use `Velo::shutdown(policy)` to close resources and join owned tasks while Tokio keeps running. The instance and its handles stay valid after shutdown, and shutdown does not release them from memory. Accepted requests remain counted until their replies are submitted, including error replies. See [Shutdown and drain](docs/src/concepts/shutdown.md).
 
 Call `Velo::unregister_peer` when a peer leaves. A restarted peer has a new instance id, so without the call a long-lived node keeps state and connections for every peer it ever served. See [Forget a peer](docs/src/concepts/discovery.md#forget-a-peer).

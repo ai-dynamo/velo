@@ -14,6 +14,7 @@ SPDX-License-Identifier: Apache-2.0
 - Replace `Arc<Velo>` with `Velo` in your types and signatures.
 - Keep `.clone()` as it is. It now clones the handle.
 - Change `Arc::clone(&velo)` to `velo.clone()`.
+- Change `Arc::downgrade(&velo)` to `velo.downgrade()`. It returns a `WeakVelo`, and `WeakVelo::upgrade()` returns `Option<Velo>`. A handler that reaches its own instance must hold a `WeakVelo`. A `Velo` clone in the handler keeps the instance alive, so its final drop never runs.
 - Remove `Arc::new(velo)` if you wrapped a built `Velo`. Pass `velo` or `velo.clone()` instead.
 
 ```rust,ignore
@@ -32,5 +33,6 @@ let worker = velo.clone();
 
 - Clones share one instance and one set of handlers, streams, and rendezvous state.
 - The final drop of the last clone cancels the streaming services. Dropping any other clone does not.
-- `shutdown` and `graceful_shutdown` run once, even when you call them through different clones. A later call waits for the first and then returns.
+- `graceful_shutdown` runs its teardown once, even when you call it through different clones. A later call waits for the first and then returns.
+- `shutdown` calls `graceful_shutdown`, then closes the streaming services. It does the streaming step again on each call.
 - Wire formats and `velo-ext` traits do not change.
