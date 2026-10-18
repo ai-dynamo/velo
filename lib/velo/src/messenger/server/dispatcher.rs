@@ -736,6 +736,7 @@ impl DispatcherHub {
 mod tests {
     use super::*;
     use crate::messenger::Handler;
+    use crate::transports::Transport;
     use crate::transports::tcp::TcpTransportBuilder;
     use std::time::Duration;
 
