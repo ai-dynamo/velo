@@ -666,7 +666,7 @@ async fn serve(transport_type: TransportType, done_tx: flume::Sender<()>) -> Res
     }
     {
         // A weak reference: the handler is owned by `velo`'s own registry.
-        let weak = Arc::downgrade(&velo);
+        let weak = velo.downgrade();
         let stream_to_handler = Handler::unary_handler("stream_to", move |ctx| {
             let request: StreamRequest = rmp_serde::from_slice(&ctx.payload)
                 .map_err(|e| anyhow::anyhow!("deserialize: {e}"))?;
