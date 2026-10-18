@@ -384,6 +384,20 @@ pub trait Transport: Send + Sync {
         std::num::NonZeroU16::MIN
     }
 
+    /// Whether every connection this transport terminates is attributed to a
+    /// [`SenderIdentity`] — its own dialed connections and the ones it
+    /// accepts after a connection-open announcement.
+    ///
+    /// The default is `false` (store-and-forward backends and out-of-tree
+    /// transports that predate the API): a reply arriving
+    /// [`SenderIdentity::Unattributed`] from such a peer is normal, so the
+    /// response layer must not treat unattributed as suspicious. A transport
+    /// that answers `true` promises every frame it delivers is attributed, so
+    /// an unattributed reply to one of its peers is a forgery and is dropped.
+    fn identifies_connections(&self) -> bool {
+        false
+    }
+
     /// Send on `lane`, as [`send_message`](Transport::send_message) does on
     /// lane 0.
     ///
@@ -771,9 +785,14 @@ pub struct TransportAdapter {
     /// enqueue is [`admit_message`](Self::admit_message).
     message_stream: flume::Sender<InboundMessage>,
     /// Channel for inbound [`MessageType::Response`] frames.
-    pub response_stream: flume::Sender<(Bytes, Bytes)>,
+    ///
+    /// Every item carries the [`SenderIdentity`] of the connection the frame
+    /// arrived on, so the response layer can check a completion against the
+    /// request's target instead of trusting the frame alone.
+    pub response_stream: flume::Sender<(Bytes, Bytes, SenderIdentity)>,
     /// Channel for inbound [`MessageType::Ack`] and [`MessageType::Event`] frames.
-    pub event_stream: flume::Sender<(Bytes, Bytes)>,
+    /// Same identity contract as [`response_stream`](Self::response_stream).
+    pub event_stream: flume::Sender<(Bytes, Bytes, SenderIdentity)>,
     /// Channel for inbound [`MessageType::ShuttingDown`] frames — drain
     /// rejections from a peer.
     ///
@@ -781,7 +800,8 @@ pub struct TransportAdapter {
     /// the sender can correlate it, and an empty payload. The header is in
     /// the request format, not the response format — which is why these
     /// frames have their own stream instead of sharing `response_stream`.
-    pub shutdown_stream: flume::Sender<(Bytes, Bytes)>,
+    /// Same identity contract as [`response_stream`](Self::response_stream).
+    pub shutdown_stream: flume::Sender<(Bytes, Bytes, SenderIdentity)>,
     /// Shared shutdown coordinator for drain-aware routing.
     pub shutdown_state: ShutdownState,
 }
@@ -885,12 +905,12 @@ pub struct DataStreams {
     /// pin [`ShutdownState::wait_for_drain`] above zero for good.
     pub message_stream: flume::Receiver<InboundMessage>,
     /// Receiver for inbound response frames.
-    pub response_stream: flume::Receiver<(Bytes, Bytes)>,
+    pub response_stream: flume::Receiver<(Bytes, Bytes, SenderIdentity)>,
     /// Receiver for inbound ack and event frames.
-    pub event_stream: flume::Receiver<(Bytes, Bytes)>,
+    pub event_stream: flume::Receiver<(Bytes, Bytes, SenderIdentity)>,
     /// Receiver for inbound shutting-down frames (drain rejections): the
     /// rejected request's header, echoed verbatim, with an empty payload.
-    pub shutdown_stream: flume::Receiver<(Bytes, Bytes)>,
+    pub shutdown_stream: flume::Receiver<(Bytes, Bytes, SenderIdentity)>,
     /// Shared shutdown coordinator.
     pub shutdown_state: ShutdownState,
 }

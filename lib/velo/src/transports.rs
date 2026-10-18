@@ -423,6 +423,14 @@ impl VeloBackend {
         self.send_message_on_lane(target, 0, header, payload, message_type, on_error)
     }
 
+    /// Whether the peer's primary transport attributes every connection it
+    /// terminates. See [`Transport::identifies_connections`].
+    pub(crate) fn identifies_connections(&self, target: InstanceId) -> bool {
+        self.primary_transport
+            .get(&target)
+            .is_some_and(|transport| transport.identifies_connections())
+    }
+
     /// How many lanes the primary transport to `target` keeps. See
     /// [`Transport::lanes`].
     ///

@@ -471,6 +471,12 @@ impl Transport for TcpTransport {
         self.lanes
     }
 
+    fn identifies_connections(&self) -> bool {
+        // This transport announces at dial and records announcements at
+        // accept, so every frame it delivers is attributed.
+        true
+    }
+
     #[inline]
     fn send_message(
         &self,

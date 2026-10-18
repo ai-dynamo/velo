@@ -731,15 +731,15 @@ fn route_frame(
         },
         MessageType::Response => adapter
             .response_stream
-            .try_send((header, body))
+            .try_send((header, body, velo_ext::SenderIdentity::Unattributed))
             .map_err(|_| ()),
         MessageType::Ack | MessageType::Event => adapter
             .event_stream
-            .try_send((header, body))
+            .try_send((header, body, velo_ext::SenderIdentity::Unattributed))
             .map_err(|_| ()),
         MessageType::ShuttingDown => adapter
             .shutdown_stream
-            .try_send((header, body))
+            .try_send((header, body, velo_ext::SenderIdentity::Unattributed))
             .map_err(|_| ()),
         // Identify is a TCP/UDS connection-open record; it never appears on a
         // NATS subject.

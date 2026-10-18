@@ -503,18 +503,26 @@ async fn resolve_and_dispatch(job: ResolveJob) {
 /// Creates a task that handles responses from the response channel.
 async fn create_response_handler(
     response_manager: ResponseManager,
-    response_rx: flume::Receiver<(Bytes, Bytes)>,
+    response_rx: flume::Receiver<(Bytes, Bytes, velo_ext::SenderIdentity)>,
 ) -> anyhow::Result<()> {
-    while let Ok((header, payload)) = response_rx.recv_async().await {
+    while let Ok((header, payload, sender)) = response_rx.recv_async().await {
         match decode_response_header(header) {
             Ok((response_id, outcome, _headers)) => match outcome {
                 Outcome::Ok => {
-                    response_manager.complete_outcome(response_id, Ok(Some(payload)));
+                    response_manager.complete_outcome_attributed(
+                        response_id,
+                        Ok(Some(payload)),
+                        sender,
+                    );
                 }
                 Outcome::Error => {
                     let error_message =
                         String::from_utf8(payload.to_vec()).unwrap_or("unknown error".to_string());
-                    response_manager.complete_outcome(response_id, Err(error_message));
+                    response_manager.complete_outcome_attributed(
+                        response_id,
+                        Err(error_message),
+                        sender,
+                    );
                 }
             },
             Err(e) => {
@@ -535,9 +543,9 @@ async fn create_response_handler(
 /// `complete_outcome` tolerates.
 async fn create_shutdown_handler(
     response_manager: ResponseManager,
-    shutdown_rx: flume::Receiver<(Bytes, Bytes)>,
+    shutdown_rx: flume::Receiver<(Bytes, Bytes, velo_ext::SenderIdentity)>,
 ) -> anyhow::Result<()> {
-    while let Ok((header, _payload)) = shutdown_rx.recv_async().await {
+    while let Ok((header, _payload, sender)) = shutdown_rx.recv_async().await {
         match decode_response_id_from_request_header(&header) {
             Some(response_id) => {
                 tracing::debug!(
@@ -545,9 +553,10 @@ async fn create_shutdown_handler(
                     response_id = %response_id,
                     "Completing awaiter for drain-rejected request"
                 );
-                response_manager.complete_outcome(
+                response_manager.complete_outcome_attributed(
                     response_id,
                     Err("request rejected: peer is shutting down".to_string()),
+                    sender,
                 );
             }
             None => {
@@ -565,18 +574,26 @@ async fn create_shutdown_handler(
 /// Creates a task that handles events and acks from the event channel.
 async fn create_ack_and_event_handler(
     response_manager: ResponseManager,
-    event_rx: flume::Receiver<(Bytes, Bytes)>,
+    event_rx: flume::Receiver<(Bytes, Bytes, velo_ext::SenderIdentity)>,
 ) -> anyhow::Result<()> {
-    while let Ok((header, payload)) = event_rx.recv_async().await {
+    while let Ok((header, payload, sender)) = event_rx.recv_async().await {
         let event_type = decode_event_header(header);
         match event_type {
             Some(EventType::Ack(response_id, Outcome::Ok)) => {
-                response_manager.complete_outcome(response_id, Ok(Some(payload)));
+                response_manager.complete_outcome_attributed(
+                    response_id,
+                    Ok(Some(payload)),
+                    sender,
+                );
             }
             Some(EventType::Ack(response_id, Outcome::Error)) => {
                 let error_message =
                     String::from_utf8(payload.to_vec()).unwrap_or("unknown error".to_string());
-                response_manager.complete_outcome(response_id, Err(error_message));
+                response_manager.complete_outcome_attributed(
+                    response_id,
+                    Err(error_message),
+                    sender,
+                );
             }
             Some(EventType::Event(raw_handle, _)) => {
                 tracing::warn!(

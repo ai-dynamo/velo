@@ -452,6 +452,12 @@ impl Transport for UdsTransport {
         self.slow_path_send(instance_id, send_msg)
     }
 
+    fn identifies_connections(&self) -> bool {
+        // This transport announces at dial and records announcements at
+        // accept, so every frame it delivers is attributed.
+        true
+    }
+
     fn start(
         &self,
         instance_id: crate::InstanceId,

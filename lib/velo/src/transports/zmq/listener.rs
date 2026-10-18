@@ -265,7 +265,9 @@ pub(crate) fn run_listener(cfg: ListenerConfig) {
                 );
             }
 
-            if let Err(e) = sender.try_send((header, payload)) {
+            if let Err(e) =
+                sender.try_send((header, payload, velo_ext::SenderIdentity::Unattributed))
+            {
                 if let Some(ref m) = cfg.metrics {
                     m.record_rejection(crate::observability::TransportRejection::RouteFailed);
                 }

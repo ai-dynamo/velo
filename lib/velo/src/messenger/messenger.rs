@@ -843,6 +843,9 @@ mod tests {
         /// This transport's own adapter, for tests that feed it frames
         /// directly. Not the shared registry: another test clears that.
         adapter: OnceLock<TransportAdapter>,
+        /// This node's own instance id, set in `start()`; loopback deliveries
+        /// attribute themselves with it, as a dialed connection would.
+        own_instance: OnceLock<InstanceId>,
     }
 
     impl InMemoryTransport {
@@ -854,6 +857,7 @@ mod tests {
                 endpoint,
                 peers: Mutex::new(HashMap::new()),
                 adapter: OnceLock::new(),
+                own_instance: OnceLock::new(),
             })
         }
     }
@@ -915,6 +919,16 @@ mod tests {
                 return SendOutcome::Admitted;
             };
 
+            // Loopback deliveries attribute themselves with the sending
+            // instance, the in-process equivalent of a dialed connection's
+            // announcement, so response completion can be checked against it.
+            let sender = self
+                .own_instance
+                .get()
+                .copied()
+                .map_or(velo_ext::SenderIdentity::Unattributed, |id| {
+                    velo_ext::SenderIdentity::AnnouncedPeer(id)
+                });
             let send_result = match message_type {
                 // Loopback still goes through the target's drain gate: it is
                 // the only path that acquires the in-flight guard, and a
@@ -923,7 +937,7 @@ mod tests {
                 // Identify is a connection-open record the transport reader
                 // consumes; nothing ever loops it back.
                 MessageType::Identify => Err(flume::SendError((header, payload))),
-                MessageType::Message => match adapter.admit_message(header, payload) {
+                MessageType::Message => match adapter.admit_message_from(header, payload, sender) {
                     velo_ext::AdmitOutcome::Admitted => Ok(()),
                     velo_ext::AdmitOutcome::Draining { header, payload } => {
                         on_error.on_error(
@@ -937,10 +951,12 @@ mod tests {
                         Err(flume::SendError((header, payload)))
                     }
                 },
-                MessageType::Response => adapter.response_stream.send((header, payload)),
-                MessageType::ShuttingDown => adapter.shutdown_stream.send((header, payload)),
+                MessageType::Response => adapter.response_stream.send((header, payload, sender)),
+                MessageType::ShuttingDown => {
+                    adapter.shutdown_stream.send((header, payload, sender))
+                }
                 MessageType::Ack | MessageType::Event => {
-                    adapter.event_stream.send((header, payload))
+                    adapter.event_stream.send((header, payload, sender))
                 }
             };
 
@@ -955,11 +971,12 @@ mod tests {
 
         fn start(
             &self,
-            _instance_id: InstanceId,
+            instance_id: InstanceId,
             channels: TransportAdapter,
             _rt: tokio::runtime::Handle,
         ) -> BoxFuture<'_, anyhow::Result<()>> {
             let endpoint = self.endpoint.clone();
+            let _ = self.own_instance.set(instance_id);
             let _ = self.adapter.set(channels.clone());
             Box::pin(async move {
                 test_transport_registry()
@@ -975,6 +992,10 @@ mod tests {
                 .lock()
                 .expect("transport registry poisoned")
                 .remove(&self.endpoint);
+        }
+
+        fn identifies_connections(&self) -> bool {
+            true
         }
 
         fn check_health(

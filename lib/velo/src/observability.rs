@@ -347,6 +347,11 @@ pub(crate) enum DispatchFailure {
     InlineHandlerPanic,
     /// A spawned handler panicked before it could complete its response.
     HandlerPanic,
+    /// A response/ack arrived on a connection attributed to an instance
+    /// other than the request's target — or to none, when the target's
+    /// transport attributes its connections. The completion was dropped;
+    /// the wait continues.
+    ResponseProvenanceMismatch,
 }
 
 impl DispatchFailure {
@@ -366,6 +371,7 @@ impl DispatchFailure {
             Self::OrderedHandlerPanic => ("dispatch", "ordered_handler_panic"),
             Self::InlineHandlerPanic => ("dispatch", "inline_handler_panic"),
             Self::HandlerPanic => ("dispatch", "handler_panic"),
+            Self::ResponseProvenanceMismatch => ("dispatch", "response_provenance_mismatch"),
         }
     }
 }

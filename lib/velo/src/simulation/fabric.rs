@@ -533,7 +533,7 @@ mod tests {
         sim.run().unwrap();
 
         assert!(target_streams.message_stream.try_recv().is_err());
-        let (header, payload) = source_streams.shutdown_stream.try_recv().unwrap();
+        let (header, payload, _sender) = source_streams.shutdown_stream.try_recv().unwrap();
         assert_eq!(&header[..], b"hdr");
         assert!(payload.is_empty());
     }

@@ -1188,7 +1188,11 @@ unsafe extern "C" fn recv_trampoline(
                     }
                     Some(MessageType::Response) => {
                         record(MessageType::Response);
-                        if adapter.response_stream.send((header, payload)).is_err() {
+                        if adapter
+                            .response_stream
+                            .send((header, payload, velo_ext::SenderIdentity::Unattributed))
+                            .is_err()
+                        {
                             record_rejection(
                                 &ra.shared.worker,
                                 velo_ext::TransportRejection::RouteFailed,
@@ -1197,7 +1201,11 @@ unsafe extern "C" fn recv_trampoline(
                     }
                     Some(MessageType::ShuttingDown) => {
                         record(MessageType::ShuttingDown);
-                        if adapter.shutdown_stream.send((header, payload)).is_err() {
+                        if adapter
+                            .shutdown_stream
+                            .send((header, payload, velo_ext::SenderIdentity::Unattributed))
+                            .is_err()
+                        {
                             record_rejection(
                                 &ra.shared.worker,
                                 velo_ext::TransportRejection::RouteFailed,
@@ -1206,7 +1214,11 @@ unsafe extern "C" fn recv_trampoline(
                     }
                     Some(event @ (MessageType::Ack | MessageType::Event)) => {
                         record(event);
-                        if adapter.event_stream.send((header, payload)).is_err() {
+                        if adapter
+                            .event_stream
+                            .send((header, payload, velo_ext::SenderIdentity::Unattributed))
+                            .is_err()
+                        {
                             record_rejection(
                                 &ra.shared.worker,
                                 velo_ext::TransportRejection::RouteFailed,

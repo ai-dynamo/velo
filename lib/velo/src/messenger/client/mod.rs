@@ -208,6 +208,16 @@ impl ActiveMessageClient {
         )
     }
 
+    /// Record which peer may complete this send's response slot, when the
+    /// target's transport attributes its connections. See
+    /// [`ResponseManager::complete_outcome_attributed`].
+    pub(crate) fn expect_response_from(&self, response_id: ResponseId, target: InstanceId) {
+        if self.backend.identifies_connections(target) {
+            self.response_manager
+                .expect_response_from(response_id, target);
+        }
+    }
+
     /// Largest payload this client will carry to `target` in one eager send
     /// under `handler_name` with `headers`.
     ///
@@ -383,6 +393,7 @@ impl ActiveMessageClient {
         // Register response and send message
         let mut outcome = self.register_outcome()?;
         let response_id = outcome.response_id();
+        self.expect_response_from(response_id, target);
 
         let message = crate::messenger::common::ActiveMessage {
             metadata: crate::messenger::common::messages::MessageMetadata::new_unary(

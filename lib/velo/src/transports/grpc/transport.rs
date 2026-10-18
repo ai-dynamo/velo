@@ -705,6 +705,7 @@ async fn connection_writer_inner(
                                 .send_async((
                                     Bytes::from(framed_data.header),
                                     Bytes::from(framed_data.payload),
+                                    velo_ext::SenderIdentity::Unattributed,
                                 ))
                                 .await
                                 .is_err()

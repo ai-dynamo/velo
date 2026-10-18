@@ -508,6 +508,56 @@ impl ResponseManager {
         }
     }
 
+    /// Record which instance may complete this send's response slot. The
+    /// caller (a send builder or the handshake) records it only when the
+    /// target's transport attributes connections; slots without an
+    /// expectation complete unchecked, as every send did before this check
+    /// existed.
+    pub(crate) fn expect_response_from(
+        &self,
+        response_id: ResponseId,
+        target: velo_ext::InstanceId,
+    ) {
+        self.inner
+            .expected_peer
+            .insert(response_id.slot_index(), target);
+    }
+
+    /// [`complete_outcome`](Self::complete_outcome) with a provenance check:
+    /// when the send recorded an expected responder, the completing frame
+    /// must arrive attributed to that same instance. A frame that is
+    /// unattributed — or attributed to another instance — is dropped without
+    /// completing the wait: the genuine reply can still arrive, and the
+    /// caller's own deadline ends the wait otherwise. This is not
+    /// authentication; the identity is the connection's self-asserted
+    /// announcement.
+    pub(crate) fn complete_outcome_attributed(
+        &self,
+        response_id: ResponseId,
+        outcome: Result<Option<Bytes>, String>,
+        sender: velo_ext::SenderIdentity,
+    ) -> bool {
+        if let Some(expected) = self.inner.expected_peer.get(&response_id.slot_index()) {
+            let expected = *expected;
+            if sender.instance_id() == Some(expected) {
+                self.inner.expected_peer.remove(&response_id.slot_index());
+            } else {
+                if let Some(metrics) = self.inner.observability.as_ref() {
+                    metrics.record_dispatch_failure(
+                        crate::observability::DispatchFailure::ResponseProvenanceMismatch,
+                    );
+                }
+                tracing::warn!(
+                    target: "crate::messenger::responses",
+                    response_id = %response_id,
+                    "Dropping a completion from the wrong or no connection identity"
+                );
+                return false;
+            }
+        }
+        self.inner.complete_outcome(response_id, outcome)
+    }
+
     pub fn complete_outcome(
         &self,
         response_id: ResponseId,
@@ -523,6 +573,11 @@ impl ResponseManager {
 
 struct ResponseManagerInner {
     worker_id: WorkerId,
+    /// Which instance may complete each live slot, recorded at send time when
+    /// the target's transport attributes its connections. Keyed by slot
+    /// index: a response id encodes its slot, and the check needs no second
+    /// lookup. An entry is removed when the slot completes or recycles.
+    expected_peer: dashmap::DashMap<usize, velo_ext::InstanceId>,
     arena: Arc<SlotArena<Option<Bytes>, String>>,
     // Capacity gate. Holds `capacity` permits; one is consumed per outstanding
     // awaiter and released when the awaiter drops. The semaphore is the
@@ -547,6 +602,7 @@ impl ResponseManagerInner {
             pending: AtomicUsize::new(0),
             capacity,
             observability,
+            expected_peer: dashmap::DashMap::new(),
         }
     }
 
@@ -587,6 +643,7 @@ impl ResponseManagerInner {
     }
 
     fn recycle_slot(&self, index: usize, permit: OwnedSemaphorePermit) {
+        self.expected_peer.remove(&index);
         let retired = self.arena.recycle(index);
         if retired {
             // Slot's generation counter is saturated; the arena won't reuse
@@ -966,6 +1023,88 @@ impl<T, E> SlotArena<T, E> {
 
 #[cfg(test)]
 mod tests {
+    use futures::FutureExt;
+
+    /// The provenance check: a completion for a slot with a recorded target
+    /// must arrive attributed to that instance. A rogue frame — right
+    /// response id, wrong or no connection identity — is dropped and the
+    /// wait continues until the genuine reply lands.
+    #[tokio::test]
+    async fn an_attributed_completion_must_match_the_expected_peer() {
+        let rm = ResponseManager::new(WorkerId::from_u64(7));
+        let mut awaiter = rm.register_outcome().expect("slot");
+        let id = awaiter.response_id();
+        let target = velo_ext::InstanceId::new_v4();
+        rm.expect_response_from(id, target);
+
+        let rogue = velo_ext::InstanceId::new_v4();
+        assert!(!rm.complete_outcome_attributed(
+            id,
+            Ok(Some(Bytes::from_static(b"rogue"))),
+            velo_ext::SenderIdentity::AnnouncedPeer(rogue),
+        ));
+        assert!(awaiter.recv().now_or_never().is_none());
+
+        assert!(!rm.complete_outcome_attributed(
+            id,
+            Ok(Some(Bytes::from_static(b"anon"))),
+            velo_ext::SenderIdentity::Unattributed,
+        ));
+        assert!(awaiter.recv().now_or_never().is_none());
+
+        assert!(rm.complete_outcome_attributed(
+            id,
+            Ok(Some(Bytes::from_static(b"real"))),
+            velo_ext::SenderIdentity::AnnouncedPeer(target),
+        ));
+        assert_eq!(
+            awaiter.recv().await.expect("completed").expect("ok"),
+            Some(Bytes::from_static(b"real"))
+        );
+    }
+
+    /// A slot with no recorded expectation — a send to a peer on a
+    /// store-and-forward transport, or one that predates the check —
+    /// completes unchecked, as every send did before it.
+    #[tokio::test]
+    async fn an_unattributed_completion_without_an_expectation_still_completes() {
+        let rm = ResponseManager::new(WorkerId::from_u64(7));
+        let mut awaiter = rm.register_outcome().expect("slot");
+        let id = awaiter.response_id();
+        assert!(rm.complete_outcome_attributed(
+            id,
+            Ok(Some(Bytes::from_static(b"legacy"))),
+            velo_ext::SenderIdentity::Unattributed,
+        ));
+        assert_eq!(
+            awaiter.recv().await.expect("completed").expect("ok"),
+            Some(Bytes::from_static(b"legacy"))
+        );
+    }
+
+    /// A recycled slot drops its expectation: an abandoned send must not
+    /// leave a stale one for the slot's next generation.
+    #[tokio::test]
+    async fn a_recycled_slot_forgets_its_expected_peer() {
+        let rm = ResponseManager::with_capacity(WorkerId::from_u64(7), 1, None);
+        let id = {
+            let awaiter = rm.register_outcome().expect("slot");
+            let id = awaiter.response_id();
+            rm.expect_response_from(id, velo_ext::InstanceId::new_v4());
+            id
+            // awaiter drops here, recycling the slot
+        };
+        let _ = id;
+        let awaiter = rm.register_outcome().expect("the slot recycles");
+        let id = awaiter.response_id();
+        // No expectation was recorded for the new generation: an
+        // unattributed completion is accepted.
+        assert!(rm.complete_outcome_attributed(
+            id,
+            Ok(Some(Bytes::from_static(b"next"))),
+            velo_ext::SenderIdentity::Unattributed,
+        ));
+    }
     use super::*;
 
     #[tokio::test]

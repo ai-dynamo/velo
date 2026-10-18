@@ -146,8 +146,9 @@ pub(crate) async fn route_frame(
 
     record_inbound_frame(metrics, transport_key, msg_type, frame_bytes);
 
-    // Try to send with ownership transfer (zero-copy)
-    match stream.send_async((header, payload)).await {
+    // Try to send with ownership transfer (zero-copy). The connection's
+    // identity rides along: response completion is checked against it.
+    match stream.send_async((header, payload, sender)).await {
         Ok(_) => Ok(Routed::Delivered),
         Err(e) => {
             if let Some(metrics) = metrics {

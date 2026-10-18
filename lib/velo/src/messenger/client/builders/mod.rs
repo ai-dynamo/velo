@@ -482,6 +482,7 @@ impl SlowPath {
 
     /// Stage 3 — send, and wait for the frame to reach the send channel.
     async fn send(self, target: InstanceId) -> AdmissionReport {
+        self.client.expect_response_from(self.response_id, target);
         let metadata = build_metadata(
             self.response_id,
             self.handler,
@@ -696,6 +697,7 @@ impl MessageBuilder {
                 if let Some(metrics) = self.client.observability.as_ref() {
                     metrics.record_client_resolution(ClientResolution::DirectSuccess);
                 }
+                self.client.expect_response_from(response_id, target);
                 let metadata = self.create_metadata(response_id, message_type);
                 let message = ActiveMessage {
                     metadata,

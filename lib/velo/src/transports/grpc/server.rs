@@ -195,6 +195,7 @@ impl VeloStreaming for VeloStreamingService {
                     .send_async((
                         Bytes::from(framed_data.header),
                         Bytes::from(framed_data.payload),
+                        velo_ext::SenderIdentity::Unattributed,
                     ))
                     .await
                 {
