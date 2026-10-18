@@ -186,6 +186,7 @@ struct CappedTransport {
     key: velo_ext::TransportKey,
     address: velo_ext::WorkerAddress,
     capacity: usize,
+    lanes: std::num::NonZeroU16,
     peers: std::sync::Mutex<std::collections::HashSet<InstanceId>>,
     accepted: std::sync::Mutex<Vec<(bytes::Bytes, bytes::Bytes)>>,
     rejected: std::sync::Mutex<Vec<String>>,
@@ -193,6 +194,10 @@ struct CappedTransport {
 
 impl CappedTransport {
     fn new(capacity: usize) -> std::sync::Arc<Self> {
+        Self::with_lanes(capacity, std::num::NonZeroU16::MIN)
+    }
+
+    fn with_lanes(capacity: usize, lanes: std::num::NonZeroU16) -> std::sync::Arc<Self> {
         let key = velo_ext::TransportKey::from("capped");
         let mut address = crate::transports::address::WorkerAddressBuilder::new();
         address
@@ -202,6 +207,7 @@ impl CappedTransport {
             key,
             address: address.build().expect("address"),
             capacity,
+            lanes,
             peers: std::sync::Mutex::new(std::collections::HashSet::new()),
             accepted: std::sync::Mutex::new(Vec::new()),
             rejected: std::sync::Mutex::new(Vec::new()),
@@ -247,6 +253,10 @@ impl crate::transports::Transport for CappedTransport {
 
     fn unregister(&self, instance_id: InstanceId) {
         self.peers.lock().unwrap().remove(&instance_id);
+    }
+
+    fn lanes(&self, _target: InstanceId) -> std::num::NonZeroU16 {
+        self.lanes
     }
 
     fn send_message(
@@ -330,6 +340,72 @@ async fn endpoint_connect_releases_provisional_peer_when_cancelled() {
     assert_eq!(transport.peers.lock().unwrap().len(), 1);
     drop(connect);
     assert!(transport.peers.lock().unwrap().is_empty());
+}
+
+/// An explicit lane past the peer's lane count fails the send instead of
+/// being remapped modulo the count the way `Transport::send_message_on_lane`
+/// documents: remapping would silently move the frame onto another lane's
+/// connection, which is what reserving a lane exists to rule out.
+#[tokio::test]
+async fn a_lane_past_the_peers_lane_count_fails_the_send() {
+    let (local, target, transport) = capped_messenger(usize::MAX).await;
+
+    let fire = local
+        .am_send_streaming("_stream_batch")
+        .expect("streaming builder")
+        .lane(1)
+        .instance(target)
+        .send();
+    let error = tokio::time::timeout(Duration::from_secs(2), fire)
+        .await
+        .expect("the rejection surfaces on the result, not on a timeout")
+        .expect_err("a lane the peer does not keep cannot be sent on");
+    assert!(error.to_string().contains("lane 1"), "got: {error}");
+
+    let unary = local
+        .unary_streaming("_stream_batch")
+        .lane(1)
+        .instance(target)
+        .send();
+    let error = tokio::time::timeout(Duration::from_secs(2), unary)
+        .await
+        .expect("the rejection surfaces on the result, not on a timeout")
+        .expect_err("a lane the peer does not keep cannot be sent on");
+    assert!(error.to_string().contains("lane 1"), "got: {error}");
+
+    assert!(
+        transport.accepted.lock().unwrap().is_empty(),
+        "a send refused for its lane must not reach the wire"
+    );
+}
+
+/// The same send on a lane the peer's transport does keep is admitted.
+#[tokio::test]
+async fn an_explicit_lane_within_the_peers_lane_count_is_admitted() {
+    let transport = CappedTransport::with_lanes(usize::MAX, std::num::NonZeroU16::new(2).unwrap());
+    let messenger = Messenger::builder()
+        .add_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+    let target = InstanceId::new_v4();
+    messenger
+        .register_peer(velo_ext::PeerInfo::new(target, transport.address()))
+        .expect("register peer");
+
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        messenger
+            .am_send_streaming("_stream_batch")
+            .expect("streaming builder")
+            .lane(1)
+            .instance(target)
+            .send(),
+    )
+    .await
+    .expect("a registered peer and an underscore handler take the fast path")
+    .expect("lane 1 of 2 is admitted");
+    assert_eq!(transport.accepted.lock().unwrap().len(), 1);
 }
 
 /// A messenger whose only transport reports `capacity`, plus a peer registered

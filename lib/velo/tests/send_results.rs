@@ -192,3 +192,97 @@ async fn a_send_to_an_unknown_peer_fails_its_admission() {
     );
     assert_eq!(result.admission_state(), AdmissionState::Failed);
 }
+
+/// An explicit lane on `am_send`/`unary` is validated against the lane count
+/// of the peer's transport: a lane the peer does not keep fails the send
+/// rather than being remapped onto another lane's connection, and a lane it
+/// does keep carries the frame. Over a real wire, because the validation is
+/// the whole contract a reserved-lane user relies on.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_explicit_lane_is_validated_against_the_peers_transport() {
+    let two_lane_transport = || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        Arc::new(
+            TcpTransportBuilder::new()
+                .from_listener(listener)
+                .unwrap()
+                .lanes(2)
+                .build()
+                .unwrap(),
+        )
+    };
+    let server = Velo::builder()
+        .add_transport(two_lane_transport())
+        .build()
+        .await
+        .unwrap();
+    server
+        .register_handler(Handler::unary_handler("echo", |ctx| Ok(Some(ctx.payload))).build())
+        .unwrap();
+    let client = Velo::builder()
+        .add_transport(two_lane_transport())
+        .build()
+        .await
+        .unwrap();
+    client.register_peer(server.peer_info()).unwrap();
+    server.register_peer(client.peer_info()).unwrap();
+    client
+        .messenger()
+        .available_handlers(server.instance_id())
+        .await
+        .unwrap();
+
+    // Lane 1 of 2 carries the request; the response still returns on lane 0.
+    let echoed = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .unary("echo")
+            .unwrap()
+            .raw_payload(Bytes::from_static(b"lane"))
+            .lane(1)
+            .instance(server.instance_id())
+            .send(),
+    )
+    .await
+    .expect("a lane the peer keeps resolves")
+    .expect("a lane the peer keeps is admitted and answered");
+    assert_eq!(echoed, Bytes::from_static(b"lane"));
+
+    // Lane 2 is past the count and fails on the result, not on a timeout.
+    let err = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .unary("echo")
+            .unwrap()
+            .lane(2)
+            .instance(server.instance_id())
+            .send(),
+    )
+    .await
+    .expect("the rejection resolves")
+    .expect_err("a lane past the peer's count cannot be sent on");
+    assert!(
+        err.to_string().contains("lane 2"),
+        "unexpected error: {err}"
+    );
+
+    let err = client
+        .am_send("echo")
+        .unwrap()
+        .lane(2)
+        .instance(server.instance_id())
+        .send()
+        .await
+        .expect_err("a fire send on a lane past the peer's count also fails");
+    assert!(
+        err.to_string().contains("lane 2"),
+        "unexpected error: {err}"
+    );
+
+    client
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(1)))
+        .await;
+    server
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(1)))
+        .await;
+}

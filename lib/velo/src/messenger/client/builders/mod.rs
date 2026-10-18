@@ -76,10 +76,17 @@ impl AmSendBuilder {
 
     /// Send on transport lane `lane` instead of lane 0.
     ///
-    /// Frames on one lane to one peer arrive in order; nothing is ordered
-    /// across lanes. Crate-private because only the stream mux, which keeps
-    /// each stream on one lane, may give up per-peer order.
-    pub(crate) fn lane(mut self, lane: u16) -> Self {
+    /// Frames on one `(peer, lane)` arrive in the order they were admitted;
+    /// nothing is ordered across lanes, so traffic for one ordered handler
+    /// stays on one lane — the messenger's own traffic uses lane 0.
+    ///
+    /// The lane is validated against the lane count of the peer's transport
+    /// when the send resolves its target: a lane the peer does not keep fails
+    /// the send rather than being reduced modulo the lane count the way
+    /// `Transport::send_message_on_lane` documents, because silently remapping
+    /// the frame onto another lane's connection is exactly what reserving a
+    /// lane is meant to rule out.
+    pub fn lane(mut self, lane: u16) -> Self {
         self.inner = self.inner.lane(lane);
         self
     }
@@ -204,6 +211,16 @@ impl UnaryBuilder {
 
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
         self.inner = self.inner.headers(headers);
+        self
+    }
+
+    /// Send on transport lane `lane` instead of lane 0. The response still
+    /// comes back on the responder's lane 0.
+    ///
+    /// The lane is validated against the peer's transport lane count when the
+    /// send resolves its target; see [`AmSendBuilder::lane`].
+    pub fn lane(mut self, lane: u16) -> Self {
+        self.inner = self.inner.lane(lane);
         self
     }
 
@@ -342,8 +359,8 @@ pub struct MessageBuilder {
     // down is `SendOutcome::Pending`: callers doing fan-out get bounded
     // in-flight backpressure for free.
     await_capacity: bool,
-    // The transport lane to send on. Only the stream mux sets it; other
-    // traffic stays on lane 0, the one ordered channel it had before lanes.
+    // The transport lane to send on. Lane 0 is the default: the one ordered
+    // channel every transport keeps and the messenger's own traffic uses.
     lane: u16,
 }
 
@@ -544,7 +561,6 @@ impl MessageBuilder {
         self.lane = lane;
         self
     }
-
     /// Opt into backpressure on response-slot exhaustion.
     ///
     /// Default: `register_outcome` fails immediately with

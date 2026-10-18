@@ -145,6 +145,20 @@ impl ActiveMessageClient {
         mut message: ActiveMessage,
         lane: u16,
     ) -> Result<SendOutcome> {
+        // An explicit lane is validated against the lane count of the peer's
+        // transport rather than reduced modulo it the way
+        // `Transport::send_message_on_lane` documents: a remapped lane would
+        // silently move the frame onto another lane's connection, which is
+        // what reserving a lane exists to rule out. Lane 0 skips the lookup —
+        // every transport keeps at least one lane by type.
+        if lane > 0 {
+            let lanes = self.backend.lanes(target)?;
+            anyhow::ensure!(
+                lane < lanes.get(),
+                "lane {lane} is past the {lanes} lane(s) the transport to {target} keeps"
+            );
+        }
+
         // Transparent large payload staging: if payload exceeds threshold,
         // stage it via rendezvous and replace with a handle in the headers.
         if let Some(stager) = self.large_payload_stager.get()
