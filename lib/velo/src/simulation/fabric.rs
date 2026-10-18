@@ -245,13 +245,17 @@ impl SimFabric {
             return;
         };
 
+        // The fabric knows the sender authoritatively — deliveries read as
+        // announced by their source, the in-fabric equivalent of a dialed
+        // connection's announcement.
+        let sender = velo_ext::SenderIdentity::AnnouncedPeer(transfer.source);
         let result = match transfer.message_type {
             // The drain gate. `admit_message` acquires the target's in-flight
             // guard before it re-reads the flag, so a message that is merely
             // queued on the target's inbound stream is work its
             // `wait_for_drain` can see.
             MessageType::Message => {
-                let outcome = adapter.admit_message(transfer.header, transfer.payload);
+                let outcome = adapter.admit_message_from(transfer.header, transfer.payload, sender);
                 match outcome {
                     AdmitOutcome::Admitted => Ok(()),
                     AdmitOutcome::Draining { header, payload } => {
@@ -270,13 +274,19 @@ impl SimFabric {
             }
             MessageType::Response => adapter
                 .response_stream
-                .send((transfer.header, transfer.payload)),
+                .send((transfer.header, transfer.payload, sender))
+                .map_err(|e| flume::SendError((e.0.0, e.0.1))),
             MessageType::ShuttingDown => adapter
                 .shutdown_stream
-                .send((transfer.header, transfer.payload)),
+                .send((transfer.header, transfer.payload, sender))
+                .map_err(|e| flume::SendError((e.0.0, e.0.1))),
             MessageType::Ack | MessageType::Event => adapter
                 .event_stream
-                .send((transfer.header, transfer.payload)),
+                .send((transfer.header, transfer.payload, sender))
+                .map_err(|e| flume::SendError((e.0.0, e.0.1))),
+            // Identify is a TCP/UDS connection-open record; the fabric
+            // attributes every delivery directly.
+            MessageType::Identify => Err(flume::SendError((transfer.header, transfer.payload))),
         };
 
         if let Err(e) = result {
@@ -312,10 +322,11 @@ impl SimFabric {
             return;
         };
 
-        if let Err(e) = source_adapter
-            .shutdown_stream
-            .send((transfer.header, Bytes::new()))
-        {
+        if let Err(e) = source_adapter.shutdown_stream.send((
+            transfer.header,
+            Bytes::new(),
+            velo_ext::SenderIdentity::AnnouncedPeer(transfer.target),
+        )) {
             tracing::warn!(
                 source = %source,
                 target = %target,

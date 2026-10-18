@@ -351,10 +351,18 @@ impl Transport for LoopbackTransport {
                 }
             }
             MessageType::Response => {
-                let _ = adapter.response_stream.send((header, payload));
+                let _ = adapter.response_stream.send((
+                    header,
+                    payload,
+                    velo::ext::SenderIdentity::Unattributed,
+                ));
             }
             MessageType::Ack | MessageType::Event => {
-                let _ = adapter.event_stream.send((header, payload));
+                let _ = adapter.event_stream.send((
+                    header,
+                    payload,
+                    velo::ext::SenderIdentity::Unattributed,
+                ));
                 if let Some(gate) = self.reply_gate.lock().unwrap().as_ref() {
                     let outcome = gate.send(());
                     self.reply_sent.notify_one();
@@ -362,7 +370,11 @@ impl Transport for LoopbackTransport {
                 }
             }
             MessageType::ShuttingDown => {
-                let _ = adapter.shutdown_stream.send((header, payload));
+                let _ = adapter.shutdown_stream.send((
+                    header,
+                    payload,
+                    velo::ext::SenderIdentity::Unattributed,
+                ));
             }
             // This test transport is a loopback shim; it never announces.
             MessageType::Identify => {}

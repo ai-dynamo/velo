@@ -55,6 +55,11 @@ impl SimTransport {
 }
 
 impl Transport for SimTransport {
+    fn identifies_connections(&self) -> bool {
+        // The fabric stamps every delivery with its source instance.
+        true
+    }
+
     fn key(&self) -> TransportKey {
         self.key.clone()
     }
