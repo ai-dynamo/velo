@@ -1058,7 +1058,7 @@ mod tests {
             velo_ext::SenderIdentity::AnnouncedPeer(target),
         ));
         assert_eq!(
-            awaiter.recv().await.expect("completed").expect("ok"),
+            awaiter.recv().await.expect("completed"),
             Some(Bytes::from_static(b"real"))
         );
     }
@@ -1077,7 +1077,7 @@ mod tests {
             velo_ext::SenderIdentity::Unattributed,
         ));
         assert_eq!(
-            awaiter.recv().await.expect("completed").expect("ok"),
+            awaiter.recv().await.expect("completed"),
             Some(Bytes::from_static(b"legacy"))
         );
     }
