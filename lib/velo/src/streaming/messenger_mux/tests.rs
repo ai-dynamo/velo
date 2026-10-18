@@ -547,6 +547,62 @@ async fn a_zero_sweep_interval_is_refused_when_the_mux_is_built() {
     .expect("the same messenger takes a mux with a positive interval");
 }
 
+/// A reservation that leaves some installed transport no lane to place a
+/// stream on is refused where the mux is built, not on the first attach that
+/// would have had nowhere to go. The binding count is the *smallest* any
+/// transport keeps: a peer can be reached over any of them, and reserving the
+/// top lane of a one-lane transport would leave it none.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reservation_that_leaves_no_placement_lane_is_refused_when_the_mux_is_built() {
+    let two_lane_transport = || {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+        Arc::new(
+            TcpTransportBuilder::new()
+                .from_listener(listener)
+                .expect("from_listener")
+                .lanes(2)
+                .build()
+                .expect("build transport"),
+        )
+    };
+    let messenger = Messenger::builder()
+        .add_transport(two_lane_transport())
+        .build()
+        .await
+        .expect("messenger");
+
+    let error = MessengerMuxTransport::new(
+        Arc::clone(&messenger),
+        MuxConfig {
+            reserved_lanes: 2,
+            ..MuxConfig::default()
+        },
+        None,
+    )
+    .err()
+    .expect("reserving both lanes leaves none for streams, so the build must say so");
+    assert!(
+        error.to_string().contains("reserved_lanes"),
+        "the refusal names the field: {error}"
+    );
+
+    MessengerMuxTransport::new(
+        messenger,
+        MuxConfig {
+            reserved_lanes: 1,
+            ..MuxConfig::default()
+        },
+        None,
+    )
+    .expect("the same messenger takes a reservation that leaves a lane");
+}
+
+/// The default reservation is none: the placement every mux has always had.
+#[test]
+fn the_default_reservation_is_zero() {
+    assert_eq!(MuxConfig::default().reserved_lanes, 0);
+}
+
 // ---------------------------------------------------------------------------
 // Round trips
 // ---------------------------------------------------------------------------

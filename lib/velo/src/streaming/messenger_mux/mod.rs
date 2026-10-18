@@ -329,6 +329,21 @@ impl MessengerMuxTransport {
                 "messenger mux: credit_sweep_interval must be non-zero; the sweep ticks on it"
             ));
         }
+        // The reservation takes the top lanes of every peer relationship, so
+        // the smallest lane count any installed transport keeps is what must
+        // still leave a lane to place streams on. Per-peer clamping then keeps
+        // a mismatched peer below its own reservation — spread is lost before
+        // isolation is.
+        let placement = lane::mux_lanes(messenger.backend().min_lanes());
+        if config.reserved_lanes >= placement.get() {
+            return Err(anyhow!(
+                "messenger mux: reserved_lanes ({}) must be below the {} lane(s) \
+                 every installed messenger transport keeps, or no lane is left \
+                 for stream placement",
+                config.reserved_lanes,
+                placement
+            ));
+        }
         // Normalised so every reader of the config sees the effective budget
         // rather than the "use the default" zero.
         let config = MuxConfig {

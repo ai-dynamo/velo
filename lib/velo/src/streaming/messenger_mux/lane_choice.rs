@@ -258,6 +258,22 @@ impl MuxCore {
     pub(super) fn local_lanes(&self) -> NonZeroU16 {
         self.messenger.backend().max_lanes()
     }
+
+    /// How many of the lanes a transport keeps streams may be placed on: its
+    /// lanes, minus the reserved top ones.
+    ///
+    /// The build-time check in [`MessengerMuxTransport::new`] keeps every
+    /// installed transport's count above the reservation, so the subtraction
+    /// cannot reach zero for an in-tree transport, whose count does not vary
+    /// by peer. The floor covers one that does: that peer's streams all land
+    /// on lane 0, so spread — and, at or under the reservation, isolation —
+    /// is lost for it. Nothing in-tree can take that arm.
+    pub(super) fn placement_lanes(&self, transport: NonZeroU16) -> NonZeroU16 {
+        let lanes = mux_lanes(transport)
+            .get()
+            .saturating_sub(self.config.reserved_lanes);
+        NonZeroU16::new(lanes).unwrap_or(NonZeroU16::MIN)
+    }
 }
 
 impl MessengerMuxTransport {
@@ -272,10 +288,12 @@ impl MessengerMuxTransport {
     /// caller's lane key; the module docs say how each case is placed.
     ///
     /// The lane count is the mux lanes of the transport to `peer`, or for a
-    /// pre-bind the most any transport here keeps. With one lane every stream
-    /// is on lane 0, which keeps a default deployment's attach answers and
-    /// tickets the same bytes as before lanes: a ticket naming another lane
-    /// cannot be read by a worker built before lanes.
+    /// pre-bind the most any transport here keeps, minus the reserved top
+    /// lanes ([`MuxConfig::reserved_lanes`](super::MuxConfig::reserved_lanes)).
+    /// With one lane every stream is on lane 0, which keeps a default
+    /// deployment's attach answers and tickets the same bytes as before lanes:
+    /// a ticket naming another lane cannot be read by a worker built before
+    /// lanes.
     ///
     /// The returned reservation goes to [`Self::bind_on_lane`]; dropping it
     /// gives the count back.
@@ -284,6 +302,7 @@ impl MessengerMuxTransport {
             || self.core.local_lanes(),
             |peer| self.core.transport_lanes(peer),
         );
+        let lanes = self.core.placement_lanes(lanes);
         let ingress = &self.core.ingress;
         self.core
             .lane_load
@@ -311,14 +330,17 @@ impl MessengerMuxTransport {
     /// The (peer, lane) a stream that `peer` placed on `lane` is sent on from
     /// this node.
     ///
-    /// `lane` modulo the lanes this node's transport keeps to `peer`. The peer
-    /// chose the lane from its own transport's count, which may be larger;
-    /// any lane is correct for any stream, because every node takes batches on
-    /// every lane and replies on the lane a batch arrived on.
+    /// `lane` modulo the placement lanes this node's transport keeps to
+    /// `peer` — its lanes minus the reserved top ones, so a stream never maps
+    /// onto a lane this node reserved for other traffic. The peer chose the
+    /// lane from its own placement count, which may be larger; any lane is
+    /// correct for any stream, because every node takes batches on every lane
+    /// and replies on the lane a batch arrived on.
     pub(crate) fn sender_lane(&self, peer: WorkerId, lane: u16) -> PeerLane {
+        let lanes = self.core.transport_lanes(peer);
         PeerLane::new(
             peer,
-            LaneIndex::clamped(lane, self.core.transport_lanes(peer)),
+            LaneIndex::clamped(lane, self.core.placement_lanes(lanes)),
         )
     }
 }

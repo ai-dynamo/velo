@@ -37,6 +37,10 @@ struct Node {
 
 impl Node {
     async fn new(lanes: u16) -> Self {
+        Self::new_with_mux(lanes, 0).await
+    }
+
+    async fn new_with_mux(lanes: u16, reserved_lanes: u16) -> Self {
         let quic = Arc::new(
             QuicTransportBuilder::new()
                 .bind_addr("127.0.0.1:0".parse().expect("loopback"))
@@ -47,6 +51,11 @@ impl Node {
         let velo = Velo::builder()
             .add_transport(Arc::clone(&quic) as Arc<dyn crate::Transport>)
             .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
+            .messenger_mux(crate::streaming::MuxConfig {
+                reserved_lanes,
+                ..Default::default()
+            })
+            .expect("mux config")
             .build()
             .await
             .expect("build velo");
@@ -89,6 +98,15 @@ fn live_per_lane(mux: &MessengerMuxTransport, peer: velo_ext::WorkerId, lanes: u
 async fn pair(consumer_lanes: u16, producer_lanes: u16) -> (Node, Node) {
     let consumer = Node::new(consumer_lanes).await;
     let producer = Node::new(producer_lanes).await;
+    connect(&consumer, &producer).await;
+    (consumer, producer)
+}
+
+/// A pair whose muxes reserve the top `reserved` of their lanes from stream
+/// placement.
+async fn pair_reserved(consumer_lanes: u16, producer_lanes: u16, reserved: u16) -> (Node, Node) {
+    let consumer = Node::new_with_mux(consumer_lanes, reserved).await;
+    let producer = Node::new_with_mux(producer_lanes, reserved).await;
     connect(&consumer, &producer).await;
     (consumer, producer)
 }
@@ -698,6 +716,80 @@ async fn keyed_streams_ride_their_lanes_and_all_arrive_in_order() {
             "the producer's batches must travel on its QUIC lane {lane}"
         );
     }
+}
+
+/// A reserved lane carries no stream, in either direction.
+///
+/// Both nodes keep four QUIC lanes with the top one reserved. A key that
+/// hashes onto lane 3 of 4 — the reserved lane, without the reservation — is
+/// placed and carried on `key % 3` instead: the consumer's ingress table for
+/// (producer, 3) stays empty, and neither side ever opens its lane-3
+/// connection, which is where the producer's batches and the consumer's
+/// credit would show. Unkeyed attaches spread over the three placement lanes
+/// only.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reserved_lane_carries_no_stream_in_either_direction() {
+    let (consumer, producer) = pair_reserved(4, 4, 1).await;
+    let on_reserved = PeerLane::new(producer.worker(), LaneIndex::new(3));
+    let consumer_mux = consumer.mux();
+
+    // Keyed: a key bound for lane 3 of 4 is placed within the three
+    // placement lanes, and arrives there.
+    let key = key_for(3, 4);
+    let placed = keyed_lane(key, std::num::NonZeroU16::new(3).expect("non-zero"));
+    let on_placed = PeerLane::new(producer.worker(), placed);
+    let anchor = consumer.velo.create_anchor::<u32>();
+    let sender = producer
+        .velo
+        .attach_anchor_keyed::<u32>(transfer(anchor.handle()), key)
+        .await
+        .expect("remote attach");
+    sender.send(u32::MAX).await.expect("first send");
+    eventually("the slot to open on the reduced lane", || {
+        consumer_mux.live_ingress_slots(on_placed) == 1
+    })
+    .await;
+    assert_eq!(consumer_mux.live_ingress_slots(on_reserved), 0);
+    stream_through(sender, anchor).await;
+
+    // Unkeyed: six attaches spread over the three placement lanes only.
+    let streams = attach_all(&consumer, &producer, 6).await;
+    for (sender, _) in &streams {
+        sender.send(u32::MAX).await.expect("first send");
+    }
+    eventually("all six slots to open", || {
+        live_per_lane(&consumer_mux, producer.worker(), 4)
+            .iter()
+            .sum::<usize>()
+            == 6
+    })
+    .await;
+    assert_eq!(
+        live_per_lane(&consumer_mux, producer.worker(), 4)[..3],
+        [2, 2, 2]
+    );
+    assert_eq!(consumer_mux.live_ingress_slots(on_reserved), 0);
+
+    let finished =
+        futures::future::join_all(streams.into_iter().map(|(sender, anchor)| async move {
+            stream_through(sender, drain_first(anchor).await).await
+        }));
+    tokio::time::timeout(BOUND, finished)
+        .await
+        .expect("streams finished");
+
+    assert!(
+        !producer
+            .quic
+            .has_lane_connection(consumer.velo.instance_id(), 3),
+        "the producer's batches must never ride its reserved lane 3"
+    );
+    assert!(
+        !consumer
+            .quic
+            .has_lane_connection(producer.velo.instance_id(), 3),
+        "the consumer's credit must never ride its reserved lane 3"
+    );
 }
 
 /// A consumer whose transport keeps one lane answers lane 0 to every key and

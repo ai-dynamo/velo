@@ -445,6 +445,20 @@ impl VeloBackend {
             .unwrap_or(std::num::NonZeroU16::MIN)
     }
 
+    /// The fewest lanes any installed transport keeps.
+    ///
+    /// The reservation check the mux's `reserved_lanes` is validated against:
+    /// a peer can be reached over any of these transports, so reserving the
+    /// top lanes of each must leave every one of them a lane to place on.
+    /// One lane with no transports installed, as [`max_lanes`](Self::max_lanes).
+    pub(crate) fn min_lanes(&self) -> std::num::NonZeroU16 {
+        self.transports
+            .values()
+            .map(|transport| transport.lanes(self.instance_id))
+            .min()
+            .unwrap_or(std::num::NonZeroU16::MIN)
+    }
+
     /// Send a message to a registered peer on one of its primary transport's
     /// lanes.
     ///

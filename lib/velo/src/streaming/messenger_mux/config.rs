@@ -408,6 +408,28 @@ pub struct MuxConfig {
     ///
     /// Defaults to 1 ms.
     pub reply_linger: Duration,
+    /// Lanes at the top of each peer's transport lane range that stream
+    /// placement must not use, reserving them for other active-message
+    /// traffic such as a control or credit protocol sent with an explicit
+    /// `lane` on `am_send`/`unary`.
+    ///
+    /// Keyed and unkeyed placement choose among the remaining lanes, and a
+    /// sender maps the lane a consumer named into that same reduced range,
+    /// so a stream never shares a connection or write queue with the
+    /// reserved traffic. Each node applies its own reservation to its own
+    /// lanes: with the same counts on both peers the reserved lanes line up,
+    /// and a peer whose transport keeps fewer lanes still maps every stream
+    /// below its own reservation — spread is lost before isolation is.
+    ///
+    /// Receive is unaffected: a batch is accepted on every lane, reserved or
+    /// not, so a peer built without the reservation is still served.
+    ///
+    /// Building a mux refuses a count that leaves some installed messenger
+    /// transport no lane to place on: `reserved_lanes` must be below the
+    /// smallest lane count of any installed transport, further capped at the
+    /// mux's own lane maximum. Zero, the default, is the placement every mux
+    /// has always had.
+    pub reserved_lanes: u16,
 }
 
 impl Default for MuxConfig {
@@ -424,6 +446,7 @@ impl Default for MuxConfig {
             flush_policy: FlushPolicy::Auto(AutoFlush::default()),
             async_open_ack: false,
             reply_linger: Duration::from_millis(1),
+            reserved_lanes: 0,
         }
     }
 }
