@@ -200,7 +200,7 @@ pub async fn run_r3_refcount(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let per_worker = total_iters / workers as u64;
     let mut set: JoinSet<Result<()>> = JoinSet::new();
     for w in 0..workers {
-        let consumer = Arc::clone(&consumer);
+        let consumer = consumer.clone();
         let handles = handles.clone();
         let oracle = Arc::clone(&oracle);
         set.spawn(async move {
