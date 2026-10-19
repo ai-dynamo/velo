@@ -35,7 +35,10 @@ use futures::future::BoxFuture;
 use reqwest::{Method, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use velo::discovery::PeerDiscovery;
+use std::pin::Pin;
+
+use futures::{Stream, StreamExt};
+use velo::discovery::{PeerDiscovery, ServiceDiscovery, ServiceEvent, ServiceRegistrationGuard};
 use velo::{Handler, InstanceId, PeerInfo, Velo, VeloBuilder, WorkerId};
 
 use crate::protocol::{
@@ -168,8 +171,11 @@ impl HubClientBuilder {
 
     /// A configured `reqwest::Client` (TLS, proxies, timeouts). It keeps its
     /// own timeouts: without one, a call to a hub that is gone waits for
-    /// ever. Without this, the client uses [`DEFAULT_CONNECT_TIMEOUT`] and
-    /// [`DEFAULT_REQUEST_TIMEOUT`].
+    /// ever. It also serves service watches, where a total request timeout
+    /// ends every watch after that long; prefer a read timeout. Without
+    /// this, the client uses [`DEFAULT_CONNECT_TIMEOUT`] and
+    /// [`DEFAULT_REQUEST_TIMEOUT`], and [`DEFAULT_WATCH_IDLE_TIMEOUT`] for
+    /// watches.
     pub fn http_client(mut self, http: reqwest::Client) -> Self {
         self.http = Some(http);
         self
@@ -190,15 +196,24 @@ impl HubClientBuilder {
             Url::parse(&format!("{}://{host}:{port}", self.scheme))
                 .map_err(|error| ClientError::InvalidUrl(format!("{host}:{port}: {error}")))
         };
-        let http = match self.http {
-            Some(http) => http,
-            None => reqwest::Client::builder()
-                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-                .timeout(DEFAULT_REQUEST_TIMEOUT)
-                .build()?,
+        // A watch is one long response, so the default watch client has no
+        // total timeout, only an idle one longer than the hub's keep-alive.
+        let (http, watch) = match self.http {
+            Some(http) => (http.clone(), http),
+            None => (
+                reqwest::Client::builder()
+                    .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+                    .timeout(DEFAULT_REQUEST_TIMEOUT)
+                    .build()?,
+                reqwest::Client::builder()
+                    .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+                    .read_timeout(DEFAULT_WATCH_IDLE_TIMEOUT)
+                    .build()?,
+            ),
         };
         let endpoints = Arc::new(Endpoints {
             http,
+            watch,
             public: url(self.public_port)?,
             control: url(self.control_port)?,
         });
@@ -220,10 +235,17 @@ pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// extensions: 5 s for the lock, then 5 s for each of `2n + 3` steps.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The HTTP client and the two listener URLs, shared by every handle.
+/// Idle timeout of a service watch on the default client: no bytes for
+/// this long (the hub sends a keep-alive every 10 s) ends the watch with
+/// `Disconnected`.
+pub const DEFAULT_WATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The HTTP clients and the two listener URLs, shared by every handle.
 #[derive(Debug)]
 struct Endpoints {
     http: reqwest::Client,
+    /// For service watches: no total timeout.
+    watch: reqwest::Client,
     public: Url,
     control: Url,
 }
@@ -639,6 +661,49 @@ impl HubClient {
         endpoints.call::<(), _>(Method::GET, url, None, None).await
     }
 
+    /// Service discovery through this hub, for code that takes a
+    /// [`ServiceDiscovery`]. It holds no registration.
+    pub fn services(&self) -> HubServices {
+        HubServices {
+            endpoints: Arc::clone(&self.inner.endpoints),
+        }
+    }
+
+    /// Add this client's instance to the service `name`. The entry lives
+    /// until the guard unregisters it or the registration ends; a
+    /// re-registration with the credential keeps it. Dropping the guard
+    /// removes it in the background, best effort.
+    pub async fn register_service(
+        &self,
+        name: &str,
+    ) -> Result<HubServiceRegistration, ClientError> {
+        if !protocol::is_valid_service_name(name) {
+            return Err(ClientError::InvalidUrl(format!(
+                "{name:?} is not a service name: 1 to 128 of A-Z a-z 0-9 . _ -"
+            )));
+        }
+        let (instance_id, credential) = self
+            .inner
+            .shared
+            .credential()
+            .ok_or(ClientError::NotRegistered)?;
+        service_call(
+            &self.inner.endpoints,
+            Method::PUT,
+            name,
+            instance_id,
+            &credential,
+        )
+        .await?;
+        Ok(HubServiceRegistration {
+            endpoints: Arc::clone(&self.inner.endpoints),
+            registration: Arc::downgrade(&self.inner.shared),
+            name: name.to_string(),
+            instance_id,
+            done: false,
+        })
+    }
+
     /// Calls to the routes of the extension named `name`. The `ExtClient`
     /// does not keep the registration alive: once every `HubClient` clone
     /// is dropped, its control calls answer [`ClientError::NotRegistered`].
@@ -807,4 +872,258 @@ impl ExtClient {
         self.request::<(), _>(Method::DELETE, Listener::Control, path, None)
             .await
     }
+}
+
+async fn service_call(
+    endpoints: &Endpoints,
+    method: Method,
+    name: &str,
+    instance_id: InstanceId,
+    credential: &Credential,
+) -> Result<(), ClientError> {
+    let url = Endpoints::join(
+        &endpoints.control,
+        &protocol::service_instance(name, instance_id),
+    )?;
+    endpoints
+        .call::<(), ()>(method, url, Some(credential), None)
+        .await
+}
+
+/// One instance's entry in one service. Holds the registration weakly:
+/// when the client is gone, its registration's end removes the entry.
+#[derive(Debug)]
+pub struct HubServiceRegistration {
+    endpoints: Arc<Endpoints>,
+    registration: Weak<Shared>,
+    name: String,
+    instance_id: InstanceId,
+    done: bool,
+}
+
+impl HubServiceRegistration {
+    /// The service's name.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The current credential of the registration this entry belongs to:
+    /// a re-registration rotates it and keeps the entry.
+    fn credential(&self) -> Option<Credential> {
+        self.registration
+            .upgrade()
+            .and_then(|shared| shared.credential())
+            .filter(|(id, _)| *id == self.instance_id)
+            .map(|(_, credential)| credential)
+    }
+
+    async fn remove(&mut self) -> Result<(), ClientError> {
+        if self.done {
+            return Ok(());
+        }
+        // No registration: the hub dropped the entry with it.
+        if let Some(credential) = self.credential() {
+            match service_call(
+                &self.endpoints,
+                Method::DELETE,
+                &self.name,
+                self.instance_id,
+                &credential,
+            )
+            .await
+            {
+                Err(error) if !owns_nothing(&error) => return Err(error),
+                _ => {}
+            }
+        }
+        self.done = true;
+        Ok(())
+    }
+}
+
+impl ServiceRegistrationGuard for HubServiceRegistration {
+    fn unregister(&mut self) -> BoxFuture<'_, anyhow::Result<()>> {
+        Box::pin(async move { Ok(self.remove().await?) })
+    }
+}
+
+impl Drop for HubServiceRegistration {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let Some(credential) = self.credential() else {
+            return;
+        };
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let endpoints = Arc::clone(&self.endpoints);
+        let (name, instance_id) = (std::mem::take(&mut self.name), self.instance_id);
+        runtime.spawn(async move {
+            let _ = service_call(&endpoints, Method::DELETE, &name, instance_id, &credential).await;
+        });
+    }
+}
+
+/// Service discovery through a hub. Cheap to clone. Get one from
+/// [`HubClient::services`].
+#[derive(Debug, Clone)]
+pub struct HubServices {
+    endpoints: Arc<Endpoints>,
+}
+
+impl HubServices {
+    fn checked(name: &str) -> Result<(), ClientError> {
+        if protocol::is_valid_service_name(name) {
+            Ok(())
+        } else {
+            Err(ClientError::InvalidUrl(format!(
+                "{name:?} is not a service name"
+            )))
+        }
+    }
+}
+
+impl ServiceDiscovery for HubServices {
+    fn list_services(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
+        Box::pin(async move {
+            let url = Endpoints::join(&self.endpoints.public, protocol::paths::SERVICES)?;
+            let list: protocol::ServiceListResponse = self
+                .endpoints
+                .call::<(), _>(Method::GET, url, None, None)
+                .await?;
+            Ok(list.services)
+        })
+    }
+
+    fn get_instances(&self, service_name: &str) -> BoxFuture<'_, anyhow::Result<Vec<InstanceId>>> {
+        let name = service_name.to_string();
+        Box::pin(async move {
+            Self::checked(&name)?;
+            let url = Endpoints::join(&self.endpoints.public, &protocol::service(&name))?;
+            let found: protocol::ServiceInstancesResponse = self
+                .endpoints
+                .call::<(), _>(Method::GET, url, None, None)
+                .await?;
+            Ok(found.instances)
+        })
+    }
+
+    fn watch_instances(
+        &self,
+        service_name: &str,
+    ) -> BoxFuture<'_, anyhow::Result<Pin<Box<dyn Stream<Item = ServiceEvent> + Send>>>> {
+        let name = service_name.to_string();
+        Box::pin(async move {
+            Self::checked(&name)?;
+            let url = Endpoints::join(&self.endpoints.public, &protocol::service_watch(&name))?;
+            let response = self
+                .endpoints
+                .watch
+                .get(url)
+                .send()
+                .await
+                .map_err(ClientError::from)?;
+            if !response.status().is_success() {
+                return Err(decode::<()>(response).await.unwrap_err().into());
+            }
+            let stream: Pin<Box<dyn Stream<Item = ServiceEvent> + Send>> =
+                Box::pin(watch_events(response));
+            Ok(stream)
+        })
+    }
+}
+
+/// Parse the hub's SSE stream into [`ServiceEvent`]s. Anything that ends
+/// the stream other than the hub closing it cleanly after a
+/// `disconnected` (a dropped connection, an idle timeout, a hub that
+/// stopped, bytes that do not parse) yields `Disconnected`, then the stream
+/// ends: the watcher's set is stale either way.
+fn watch_events(response: reqwest::Response) -> impl Stream<Item = ServiceEvent> + Send {
+    parse_events(response.bytes_stream())
+}
+
+fn parse_events<S, B>(bytes: S) -> impl Stream<Item = ServiceEvent> + Send
+where
+    S: Stream<Item = reqwest::Result<B>> + Send + 'static,
+    B: AsRef<[u8]>,
+{
+    struct State<S> {
+        bytes: Pin<Box<S>>,
+        buffer: Vec<u8>,
+        pending: std::collections::VecDeque<ServiceEvent>,
+        ended: bool,
+    }
+    let state = State {
+        bytes: Box::pin(bytes),
+        buffer: Vec::new(),
+        pending: std::collections::VecDeque::new(),
+        ended: false,
+    };
+    futures::stream::unfold(state, |mut state| async move {
+        loop {
+            if let Some(event) = state.pending.pop_front() {
+                if event == ServiceEvent::Disconnected {
+                    state.ended = true;
+                }
+                return Some((event, state));
+            }
+            if state.ended {
+                return None;
+            }
+            match state.bytes.next().await {
+                Some(Ok(chunk)) => {
+                    state.buffer.extend_from_slice(chunk.as_ref());
+                    while let Some(end) = find_event_end(&state.buffer) {
+                        let raw: Vec<u8> = state.buffer.drain(..end).collect();
+                        match parse_event(&raw) {
+                            Ok(Some(event)) => state.pending.push_back(event),
+                            Ok(None) => {}
+                            Err(()) => state.pending.push_back(ServiceEvent::Disconnected),
+                        }
+                    }
+                }
+                Some(Err(_)) | None => state.pending.push_back(ServiceEvent::Disconnected),
+            }
+        }
+    })
+}
+
+/// The end of the first complete SSE event in `buffer` (past its blank
+/// line), if there is one.
+fn find_event_end(buffer: &[u8]) -> Option<usize> {
+    buffer
+        .windows(2)
+        .position(|pair| pair == b"\n\n")
+        .map(|at| at + 2)
+}
+
+/// One SSE event: `None` for a comment (keep-alive), `Err` for one that
+/// does not parse.
+fn parse_event(raw: &[u8]) -> Result<Option<ServiceEvent>, ()> {
+    let text = std::str::from_utf8(raw).map_err(|_| ())?;
+    let (mut name, mut data) = (None, String::new());
+    for line in text.lines() {
+        if let Some(value) = line.strip_prefix("event:") {
+            name = Some(value.trim());
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data.push_str(value.trim());
+        }
+    }
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let event = match name {
+        protocol::WATCH_INITIAL => {
+            ServiceEvent::Initial(serde_json::from_str(&data).map_err(|_| ())?)
+        }
+        protocol::WATCH_ADDED => ServiceEvent::Added(serde_json::from_str(&data).map_err(|_| ())?),
+        protocol::WATCH_REMOVED => {
+            ServiceEvent::Removed(serde_json::from_str(&data).map_err(|_| ())?)
+        }
+        protocol::WATCH_DISCONNECTED => ServiceEvent::Disconnected,
+        _ => return Ok(None),
+    };
+    Ok(Some(event))
 }

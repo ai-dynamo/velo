@@ -155,6 +155,25 @@ velo keeps its discovery for as long as it lives, so the discovery that `velo_bu
 
 The default HTTP client has a 5 s connect timeout and a 60 s request timeout. A registration on a hub with default settings and up to three extensions takes at most 50 s: 5 s to wait for the lock, and 5 s for each step under it. A caller that passes its own `reqwest::Client` sets its own timeouts.
 
+## Services
+
+A registered instance can serve named services. Another program asks the hub which instances serve a name, or watches the name. A service name is 1 to 128 of `A-Z a-z 0-9 . _ -`, so it is always one path segment.
+
+| Route | Listener | Use |
+|---|---|---|
+| `GET /v1/services` | both | names that have at least one instance |
+| `GET /v1/services/{name}` | both | the instances of one name |
+| `GET /v1/services/{name}/watch` | both | server-sent events: `initial`, then `added` and `removed` |
+| `PUT`, `DELETE /v1/services/{name}/instances/{id}` | control | add or remove an instance, with that instance's credential |
+
+The services are a built-in extension, named `services`, first in the start order. So a service entry follows the same transaction and removal rules as an extension's state: it goes when its registration goes (unregister, expiry, or heartbeat eviction), and there is no second cleanup path that could leave an orphan. A re-registration with the credential keeps the instance's services, because the peer still serves them. A registration without a credential starts with none. A `PUT` or `DELETE` applies only if its lease's epoch is the one the directory committed, under the directory's own lock. The hub does not list the built-in in `GET /v1/hub`, and no other extension can take its name.
+
+A watch takes its snapshot and subscribes in one step, under the directory's lock, so a watcher never misses a change or sees one twice. A watcher that falls more than 1024 changes behind gets `disconnected`, and its stream ends: its set is stale, so it watches again. At shutdown the directory's `shutdown` hook ends every watch stream, before the hub drains its listeners, so an open watch does not hold the drain. The hub sends a keep-alive comment every 10 s.
+
+The client implements velo's `ServiceDiscovery` with `client.services()`. `client.register_service(name)` adds the client's instance and returns a guard. Dropping the guard removes the entry, as a best effort. The default client watches with a separate HTTP client that has no total timeout and a 30 s idle timeout. If the watch ends for any reason other than the hub's own `disconnected`, the client's stream yields `Disconnected` and ends.
+
+Services are kept in the hub's memory, like extension state. A hub that restarts with a persistent store restores peer discovery only, and the instances add their services again when they register again.
+
 ## Startup and shutdown
 
 `HubBuilder::serve` does these steps in this order:

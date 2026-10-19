@@ -40,6 +40,7 @@ mod heartbeat;
 mod lifecycle;
 mod registration;
 mod routes;
+mod services;
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -83,6 +84,8 @@ pub(crate) struct Shared {
     /// In start order.
     pub(crate) extensions: Vec<Arc<dyn DynExtension>>,
     pub(crate) by_name: HashMap<&'static str, Arc<dyn Any + Send + Sync>>,
+    /// The built-in service directory, also in `extensions`.
+    pub(crate) services: Arc<services::ServiceDirectory>,
     /// The hub-wide registration lock. Every extension mutation
     /// (`commit`, `on_registered`, `on_removed`) runs under it.
     pub(crate) lock: tokio::sync::Mutex<()>,
@@ -180,12 +183,15 @@ impl HubBuilder {
             store,
             velo,
             bundles,
-            direct,
+            mut direct,
         } = self;
         let server = config.server.clone();
 
-        // 1. Graph and config, before any I/O.
+        // 1. Graph and config, before any I/O. The service directory is a
+        // built-in extension, first in start order.
         server.validate()?;
+        let directory = Arc::new(services::ServiceDirectory::default());
+        direct.insert(0, PendingExtension::new(Arc::clone(&directory), HUB_OWNER));
         let extensions = graph::plan(bundles, direct, &config.bundles)?;
 
         // 2. Listeners.
@@ -318,6 +324,7 @@ impl HubBuilder {
             velo: unwind.velo.clone(),
             by_name: attached,
             extensions,
+            services: directory,
             lock: tokio::sync::Mutex::new(()),
             admission: AtomicBool::new(false),
             jobs: jobs.clone(),
