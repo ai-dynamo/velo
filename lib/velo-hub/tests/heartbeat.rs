@@ -359,7 +359,9 @@ async fn a_registrant_that_lost_its_response_is_freed_by_answering_not_ok() {
             .build(),
     ));
     let mut config = config();
-    config.server.heartbeat_interval = Duration::from_millis(100);
+    // The 401 below must land before two failed probes evict the entry:
+    // at 100 ms a slow (coverage) build lost that race.
+    config.server.heartbeat_interval = Duration::from_millis(500);
     config.server.heartbeat_max_failures = 2;
     let hub = Hub::builder(config)
         .store(store.clone())
@@ -398,7 +400,7 @@ async fn a_registrant_that_lost_its_response_is_freed_by_answering_not_ok() {
 
     let store_ref = &store;
     assert!(
-        eventually(Duration::from_secs(3), || store_ref.get(owner).is_none()).await,
+        eventually(Duration::from_secs(10), || store_ref.get(owner).is_none()).await,
         "probes answered not ok kept the orphaned registration"
     );
     assert_eq!(
