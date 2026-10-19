@@ -3627,6 +3627,7 @@ dependencies = [
  "anyhow",
  "axum",
  "dashmap",
+ "etcd-client",
  "futures",
  "http",
  "parking_lot",

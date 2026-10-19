@@ -5,10 +5,10 @@
 //!
 //! [`HubStore`] is the backend contract. The hub's HTTP routes, its
 //! registration transaction, and its own velo instance (through
-//! [`PeerDiscovery`]) all read and write the same store. [`InMemoryStore`]
-//! is the backend that ships; remote backends implement the same trait and
-//! must pass the same conformance suite (`store::conformance`, feature
-//! `test-support`).
+//! [`PeerDiscovery`]) all read and write the same store. Two backends ship:
+//! [`InMemoryStore`], and the etcd store (`store::etcd`, feature `etcd`),
+//! whose registrations outlive the hub process. Every backend must pass the
+//! same conformance suite (`store::conformance`, feature `test-support`).
 //!
 //! The stored record is complete enough for another hub to take over: the
 //! peer, a digest of the credentials that may claim it, its epoch, and the
@@ -26,6 +26,8 @@ use velo::{InstanceId, PeerDiscovery, PeerInfo, WorkerId};
 
 use crate::protocol::{Credential, RegistrationEpoch};
 
+#[cfg(feature = "etcd")]
+pub mod etcd;
 mod memory;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -79,6 +81,12 @@ impl OpId {
 impl Default for OpId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Display for OpId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 
@@ -151,15 +159,15 @@ pub struct RegistrationRecord {
     /// holds until it reads the response to this registration.
     pub accepted: Option<CredentialDigest>,
     /// Digest of the credential this registration minted. With
-    /// `accepted`, it is what a hub that takes the record over needs to
-    /// let the registrant back in after a crash between the write and the
-    /// response. The hub does not read either digest yet: an owner whose
-    /// entry it did not write is reserved, and can register again only
-    /// after that entry expires.
+    /// `accepted`, it lets the registrant back in after a hub restart: a
+    /// hub that finds the record reserves the instance, and a registration
+    /// presenting a credential with either digest proceeds as a
+    /// re-registration (a crash between the write and the response cannot
+    /// lock the registrant out).
     pub pending: Option<CredentialDigest>,
     /// The extension payloads as committed, keyed by extension name.
     pub extensions: BTreeMap<String, serde_json::Value>,
-    /// The hub's own entry: it never expires.
+    /// The hub's own entry: the store's liveness never expires it.
     pub pinned: bool,
 }
 
@@ -243,6 +251,11 @@ pub enum Continuity {
     /// The backend lost history (for example a compacted watch or a lost
     /// leader). The cache is stale until the backend resynchronizes.
     Lost,
+    /// Another hub took the store over, or this hub lost its hold on it
+    /// (for example its etcd lock lease expired during a partition). The
+    /// state is terminal: every later write fails, and the hub must stop,
+    /// because a second hub may now answer for the same owners.
+    Fenced,
 }
 
 /// Errors from [`HubStore`] operations.
@@ -306,9 +319,21 @@ impl StoreError {
 ///   share one linearization point: every entry present at that point is in
 ///   the snapshot, and every later removal is reported exactly once, outside
 ///   locks.
+/// - Every removal that a mutating call (`put`, `remove`, `resolve`)
+///   causes or races is reported to the hook before the call returns, and
+///   sync reads reflect the call's own write when it returns. The hub reads
+///   its own state right after these calls and relies on the hook having
+///   run: a hook that runs later could revoke an owner the hub has already
+///   handed back. A remote backend that learns of removals from a watch
+///   waits until the watch has applied the call's revision and run the hook
+///   for it, and answers [`StoreError::Indeterminate`] when it cannot.
 /// - Sync reads are served from a local view; a remote backend keeps it fed
 ///   by a watch and reports gaps through [`continuity`](Self::continuity).
-/// - A pinned record never expires.
+///   Readers other than the caller may see a write a little later than the
+///   caller does.
+/// - The backend's liveness never expires a pinned record. A backend may
+///   drop one only once the hub that wrote it is gone (etcd: its custody
+///   lease expired, or the next hub on the prefix deleted it).
 pub trait HubStore: PeerDiscovery + Send + Sync + 'static {
     /// Write `record`, conditional on the instance's current incarnation.
     /// `expected: None` requires that the instance has no entry;
@@ -395,11 +420,26 @@ pub trait HubStore: PeerDiscovery + Send + Sync + 'static {
     /// Whether the store's view is current. See [`Continuity`].
     fn continuity(&self) -> watch::Receiver<Continuity>;
 
-    /// Spawn the backend's liveness task (a TTL reaper), if it needs one.
-    /// Backends with native leases return `None`. At shutdown the hub
-    /// cancels `cancel`, waits up to its shutdown timeout for the task, then
-    /// aborts it.
+    /// Spawn the backend's liveness task (a TTL reaper), if the hub should
+    /// run it. A backend that runs its own tasks (started when it is built,
+    /// stopped when it is closed or dropped, as the etcd store does) must
+    /// not stop its watch here: the hub cancels this task before it removes
+    /// its own entry at shutdown, and that last remove still needs the
+    /// watch. It may return a task that stops its expiry when `cancel`
+    /// fires, because the hub's probes, which keep entries fresh, stop
+    /// then too. At shutdown the hub cancels `cancel`, waits up to its
+    /// shutdown timeout for the task, then aborts it.
     fn spawn_liveness_task(self: Arc<Self>, _cancel: CancellationToken) -> Option<JoinHandle<()>> {
         None
+    }
+
+    /// Stop the backend's own tasks and release what it holds for this
+    /// hub (the etcd store's prefix lock), so the next hub can start at
+    /// once. The hub calls this last at shutdown, after it removed its own
+    /// entry. Later calls fail; a call already waiting on the backend
+    /// returns its outcome without running the hook. Idempotent. The
+    /// in-memory store has nothing to release.
+    fn close(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
     }
 }

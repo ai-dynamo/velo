@@ -20,12 +20,13 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use velo::{InstanceId, PeerInfo};
 
 use super::Shared;
-use super::authority::{AbortOutcome, RegistrationPermit};
+use super::authority::{AbortOutcome, AuthorityError, RegistrationPermit};
 use super::error::HubError;
 use super::extension::{AnyPayload, AnyStaged, Committed, RegistrationView, Txn};
 use super::lifecycle::Job;
@@ -56,20 +57,35 @@ pub(crate) async fn register(
     let owner = request.peer.instance_id();
     let checked = presented.clone();
     let authority = shared.authority.clone();
-    let answer = hub_task("registration", async move {
-        let request = decode(&shared, presented, request)?;
-        transact(shared, request).await
+    // Set by the transaction when its store write is recorded: a failure
+    // after it dropped the prior registration. Authority state alone cannot
+    // say so: a reserved owner (recovery) fails `authorize` either way.
+    let written = Arc::new(AtomicBool::new(false));
+    let answer = hub_task("registration", {
+        let written = Arc::clone(&written);
+        async move {
+            let request = decode(&shared, presented, request)?;
+            transact(shared, request, written).await
+        }
     })
     .await;
     // A panic after the write has dropped the prior registration (the
     // transaction's `Drop` failed it closed); say so, as every other
     // post-write failure does, or the client keeps a dead credential.
+    // The prior registration is gone if the write happened, or if a removal
+    // took it while the transaction ran (the credential is now unknown to
+    // the hub). Not on `Recovered` (a reserved owner's credential can still
+    // recover it) or `Unavailable`/`Busy` (the hub cannot tell yet).
+    let prior_gone = |credential: &Credential| {
+        written.load(Ordering::Acquire)
+            || matches!(
+                authority.authorize(owner, Some(credential)),
+                Err(AuthorityError::Unauthorized { .. } | AuthorityError::NotFound { .. })
+            )
+    };
     match answer {
         Err(error)
-            if error.code() == ErrorCode::Internal
-                && checked.as_ref().is_some_and(|credential| {
-                    authority.authorize(owner, Some(credential)).is_err()
-                }) =>
+            if error.code() == ErrorCode::Internal && checked.as_ref().is_some_and(prior_gone) =>
         {
             Err(HubError::new(
                 ErrorCode::RegisterAgain,
@@ -284,13 +300,22 @@ impl Transaction<'_> {
         });
         let reservation = self.shared.store.current_incarnation(self.owner);
         self.settle_after_write(removal, reservation);
-        // `register_again`, not `unavailable`: the prior registration is
-        // gone, and a client that read "unavailable" as "nothing happened"
-        // would keep its dead credential.
+        // Not `unavailable`: the prior registration is gone, and a client
+        // that read "unavailable" as "nothing happened" would keep its dead
+        // credential. When a credential was presented and an entry is
+        // reserved, that credential recovers it (the reserved record is
+        // either the attempted write, which names it as presented, or the
+        // prior registration, which minted it): say `recovered`, so the
+        // client keeps it and registers again with it.
+        let code = if prior.is_some() && reservation.is_some() {
+            ErrorCode::Recovered
+        } else {
+            ErrorCode::RegisterAgain
+        };
         HubError::new(
-            ErrorCode::RegisterAgain,
+            code,
             format!(
-                "store write outcome is unknown and could not be resolved ({error}); the registration is dropped and its entry reserved until it expires"
+                "store write outcome is unknown and could not be resolved ({error}); the registration is dropped and its entry reserved"
             ),
         )
     }
@@ -301,6 +326,7 @@ impl Transaction<'_> {
     async fn fail_after_write(&mut self, incarnation: Incarnation, error: HubError) -> HubError {
         let shared = self.shared;
         let owner = self.owner;
+        let prior = self.permit().previous().is_some();
         if let Err(remove_error) = shared.remove_bounded(owner, incarnation).await
             && !remove_error.is_gone()
         {
@@ -317,15 +343,28 @@ impl Transaction<'_> {
             id: owner,
             incarnation,
         };
-        self.settle_after_write(Some(removal), shared.store.current_incarnation(owner));
+        let reservation = shared.store.current_incarnation(owner);
+        self.settle_after_write(Some(removal), reservation);
+        // As in `fail_unresolved`: an entry still held, whose record names
+        // the presented credential, is recovered by it, not by a bare
+        // register.
+        let code = if prior && reservation.is_some() {
+            ErrorCode::Recovered
+        } else {
+            ErrorCode::RegisterAgain
+        };
         HubError::new(
-            ErrorCode::RegisterAgain,
+            code,
             format!("registration failed after it was recorded; register again: {error}"),
         )
     }
 }
 
-async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterResponse, HubError> {
+async fn transact(
+    shared: Arc<Shared>,
+    request: Request,
+    written: Arc<AtomicBool>,
+) -> Result<RegisterResponse, HubError> {
     let Request {
         peer,
         presented,
@@ -343,9 +382,11 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
     }
     let locked_at = Instant::now();
 
+    // Read under the lock: the record a reserved owner recovers from.
+    let stored = presented.as_ref().and_then(|_| shared.store.get(owner));
     let permit = shared
         .authority
-        .begin_registration(owner, presented.as_ref())?;
+        .begin_registration(owner, presented.as_ref(), stored.as_ref())?;
     let mut txn = Transaction {
         _in_flight: shared.in_flight.enter(owner),
         shared: &shared,
@@ -406,6 +447,7 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
             match super::bounded(config.step_timeout, shared.store.resolve(owner, op)).await {
                 Ok(Some(incarnation)) => {
                     txn.written = Some(incarnation);
+                    written.store(true, Ordering::Release);
                     let error =
                         HubError::unavailable(format!("store write was indeterminate: {reason}"));
                     return Err(txn.fail_after_write(incarnation, error).await);
@@ -431,6 +473,7 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
         Err(error) => return Err(txn.abort(error.into())),
     };
     txn.written = Some(incarnation);
+    written.store(true, Ordering::Release);
 
     // Everything below fails through `fail_after_write`.
     if let Err(error) = shared.authority.record_write(txn.permit(), incarnation) {
@@ -500,6 +543,7 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
         hub_instance_id: shared.velo.as_ref().map(|velo| velo.instance_id()),
         credential,
         epoch: lease.epoch,
+        hub_id: shared.hub_id,
     })
 }
 

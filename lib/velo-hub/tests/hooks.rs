@@ -470,7 +470,11 @@ async fn indeterminate_put_that_applied_fails_closed() {
 }
 
 /// Neither outcome can be learned. The hub drops the prior registration's
-/// extension state and reserves whatever the store holds until it expires.
+/// extension state and reserves whatever the store holds. Nobody can claim
+/// it without a credential, but the record the unresolved write stored
+/// holds the presented credential's digest, so the registrant gets back in
+/// with that credential (the route answers `recovered`), without waiting
+/// for the entry to expire.
 #[tokio::test]
 async fn indeterminate_put_that_cannot_be_resolved_drops_and_reserves() {
     let f = plain().await;
@@ -486,24 +490,27 @@ async fn indeterminate_put_that_cannot_be_resolved_drops_and_reserves() {
         Some(&prior.credential),
     )
     .await;
+    // The presented credential recovers the reserved entry, so the answer
+    // says so and the client keeps it.
     assert_eq!(response.status(), 409);
-    assert_eq!(error_code(response).await, ErrorCode::RegisterAgain);
+    assert_eq!(error_code(response).await, ErrorCode::Recovered);
     assert!(!f.ledger.has_owner(owner));
     assert!(f.store.contains(owner), "the written entry is still there");
     assert_eq!(
         heartbeat_status(&f.hub, owner, Some(&prior.credential)).await,
-        401,
-        "reserved"
+        409,
+        "reserved, and the credential may recover it"
     );
     assert_eq!(
         post_register(&f.hub, &request(&peer), None).await.status(),
         401
     );
-
-    f.store.expire(owner);
     assert_eq!(
-        post_register(&f.hub, &request(&peer), None).await.status(),
-        200
+        post_register(&f.hub, &request(&peer), Some(&prior.credential))
+            .await
+            .status(),
+        200,
+        "the presented credential recovers the reserved entry"
     );
 }
 
@@ -1660,5 +1667,181 @@ async fn stop_waits_out_a_slow_conforming_transaction() {
     assert!(
         !f.ledger.has_owner(other.instance_id()),
         "stop gave up on the lock and left the queued removal undelivered"
+    );
+}
+
+/// A recovery registration (a reserved owner presenting its credential)
+/// that fails before its write changed nothing: the answer must not be
+/// `register_again`, which would make the client drop the one credential
+/// that can recover the entry.
+#[tokio::test]
+async fn a_recovery_that_fails_before_its_write_is_not_register_again() {
+    let f = plain().await;
+    let peer = make_peer();
+    let owner = peer.instance_id();
+    let prior = seeded(&f, &peer).await;
+    // Reserve the owner: an unresolved write drops the registration and
+    // reserves the entry, whose record holds the presented credential.
+    f.store.fault_next_put(PutFault::IndeterminateWritten);
+    f.store.fail_next_resolve();
+    let response = post_register(
+        &f.hub,
+        &request_with(&peer, &[ledger_opt_in()]),
+        Some(&prior.credential),
+    )
+    .await;
+    assert_eq!(error_code(response).await, ErrorCode::Recovered);
+    assert_eq!(
+        heartbeat_status(&f.hub, owner, Some(&prior.credential)).await,
+        409,
+        "reserved"
+    );
+    // The recovery's put fails before anything is written.
+    f.store.fault_next_put(PutFault::Fail);
+    let response = post_register(&f.hub, &request(&peer), Some(&prior.credential)).await;
+    let (status, code) = (response.status(), error_code(response).await);
+    assert_ne!(
+        code,
+        ErrorCode::RegisterAgain,
+        "nothing was written; got {status} {code:?}"
+    );
+    assert_eq!(
+        post_register(&f.hub, &request(&peer), Some(&prior.credential))
+            .await
+            .status(),
+        200,
+        "the credential still recovers"
+    );
+}
+
+/// An `Internal` failure before the write, while
+/// the store is not live, must not answer `register_again`: the prior
+/// registration is intact and `authorize` only says `Unavailable`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn internal_failure_while_the_store_is_degraded_keeps_the_active_credential() {
+    let f = plain().await;
+    let peer = make_peer();
+    let owner = peer.instance_id();
+    let prior = seeded(&f, &peer).await;
+    let incarnation = f.store.current_incarnation(owner).unwrap();
+    let gate = f.store.gate_next_put();
+    f.store.fault_next_put(PutFault::Fail);
+    let hub = f.hub.clone();
+    let (p, c) = (peer.clone(), prior.credential.clone());
+    let task = tokio::spawn(async move {
+        post_register(&hub, &request_with(&p, &[ledger_opt_in()]), Some(&c)).await
+    });
+    gate.entered().await;
+    f.store.set_continuity(Continuity::Degraded);
+    assert!(eventually(Duration::from_secs(1), || !f.hub.authority().is_live()).await);
+    gate.release();
+    let response = task.await.unwrap();
+    let (status, code) = (response.status(), error_code(response).await);
+    assert_ne!(
+        code,
+        ErrorCode::RegisterAgain,
+        "nothing was written and the prior is intact; got {status} {code:?}"
+    );
+    f.store.set_continuity(Continuity::Live);
+    assert!(eventually(Duration::from_secs(1), || f.hub.authority().is_live()).await);
+    assert_prior_intact(&f, &peer, &prior, incarnation).await;
+}
+
+/// An indeterminate write that did not apply and
+/// cannot be resolved reserves the prior record; its `pending` digest is
+/// the credential the client holds, so the answer is `recovered` and that
+/// credential recovers the entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unresolved_write_that_did_not_apply_answers_recovered_and_recovers() {
+    let f = plain().await;
+    let peer = make_peer();
+    let owner = peer.instance_id();
+    let prior = seeded(&f, &peer).await;
+    let incarnation = f.store.current_incarnation(owner).unwrap();
+    f.store.fault_next_put(PutFault::IndeterminateNotWritten);
+    f.store.fail_next_resolve();
+    let response = post_register(
+        &f.hub,
+        &request_with(&peer, &[ledger_opt_in()]),
+        Some(&prior.credential),
+    )
+    .await;
+    assert_eq!(response.status(), 409);
+    assert_eq!(error_code(response).await, ErrorCode::Recovered);
+    assert_eq!(
+        f.store.current_incarnation(owner),
+        Some(incarnation),
+        "the prior record is what is reserved"
+    );
+    assert_eq!(
+        heartbeat_status(&f.hub, owner, Some(&prior.credential)).await,
+        409
+    );
+    let again = register(&f.hub, &request(&peer), Some(&prior.credential)).await;
+    assert_ne!(again.epoch, prior.epoch);
+    assert_eq!(
+        heartbeat_status(&f.hub, owner, Some(&again.credential)).await,
+        200
+    );
+    assert_eq!(
+        heartbeat_status(&f.hub, owner, Some(&prior.credential)).await,
+        401,
+        "recovery is single-use"
+    );
+}
+
+/// A credentialed re-registration that fails after
+/// its write, whose remove then fails too, leaves the new entry reserved;
+/// that record holds the presented credential's digest as `accepted`, so
+/// the credential recovers it. The answer must say `recovered`, as the
+/// unresolved path does since pass 2; `register_again` makes the client
+/// drop that credential, and the entry is then locked until eviction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn post_write_failure_with_a_failed_remove_answers_recovered() {
+    let f = fixture(|_| {}, true).await;
+    let client = new_velo().await;
+    let owner = client.instance_id();
+    let prior = seeded(&f, &client.peer_info()).await;
+    let unreachable = PeerInfo::new(owner, unreachable_peer().worker_address().clone());
+    f.store.fail_next_remove();
+    let response = post_register(
+        &f.hub,
+        &request_with(&unreachable, &[ledger_opt_in()]),
+        Some(&prior.credential),
+    )
+    .await;
+    assert_eq!(response.status(), 409);
+    let code = error_code(response).await;
+    assert!(
+        f.store.contains(owner),
+        "control: the remove failed; the entry stays"
+    );
+    assert_eq!(
+        heartbeat_status(&f.hub, owner, Some(&prior.credential)).await,
+        409,
+        "control: the entry is reserved and the credential is told so"
+    );
+    assert_eq!(
+        post_register(&f.hub, &request(&client.peer_info()), None)
+            .await
+            .status(),
+        401,
+        "control: a bare register (what the client does after register_again) is refused"
+    );
+    let again = post_register(
+        &f.hub,
+        &request(&client.peer_info()),
+        Some(&prior.credential),
+    )
+    .await;
+    assert_eq!(
+        again.status(),
+        200,
+        "control: the presented credential recovers the reserved entry"
+    );
+    assert_eq!(
+        code,
+        ErrorCode::Recovered,
+        "the hub told the client to drop the one credential that recovers the entry"
     );
 }

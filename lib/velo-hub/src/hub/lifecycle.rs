@@ -31,15 +31,23 @@ pub(crate) enum Job {
     /// A registration that wrote this entry stopped without finishing (its
     /// task panicked). Remove the entry, then deliver its removal.
     Retire(Removal),
+    /// A reserved entry went; forget its peer in the hub's velo.
+    ForgetPeer(Removal),
 }
 
 /// The hook the hub installs in its store.
 pub(crate) fn removal_hook(authority: Authority, jobs: mpsc::UnboundedSender<Job>) -> RemovalHook {
     Arc::new(move |removal| {
-        if authority.begin_revocation(removal) == RevocationAction::Cleanup {
-            // A closed queue means the hub is stopping and nothing will
-            // read authority again.
-            let _ = jobs.send(Job::Removal(removal));
+        // A closed queue means the hub is stopping and nothing will read
+        // authority again.
+        match authority.begin_revocation(removal) {
+            RevocationAction::Cleanup => {
+                let _ = jobs.send(Job::Removal(removal));
+            }
+            RevocationAction::ForgetPeer => {
+                let _ = jobs.send(Job::ForgetPeer(removal));
+            }
+            RevocationAction::Ignore => {}
         }
     })
 }
@@ -48,16 +56,7 @@ impl Shared {
     /// Deliver one removal. The caller holds the registration lock.
     pub(crate) fn deliver_removal(&self, removal: Removal) {
         self.notify_removed(removal);
-        // Forget the velo peer only if no later incarnation replaced it, so
-        // a delayed delivery cannot disconnect a replacement.
-        if let Some(velo) = &self.velo
-            && self
-                .store
-                .current_incarnation(removal.id)
-                .is_none_or(|current| current == removal.incarnation)
-        {
-            velo.unregister_peer(removal.id);
-        }
+        self.forget_peer(removal);
         self.authority.finish_revocation(removal);
     }
 
@@ -79,6 +78,19 @@ impl Shared {
         }
     }
 
+    /// Forget the velo peer, but only if no later incarnation replaced it,
+    /// so a delayed delivery cannot disconnect a replacement.
+    fn forget_peer(&self, removal: Removal) {
+        if let Some(velo) = &self.velo
+            && self
+                .store
+                .current_incarnation(removal.id)
+                .is_none_or(|current| current == removal.incarnation)
+        {
+            velo.unregister_peer(removal.id);
+        }
+    }
+
     /// Run one job. The caller holds the registration lock.
     pub(crate) async fn run_job(&self, job: Job) {
         match job {
@@ -94,6 +106,7 @@ impl Shared {
                 }
                 self.deliver_removal(removal);
             }
+            Job::ForgetPeer(removal) => self.forget_peer(removal),
         }
     }
 }

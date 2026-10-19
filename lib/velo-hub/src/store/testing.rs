@@ -316,6 +316,6 @@ mod tests {
     /// With no fault armed the fixture is a faithful backend.
     #[tokio::test]
     async fn fault_store_passes_the_conformance_suite() {
-        crate::store::conformance::run_all(|| Arc::new(FaultStore::default())).await;
+        crate::store::conformance::run_all(|| async { Arc::new(FaultStore::default()) }).await;
     }
 }
