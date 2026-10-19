@@ -76,7 +76,43 @@ Measured against a local etcd 3.5 in Docker (release build, one call at a time):
 
 A hub that starts on a store with registrations in it reserves each of them: nobody can claim the instance without a credential, and peer lookups keep working. It also tells its velo instance about each peer, so its probes reach them.
 
-The registrant gets back in with its credential. The hub's heartbeat carries the hub's id, and the client notices that the id changed (`HubClient::recovered()`); a route the registrant calls with its credential answers `recovered`. The client then registers again presenting its credential. The hub checks the credential's digest against the stored record (the credential the registrant presented, or the one that registration minted, whose answer may have been lost), and the registration proceeds as a re-registration of the stored one, with a new credential and a new epoch. Extension state is not replayed: extensions see the owner as new. The registration carries the client's services, so they come back with it. A recovery that fails before its write (an extension refuses it) leaves the instance reserved, so the credential can try again. The same holds for a registration that presented a credential and failed after its write, when the hub could not remove the entry it wrote: the hub answers `recovered`, not `register_again`, so the client keeps the one credential that can recover the entry. The credential the registrant presented stays able to recover until the registrant registers once more, because the record keeps it for the case where the answer to that registration was lost.
+The registrant gets back in with its credential. The hub's heartbeat carries the hub's id, and the client notices a hub id that it never registered with (`HubClient::recovered()`); a route the registrant calls with its credential answers `recovered`. The client then registers again presenting its credential. The hub checks the credential's digest against the stored record (the credential the registrant presented, or the one that registration minted, whose answer may have been lost), and the registration proceeds as a re-registration of the stored one, with a new credential and a new epoch. Extension state is not replayed: extensions see the owner as new. The registration carries the client's services, so they come back with it. A recovery that fails before its write (an extension refuses it) leaves the instance reserved, so the credential can try again. The same holds for a registration that presented a credential and failed after its write, when the hub could not remove the entry it wrote: the hub answers `recovered`, not `register_again`, so the client keeps the one credential that can recover the entry. The credential the registrant presented stays able to recover until the registrant registers once more, because the record keeps it for the case where the answer to that registration was lost.
+
+## High availability
+
+High availability is one active hub and one or more standby hubs on the same etcd prefix. A standby connects its store with `wait_for_prefix(Duration::MAX)`. It does not bind its listeners until its store holds the prefix lock. While another hub holds the lock, the standby watches the lock key, and after any other error it tries again every 250 ms, so a short etcd outage does not stop it. When the active hub goes, the standby takes the lock, loads the prefix, reserves each registration, and serves. Each registrant then gets back in with its credential, as after a restart (see [Recovery after a restart](#recovery-after-a-restart)).
+
+Raft between hubs was rejected for now. It needs a replicated log, snapshots, membership changes, and at least three hubs. A Raft leader that is cut off from its quorum has the same problem as a hub cut off from etcd, and it needs the same lease rule.
+
+Takeover times, measured with `tests/ha_etcd.rs`: one local etcd 3.5.13 node, loopback, request deadline one third of the lock TTL, `heartbeat_interval` 200 ms.
+
+| How the active hub goes | Lock TTL | Standby serves after | Registrant back after | Runs |
+|---|---|---|---|---|
+| `Hub::shutdown` (frees the lock) | 3 s | 39 to 47 ms | 249 to 265 ms | 6 |
+| crash (the lock lease expires) | 3 s | 2.52 to 2.90 s | 2.74 to 3.10 s | 6 |
+| crash | 10 s (default) | 9.57 to 9.88 s | 9.79 to 10.10 s | 4 |
+| cut off from etcd, packets dropped | 3 s | 2.59 to 2.94 s | | 5 |
+| cut off from etcd, connections refused, client with both hosts | 3 s | | 3.22 to 3.51 s | 6 |
+
+After a crash, the lock lease has two thirds to one lock TTL left, so the standby serves after that time. "Registrant back" adds up to one heartbeat interval, because the registrant learns of the new hub from its first probe. That interval is 200 ms in the test and 10 s by default, so with the defaults a registrant is back about 10 s after the standby serves. A lower lock TTL gives a faster takeover. But etcd raises a TTL below its minimum (about 2 s), and with a lock TTL of a few seconds an etcd leader election or a long pause of the hub becomes a takeover, with a new registration for every registrant.
+
+A hub cut off from etcd is `Degraded` one lock TTL after it sent its last answered renewal, before a standby can take the lock (see [The etcd store](#the-etcd-store)). With packets dropped, it was `Degraded` 2.45 s after the cut in every run, 0.14 to 0.49 s before the standby served. Without that deadline, it stayed `Live` until its connection to etcd broke, 5.5 s after the cut, and in that window it accepted the old credential and refused the new one. When it reaches etcd again, it is fenced within about 150 ms and stops.
+
+**One address.** Put the hubs behind one address (a VIP, a DNS name, or a Kubernetes Service) whose readiness check is `GET /v1/ready`, not `/v1/health`. A standby is not bound, so it gets no traffic. A hub cut off from etcd is still bound and still answers `/v1/health`, but `/v1/ready` answers 503 while its store is not `Live`, so the address moves the traffic to the standby. Without one address, give the client every host with `HubClientBuilder::hosts` (see [Client](#client)).
+
+**During the gap.** From the moment the active hub goes until the standby serves:
+
+- Registrations, heartbeats, and every call with a credential fail: the hub cannot be reached, or a `Degraded` hub answers 503 `unavailable`.
+- Peer lookups get connection errors, or, on a `Degraded` hub, answers from its local view, which can be stale.
+- A service watch ends with `Disconnected`. The watcher watches again.
+- The standby starts each registrant's TTL clock when it loads the prefix, so a takeover spends none of the registrant TTL.
+- Extension state does not move to the standby. Extensions see each owner as new when it registers again. An extension that needs state across a takeover stores it itself.
+
+**The longest gap.** The registrations wait in etcd for the custody TTL (5 min by default) after the last hub kept them alive. After a longer gap they are gone: the new hub does not probe the registrant, so `recovered()` never rises, and the old credential answers `unauthorized`. So the application loop is:
+
+1. Wait until `recovered()` is true, or until `last_hub_heartbeat()` is older than a few heartbeat intervals.
+2. Call `register` again. It presents the credential.
+3. If the hub answers `unauthorized`, the client has dropped the registration. Call `register` once more, without a credential.
 
 ## Authority
 
@@ -172,6 +208,8 @@ An answer that says the hub does not accept the credential (`unauthorized`, `reg
 The client is a cheap handle; its clones share the one registration. Dropping the last clone sends `DELETE` in the background on the current runtime, as a best effort: without a runtime, or when the runtime shuts down first, the request is not sent, and the hub's probes or the TTL remove the entry. A program that can await calls `unregister`. If `DELETE` fails, the client keeps the registration, so a retry or the drop sends it again.
 
 velo keeps its discovery for as long as it lives, so the discovery that `velo_builder()` installs is a separate handle, `HubDiscovery`, that holds no registration. If velo held the client itself, the registration would live as long as velo does, and dropping the client would not unregister. The heartbeat handler and `ExtClient` hold the registration weakly for the same reason.
+
+`HubClientBuilder::hosts` gives the client an ordered list of hosts that share the ports: an active hub and its standbys, where no shared address is in front of them. A call goes to the host that answered last. It moves to the next host only when no hub that could act got the request: the client could not connect, or the hub answered 503 with `not_ready` set in its `ErrorBody`. A hub sets `not_ready` only when it is not ready and did nothing for the request: its store is not `Live`, or it does not take registrations. Every other answer belongs to the hub, and the call returns it. So a request that can have changed one hub's state, such as a write whose outcome is unknown, never goes to a second hub. The client ignores a probe from a hub that it registered with before and has left, so an old hub that still probes cannot raise `recovered()` again.
 
 `client.ext(name)` makes JSON calls under `/v1/ext/{name}`. `get` and `post` use the public listener. `control_get`, `control_post`, and `control_delete` use the control listener and send the registration's credential; once every `HubClient` clone is dropped, they answer `NotRegistered`. A bundle crate builds its typed client on it. Every error that the hub answers is a `ClientError::Hub` with the hub's `ErrorCode`, so a caller acts on the code.
 

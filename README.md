@@ -31,7 +31,7 @@ Batched streams give each stream a window of 32 records in flight by default. A 
 |---|---|---|
 | `velo` | Application authors | The runtime: messaging, streaming, rendezvous, events, queues, discovery, all in-tree transports (TCP, UDS, NATS, gRPC, ZMQ, UCX, QUIC), metrics |
 | `velo-ext` | Authors of out-of-tree plugins | The stable trait surface: `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`, and the types they use |
-| `velo-hub` | Authors of a hub service, and programs that use a hub | A hub (`server`): peer and service discovery, registration, and liveness for a velo application, plus hosted extensions. Its etcd store (`etcd`): registrations that survive a hub restart. Its client (`client`): registration, peer and service discovery through the hub, and calls to extensions. Not published yet. |
+| `velo-hub` | Authors of a hub service, and programs that use a hub | A hub (`server`): peer and service discovery, registration, and liveness for a velo application, plus hosted extensions. Its etcd store (`etcd`): registrations that survive a hub restart, and standby hubs that take over from the active one. Its client (`client`): registration, peer and service discovery through the hub, one hub or a list of hubs, and calls to extensions. Not published yet. |
 
 Application authors depend on `velo` only. `velo-hub` builds one service that is the peer discovery for an application and hosts extensions. It takes the workspace version and requires `velo` with a caret on it. See [The hub](docs/src/concepts/hub.md), [Workspace crates](docs/src/development/architecture.md), and [Versioning](docs/src/development/versioning.md).
 
