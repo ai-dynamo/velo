@@ -68,3 +68,13 @@ tracing-subscriber = { workspace = true }
 name = "integration"
 path = "tests/integration.rs"
 required-features = ["test-support"]
+
+[[test]]
+name = "heartbeat"
+path = "tests/heartbeat.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "registration_lifecycle"
+path = "tests/registration_lifecycle.rs"
+required-features = ["test-support"]
