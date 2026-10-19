@@ -365,15 +365,17 @@ async fn hub_errors_carry_their_code() {
     assert!(!client.is_registered());
 }
 
-/// When the hub no longer knows the registration (here it was deleted by
-/// someone holding the credential), a heartbeat says so with a code, and a
-/// re-registration answered `unauthorized` drops the dead registration, so
-/// the next `register` starts fresh and succeeds.
+/// When the hub no longer knows the registration (here someone holding the
+/// credential deleted it), the client learns it from its next call and
+/// drops the dead registration, so the next `register` starts fresh. Both
+/// calls that present the credential follow the rule: a heartbeat answered
+/// `not_found`, and a re-registration answered `unauthorized`.
 #[tokio::test]
 async fn a_dead_registration_is_dropped_and_the_next_register_starts_fresh() {
     let hub = start().await;
     let client = client_for(&hub);
     let peer = make_peer();
+
     let response = client.register_peer(peer.clone(), none()).await.unwrap();
     assert_eq!(
         unregister_status(&hub, peer.instance_id(), Some(&response.credential)).await,
@@ -381,6 +383,13 @@ async fn a_dead_registration_is_dropped_and_the_next_register_starts_fresh() {
     );
     let error = client.send_heartbeat().await.unwrap_err();
     assert!(error.code().is_some(), "{error}");
+    assert!(!client.is_registered());
+    let response = client.register_peer(peer.clone(), none()).await.unwrap();
+
+    assert_eq!(
+        unregister_status(&hub, peer.instance_id(), Some(&response.credential)).await,
+        204
+    );
     let error = client
         .register_peer(peer.clone(), none())
         .await
@@ -526,4 +535,182 @@ async fn a_client_without_the_registration_answers_not_ok_and_is_freed() {
     client.register(&velo, none()).await.unwrap();
     client.unregister().await.unwrap();
     hub.shutdown().await.unwrap();
+}
+
+// ---- cancellation and handle rules ------------------------------------------
+
+/// A `register` future dropped while the hub runs the transaction (here a
+/// caller's timeout): the hub commits anyway, in its own task, and the
+/// client holds nothing. Its handler must answer the hub's probes not ok,
+/// so the hub frees the entry and the next `register` succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_register_future_does_not_answer_probes_ok() {
+    let mut config = config();
+    config.server.heartbeat_interval = Duration::from_millis(100);
+    config.server.heartbeat_max_failures = 2;
+    let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::default());
+    let hub = Hub::builder(config)
+        .velo(velo_builder())
+        .store(store.clone())
+        .serve()
+        .await
+        .unwrap();
+    let client = client_for(&hub);
+    let velo = client
+        .velo_builder()
+        .add_transport(tcp_transport())
+        .build()
+        .await
+        .unwrap();
+    let id = velo.instance_id();
+    let gate = store.gate_next_put();
+    let (timed_out, ()) = tokio::join!(
+        tokio::time::timeout(Duration::from_millis(200), client.register(&velo, none())),
+        gate.entered()
+    );
+    assert!(timed_out.is_err());
+    gate.release();
+    let hub_ref = &hub;
+    assert!(eventually(Duration::from_secs(2), || hub_ref.store().get(id).is_some()).await);
+    assert!(!client.is_registered());
+    assert!(
+        eventually(Duration::from_secs(3), || hub_ref.store().get(id).is_none()).await,
+        "the client holds no registration but answers the hub's probes ok"
+    );
+    client.register(&velo, none()).await.unwrap();
+    client.unregister().await.unwrap();
+    hub.shutdown().await.unwrap();
+}
+
+/// A re-registration whose future is dropped after the hub committed leaves
+/// the client with the old credential. `unregister` then gets 401, which
+/// means "this credential owns nothing there", so it answers Ok and drops
+/// the registration, while the hub still holds the new one. The client
+/// then answers probes not ok, and the hub frees the entry.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dropped_re_register_heals_through_the_probes() {
+    let mut config = config();
+    config.server.heartbeat_interval = Duration::from_millis(100);
+    config.server.heartbeat_max_failures = 2;
+    let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::default());
+    let hub = Hub::builder(config)
+        .velo(velo_builder())
+        .store(store.clone())
+        .serve()
+        .await
+        .unwrap();
+    let client = client_for(&hub);
+    let velo = client
+        .velo_builder()
+        .add_transport(tcp_transport())
+        .build()
+        .await
+        .unwrap();
+    let id = velo.instance_id();
+    let first = client.register(&velo, none()).await.unwrap();
+    let gate = store.gate_next_put();
+    let (timed_out, ()) = tokio::join!(
+        tokio::time::timeout(Duration::from_millis(200), client.register(&velo, none())),
+        gate.entered()
+    );
+    assert!(timed_out.is_err());
+    gate.release();
+    let hub_ref = &hub;
+    assert!(
+        eventually(Duration::from_secs(2), || {
+            hub_ref
+                .authority()
+                .authorize(id, Some(&first.credential))
+                .is_err()
+        })
+        .await
+    );
+    assert!(client.unregister().await.is_ok());
+    assert!(!client.is_registered());
+    assert!(
+        eventually(Duration::from_secs(3), || hub_ref.store().get(id).is_none()).await,
+        "the hub did not free the registration the client lost"
+    );
+    client.register(&velo, none()).await.unwrap();
+    client.unregister().await.unwrap();
+    hub.shutdown().await.unwrap();
+}
+
+/// An `ExtClient` is not a clone of the client: like `HubDiscovery`, it
+/// must not keep the registration alive once every `HubClient` is dropped.
+/// Its control calls then answer `NotRegistered`.
+#[tokio::test]
+async fn an_ext_client_does_not_keep_the_registration_alive() {
+    let hub = start().await;
+    let peer = make_peer();
+    let client = client_for(&hub);
+    client.register_peer(peer.clone(), none()).await.unwrap();
+    let ext = client.ext("anything");
+    drop(client);
+    let hub_ref = &hub;
+    assert!(
+        eventually(Duration::from_secs(2), || hub_ref
+            .store()
+            .get(peer.instance_id())
+            .is_none())
+        .await,
+        "the ExtClient kept the registration alive"
+    );
+    assert!(matches!(
+        ext.control_post::<_, ()>("/x", &()).await,
+        Err(ClientError::NotRegistered)
+    ));
+}
+
+/// The hub no longer has the registration (an `unregister` whose future
+/// was dropped after the hub removed the entry). The next heartbeat's
+/// answer says so, and the client drops the registration, so
+/// `is_registered()` tells the truth again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_heartbeat_the_hub_does_not_know_drops_the_registration() {
+    let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::default());
+    let hub = builder()
+        .velo(velo_builder())
+        .store(store.clone())
+        .serve()
+        .await
+        .unwrap();
+    let client = client_for(&hub);
+    let velo = client
+        .velo_builder()
+        .add_transport(tcp_transport())
+        .build()
+        .await
+        .unwrap();
+    let id = velo.instance_id();
+    client.register(&velo, none()).await.unwrap();
+    let gate = store.gate_next_remove();
+    let (timed_out, ()) = tokio::join!(
+        tokio::time::timeout(Duration::from_millis(200), client.unregister()),
+        gate.entered()
+    );
+    assert!(timed_out.is_err());
+    gate.release();
+    let hub_ref = &hub;
+    assert!(eventually(Duration::from_secs(2), || hub_ref.store().get(id).is_none()).await);
+    assert!(client.send_heartbeat().await.is_err());
+    assert!(!client.is_registered());
+    client.register(&velo, none()).await.unwrap();
+    client.unregister().await.unwrap();
+    hub.shutdown().await.unwrap();
+}
+
+#[test]
+fn an_ipv6_literal_host_builds() {
+    let client = HubClientBuilder::default()
+        .host("2001:db8::1")
+        .build()
+        .unwrap();
+    assert_eq!(
+        client.public_url().as_str(),
+        format!(
+            "http://[2001:db8::1]:{}/",
+            velo_hub::protocol::DEFAULT_PUBLIC_PORT
+        )
+    );
 }

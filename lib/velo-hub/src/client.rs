@@ -27,7 +27,7 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -166,8 +166,10 @@ impl HubClientBuilder {
         self
     }
 
-    /// A configured `reqwest::Client` (timeouts, TLS). A default one is
-    /// built otherwise.
+    /// A configured `reqwest::Client` (TLS, proxies, timeouts). It keeps its
+    /// own timeouts: without one, a call to a hub that is gone waits for
+    /// ever. Without this, the client uses [`DEFAULT_CONNECT_TIMEOUT`] and
+    /// [`DEFAULT_REQUEST_TIMEOUT`].
     pub fn http_client(mut self, http: reqwest::Client) -> Self {
         self.http = Some(http);
         self
@@ -178,13 +180,22 @@ impl HubClientBuilder {
         let host = self
             .host
             .ok_or_else(|| ClientError::InvalidUrl("no host".to_string()))?;
+        // An IPv6 literal needs brackets in a URL.
+        let host = if host.contains(':') && !host.starts_with('[') {
+            format!("[{host}]")
+        } else {
+            host
+        };
         let url = |port: u16| {
             Url::parse(&format!("{}://{host}:{port}", self.scheme))
                 .map_err(|error| ClientError::InvalidUrl(format!("{host}:{port}: {error}")))
         };
         let http = match self.http {
             Some(http) => http,
-            None => reqwest::Client::builder().build()?,
+            None => reqwest::Client::builder()
+                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+                .timeout(DEFAULT_REQUEST_TIMEOUT)
+                .build()?,
         };
         let endpoints = Arc::new(Endpoints {
             http,
@@ -194,13 +205,20 @@ impl HubClientBuilder {
         Ok(HubClient {
             inner: Arc::new(Inner {
                 endpoints,
-                registration: tokio::sync::Mutex::new(None),
-                held: parking_lot::Mutex::new(None),
-                heartbeat: Arc::new(HubHeartbeat::default()),
+                op: tokio::sync::Mutex::new(()),
+                shared: Arc::new(Shared::default()),
             }),
         })
     }
 }
+
+/// Connect timeout of the client's default HTTP client.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Request timeout of the client's default HTTP client. Longer than a
+/// registration can take on a hub with default settings and up to three
+/// extensions: 5 s for the lock, then 5 s for each of `2n + 3` steps.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The HTTP client and the two listener URLs, shared by every handle.
 #[derive(Debug)]
@@ -241,7 +259,8 @@ impl Endpoints {
 }
 
 /// Decode a hub answer. A success with an empty body (204) decodes as JSON
-/// `null`, so `T = ()` reads it.
+/// `null`, so `T = ()` reads it; use `serde::de::IgnoredAny` to ignore any
+/// body.
 async fn decode<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, ClientError> {
     let status = response.status();
     let bytes = response.bytes().await?;
@@ -265,74 +284,129 @@ async fn decode<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, C
     }
 }
 
-/// What the client keeps of its registration.
-#[derive(Debug, Clone)]
-struct Held {
-    response: RegisterResponse,
+/// The registration, as the client knows it. One cell, so no reader sees
+/// two copies disagree.
+#[derive(Debug, Default)]
+struct State {
+    /// The hub's answer to the registration the client holds.
+    response: Option<RegisterResponse>,
+    /// A register call is running. The hub may commit before the client
+    /// sees the answer, and its first probe may arrive first.
+    acquiring: bool,
 }
 
-/// What the client's heartbeat handler reads and records.
+/// What the client's handles share: the registration and what the
+/// heartbeat handler records. The heartbeat handler and [`ExtClient`] hold
+/// it weakly, so neither keeps the registration alive.
 #[derive(Debug, Default)]
-struct HubHeartbeat {
-    /// The handler's answer: `true` while the client holds a registration
-    /// or is acquiring one. `false` tells the hub that a registration it
-    /// holds for this peer has no owner here (its response was lost), so
-    /// the hub evicts it and the peer can register again.
-    holding: AtomicBool,
+struct Shared {
+    state: parking_lot::Mutex<State>,
     seq: AtomicU64,
     at_unix_ms: AtomicU64,
 }
 
+impl Shared {
+    fn credential(&self) -> Option<(InstanceId, Credential)> {
+        self.state
+            .lock()
+            .response
+            .as_ref()
+            .map(|response| (response.instance_id, response.credential.clone()))
+    }
+
+    /// Drop the registration if it is still the one with `credential`: a
+    /// concurrent re-registration may have replaced it.
+    fn forget(&self, credential: &Credential) {
+        let mut state = self.state.lock();
+        if state
+            .response
+            .as_ref()
+            .is_some_and(|response| &response.credential == credential)
+        {
+            state.response = None;
+        }
+    }
+}
+
+/// Clears [`State::acquiring`] when a register call ends, also when its
+/// future is dropped: a flag left set would answer the hub's probes ok for
+/// a registration the client never got, and the hub would keep it.
+struct Acquiring<'a>(&'a Shared);
+
+impl<'a> Acquiring<'a> {
+    fn start(shared: &'a Shared) -> Self {
+        shared.state.lock().acquiring = true;
+        Self(shared)
+    }
+}
+
+impl Drop for Acquiring<'_> {
+    fn drop(&mut self) {
+        self.0.state.lock().acquiring = false;
+    }
+}
+
+/// An answer that says this credential owns nothing on the hub (any more).
+fn owns_nothing(error: &ClientError) -> bool {
+    match error {
+        ClientError::Hub { code, .. } => matches!(
+            code,
+            ErrorCode::Unauthorized | ErrorCode::RegisterAgain | ErrorCode::NotFound
+        ),
+        ClientError::Unexpected { status, .. } => *status == StatusCode::UNAUTHORIZED,
+        _ => false,
+    }
+}
+
 struct Inner {
     endpoints: Arc<Endpoints>,
-    /// The registration. Held across register and unregister requests, so
-    /// they never interleave.
-    registration: tokio::sync::Mutex<Option<Held>>,
-    /// A copy of the registration for sync reads, written under
-    /// `registration`.
-    held: parking_lot::Mutex<Option<Held>>,
-    heartbeat: Arc<HubHeartbeat>,
+    /// Serializes register and unregister calls; holds no data.
+    op: tokio::sync::Mutex<()>,
+    shared: Arc<Shared>,
 }
 
 impl Drop for Inner {
     fn drop(&mut self) {
-        let Some(held) = self.registration.get_mut().take() else {
+        let Some(response) = self.shared.state.lock().response.take() else {
             return;
         };
-        // Best effort: an awaiting caller should use `unregister`. Without a
-        // runtime there is nothing to send the request on.
+        // Best effort: a program that can await calls `unregister`. Without
+        // a runtime there is nothing to send the request on, and a runtime
+        // that shuts down drops the task.
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
         let endpoints = Arc::clone(&self.endpoints);
         runtime.spawn(async move {
-            let _ = delete(&endpoints, &held).await;
+            let _ = delete(&endpoints, response.instance_id, &response.credential).await;
         });
     }
 }
 
-/// `DELETE` the registration. Ok when it is gone: deleted now, or unknown
-/// to the hub (404), or no longer this credential's (401).
-async fn delete(endpoints: &Endpoints, held: &Held) -> Result<(), ClientError> {
-    let url = Endpoints::join(
-        &endpoints.control,
-        &protocol::instance_by_id(held.response.instance_id),
-    )?;
+/// `DELETE` the registration. Ok when this credential owns nothing there
+/// any more: deleted now, unknown to the hub (404), or no longer this
+/// credential's (401). In the 401 case the hub may still hold a later
+/// registration of the peer whose answer this client lost; the hub's probes
+/// remove it, because the client then answers them not ok.
+async fn delete(
+    endpoints: &Endpoints,
+    instance_id: InstanceId,
+    credential: &Credential,
+) -> Result<(), ClientError> {
+    let url = Endpoints::join(&endpoints.control, &protocol::instance_by_id(instance_id))?;
     match endpoints
-        .call::<(), ()>(Method::DELETE, url, Some(&held.response.credential), None)
+        .call::<(), ()>(Method::DELETE, url, Some(credential), None)
         .await
     {
-        Err(ClientError::Hub {
-            code: ErrorCode::NotFound | ErrorCode::Unauthorized,
-            ..
-        }) => Ok(()),
+        Err(error) if owns_nothing(&error) => Ok(()),
         other => other,
     }
 }
 
 /// A client of one hub. Cheap to clone; every clone shares the one
 /// registration, and dropping the last clone unregisters it in the
-/// background. Prefer [`unregister`](Self::unregister) where you can await.
+/// background, best effort. Prefer [`unregister`](Self::unregister) where
+/// you can await.
 #[derive(Clone)]
 pub struct HubClient {
     inner: Arc<Inner>,
@@ -387,131 +461,130 @@ impl HubClient {
         velo: &Velo,
         extensions: Extensions,
     ) -> Result<RegisterResponse, ClientError> {
-        velo.register_handler(heartbeat_handler(Arc::downgrade(&self.inner.heartbeat)))
+        self.check_peer(velo.instance_id())?;
+        velo.register_handler(heartbeat_handler(Arc::downgrade(&self.inner.shared)))
             .map_err(ClientError::Velo)?;
         self.register_peer(velo.peer_info(), extensions).await
+    }
+
+    /// Refuse a peer other than the one the client holds.
+    fn check_peer(&self, peer: InstanceId) -> Result<Option<Credential>, ClientError> {
+        match self.inner.shared.credential() {
+            Some((held, _)) if held != peer => Err(ClientError::AlreadyRegistered(held)),
+            Some((_, credential)) => Ok(Some(credential)),
+            None => Ok(None),
+        }
     }
 
     /// Register `peer`. If the client already holds a registration of this
     /// peer, it presents that credential and the hub replaces the
     /// registration: a new credential and a new epoch, and the old
-    /// credential stops working. An `unauthorized` or `register_again`
-    /// answer to such a call drops the registration the client held, so the
-    /// next call registers afresh.
+    /// credential stops working. An answer that says the credential owns
+    /// nothing (`unauthorized`, `register_again`) drops the registration
+    /// the client held, so the next call registers afresh.
+    ///
+    /// Cancellation: if this future is dropped, the hub may still commit
+    /// the registration. The client then holds nothing, answers the hub's
+    /// probes not ok, and the hub removes that registration after
+    /// `heartbeat_max_failures` probes; register again after that.
     pub async fn register_peer(
         &self,
         peer: PeerInfo,
         extensions: Extensions,
     ) -> Result<RegisterResponse, ClientError> {
-        let mut registration = self.inner.registration.lock().await;
-        let presented = match registration.as_ref() {
-            Some(held) if held.response.instance_id != peer.instance_id() => {
-                return Err(ClientError::AlreadyRegistered(held.response.instance_id));
-            }
-            Some(held) => Some(held.response.credential.clone()),
-            None => None,
-        };
-        // Answer probes ok from the moment the hub may commit: its first
-        // probe can arrive before this call returns.
-        self.inner.heartbeat.holding.store(true, Ordering::Release);
+        let _op = self.inner.op.lock().await;
+        let presented = self.check_peer(peer.instance_id())?;
+        let shared = &self.inner.shared;
+        let _acquiring = Acquiring::start(shared);
         let endpoints = &self.inner.endpoints;
         let url = Endpoints::join(&endpoints.control, protocol::paths::INSTANCES)?;
         let request = RegisterRequest { peer, extensions };
         let answer: Result<RegisterResponse, ClientError> = endpoints
             .call(Method::POST, url, presented.as_ref(), Some(&request))
             .await;
-        let result = match answer {
+        match answer {
             Ok(response) => {
-                let held = Held {
-                    response: response.clone(),
-                };
-                *self.inner.held.lock() = Some(held.clone());
-                *registration = Some(held);
+                // Set before `_acquiring` clears, so probes never see neither.
+                shared.state.lock().response = Some(response.clone());
                 Ok(response)
             }
             Err(error) => {
-                if matches!(
-                    error.code(),
-                    Some(ErrorCode::Unauthorized | ErrorCode::RegisterAgain)
-                ) {
-                    *self.inner.held.lock() = None;
-                    *registration = None;
+                if owns_nothing(&error)
+                    && let Some(credential) = &presented
+                {
+                    shared.forget(credential);
                 }
                 Err(error)
             }
-        };
-        self.inner
-            .heartbeat
-            .holding
-            .store(registration.is_some(), Ordering::Release);
-        result
+        }
     }
 
     /// Unregister. Without a registration this does nothing. On failure the
     /// client keeps the registration, so a retry, or the drop, sends the
     /// `DELETE` again.
     pub async fn unregister(&self) -> Result<(), ClientError> {
-        let mut registration = self.inner.registration.lock().await;
-        let Some(held) = registration.as_ref() else {
+        let _op = self.inner.op.lock().await;
+        let Some((instance_id, credential)) = self.inner.shared.credential() else {
             return Ok(());
         };
-        delete(&self.inner.endpoints, held).await?;
-        *self.inner.held.lock() = None;
-        *registration = None;
-        self.inner.heartbeat.holding.store(false, Ordering::Release);
+        delete(&self.inner.endpoints, instance_id, &credential).await?;
+        self.inner.shared.forget(&credential);
         Ok(())
     }
 
     /// Whether the client holds a registration.
     pub fn is_registered(&self) -> bool {
-        self.inner.held.lock().is_some()
+        self.inner.shared.state.lock().response.is_some()
     }
 
     /// The hub's answer to the registration the client holds: instance id,
     /// the hub's velo instance id, credential and epoch.
     pub fn registration(&self) -> Option<RegisterResponse> {
-        self.inner
-            .held
-            .lock()
-            .as_ref()
-            .map(|held| held.response.clone())
+        self.inner.shared.state.lock().response.clone()
     }
 
     /// Refresh the registration's liveness over HTTP. The hub's own velo
     /// heartbeat does this for a client registered with
-    /// [`register`](Self::register); this is for a hub without velo.
+    /// [`register`](Self::register); this is for a hub without velo. An
+    /// answer that says the hub no longer has the registration drops it.
     pub async fn send_heartbeat(&self) -> Result<(), ClientError> {
-        let held = self
+        let (instance_id, credential) = self
             .inner
-            .held
-            .lock()
-            .clone()
+            .shared
+            .credential()
             .ok_or(ClientError::NotRegistered)?;
         let endpoints = &self.inner.endpoints;
         let url = Endpoints::join(
             &endpoints.control,
-            &protocol::instance_heartbeat(held.response.instance_id),
+            &protocol::instance_heartbeat(instance_id),
         )?;
-        let answer: HeartbeatResponse = endpoints
-            .call::<(), _>(Method::POST, url, Some(&held.response.credential), None)
-            .await?;
-        if !answer.acknowledged {
-            return Err(ClientError::Unexpected {
+        let answer: Result<HeartbeatResponse, ClientError> = endpoints
+            .call::<(), _>(Method::POST, url, Some(&credential), None)
+            .await;
+        match answer {
+            Ok(answer) if answer.acknowledged => Ok(()),
+            Ok(_) => Err(ClientError::Unexpected {
                 status: StatusCode::OK,
                 body: "heartbeat not acknowledged".to_string(),
-            });
+            }),
+            Err(error) => {
+                if owns_nothing(&error) {
+                    self.inner.shared.forget(&credential);
+                }
+                Err(error)
+            }
         }
-        Ok(())
     }
 
     /// The last hub heartbeat the handler installed by
     /// [`register`](Self::register) answered: its sequence number and when
     /// it arrived. `None` before the first.
     pub fn last_hub_heartbeat(&self) -> Option<(u64, SystemTime)> {
-        let at = self.inner.heartbeat.at_unix_ms.load(Ordering::Acquire);
+        let shared = &self.inner.shared;
+        let at = shared.at_unix_ms.load(Ordering::Acquire);
         (at != 0).then(|| {
             (
-                self.inner.heartbeat.seq.load(Ordering::Acquire),
+                shared.seq.load(Ordering::Acquire),
                 UNIX_EPOCH + Duration::from_millis(at),
             )
         })
@@ -524,37 +597,42 @@ impl HubClient {
         endpoints.call::<(), _>(Method::GET, url, None, None).await
     }
 
-    /// Calls to the routes of the extension named `name`.
+    /// Calls to the routes of the extension named `name`. The `ExtClient`
+    /// does not keep the registration alive: once every `HubClient` clone
+    /// is dropped, its control calls answer [`ClientError::NotRegistered`].
     pub fn ext(&self, name: &str) -> ExtClient {
         ExtClient {
-            client: self.clone(),
+            endpoints: Arc::clone(&self.inner.endpoints),
+            registration: Arc::downgrade(&self.inner.shared),
             root: protocol::extension_root(name),
         }
     }
 }
 
-/// The client's velo heartbeat handler. It holds a `Weak` of what it
-/// records, so velo keeping the handler keeps no client alive.
-fn heartbeat_handler(heartbeat: Weak<HubHeartbeat>) -> Handler {
+/// The client's velo heartbeat handler. It answers ok only while the client
+/// holds or is getting a registration, so the hub removes one the client
+/// never got. It holds the client's state weakly: velo keeping the handler
+/// keeps no registration alive, and a dropped client answers not ok.
+fn heartbeat_handler(shared: Weak<Shared>) -> Handler {
     Handler::typed_unary_async::<HeartbeatRequest, HeartbeatAck, _, _>(
         HEARTBEAT_HANDLER,
         move |ctx| {
-            let heartbeat = heartbeat.clone();
+            let shared = shared.clone();
             async move {
                 let seq = ctx.input.seq;
-                // A dropped client holds nothing: answer not ok.
-                let Some(heartbeat) = heartbeat.upgrade() else {
+                let Some(shared) = shared.upgrade() else {
                     return Ok(HeartbeatAck { seq, ok: false });
                 };
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_or(1, |since| since.as_millis().max(1) as u64);
-                heartbeat.seq.store(seq, Ordering::Release);
-                heartbeat.at_unix_ms.store(now, Ordering::Release);
-                Ok(HeartbeatAck {
-                    seq,
-                    ok: heartbeat.holding.load(Ordering::Acquire),
-                })
+                shared.seq.store(seq, Ordering::Release);
+                shared.at_unix_ms.store(now, Ordering::Release);
+                let ok = {
+                    let state = shared.state.lock();
+                    state.response.is_some() || state.acquiring
+                };
+                Ok(HeartbeatAck { seq, ok })
             }
         },
     )
@@ -597,33 +675,52 @@ impl PeerDiscovery for HubDiscovery {
 /// JSON calls to one extension's routes, under `/v1/ext/{name}`. Paths are
 /// relative to that root (`"/instances/{id}/publish"`). Calls on the
 /// control listener carry the registration's credential. A bundle crate
-/// builds its typed client on this.
+/// builds its typed client on this. For a route whose body you do not need,
+/// decode `serde::de::IgnoredAny`.
 #[derive(Debug, Clone)]
 pub struct ExtClient {
-    client: HubClient,
+    endpoints: Arc<Endpoints>,
+    registration: Weak<Shared>,
     root: String,
 }
 
-impl ExtClient {
-    fn url(&self, base: &Url, path: &str) -> Result<Url, ClientError> {
-        Endpoints::join(base, &format!("{}{path}", self.root))
-    }
+/// Which listener an [`ExtClient`] call goes to. Control calls always carry
+/// the credential.
+#[derive(Clone, Copy)]
+enum Listener {
+    Public,
+    Control,
+}
 
-    fn credential(&self) -> Result<Credential, ClientError> {
-        self.client
-            .inner
-            .held
-            .lock()
-            .as_ref()
-            .map(|held| held.response.credential.clone())
-            .ok_or(ClientError::NotRegistered)
+impl ExtClient {
+    async fn request<B: Serialize + ?Sized, T: DeserializeOwned>(
+        &self,
+        method: Method,
+        listener: Listener,
+        path: &str,
+        body: Option<&B>,
+    ) -> Result<T, ClientError> {
+        let (base, credential) = match listener {
+            Listener::Public => (&self.endpoints.public, None),
+            Listener::Control => {
+                let (_, credential) = self
+                    .registration
+                    .upgrade()
+                    .and_then(|shared| shared.credential())
+                    .ok_or(ClientError::NotRegistered)?;
+                (&self.endpoints.control, Some(credential))
+            }
+        };
+        let url = Endpoints::join(base, &format!("{}{path}", self.root))?;
+        self.endpoints
+            .call(method, url, credential.as_ref(), body)
+            .await
     }
 
     /// `GET` on the public listener.
     pub async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
-        let endpoints = &self.client.inner.endpoints;
-        let url = self.url(&endpoints.public, path)?;
-        endpoints.call::<(), _>(Method::GET, url, None, None).await
+        self.request::<(), _>(Method::GET, Listener::Public, path, None)
+            .await
     }
 
     /// `POST` with a JSON body on the public listener.
@@ -632,18 +729,13 @@ impl ExtClient {
         path: &str,
         body: &B,
     ) -> Result<T, ClientError> {
-        let endpoints = &self.client.inner.endpoints;
-        let url = self.url(&endpoints.public, path)?;
-        endpoints.call(Method::POST, url, None, Some(body)).await
+        self.request(Method::POST, Listener::Public, path, Some(body))
+            .await
     }
 
     /// `GET` on the control listener, with the credential.
     pub async fn control_get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
-        let credential = self.credential()?;
-        let endpoints = &self.client.inner.endpoints;
-        let url = self.url(&endpoints.control, path)?;
-        endpoints
-            .call::<(), _>(Method::GET, url, Some(&credential), None)
+        self.request::<(), _>(Method::GET, Listener::Control, path, None)
             .await
     }
 
@@ -653,21 +745,13 @@ impl ExtClient {
         path: &str,
         body: &B,
     ) -> Result<T, ClientError> {
-        let credential = self.credential()?;
-        let endpoints = &self.client.inner.endpoints;
-        let url = self.url(&endpoints.control, path)?;
-        endpoints
-            .call(Method::POST, url, Some(&credential), Some(body))
+        self.request(Method::POST, Listener::Control, path, Some(body))
             .await
     }
 
     /// `DELETE` on the control listener, with the credential.
     pub async fn control_delete<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
-        let credential = self.credential()?;
-        let endpoints = &self.client.inner.endpoints;
-        let url = self.url(&endpoints.control, path)?;
-        endpoints
-            .call::<(), _>(Method::DELETE, url, Some(&credential), None)
+        self.request::<(), _>(Method::DELETE, Listener::Control, path, None)
             .await
     }
 }

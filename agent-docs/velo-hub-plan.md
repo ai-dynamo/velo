@@ -519,3 +519,10 @@ Ported: rows 6, 26-37 of the M1 ledger; the drop half of 38; `client_unregister.
 - **R2-7. The handler answers `ok` only while the client holds or is getting a registration.** Mega review round 3 of M1 found that a lost registration response locked the owner out while it answered the hub's probes. The hub now counts `ok: false` as a failed probe (M1 fix ab987f1); the client sets a `holding` flag when `register_peer` starts and stores `registration.is_some()` when it ends, so a probe that arrives before the response is still answered ok. A dropped client (the handler's `Weak` fails) answers not ok. Test: `a_client_without_the_registration_answers_not_ok_and_is_freed`.
 - **Velo sends to `.instance(id)` do not consult discovery**; `.worker(id)` targets and `Velo::discover_and_register_peer` do. The two-velo test addresses the peer by worker id.
 - Mutation checks: velo's discovery holding the client (R2-1) fails `dropping_the_client_unregisters_while_its_velo_lives`; `register` not installing the handler fails `the_hub_heartbeat_reaches_the_client_and_keeps_it_registered`.
+
+### 15.5 After review pass 1, 2026-10-19
+
+- **R2-8. One state cell.** `Shared { state: Mutex<State { response, acquiring }>, seq, at }`; an `Acquiring` guard clears `acquiring` on every exit, so a dropped `register` future cannot leave the handler answering ok (pass 1 A1). `op: tokio::Mutex<()>` only serializes register and unregister.
+- **R2-9. `ExtClient` holds the registration weakly** (pass 1 A2), like the handler; its control calls answer `NotRegistered` once every `HubClient` is gone.
+- **R2-10. Default timeouts**: connect 5 s, request 60 s (pass 1 A3). M3's watch stream needs a per-request override.
+- **R2-11. "Owns nothing" drops the registration** on every call that presents the credential: `unauthorized`, `register_again`, `not_found`, or a raw HTTP 401 (pass 1 A4).
