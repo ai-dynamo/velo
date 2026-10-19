@@ -1346,3 +1346,47 @@ async fn a_panicking_descriptor_answers_an_error_body() {
     );
     hub.shutdown().await.unwrap();
 }
+
+/// The hub's own pinned entry is written like any store call the hub
+/// awaits: under `step_timeout_ms`, and read back when the answer is
+/// `Indeterminate`. A pinned entry never expires and is never probed, so
+/// one left behind by a hub that did not start would live for ever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_pinned_startup_write_is_bounded_and_read_back() {
+    use velo_hub::store::testing::PutFault;
+    let store = Arc::new(FaultStore::default());
+    store.fault_next_put(PutFault::IndeterminateWritten);
+    assert!(
+        Hub::builder(config())
+            .store(store.clone())
+            .velo(velo_builder())
+            .serve()
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .list()
+            .iter()
+            .filter(|stored| stored.record.pinned)
+            .count(),
+        0,
+        "a pinned write that applied but answered Indeterminate was left behind"
+    );
+
+    let store = Arc::new(FaultStore::default());
+    let gate = store.gate_next_put();
+    let mut config = config();
+    config.server.step_timeout = Duration::from_millis(200);
+    let started = tokio::time::timeout(
+        Duration::from_secs(3),
+        Hub::builder(config)
+            .store(store.clone())
+            .velo(velo_builder())
+            .serve(),
+    )
+    .await;
+    gate.release();
+    let outcome = started.expect("the pinned write has no deadline");
+    assert!(outcome.is_err());
+}

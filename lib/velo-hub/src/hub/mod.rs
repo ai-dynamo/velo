@@ -241,9 +241,18 @@ impl HubBuilder {
         if let Some(velo) = &unwind.velo {
             let mut record = RegistrationRecord::bare(velo.peer_info());
             record.pinned = true;
-            match store.put(record, None).await {
-                Ok(incarnation) => unwind.pinned = Some((velo.instance_id(), incarnation)),
+            let (id, op) = (velo.instance_id(), record.op);
+            let step = server.step_timeout;
+            match bounded(step, store.put(record, None)).await {
+                Ok(incarnation) => unwind.pinned = Some((id, incarnation)),
                 Err(error) => {
+                    // A write that may have applied is read back, so the
+                    // unwind removes it: a pinned entry never expires.
+                    if let StoreError::Indeterminate(_) = error
+                        && let Ok(Some(incarnation)) = bounded(step, store.resolve(id, op)).await
+                    {
+                        unwind.pinned = Some((id, incarnation));
+                    }
                     return Err(unwind
                         .run(anyhow::Error::new(error).context("putting the hub's own entry"))
                         .await);
