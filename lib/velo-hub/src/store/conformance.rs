@@ -15,7 +15,6 @@
 //! it found broken. Liveness (TTL, leases) is backend-specific and is not
 //! checked here.
 
-use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -32,7 +31,7 @@ where
     S: HubStore,
     F: Fn() -> Arc<S>,
 {
-    incarnations_are_never_reused(factory().as_ref()).await;
+    incarnations_increase(factory().as_ref()).await;
     put_is_conditional(factory().as_ref()).await;
     remove_and_touch_are_conditional(factory().as_ref()).await;
     hook_snapshot_and_removals_agree(factory().as_ref()).await;
@@ -66,20 +65,19 @@ fn recording_hook() -> (RemovalHook, Arc<Mutex<Vec<Removal>>>) {
     (hook, removals)
 }
 
-/// A put after a replacement or a removal never yields an incarnation the
-/// instance had before.
-pub async fn incarnations_are_never_reused<S: HubStore>(store: &S) {
+/// A put after a replacement or a removal yields an incarnation greater
+/// than any the instance had before. Greater, not only new: the hub and its
+/// extensions tell a stale removal from a current one by comparing them.
+pub async fn incarnations_increase<S: HubStore>(store: &S) {
     let peer = peer();
     let id = peer.instance_id();
     let first = store.put(record(&peer), None).await.unwrap();
     let second = store.put(record(&peer), Some(first)).await.unwrap();
     store.remove(id, second).await.unwrap();
     let third = store.put(record(&peer), None).await.unwrap();
-    let distinct: HashSet<Incarnation> = [first, second, third].into_iter().collect();
-    assert_eq!(
-        distinct.len(),
-        3,
-        "incarnation reused: {first} {second} {third}"
+    assert!(
+        first < second && second < third,
+        "incarnations must increase for an instance: {first} {second} {third}"
     );
 }
 

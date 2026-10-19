@@ -46,7 +46,7 @@ The hub keeps registrations in a `HubStore`. The hub's routes, its registration 
 
 The store contract:
 
-- Each write of an instance gets a new incarnation. An incarnation is never used again for that instance.
+- Each write of an instance gets a new incarnation, greater than every earlier one of that instance. The hub and the extensions compare incarnations to tell a stale removal from a current one.
 - Writes, removals, and touches are conditional on the current incarnation. Work that runs later carries the incarnation that it saw, so it cannot change a later registration of the same instance.
 - The removal hook and its snapshot share one point in time. Each entry present at that point is in the snapshot, and the hook hears each later removal once.
 - The store reports its continuity. When the store is not `Live`, the hub refuses every credential with 503 and refuses new registrations. Peer lookups continue from the store's local view.

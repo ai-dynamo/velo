@@ -37,8 +37,8 @@ pub use memory::{DEFAULT_PRUNE_INTERVAL, DEFAULT_TTL, InMemoryStore, InMemorySto
 
 /// Identity of one successful [`HubStore::put`].
 ///
-/// Every put of an instance yields a new one, never reused for that
-/// instance. Work that outlives a request carries it, so a delayed touch or
+/// Every put of an instance yields a greater one than that instance had
+/// before. Work that outlives a request carries it, so a delayed touch or
 /// remove cannot act on a later registration of the same instance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -289,8 +289,9 @@ pub enum StoreError {
 /// each backend, and checks the linearization of the hook only
 /// sequentially; a backend must show its own concurrent evidence for that.
 ///
-/// - Every `put` of an instance yields a new [`Incarnation`], never reused
-///   for that instance.
+/// - Every `put` of an instance yields a new [`Incarnation`], greater than
+///   any that instance had before. The hub and its extensions order
+///   removals by it, so a stale removal cannot drop a later registration.
 /// - Conditional operations (`put` with `expected`, `remove`, `touch`) are
 ///   compare-and-swap in the backend.
 /// - [`install_removal_hook`](Self::install_removal_hook) and its snapshot
