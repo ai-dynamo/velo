@@ -1121,12 +1121,11 @@ async fn an_unresolved_write_answers_recovered_and_the_credential_recovers() {
 
 // ---- a list of hosts ------------------------------------------------------
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// The ports a hub bound. The first hub binds (0, 0) and the second
+/// reuses its ports on another address: two probe-and-release picks can
+/// return the same port.
+fn ports_of(hub: &Hub) -> (u16, u16) {
+    (hub.public_addr().port(), hub.control_addr().port())
 }
 
 /// A hub at `host` on `ports`, on `store`.
@@ -1151,8 +1150,8 @@ fn client_on(hosts: &[&str], ports: (u16, u16)) -> HubClient {
 /// the next host gets it, and later calls go to that host first.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_dead_first_host_is_skipped() {
-    let ports = (free_port(), free_port());
-    let hub = hub_at("127.0.0.1", ports, Arc::new(InMemoryStore::default())).await;
+    let hub = hub_at("127.0.0.1", (0, 0), Arc::new(InMemoryStore::default())).await;
+    let ports = ports_of(&hub);
     let client = client_on(&["127.0.0.2", "127.0.0.1"], ports);
     let answer = client.register_peer(make_peer(), none()).await.unwrap();
     assert_eq!(answer.hub_id, hub.hub_id());
@@ -1166,15 +1165,15 @@ async fn a_dead_first_host_is_skipped() {
 /// `not_ready` before it does anything, so the next host gets the request.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hub_that_is_not_ready_is_skipped() {
-    let ports = (free_port(), free_port());
     let degraded = Arc::new(FaultStore::default());
     degraded.set_continuity(Continuity::Degraded);
     let first = hub_at(
         "127.0.0.1",
-        ports,
+        (0, 0),
         Arc::clone(&degraded) as Arc<dyn HubStore>,
     )
     .await;
+    let ports = ports_of(&first);
     let second = hub_at("127.0.0.2", ports, Arc::new(InMemoryStore::default())).await;
     let client = client_on(&["127.0.0.1", "127.0.0.2"], ports);
     let answer = client.register_peer(make_peer(), none()).await.unwrap();
@@ -1193,9 +1192,9 @@ async fn a_hub_that_is_not_ready_is_skipped() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_hub_answer_is_not_sent_to_the_next_host() {
     use velo_hub::store::testing::PutFault;
-    let ports = (free_port(), free_port());
     let store = Arc::new(FaultStore::default());
-    let first = hub_at("127.0.0.1", ports, Arc::clone(&store) as Arc<dyn HubStore>).await;
+    let first = hub_at("127.0.0.1", (0, 0), Arc::clone(&store) as Arc<dyn HubStore>).await;
+    let ports = ports_of(&first);
     let second_store = Arc::new(InMemoryStore::default());
     let second = hub_at(
         "127.0.0.2",

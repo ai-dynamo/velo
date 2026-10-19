@@ -44,8 +44,14 @@ fn store_on(url: &str, prefix: &str, lock_ttl: Duration) -> EtcdStoreBuilder {
 /// A hub on `store` at `ports`, probing every 200 ms. Also returns the
 /// store, for its continuity history.
 async fn hub_with(store: EtcdStoreBuilder, ports: (u16, u16)) -> (Hub, Arc<EtcdStore>) {
+    hub_at("127.0.0.1", store, ports).await
+}
+
+/// As [`hub_with`], listening on `host`.
+async fn hub_at(host: &str, store: EtcdStoreBuilder, ports: (u16, u16)) -> (Hub, Arc<EtcdStore>) {
     let store = Arc::new(store.connect().await.expect("connect to etcd"));
     let mut config = config();
+    config.server.bind_addr = host.parse().unwrap();
     config.server.public_port = ports.0;
     config.server.control_port = ports.1;
     config.server.heartbeat_interval = Duration::from_millis(200);
@@ -90,12 +96,11 @@ async fn continuity_becomes(
         .map(|_| started.elapsed())
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
+/// The ports a hub bound. The first hub of a test binds (0, 0) and the
+/// next one reuses its ports: two probe-and-release picks can return the
+/// same port, and the hub then fails to bind.
+fn ports_of(hub: &Hub) -> (u16, u16) {
+    (hub.public_addr().port(), hub.control_addr().port())
 }
 
 async fn hub_on(prefix: &str, ports: (u16, u16), lock_ttl: Duration) -> Hub {
@@ -127,7 +132,6 @@ enum Exit {
 /// the registrant is registered with B.
 async fn handoff(exit: Exit, lock_ttl: Duration) -> (Duration, Duration) {
     let prefix = format!("/velo-hub-test/{}", uuid::Uuid::new_v4());
-    let ports = (free_port(), free_port());
 
     // A runs on its own runtime, so a crash can stop it without any drop.
     let (a_tx, a_rx) = std::sync::mpsc::channel();
@@ -139,8 +143,8 @@ async fn handoff(exit: Exit, lock_ttl: Duration) -> (Duration, Duration) {
             .enable_all()
             .build()
             .unwrap();
-        let hub = runtime.block_on(hub_on(&a_prefix, ports, lock_ttl));
-        a_tx.send(hub.hub_id()).unwrap();
+        let hub = runtime.block_on(hub_on(&a_prefix, (0, 0), lock_ttl));
+        a_tx.send((hub.hub_id(), ports_of(&hub))).unwrap();
         stop_rx.recv().unwrap();
         match exit {
             Exit::Stop => runtime.block_on(hub.shutdown()).unwrap(),
@@ -150,7 +154,7 @@ async fn handoff(exit: Exit, lock_ttl: Duration) -> (Duration, Duration) {
             }
         }
     });
-    let a_id = tokio::task::spawn_blocking(move || a_rx.recv().unwrap())
+    let (a_id, ports) = tokio::task::spawn_blocking(move || a_rx.recv().unwrap())
         .await
         .unwrap();
 
@@ -234,9 +238,9 @@ async fn a_standby_takes_over_from_a_dead_hub_after_the_lock_ttl() {
 async fn a_hub_cut_off_from_etcd_is_degraded_before_the_standby_serves() {
     let lock_ttl = Duration::from_secs(3);
     let prefix = format!("/velo-hub-test/{}", uuid::Uuid::new_v4());
-    let (ports_a, ports_b) = ((free_port(), free_port()), (free_port(), free_port()));
     let proxy = Proxy::start(etcd_addr());
-    let (hub_a, store_a) = hub_with(store_on(&proxy.url(), &prefix, lock_ttl), ports_a).await;
+    let (hub_a, store_a) = hub_with(store_on(&proxy.url(), &prefix, lock_ttl), (0, 0)).await;
+    let ports_a = ports_of(&hub_a);
     let client = client_for(ports_a);
     let velo = client
         .velo_builder()
@@ -248,7 +252,7 @@ async fn a_hub_cut_off_from_etcd_is_degraded_before_the_standby_serves() {
     let first = client.register(&velo, Default::default()).await.unwrap();
     let b_prefix = prefix.clone();
     let standby = tokio::spawn(async move {
-        hub_with(store_on(&etcd_url(), &b_prefix, lock_ttl), ports_b)
+        hub_with(store_on(&etcd_url(), &b_prefix, lock_ttl), (0, 0))
             .await
             .0
     });
@@ -333,13 +337,13 @@ async fn a_hub_cut_off_from_etcd_is_degraded_before_the_standby_serves() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cut_past_the_local_deadline_but_inside_the_ttl_degrades_and_recovers() {
     let prefix = format!("/velo-hub-test/{}", uuid::Uuid::new_v4());
-    let ports = (free_port(), free_port());
     let proxy = Proxy::start(etcd_addr());
     let local = Duration::from_secs(3);
     let store = store_on(&proxy.url(), &prefix, Duration::from_secs(9))
         .lock_deadline(local)
         .request_deadline(Duration::from_secs(1));
-    let (hub, store) = hub_with(store, ports).await;
+    let (hub, store) = hub_with(store, (0, 0)).await;
+    let ports = ports_of(&hub);
     let cut = Instant::now();
     proxy.set(Mode::Blackhole);
     let degraded = continuity_becomes(
@@ -378,9 +382,9 @@ async fn a_cut_past_the_local_deadline_but_inside_the_ttl_degrades_and_recovers(
 async fn a_cut_past_the_lock_ttl_fences_on_reconnect() {
     let lock_ttl = Duration::from_secs(3);
     let prefix = format!("/velo-hub-test/{}", uuid::Uuid::new_v4());
-    let ports = (free_port(), free_port());
     let proxy = Proxy::start(etcd_addr());
-    let (hub, store) = hub_with(store_on(&proxy.url(), &prefix, lock_ttl), ports).await;
+    let (hub, store) = hub_with(store_on(&proxy.url(), &prefix, lock_ttl), (0, 0)).await;
+    let ports = ports_of(&hub);
     let cut = Instant::now();
     proxy.set(Mode::Blackhole);
     tokio::time::sleep(lock_ttl + Duration::from_millis(500)).await;
@@ -456,4 +460,80 @@ async fn a_waiting_standby_outlives_a_short_etcd_outage() {
         freed.elapsed()
     );
     store.close().await;
+}
+
+/// A registrant settles on the standby while the old hub, cut off from
+/// etcd, is still up and still probes it. The client knows both hosts.
+///
+/// The old hub is `Degraded` for the whole cut and keeps probing its
+/// registrants, so that an outage longer than the registrant TTL does not
+/// reap them all once it is `Live` again. Its probes carry its own hub id.
+/// The client registered there first, so it ignores them: before, each one
+/// raised `recovered`, and an application that registers again on
+/// `recovered` minted a new epoch per probe (8 in 1.5 s, measured).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registrant_settles_on_the_standby_while_the_old_hub_probes() {
+    let lock_ttl = Duration::from_secs(3);
+    let prefix = format!("/velo-hub-test/{}", uuid::Uuid::new_v4());
+    let proxy = Proxy::start(etcd_addr());
+    // B listens on another address with A's ports, as standbys share ports.
+    let (hub_a, _) = hub_at(
+        "127.0.0.1",
+        store_on(&proxy.url(), &prefix, lock_ttl),
+        (0, 0),
+    )
+    .await;
+    let ports = ports_of(&hub_a);
+    let b_prefix = prefix.clone();
+    let standby = tokio::spawn(async move {
+        hub_at(
+            "127.0.0.2",
+            store_on(&etcd_url(), &b_prefix, lock_ttl),
+            ports,
+        )
+        .await
+        .0
+    });
+    let client = HubClient::builder()
+        .hosts(["127.0.0.1", "127.0.0.2"])
+        .public_port(ports.0)
+        .control_port(ports.1)
+        .build()
+        .unwrap();
+    let velo = client
+        .velo_builder()
+        .add_transport(tcp_transport())
+        .build()
+        .await
+        .unwrap();
+    let first = client.register(&velo, Default::default()).await.unwrap();
+    assert_eq!(first.hub_id, hub_a.hub_id());
+
+    let cut = Instant::now();
+    proxy.set(Mode::Refuse);
+    let hub_b = standby.await.unwrap();
+    let mut recovered = client.recovered();
+    tokio::time::timeout(Duration::from_secs(10), recovered.wait_for(|now| *now))
+        .await
+        .expect("no probe from the standby")
+        .unwrap();
+    // A is not ready, so the call moves on to B, which recovers the entry.
+    let second = client.register(&velo, Default::default()).await.unwrap();
+    println!("registrant on B {:?} after the cut", cut.elapsed());
+    assert_eq!(second.hub_id, hub_b.hub_id());
+    assert_ne!(second.epoch, first.epoch);
+    assert!(!*client.recovered().borrow());
+
+    // A still runs and probes every 200 ms; none of it moves the client.
+    let quiet = tokio::time::timeout(Duration::from_millis(1500), recovered.wait_for(|now| *now))
+        .await
+        .is_err();
+    assert!(quiet, "a probe from the old hub raised `recovered`");
+    assert_eq!(client.registration().unwrap().epoch, second.epoch);
+    assert_eq!(*hub_a.store().continuity().borrow(), Continuity::Degraded);
+    assert!(port_open(ports.1).await, "control: the old hub still runs");
+
+    client.unregister().await.unwrap();
+    hub_b.shutdown().await.unwrap();
+    drop(hub_a);
 }
