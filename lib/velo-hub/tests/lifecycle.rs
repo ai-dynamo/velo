@@ -1303,3 +1303,46 @@ fn a_shutdown_from_another_runtime_runs_on_the_serving_one() {
     assert!(store.list().is_empty());
     assert!(log.lock().iter().any(|event| event == "shutdown witness"));
 }
+
+struct PanicsInDescriptor;
+
+impl Extension for PanicsInDescriptor {
+    const NAME: &'static str = "panics-in-descriptor";
+    type Registration = ();
+    type Staged = ();
+
+    fn descriptor(&self) -> serde_json::Value {
+        panic!("injected descriptor panic")
+    }
+
+    async fn prepare(&self, _: &velo_hub::Txn<'_>, _: Option<()>) -> Result<(), Rejection> {
+        Ok(())
+    }
+
+    fn commit(&self, _: (), _: &velo_hub::Committed<'_>) {}
+
+    fn on_removed(&self, _: Removal) {}
+}
+
+/// `GET /v1/hub` calls each extension's `descriptor`. A panic there must
+/// answer an `ErrorBody` like every other core-route failure, not drop the
+/// connection of an unauthenticated public route.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicking_descriptor_answers_an_error_body() {
+    let hub = builder()
+        .extension(PanicsInDescriptor)
+        .serve()
+        .await
+        .unwrap();
+    let result = http()
+        .get(public(&hub, velo_hub::protocol::paths::HUB))
+        .send()
+        .await;
+    let response = result.expect("the connection was dropped instead of an ErrorBody");
+    assert_eq!(response.status(), 500);
+    assert_eq!(
+        error_code(response).await,
+        velo_hub::protocol::ErrorCode::Internal
+    );
+    hub.shutdown().await.unwrap();
+}

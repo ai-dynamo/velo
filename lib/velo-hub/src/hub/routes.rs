@@ -202,29 +202,40 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn describe(State(shared): HubState) -> Json<HubDescriptor> {
-    Json(HubDescriptor {
+async fn describe(State(shared): HubState) -> Result<Json<HubDescriptor>, HubError> {
+    let mut extensions = Vec::with_capacity(shared.extensions.len());
+    for extension in &shared.extensions {
+        // Extension code on a public route: a panic must answer an
+        // `ErrorBody`, not drop the connection.
+        let descriptor =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| extension.descriptor()))
+                .map_err(|_| {
+                    tracing::error!(extension = extension.name(), "descriptor panicked");
+                    HubError::internal(format!(
+                        "extension {:?}: descriptor panicked",
+                        extension.name()
+                    ))
+                })?;
+        extensions.push(ExtensionDescriptor {
+            name: extension.name().to_string(),
+            requires: extension
+                .requires()
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+            registration_requires: extension
+                .registration_requires()
+                .iter()
+                .map(|name| name.to_string())
+                .collect(),
+            descriptor,
+        });
+    }
+    Ok(Json(HubDescriptor {
         hub_id: shared.hub_id,
         velo_instance_id: shared.velo.as_ref().map(|velo| velo.instance_id()),
-        extensions: shared
-            .extensions
-            .iter()
-            .map(|extension| ExtensionDescriptor {
-                name: extension.name().to_string(),
-                requires: extension
-                    .requires()
-                    .iter()
-                    .map(|name| name.to_string())
-                    .collect(),
-                registration_requires: extension
-                    .registration_requires()
-                    .iter()
-                    .map(|name| name.to_string())
-                    .collect(),
-                descriptor: extension.descriptor(),
-            })
-            .collect(),
-    })
+        extensions,
+    }))
 }
 
 async fn peer_by_instance(
