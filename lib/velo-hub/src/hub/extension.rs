@@ -56,6 +56,8 @@ use crate::store::{Incarnation, Removal};
 ///   after the change, and move it into `Staged`.
 /// - An undo in `Staged::drop` must be fenced by epoch: after a failure
 ///   that removed the owner (`on_removed` ran first), it must do nothing.
+///   It must not panic: the hub can drop `Staged` while it unwinds from
+///   another hook's panic, and a second panic aborts the process.
 /// - `commit` cannot fail; check everything in `prepare`. Nothing else
 ///   changes extension state between them, because `commit`,
 ///   `on_registered` and `on_removed` all run under the hub-wide

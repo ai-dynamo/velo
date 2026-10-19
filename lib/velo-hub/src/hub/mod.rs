@@ -3,9 +3,10 @@
 
 //! The hub server: [`Hub`], its builder, startup, and shutdown.
 //!
-//! Startup, in order. A failure or panic at any step undoes every earlier step in
-//! reverse, and the store's removal hook is installed only once everything
-//! before it succeeded, so an injected store stays reusable:
+//! Startup, in order. A failure at any step, or a panic in extension code
+//! (a hook or route building), undoes every earlier step in reverse, and
+//! the store's removal hook is installed only once everything before it
+//! succeeded, so an injected store stays reusable:
 //!
 //! ```text
 //! 1. validate the bundle and extension graph and config     (no I/O)
