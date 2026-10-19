@@ -3,7 +3,7 @@
 
 //! The hub server: [`Hub`], its builder, startup, and shutdown.
 //!
-//! Startup, in order. A failure at any step undoes every earlier step in
+//! Startup, in order. A failure or panic at any step undoes every earlier step in
 //! reverse, and the store's removal hook is installed only once everything
 //! before it succeeded, so an injected store stays reusable:
 //!
@@ -13,7 +13,8 @@
 //! 3. build the hub's velo instance, with the store as its discovery
 //! 4. put the hub's own pinned entry
 //! 5. attach every extension, in dependency order
-//! 6. start every extension, in dependency order
+//! 6. start every extension, in dependency order; build both routers
+//!    (extension route code, which can panic)
 //! 7. install the removal hook; reserve what the store already holds
 //! 8. spawn the reaper, heartbeat, lifecycle task and both HTTP servers;
 //!    open admission

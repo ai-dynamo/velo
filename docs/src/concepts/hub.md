@@ -134,11 +134,11 @@ The heartbeat task holds a `WeakVelo`. Extension handlers and tasks that use the
 3. Build the hub's velo instance, with the store as its discovery.
 4. Write the hub's own pinned entry.
 5. Attach each extension, in dependency order.
-6. Start each extension, in dependency order.
+6. Start each extension, in dependency order. Then build both routers, which runs each extension's route code.
 7. Install the store's removal hook, and reserve each entry that the store already holds.
 8. Start the reaper, the heartbeat, the lifecycle task, and the HTTP servers, then accept registrations.
 
-If a step fails, the hub undoes each earlier step in reverse order. The removal hook cannot be removed, so the hub installs it last. A store given to a hub that failed to start can go to another hub.
+If a step fails or panics, the hub undoes each earlier step in reverse order. Step 1 also refuses a config with a zero interval or timeout. The removal hook cannot be removed, so the hub installs it last. A store given to a hub that failed to start can go to another hub.
 
 `Hub::shutdown` stops new registrations, waits for the registration that holds the lock, stops extension background work, delivers the queued removals, shuts each extension down in reverse order, and stops the heartbeat and the reaper. Then it releases the lock, so a request that waits for it answers 503 at once. It closes both listeners and waits up to `shutdown_timeout_ms` for the requests in flight. Then each request still in flight answers 503 and its handler is dropped, and the hub waits up to `shutdown_timeout_ms` again for the connections to close. So the listener drain can take two times `shutdown_timeout_ms`. Each extension's `shutdown`, each hub task, and the velo drain also get `shutdown_timeout_ms` each. Last, it removes the pinned entry and shuts the hub's velo instance down. When it returns, the listener ports are free.
 
