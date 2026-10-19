@@ -1768,28 +1768,51 @@ mod tests {
     /// clone, the instance would hold itself, its final drop would never run,
     /// and streaming would never be cancelled. A `WeakVelo` is how a handler
     /// reaches its own instance without that cycle: it upgrades while a clone
-    /// is alive, and stops upgrading once the last clone drops.
+    /// is alive, and stops upgrading once the last clone drops. The request
+    /// is sent from a peer so the upgrade runs inside real dispatch.
     #[tokio::test]
     async fn weak_velo_in_a_handler_does_not_keep_the_instance_alive() {
         let velo = tcp_stream_node(None).await;
+        let client = tcp_stream_node(None).await;
+        velo.register_peer(client.peer_info()).unwrap();
+        client.register_peer(velo.peer_info()).unwrap();
+
         let weak = velo.downgrade();
         let captured = weak.clone();
         velo.register_handler(
-            Handler::unary_handler("self_ref", move |ctx| {
-                let _velo = captured
+            Handler::unary_handler("self_ref", move |_ctx| {
+                let own = captured
                     .upgrade()
                     .ok_or_else(|| anyhow::anyhow!("instance is gone"))?;
-                Ok(Some(ctx.payload))
+                Ok(Some(bytes::Bytes::from(own.instance_id().to_string())))
             })
             .build(),
         )
         .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.wait_for_handler(velo.instance_id(), "self_ref"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
 
-        let upgraded = weak.upgrade().expect("a live clone must upgrade");
-        assert!(Arc::ptr_eq(&upgraded.inner, &velo.inner));
-        drop(upgraded);
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client
+                .unary("self_ref")
+                .unwrap()
+                .raw_payload(bytes::Bytes::new())
+                .instance(velo.instance_id())
+                .send(),
+        )
+        .await
+        .unwrap()
+        .expect("the handler must reach its own instance through the WeakVelo");
+        assert_eq!(reply, velo.instance_id().to_string().as_bytes());
 
         velo.shutdown(ShutdownPolicy::WaitForever).await;
+        client.shutdown(ShutdownPolicy::WaitForever).await;
         drop(velo);
         assert!(
             weak.upgrade().is_none(),
