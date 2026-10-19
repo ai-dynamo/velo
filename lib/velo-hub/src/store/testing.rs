@@ -76,6 +76,7 @@ pub struct FaultStore {
     next_put: Mutex<Option<PutFault>>,
     put_gate: Mutex<Option<Arc<Gate>>>,
     touch_gate: Mutex<Option<Arc<Gate>>>,
+    remove_gate: Mutex<Option<Arc<Gate>>>,
     fail_next_remove: AtomicBool,
     fail_next_resolve: AtomicBool,
     continuity: watch::Sender<Continuity>,
@@ -95,6 +96,7 @@ impl FaultStore {
             next_put: Mutex::new(None),
             put_gate: Mutex::new(None),
             touch_gate: Mutex::new(None),
+            remove_gate: Mutex::new(None),
             fail_next_remove: AtomicBool::new(false),
             fail_next_resolve: AtomicBool::new(false),
             continuity: watch::Sender::new(Continuity::Live),
@@ -122,6 +124,13 @@ impl FaultStore {
     pub fn gate_next_touch(&self) -> Arc<Gate> {
         let gate = Arc::new(Gate::default());
         *self.touch_gate.lock() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// The next remove stops at the returned gate before it checks.
+    pub fn gate_next_remove(&self) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        *self.remove_gate.lock() = Some(Arc::clone(&gate));
         gate
     }
 
@@ -204,7 +213,13 @@ impl HubStore for FaultStore {
                 )))
             });
         }
-        self.inner.remove(id, incarnation)
+        let gate = self.remove_gate.lock().take();
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.pass().await;
+            }
+            self.inner.remove(id, incarnation).await
+        })
     }
 
     fn touch(

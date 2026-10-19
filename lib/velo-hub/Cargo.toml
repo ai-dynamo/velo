@@ -59,6 +59,9 @@ tokio-util = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 
 [dev-dependencies]
+# `test-helpers` exposes `Velo::primary_transport_key`, which the hooks
+# suite reads to prove a failed registration leaves no velo peer behind.
+velo = { workspace = true, features = ["test-helpers"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 rmp-serde = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
@@ -77,4 +80,9 @@ required-features = ["test-support"]
 [[test]]
 name = "registration_lifecycle"
 path = "tests/registration_lifecycle.rs"
+required-features = ["test-support"]
+
+[[test]]
+name = "hooks"
+path = "tests/hooks.rs"
 required-features = ["test-support"]
