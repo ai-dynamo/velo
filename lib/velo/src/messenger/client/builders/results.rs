@@ -24,12 +24,14 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll, ready};
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
 use futures::FutureExt;
 use serde::de::DeserializeOwned;
 use tokio::sync::oneshot;
+use tokio::time::{Instant, Sleep};
 
 use super::super::ActiveMessageClient;
 use crate::messenger::common::responses::{ResponseAwaiter, ResponseId};
@@ -44,6 +46,67 @@ use crate::transports::{AdmissionState, SendAdmission, SendOutcome};
 /// reportable more than once — `admitted()` and a later `.await` of the result
 /// must both surface it.
 pub(super) type AdmissionReport = std::result::Result<(), String>;
+
+/// The error a request resolves to when its `.timeout` runs out first.
+///
+/// Requests return [`anyhow::Error`], so find this one with
+/// `error.downcast_ref::<RequestTimeout>()` (or `error.is::<RequestTimeout>()`).
+/// It means only that no answer arrived in time. The remote may still have run
+/// the handler, and a reply that arrives later is discarded. Every other error
+/// means the send failed or the remote answered with an error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("no response within {timeout:?}")]
+pub struct RequestTimeout {
+    timeout: Duration,
+}
+
+impl RequestTimeout {
+    /// The timeout the call was given.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+}
+
+/// The deadline of one request, set with `.timeout`.
+///
+/// The instant is fixed when the request is sent. The timer is made on the
+/// first poll, because a `Sleep` binds to the runtime's timer when it is made
+/// and `send()` may run outside a runtime. Boxed, because `Sleep` is not
+/// `Unpin` and the result types are.
+pub(super) struct Deadline {
+    timeout: Duration,
+    at: Instant,
+    sleep: Option<Pin<Box<Sleep>>>,
+}
+
+impl Deadline {
+    /// A deadline `timeout` from now, or `None` when that instant cannot be
+    /// represented, which is a deadline that never comes.
+    pub(super) fn starting_now(timeout: Duration) -> Option<Self> {
+        Instant::now().checked_add(timeout).map(|at| Self {
+            timeout,
+            at,
+            sleep: None,
+        })
+    }
+
+    fn poll_expired(&mut self, cx: &mut Context<'_>) -> Poll<RequestTimeout> {
+        let at = self.at;
+        let sleep = self
+            .sleep
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(at)));
+        ready!(sleep.as_mut().poll(cx));
+        Poll::Ready(RequestTimeout {
+            timeout: self.timeout,
+        })
+    }
+
+    /// Whether the timer has been made, which the first poll does.
+    #[cfg(test)]
+    pub(super) fn is_armed(&self) -> bool {
+        self.sleep.is_some()
+    }
+}
 
 /// How far a send has got towards the transport's send channel.
 enum AdmissionStage {
@@ -262,6 +325,50 @@ impl SendStage {
     fn poll_fire(&mut self, cx: &mut Context<'_>) -> Poll<Result<()>> {
         ready!(self.poll_dispatched(cx)).poll_fire(cx)
     }
+
+    /// [`poll_response`](Self::poll_response), bounded by `deadline`.
+    ///
+    /// The send is polled before the timer, so an answer that is ready when the
+    /// timer fires still wins. The deadline is cleared once the call resolves,
+    /// either way, so a finished result holds no timer. With no deadline this
+    /// is `poll_response` and one branch.
+    fn poll_response_within(
+        &mut self,
+        deadline: &mut Option<Deadline>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<Option<Bytes>>> {
+        if let Poll::Ready(result) = self.poll_response(cx) {
+            *deadline = None;
+            return Poll::Ready(result);
+        }
+        let Some(pending) = deadline.as_mut() else {
+            return Poll::Pending;
+        };
+        let expired = ready!(pending.poll_expired(cx));
+        *deadline = None;
+        self.abandon();
+        // `Error::new`, not `anyhow!`, so callers can downcast to the type.
+        Poll::Ready(Err(anyhow::Error::new(expired)))
+    }
+
+    /// Give up on the response: release the response slot now, not when the
+    /// result is dropped.
+    ///
+    /// A caller can hold a timed-out result for as long as it likes, and the
+    /// arena is fixed-size, so the slot cannot wait for the drop. A reply that
+    /// arrives for the released slot fails the generation check in
+    /// `complete_outcome` and is discarded. The admission stage is left alone:
+    /// the frame may well have been sent, and `admission_state()` should still
+    /// say so. A send still waiting for a slot was never issued, so it ends as
+    /// a failed admission.
+    fn abandon(&mut self) {
+        match self {
+            SendStage::Acquiring(_) => {
+                *self = SendStage::failed("timed out before a response slot was free")
+            }
+            SendStage::Dispatched(dispatched) => dispatched.awaiter = None,
+        }
+    }
 }
 
 /// Future returned by `admitted()` on any send result.
@@ -366,27 +473,33 @@ impl Future for FireResult {
 /// [`admitted`](SyncResult::admitted) to wait only for the frame to be sent.
 pub struct SyncResult {
     pub(super) stage: SendStage,
+    pub(super) deadline: Option<Deadline>,
 }
 
 impl Future for SyncResult {
     type Output = Result<()>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.stage.poll_response(cx).map(|r| r.map(|_| ()))
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.stage
+            .poll_response_within(&mut this.deadline, cx)
+            .map(|r| r.map(|_| ()))
     }
 }
 
 /// Result wrapper for unary operations returning raw bytes.
 pub struct UnaryResult {
     pub(super) stage: SendStage,
+    pub(super) deadline: Option<Deadline>,
 }
 
 impl Future for UnaryResult {
     type Output = Result<Bytes>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.stage
-            .poll_response(cx)
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.stage
+            .poll_response_within(&mut this.deadline, cx)
             .map(|r| r.map(|b| b.unwrap_or_default()))
     }
 }
@@ -394,24 +507,29 @@ impl Future for UnaryResult {
 /// Result wrapper for typed unary operations with deserialization.
 pub struct TypedUnaryResult<R> {
     pub(super) stage: SendStage,
+    pub(super) deadline: Option<Deadline>,
     pub(super) _marker: std::marker::PhantomData<R>,
 }
 
-// Safe: `TypedUnaryResult` only holds `SendStage` (Unpin) and `PhantomData<R>`.
-// The `R` type parameter never appears in a field that stores an `R`, so `Unpin`
-// is correct regardless of `R`'s own `Unpin`.
+// Safe: `TypedUnaryResult` only holds `SendStage` and `Option<Deadline>` (both
+// Unpin; the deadline boxes its `Sleep`) and `PhantomData<R>`. The `R` type
+// parameter never appears in a field that stores an `R`, so `Unpin` is correct
+// regardless of `R`'s own `Unpin`.
 impl<R> Unpin for TypedUnaryResult<R> {}
 
 impl<R: DeserializeOwned> Future for TypedUnaryResult<R> {
     type Output = Result<R>;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.stage.poll_response(cx).map(|r| match r {
-            Ok(Some(bytes)) => serde_json::from_slice(&bytes)
-                .map_err(|e| anyhow!("Failed to deserialize response: {}", e)),
-            Ok(None) => Err(anyhow!("Expected response data, got empty")),
-            Err(e) => Err(e),
-        })
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.get_mut();
+        this.stage
+            .poll_response_within(&mut this.deadline, cx)
+            .map(|r| match r {
+                Ok(Some(bytes)) => serde_json::from_slice(&bytes)
+                    .map_err(|e| anyhow!("Failed to deserialize response: {}", e)),
+                Ok(None) => Err(anyhow!("Expected response data, got empty")),
+                Err(e) => Err(e),
+            })
     }
 }
 

@@ -48,9 +48,9 @@ pub use velo_ext as ext;
 pub use crate::messenger::{
     Admitted, AmHandlerBuilder, AmSendBuilder, AmSyncBuilder, AsyncExecutor, Context, FireResult,
     Handler, HandlerExecutor, Messenger, MessengerBuilder, OrderedConfig, OrderingKey,
-    OverflowPolicy, PeerDiscovery, SyncExecutor, SyncResult, TypedContext, TypedUnaryBuilder,
-    TypedUnaryHandlerBuilder, TypedUnaryResult, UnaryBuilder, UnaryHandlerBuilder, UnaryResult,
-    UnifiedResponse,
+    OverflowPolicy, PeerDiscovery, RequestTimeout, SyncExecutor, SyncResult, TypedContext,
+    TypedUnaryBuilder, TypedUnaryHandlerBuilder, TypedUnaryResult, UnaryBuilder,
+    UnaryHandlerBuilder, UnaryResult, UnifiedResponse,
 };
 
 // Events
@@ -1468,6 +1468,21 @@ impl Velo {
             .backend()
             .primary_transport_key(instance)
             .map(|key| key.as_str().to_string())
+    }
+
+    /// How many response slots this instance holds right now: one for each
+    /// request that is still waiting for its answer.
+    ///
+    /// Exposed for tests only. A request that gives up (`.timeout` runs out, or
+    /// its result is dropped) must give its slot back, and the arena is fixed
+    /// size, so a leak shows up here long before it exhausts the arena.
+    #[cfg(feature = "test-helpers")]
+    pub fn response_slots_in_use(&self) -> usize {
+        self.inner
+            .messenger
+            .client()
+            .response_manager
+            .pending_outcome_count()
     }
 
     /// Get the underlying rendezvous manager for direct access.

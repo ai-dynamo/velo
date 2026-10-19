@@ -175,6 +175,10 @@ velo keeps its discovery for as long as it lives, so the discovery that `velo_bu
 
 The default HTTP client has a 5 s connect timeout and a 60 s request timeout. A registration on a hub with default settings and up to two extensions of its own takes at most 50 s: 5 s to wait for the lock, and 5 s for each step under it (the built-in service directory counts as an extension). A caller that passes its own `reqwest::Client` sets its own timeouts.
 
+An extension can also serve velo handlers on the hub's velo instance, and its client calls them with velo requests, not over HTTP. velo puts no deadline on a velo request, and the hub sends each reply through its own peer table. When the hub removes a registration, it forgets the velo peer. After that, a velo request from that instance gets no reply.
+
+So a client that makes velo calls to the hub sets `.timeout` on each call. It reads `RequestTimeout` as "the hub can have forgotten this instance", and it calls `register` again. That call presents the credential that the client holds. If the hub answers `register_again` or `unauthorized`, the client drops the registration, and the next `register` starts without a credential. `is_registered()` does not show an eviction, because only an answer from the hub changes it. `recovered()` shows only a hub restart.
+
 ## Services
 
 A registered instance can serve named services. Another program asks the hub which instances serve a name, or watches the name. A service name is 1 to 128 of `A-Z a-z 0-9 . _ -`, and not `.` or `..`, so it is always one path segment and a URL resolver cannot turn it into another route.

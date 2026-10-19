@@ -22,8 +22,8 @@ pub mod events;
 
 pub(crate) use client::ActiveMessageClient;
 pub use client::builders::{
-    Admitted, AmSendBuilder, AmSyncBuilder, FireResult, SyncResult, TypedUnaryBuilder,
-    TypedUnaryResult, UnaryBuilder, UnaryResult,
+    Admitted, AmSendBuilder, AmSyncBuilder, FireResult, RequestTimeout, SyncResult,
+    TypedUnaryBuilder, TypedUnaryResult, UnaryBuilder, UnaryResult,
 };
 pub use common::MessageId;
 pub use discovery::PeerDiscovery;
