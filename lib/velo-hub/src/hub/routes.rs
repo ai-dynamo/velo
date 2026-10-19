@@ -82,6 +82,18 @@ impl<S: Send + Sync> FromRequestParts<S> for Authorized {
     }
 }
 
+/// The credential a request presents, if any, read by reference from the
+/// headers (a `HeaderMap` extractor would clone them all).
+pub(crate) struct Presented(pub(crate) Option<Credential>);
+
+impl<S: Send + Sync> FromRequestParts<S> for Presented {
+    type Rejection = HubError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        credential_from_headers(&parts.headers).map(Self)
+    }
+}
+
 /// [`axum::Json`] whose rejection is a [`HubError`], so a body the hub
 /// cannot parse still answers with an [`ErrorBody`](crate::protocol::ErrorBody).
 /// Extension routes can use it too.
@@ -280,10 +292,9 @@ async fn list(State(shared): HubState) -> Json<ListInstancesResponse> {
 
 async fn register(
     State(shared): HubState,
-    headers: HeaderMap,
+    Presented(presented): Presented,
     HubJson(request): HubJson<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, HubError> {
-    let presented = credential_from_headers(&headers)?;
     registration::register(shared, presented, request)
         .await
         .map(Json)
@@ -292,20 +303,16 @@ async fn register(
 async fn unregister(
     State(shared): HubState,
     HubPath(id): HubPath<InstanceId>,
-    headers: HeaderMap,
+    Presented(presented): Presented,
 ) -> Result<StatusCode, HubError> {
-    let presented = credential_from_headers(&headers)?;
     registration::unregister(shared, id, presented).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 async fn heartbeat(
     State(shared): HubState,
-    HubPath(id): HubPath<InstanceId>,
-    headers: HeaderMap,
+    Authorized { owner: id, lease }: Authorized,
 ) -> Result<Json<HeartbeatResponse>, HubError> {
-    let presented = credential_from_headers(&headers)?;
-    let lease = shared.authority.authorize(id, presented.as_ref())?;
     // Bounded like every store call the hub awaits: a stalled backend would
     // otherwise pile up one open request per registrant per heartbeat. A
     // `Stale` answer (a replacement won the race) is a 409.
