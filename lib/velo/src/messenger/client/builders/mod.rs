@@ -238,7 +238,10 @@ impl UnaryBuilder {
     /// out, the call releases its response slot at once, even if the result is
     /// kept, and a reply that comes later is discarded. The remote may still
     /// have run the handler. Only awaiting the result is bounded;
-    /// `admitted()` is not.
+    /// `admitted()` is not. If the time runs out while the call still waits
+    /// for a free response slot, the send is never issued: `admission_state()`
+    /// then reads `Failed` and `admitted()` returns an error that is not a
+    /// `RequestTimeout`.
     ///
     /// Costs nothing when not set: no timer and no allocation.
     pub fn timeout(mut self, timeout: Duration) -> Self {

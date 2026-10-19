@@ -196,8 +196,10 @@ async fn a_call_with_no_answer_fails_with_request_timeout() {
 
 /// A timed-out call gives its response slot back at expiry, even while the
 /// caller still holds the result, and a dropped result gives its slot back
-/// too. The late reply to the timed-out call is then discarded: the next call,
-/// which may reuse the same slot, gets its own answer.
+/// too. The late reply to the timed-out call is then discarded: the next call
+/// gets its own answer. A late reply on a reused slot is pinned in
+/// `messenger/client/builders/tests.rs`, because the free list here hands the
+/// next call a fresh slot.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_timed_out_or_dropped_call_releases_its_response_slot() {
     let gate = Arc::new(Semaphore::new(0));

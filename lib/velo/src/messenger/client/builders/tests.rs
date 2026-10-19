@@ -682,6 +682,66 @@ async fn a_timeout_while_waiting_for_a_slot_fails_the_admission() {
         .expect_err("no slot came");
     timed_out(&err);
     assert_eq!(result.admission_state(), AdmissionState::Failed);
+    let admission = result
+        .admitted()
+        .now_or_never()
+        .expect("a failed admission resolves at once")
+        .expect_err("the send was never issued");
+    assert!(
+        admission.downcast_ref::<RequestTimeout>().is_none(),
+        "admitted() reports the failed admission, not the timeout: {admission}"
+    );
+}
+
+#[tokio::test]
+async fn a_late_reply_on_a_reused_slot_cannot_complete_the_new_call() {
+    // The danger of releasing a slot at expiry: the next call takes the same
+    // slot, and the old call's reply arrives for it. Only the generation in the
+    // response id tells the two apart. A one-slot arena forces the reuse that a
+    // real arena's FIFO free list makes rare.
+    let rm = Arc::new(ResponseManager::with_capacity(1, 1, None));
+    let old_awaiter = rm.register_outcome().expect("the only slot");
+    let old_id = old_awaiter.response_id();
+    let mut old = UnaryResult {
+        stage: SendStage::Dispatched(Dispatched::issued(SendOutcome::Admitted, old_awaiter)),
+        deadline: with_deadline(DEADLINE),
+    };
+    let err = tokio::time::timeout(RESOLVES, &mut old)
+        .await
+        .expect("the deadline resolves the result")
+        .expect_err("no answer came");
+    timed_out(&err);
+    assert_eq!(rm.pending_outcome_count(), 0);
+
+    let new_awaiter = rm.register_outcome().expect("the released slot");
+    let new_id = new_awaiter.response_id();
+    assert_eq!(
+        new_id.slot_index(),
+        old_id.slot_index(),
+        "the slot is reused"
+    );
+    assert_ne!(new_id, old_id, "under a new generation");
+    let mut new = UnaryResult {
+        stage: SendStage::Dispatched(Dispatched::issued(SendOutcome::Admitted, new_awaiter)),
+        deadline: None,
+    };
+    assert!((&mut new).now_or_never().is_none());
+
+    // The old call's late reply lands on the reused slot and is refused.
+    assert!(!rm.complete_outcome(old_id, Ok(Some(Bytes::from_static(b"stale")))));
+    assert!(
+        (&mut new).now_or_never().is_none(),
+        "the new call must not resolve with the old call's reply"
+    );
+
+    assert!(rm.complete_outcome(new_id, Ok(Some(Bytes::from_static(b"mine")))));
+    let reply = tokio::time::timeout(RESOLVES, &mut new)
+        .await
+        .expect("resolves")
+        .expect("the new call gets its own answer");
+    assert_eq!(reply, Bytes::from_static(b"mine"));
+    drop(old);
+    assert_eq!(rm.pending_outcome_count(), 0, "each slot released once");
 }
 
 #[test]
