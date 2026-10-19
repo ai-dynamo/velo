@@ -901,7 +901,12 @@ async fn a_hung_store_remove_does_not_hold_the_lock_forever() {
     let peer = make_peer();
     let credential = register_plain(&hub, &peer, None).await.credential;
     let _gate = store.gate_next_remove();
-    let delete = unregister_status(&hub, peer.instance_id(), Some(&credential)).await;
+    let delete = tokio::time::timeout(
+        Duration::from_secs(3),
+        unregister_status(&hub, peer.instance_id(), Some(&credential)),
+    )
+    .await
+    .expect("the DELETE hung on the remove");
     assert_eq!(delete, 503, "an unresolved remove is retryable");
     assert_eq!(
         heartbeat_status(&hub, peer.instance_id(), Some(&credential)).await,
@@ -1080,4 +1085,200 @@ async fn a_registration_waits_at_most_lock_timeout() {
     assert!(started.elapsed() < Duration::from_secs(2));
     gate.release();
     assert_eq!(held.await.unwrap(), 200);
+}
+
+// ---- bounds the second review found untested ------------------------------
+
+/// An `on_registered` that never returns is dropped at `step_timeout_ms`;
+/// the registration still succeeds and the lock is free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_on_registered_is_dropped_at_the_deadline() {
+    let f = fixture(
+        |config| config.server.step_timeout = Duration::from_millis(200),
+        false,
+    )
+    .await;
+    let _gate = f.ledger.gate_next_registered();
+    let registered = tokio::time::timeout(
+        Duration::from_secs(3),
+        post_register(
+            &f.hub,
+            &request_with(&make_peer(), &[ledger_opt_in()]),
+            None,
+        ),
+    )
+    .await
+    .expect("a hung on_registered held the registration");
+    assert_eq!(registered.status(), 200);
+    let next = tokio::time::timeout(
+        Duration::from_secs(3),
+        post_register(&f.hub, &request(&make_peer()), None),
+    )
+    .await
+    .expect("the lock stayed held");
+    assert_eq!(next.status(), 200);
+}
+
+/// The remove after a failed write (R4) is bounded: a store that never
+/// answers it does not hold the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_remove_after_a_failed_write_is_bounded() {
+    let f = fixture(
+        |config| config.server.step_timeout = Duration::from_millis(200),
+        true,
+    )
+    .await;
+    let unreachable = PeerInfo::new(
+        InstanceId::new_v4(),
+        unreachable_peer().worker_address().clone(),
+    );
+    let _gate = f.store.gate_next_remove();
+    let failed = tokio::time::timeout(
+        Duration::from_secs(3),
+        post_register(&f.hub, &request(&unreachable), None),
+    )
+    .await
+    .expect("a hung remove held the registration");
+    assert_eq!(failed.status(), 409);
+    let next = tokio::time::timeout(
+        Duration::from_secs(3),
+        post_register(&f.hub, &request(&unreachable_peer()), None),
+    )
+    .await
+    .expect("the lock stayed held");
+    assert_eq!(
+        next.status(),
+        409,
+        "the lock is free; this one fails at velo too"
+    );
+}
+
+/// The lifecycle task's retirement of an abandoned write is bounded: its
+/// hung remove does not hold the lock for later registrations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_remove_in_a_retirement_is_bounded() {
+    let f = fixture(
+        |config| config.server.step_timeout = Duration::from_millis(200),
+        false,
+    )
+    .await;
+    f.ledger.panic_next_commit();
+    let _gate = f.store.gate_next_remove();
+    assert_eq!(
+        post_register(
+            &f.hub,
+            &request_with(&make_peer(), &[ledger_opt_in()]),
+            None
+        )
+        .await
+        .status(),
+        500
+    );
+    let next = tokio::time::timeout(
+        Duration::from_secs(3),
+        post_register(&f.hub, &request(&make_peer()), None),
+    )
+    .await
+    .expect("the retirement held the lock");
+    assert_eq!(next.status(), 200);
+}
+
+/// A DELETE that cannot get the lock in `lock_timeout_ms` answers 503.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unregistration_waits_at_most_lock_timeout() {
+    let f = fixture(
+        |config| config.server.lock_timeout = Duration::from_millis(200),
+        false,
+    )
+    .await;
+    let victim = make_peer();
+    let credential = register_plain(&f.hub, &victim, None).await.credential;
+    let gate = f.ledger.gate_next_prepare();
+    let held = tokio::spawn({
+        let hub = f.hub.clone();
+        let body = request(&make_peer());
+        async move { post_register(&hub, &body, None).await.status() }
+    });
+    gate.entered().await;
+    let delete = tokio::time::timeout(
+        Duration::from_secs(3),
+        unregister_status(&f.hub, victim.instance_id(), Some(&credential)),
+    )
+    .await
+    .expect("the DELETE waited past its lock timeout");
+    assert_eq!(delete, 503);
+    gate.release();
+    assert_eq!(held.await.unwrap(), 200);
+}
+
+/// Starts after the ledger; its prepare passes a gate, then panics.
+#[derive(Default)]
+struct PanicsInPrepare {
+    gate: parking_lot::Mutex<Option<Arc<velo_hub::store::testing::Gate>>>,
+}
+
+impl Extension for PanicsInPrepare {
+    const NAME: &'static str = "panics-in-prepare";
+    type Registration = ();
+    type Staged = ();
+
+    fn requires() -> &'static [&'static str] {
+        &["ledger"]
+    }
+
+    async fn prepare(
+        &self,
+        _txn: &velo_hub::Txn<'_>,
+        _payload: Option<()>,
+    ) -> Result<(), Rejection> {
+        let gate = self.gate.lock().take();
+        if let Some(gate) = gate {
+            gate.pass().await;
+            panic!("injected prepare panic after a gate");
+        }
+        Ok(())
+    }
+
+    fn commit(&self, _staged: (), _registration: &velo_hub::Committed<'_>) {}
+
+    fn on_removed(&self, _removal: velo_hub::store::Removal) {}
+}
+
+/// A panic before the write, after the store removed the prior
+/// registration: settling delivers that removal before it drops the
+/// ledger's staged value, so the removed entries never show again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_before_the_write_delivers_a_removal_before_undoing_hides() {
+    let store = Arc::new(FaultStore::default());
+    let hub = builder()
+        .store(store.clone())
+        .extension(Ledger::default())
+        .extension(PanicsInPrepare::default())
+        .serve()
+        .await
+        .unwrap();
+    let ledger = hub.extension::<Ledger>().unwrap();
+    let peer = make_peer();
+    let owner = peer.instance_id();
+    let prior = register(&hub, &request_with(&peer, &[ledger_opt_in()]), None).await;
+    assert_eq!(publish(&hub, owner, &prior.credential, "k", 1).await, 204);
+
+    let gate = Arc::new(velo_hub::store::testing::Gate::default());
+    *hub.extension::<PanicsInPrepare>().unwrap().gate.lock() = Some(Arc::clone(&gate));
+    let attempt = tokio::spawn({
+        let hub = hub.clone();
+        let body = request_with(&peer, &[ledger_opt_in()]);
+        let credential = prior.credential.clone();
+        async move { post_register(&hub, &body, Some(&credential)).await.status() }
+    });
+    gate.entered().await;
+    store.expire(owner);
+    gate.release();
+    assert_eq!(attempt.await.unwrap(), 500);
+    assert!(!ledger.has_owner(owner));
+    assert_eq!(
+        ledger.revealed(),
+        0,
+        "the removed owner's entries showed again"
+    );
 }

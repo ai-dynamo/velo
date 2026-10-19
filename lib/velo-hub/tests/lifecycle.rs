@@ -764,14 +764,18 @@ async fn a_probe_to_a_wedged_peer_times_out() {
     install_wedged_heartbeat(&client, Duration::from_secs(120));
     wire_mutual(&hub, &client).await;
     let started = std::time::Instant::now();
-    let response = http()
-        .post(control(
-            &hub,
-            &velo_hub::protocol::instance_probe(client.instance_id()),
-        ))
-        .send()
-        .await
-        .unwrap();
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        http()
+            .post(control(
+                &hub,
+                &velo_hub::protocol::instance_probe(client.instance_id()),
+            ))
+            .send(),
+    )
+    .await
+    .expect("the probe has no deadline")
+    .unwrap();
     assert_eq!(response.status(), 502);
     assert!(
         started.elapsed() < Duration::from_secs(3),
@@ -945,4 +949,24 @@ async fn registration_requirements_and_bundle_cycles_are_checked() {
         matches!(cycle.downcast_ref::<GraphError>(), Some(GraphError::BundleCycle(names)) if names == &["cycle-a", "cycle-b"]),
         "{cycle}"
     );
+}
+
+/// The pinned entry's removal at shutdown is bounded: a store that never
+/// answers it does not hang shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_pinned_removal_does_not_hang_shutdown() {
+    let store = Arc::new(FaultStore::default());
+    let mut config = config();
+    config.server.step_timeout = Duration::from_millis(200);
+    let hub = Hub::builder(config)
+        .store(store.clone())
+        .velo(velo_builder())
+        .serve()
+        .await
+        .unwrap();
+    let _gate = store.gate_next_remove();
+    let outcome = tokio::time::timeout(Duration::from_secs(3), hub.shutdown())
+        .await
+        .expect("shutdown hung on the pinned entry's removal");
+    assert!(outcome.is_err(), "the unresolved removal is reported");
 }

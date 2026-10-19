@@ -559,8 +559,13 @@ stale_case() {
 stale_case s '[workspace.dependencies.velo]\npath = "lib/velo"\nversion = "0.10.0"' 'does not match the workspace version 0.11.0' 0 'a sub-table'
 stale_case t '[workspace.dependencies]\nvelo.path = "lib/velo"\nvelo.version = "0.10.0"' 'does not match the workspace version 0.11.0' 0 'dotted keys'
 stale_case u '[workspace.dependencies] # deps\nvelo = { path = "lib/velo", version = "0.10.0" }' 'does not match the workspace version 0.11.0' 0 'a table header with a comment'
+# (v): the real version comes first on the line; the comment must not win.
 stale_case v '[workspace.dependencies]\nvelo = { path = "lib/velo", version = "0.10.0" } # was version = "0.11.0"' 'does not match the workspace version 0.11.0' 0 'a line with a comment'
 stale_case w '[workspace.dependencies]\n"velo" = { path = "lib/velo", version = "0.10.0" }' 'could not find the velo requirement' 1 'a form the check cannot read, with a crate that inherits it'
+# The comment holds the only version: without comment stripping the check
+# would read 0.11.0 there and pass a requirement that has no version.
+stale_case x '[workspace.dependencies]\nvelo = { path = "lib/velo" } # version = "0.11.0"' 'could not find the velo requirement' 1 'a version only in a comment'
+stale_case y '[ workspace.dependencies ]\nvelo = { path = "lib/velo", version = "0.10.0" }' 'does not match the workspace version 0.11.0' 0 'a table header with spaces'
 
 echo ""
 
