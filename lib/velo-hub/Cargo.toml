@@ -12,9 +12,8 @@ homepage.workspace = true
 repository.workspace = true
 keywords.workspace = true
 # Not published until a real port (kvbm's indexer and p2p as extensions)
-# passes kvbm's lifecycle suite against this API, and the store trait has an
-# etcd sketch that compiles against it. A published API frozen before that
-# proof is the risk this gate exists for.
+# passes kvbm's lifecycle suite against this API. A published API frozen
+# before that proof is the risk this gate exists for.
 publish = false
 
 [features]
