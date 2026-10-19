@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The hub's HTTP wire protocol: paths, request and response bodies, errors,
-//! and ids. Serde types only, so it builds under every cargo feature.
+//! The wire protocol of a velo hub: paths, request and response bodies,
+//! errors, and ids. Serde types on `velo-ext` alone, so a program that speaks
+//! the protocol does not build the velo runtime. `velo-hub` re-exports this
+//! crate as `velo_hub::protocol`.
 //!
 //! A hub serves two listeners. The **public** listener carries peer
 //! discovery. The **control** listener also carries registration, heartbeat
@@ -14,7 +16,7 @@
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use velo::{InstanceId, PeerInfo, WorkerId};
+use velo_ext::{InstanceId, PeerInfo, WorkerId};
 
 /// Default port of the public listener (peer discovery).
 pub const DEFAULT_PUBLIC_PORT: u16 = 1337;
@@ -152,15 +154,15 @@ pub fn extension_root(name: &str) -> String {
 pub struct Credential(uuid::Uuid);
 
 impl Credential {
-    /// A fresh random credential.
-    #[cfg(feature = "server")]
-    pub(crate) fn generate() -> Self {
+    /// A fresh random credential. Only a hub mints one: a client gets its
+    /// credential from a registration.
+    pub fn generate() -> Self {
         Self(uuid::Uuid::new_v4())
     }
 
-    /// The raw bytes, for hashing and constant-time comparison.
-    #[cfg(feature = "server")]
-    pub(crate) fn as_bytes(&self) -> &[u8; 16] {
+    /// The raw bytes, for the hub's digest and constant-time comparison.
+    /// Nothing else has a reason to read them.
+    pub fn as_bytes(&self) -> &[u8; 16] {
         self.0.as_bytes()
     }
 
@@ -488,7 +490,7 @@ impl ErrorCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use velo::WorkerAddress;
+    use velo_ext::WorkerAddress;
 
     fn peer() -> PeerInfo {
         PeerInfo::new(
@@ -571,6 +573,48 @@ mod tests {
             ErrorCode::Unavailable.status(),
             http::StatusCode::SERVICE_UNAVAILABLE
         );
+    }
+
+    /// Moving the protocol into its own crate must not change a byte on the
+    /// wire. The literals are what a hub and a client exchange today: a
+    /// registration epoch is a bare UUID string, and an error body names its
+    /// code in snake case. A field renamed or reordered here breaks every
+    /// peer on the other version, so this fails first.
+    #[test]
+    fn wire_format_is_unchanged() {
+        const UUID: &str = "67e55044-10b1-426f-9247-bb680e5fe0c8";
+        let uuid = uuid::Uuid::parse_str(UUID).unwrap();
+
+        let epoch = RegistrationEpoch::from_uuid(uuid);
+        let epoch_json = format!(r#""{UUID}""#);
+        assert_eq!(serde_json::to_string(&epoch).unwrap(), epoch_json);
+        assert_eq!(
+            serde_json::from_str::<RegistrationEpoch>(&epoch_json).unwrap(),
+            epoch
+        );
+
+        let error = ErrorBody {
+            code: ErrorCode::RegisterAgain,
+            message: "registration expired".to_string(),
+        };
+        let error_json = r#"{"code":"register_again","message":"registration expired"}"#;
+        assert_eq!(serde_json::to_string(&error).unwrap(), error_json);
+        let decoded: ErrorBody = serde_json::from_str(error_json).unwrap();
+        assert_eq!(decoded.code, ErrorCode::RegisterAgain);
+        assert_eq!(decoded.message, "registration expired");
+
+        let request = HeartbeatRequest {
+            seq: 42,
+            hub_id: Some(serde_json::from_str(&epoch_json).unwrap()),
+        };
+        let request_json = format!(r#"{{"seq":42,"hub_id":"{UUID}"}}"#);
+        assert_eq!(serde_json::to_string(&request).unwrap(), request_json);
+        let decoded: HeartbeatRequest = serde_json::from_str(&request_json).unwrap();
+        assert_eq!(decoded.seq, 42);
+        assert_eq!(decoded.hub_id, request.hub_id);
+        // A probe from a hub that sends no id still decodes.
+        let bare: HeartbeatRequest = serde_json::from_str(r#"{"seq":1}"#).unwrap();
+        assert_eq!((bare.seq, bare.hub_id), (1, None));
     }
 
     #[test]
