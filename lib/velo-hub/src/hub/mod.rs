@@ -62,7 +62,7 @@ pub use config::{
 };
 pub use context::{AttachContext, StartContext};
 pub use error::HubError;
-pub use extension::{Committed, Extension, RegistrationView, Rejection, Txn};
+pub use extension::{Committed, Extension, IntoExtension, RegistrationView, Rejection, Txn};
 pub use graph::{Bundle, BundleInstaller, GraphError};
 pub use routes::{Authorized, HubJson, HubPath, credential_from_headers};
 
@@ -163,10 +163,11 @@ impl HubBuilder {
         self
     }
 
-    /// Add one extension directly, without a bundle.
-    pub fn extension<E: Extension>(mut self, extension: E) -> Self {
+    /// Add one extension directly, without a bundle. Pass an `Arc` to keep
+    /// a handle to the instance that the hub runs.
+    pub fn extension<E: Extension>(mut self, extension: impl IntoExtension<E>) -> Self {
         self.direct
-            .push(PendingExtension::new(Arc::new(extension), HUB_OWNER));
+            .push(PendingExtension::new(extension.into_extension(), HUB_OWNER));
         self
     }
 
