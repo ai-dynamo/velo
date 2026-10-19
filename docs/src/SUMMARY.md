@@ -11,6 +11,7 @@
 - [Batched streaming](concepts/batched-streaming.md)
 - [Transports](concepts/transports.md)
 - [Discovery](concepts/discovery.md)
+- [The hub](concepts/hub.md)
 - [Work queues](concepts/queues.md)
 - [Shutdown and drain](concepts/shutdown.md)
 - [Rendezvous and RDMA](concepts/rendezvous.md)

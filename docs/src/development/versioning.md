@@ -4,13 +4,23 @@
 
 ## Rules
 
-1. **Only `velo` and `velo-ext` publish.** A new workspace crate gets `publish = false`. `ucx-rs` is the one documented exception.
+1. **Only `velo` and `velo-ext` publish.** A new workspace crate gets `publish = false`. `ucx-rs` and `velo-hub` are the documented exceptions. `velo-hub` has `publish = false` until a real port of kvbm's hub passes kvbm's lifecycle tests against it.
 2. **`velo-ext` has an exact pin.** `[workspace.dependencies]` has `velo-ext = { path = "lib/velo-ext", version = "=X.Y.Z" }`. A caret requirement lets a later "compatible" patch change downstream lockfiles without notice. Do not change `=` to a caret.
 3. **When `velo-ext` moves past its latest published version, `velo` must move past its own.** Update the pin to match.
 4. **A new trait method in `velo-ext` needs a default implementation.** A method with no default breaks every external implementation. A defaulted addition is a patch release (`0.5.0` to `0.5.1`). Before 1.0, Cargo reads `0.y` as the breaking position.
 5. **A change to a signature, bound, or parameter of a trait method is breaking.** Before 1.0, that is a minor bump (`0.5` to `0.6`), and `velo` must carry a bump over its latest published version too.
 6. **Removing a public item from `velo-ext` is breaking.**
 7. **A bump is measured against the latest published version.** Only versions on crates.io take part in Cargo's resolution. So `main` must carry a large enough bump over the latest published version for everything merged since that publish. Several breaking changes between two publishes share one bump. For example, if crates.io has `0.17.0` and `main` is at `0.18.0`, a breaking change stays at `0.18.0`. After the next publish, the first breaking change bumps again.
+
+## velo-hub
+
+The API of `velo-hub` uses velo types (`Velo`, `PeerInfo`, axum `Router`). A move of `velo-hub` from velo 0.21 to velo 0.22 changes these types, so it is a breaking change of `velo-hub`, but its own source does not change. `cargo semver-checks` cannot see that. These rules make it safe:
+
+1. `velo-hub` uses `version.workspace = true`. A velo minor bump is always a `velo-hub` minor bump, and `velo-hub` X.Y works with velo X.Y.
+2. `[workspace.dependencies]` requires velo with a caret on the workspace version: `velo = { path = "lib/velo", version = "0.21.0", default-features = false }`. Before 1.0, a caret on `0.21.0` means `>=0.21.0, <0.22.0`, so it never admits a second minor. An exact `=` pin would also stop a velo patch from reaching users of `velo-hub`.
+3. `scripts/check-semver.sh` fails if the major.minor of that requirement is not the workspace version. This check runs before the `semver:skip` escape and before the script stops for a change with no crate changes.
+4. velo and `velo-hub` publish together, from one commit.
+5. `velo-hub` re-exports `velo` and `axum`. Hub crates downstream use these re-exports, and require `velo-hub` with a caret.
 
 ## The CI gate
 

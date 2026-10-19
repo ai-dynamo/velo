@@ -29,6 +29,8 @@ The discovery traits and custom implementations are available without `services`
 
 A registration returns a guard. When the guard drops, the backend removes the registration.
 
+A hub from the `velo-hub` crate is a discovery service for a whole application, with registration, liveness, and hosted extensions. See [The hub](hub.md).
+
 Without a discovery backend, register each peer by hand:
 
 ```rust,ignore

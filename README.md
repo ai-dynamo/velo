@@ -31,8 +31,9 @@ Batched streams give each stream a window of 32 records in flight by default. A 
 |---|---|---|
 | `velo` | Application authors | The runtime: messaging, streaming, rendezvous, events, queues, discovery, all in-tree transports (TCP, UDS, NATS, gRPC, ZMQ, UCX, QUIC), metrics |
 | `velo-ext` | Authors of out-of-tree plugins | The stable trait surface: `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`, and the types they use |
+| `velo-hub` | Authors of a hub service | A hub: peer discovery, registration, and liveness for a velo application, plus hosted extensions. Not published yet. |
 
-Application authors depend on `velo` only. See [Workspace crates](docs/src/development/architecture.md) and [Versioning](docs/src/development/versioning.md).
+Application authors depend on `velo` only. `velo-hub` builds one service that is the peer discovery for an application and hosts extensions. It takes the workspace version and requires `velo` with a caret on it. See [The hub](docs/src/concepts/hub.md), [Workspace crates](docs/src/development/architecture.md), and [Versioning](docs/src/development/versioning.md).
 
 Streams to one peer can share its connection through the messenger mux. What the mux costs a serving frontend, and how that was measured, is in [Response-plane performance](docs/src/operations/response-plane-performance.md).
 

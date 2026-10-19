@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Workspace layout
 
-Two crates only:
+Two crates only, plus the two documented exceptions below:
 
 - **`lib/velo`** — the runtime. All concrete transport / discovery / streaming / messenger / queue / rendezvous / observability code lives here as modules (`velo::transports::tcp`, `velo::discovery::etcd`, `velo::streaming`, etc.). This is what application authors depend on.
 - **`lib/velo-ext`** — the extension trait surface. Out-of-tree implementors of `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, or `TransportObservability` depend only on this crate. It must remain small, free of heavy deps (especially `prometheus`), and stable.
@@ -14,6 +14,15 @@ build of UCX, backing the `ucx` transport feature. It is a leaf FFI crate that
 exports no types shared with `velo`/`velo-ext` (so it cannot reproduce the
 dual-copy semver bug class below), versions independently, and must be published
 to crates.io before a `velo` release that enables the `ucx` feature can ship.
+
+A second documented exception: **`lib/velo-hub`** — a crate for building a hub, one service that is the peer discovery for a velo application and hosts pluggable extensions. Unlike `ucx-rs` it *does* share types with `velo` (its API names `Velo`, `PeerInfo`, and axum `Router`), so moving it to another velo minor is a breaking change cargo-semver-checks cannot see. These rules make that safe:
+
+1. `lib/velo-hub/Cargo.toml` uses `version.workspace = true` and `velo = { workspace = true }`, so a velo minor bump is always a velo-hub minor bump.
+2. `[workspace.dependencies]` requires velo with a **caret** on the workspace version (`velo = { path = "lib/velo", version = "0.21.0", ... }`), not `=`. Pre-1.0 a caret on `0.Y.Z` never admits a second minor; `=` would only stop a velo patch reaching velo-hub users. `scripts/check-semver.sh` fails if the requirement's major.minor differs from `[workspace.package] version`, even under `semver:skip`.
+3. velo and velo-hub publish together, from one commit.
+4. velo-hub re-exports what its API exposes (`velo_hub::velo`, `velo_hub::axum`); downstream hub crates use those re-exports and depend on `velo-hub` with a caret.
+
+velo-hub carries `publish = false` until a real port (kvbm's indexer and p2p as extensions) passes kvbm's lifecycle suite against it.
 
 Anything else under `lib/` or as a workspace member is a mistake — there used to be 9 sibling crates (`velo-messenger`, `velo-transports`, `velo-streaming`, …). They were collapsed into `lib/velo/src/` because independent versioning between them silently shipped broken releases. Do not reintroduce them.
 
@@ -57,7 +66,7 @@ The bug class that motivated the workspace collapse: a 0.1.1 "patch" of an inter
 
 ### Hard rules
 
-1. **Only `velo` and `velo-ext` are publishable.** Any new crate added to the workspace must have `publish = false` in its `Cargo.toml` unless there is a deliberate, documented reason to publish it. Adding a third publishable crate reopens the bug class.
+1. **Only `velo` and `velo-ext` are publishable** (plus `ucx-rs` and, once its publish gate clears, `velo-hub` — the two documented exceptions above). Any new crate added to the workspace must have `publish = false` in its `Cargo.toml` unless there is a deliberate, documented reason to publish it. Adding a third publishable crate reopens the bug class.
 2. **`velo-ext` is `=`-pinned in `[workspace.dependencies]`.** The line is:
    ```toml
    velo-ext = { path = "lib/velo-ext", version = "=0.5.6" }
