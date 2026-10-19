@@ -94,22 +94,31 @@ impl Shared {
 
     /// A store remove under `step_timeout_ms`. Every remove that runs under
     /// the registration lock goes through this, so a backend that never
-    /// answers cannot hold the lock. Expiry reads as `Indeterminate`: a
-    /// remote remove can still apply after its future is dropped.
+    /// answers cannot hold the lock.
     pub(crate) async fn remove_bounded(
         &self,
         id: InstanceId,
         incarnation: Incarnation,
     ) -> Result<(), StoreError> {
-        match tokio::time::timeout(self.config.step_timeout, self.store.remove(id, incarnation))
-            .await
-        {
-            Ok(result) => result,
-            Err(_) => Err(StoreError::Indeterminate(format!(
-                "remove did not complete within {:?}",
-                self.config.step_timeout
-            ))),
-        }
+        bounded(self.config.step_timeout, self.store.remove(id, incarnation)).await
+    }
+}
+
+/// One store call under `limit`. Every store call the hub awaits under its
+/// lock, in a request, in the heartbeat or in shutdown goes through this.
+/// Expiry reads as `Indeterminate`: a remote call can still apply after its
+/// future is dropped. A backend that does its work before it returns a
+/// ready future (the in-memory store) is not cut off by this, and need not
+/// be.
+pub(crate) async fn bounded<T>(
+    limit: std::time::Duration,
+    call: impl std::future::Future<Output = Result<T, StoreError>>,
+) -> Result<T, StoreError> {
+    match tokio::time::timeout(limit, call).await {
+        Ok(result) => result,
+        Err(_) => Err(StoreError::Indeterminate(format!(
+            "did not complete within {limit:?}"
+        ))),
     }
 }
 
@@ -422,18 +431,11 @@ impl Unwind {
         }
         let mut error = error;
         if let Some((id, incarnation)) = self.pinned
-            && let Err(cleanup) = match tokio::time::timeout(
+            && let Err(cleanup) = bounded(
                 self.shutdown_timeout,
                 remove_pinned(self.store.as_ref(), id, incarnation),
             )
             .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(StoreError::Indeterminate(format!(
-                    "did not complete within {:?}",
-                    self.shutdown_timeout
-                ))),
-            }
         {
             error = error.context(format!(
                 "and removing the hub's own entry failed: {cleanup}"
@@ -593,15 +595,41 @@ impl HubInner {
 /// cannot leave the hub half stopped.
 async fn stop(shared: &Shared, running: Running) -> anyhow::Result<()> {
     let config = &shared.config;
-    let guard = shared.lock.lock().await;
+    // Every async holder of the lock is bounded, but a sync hook that
+    // blocks its thread (against the extension rules) holds it for as long
+    // as it blocks. Stop without the lock rather than hang.
+    let guard = match tokio::time::timeout(config.shutdown_timeout, shared.lock.lock()).await {
+        Ok(guard) => Some(guard),
+        Err(_) => {
+            tracing::warn!(
+                timeout = ?config.shutdown_timeout,
+                "the registration lock was not released; stopping without it"
+            );
+            None
+        }
+    };
     running.extension_cancel.cancel();
     running.lifecycle_cancel.cancel();
-    if let Ok((mut queue, in_flight)) = running.lifecycle.await {
-        if let Some(job) = in_flight {
-            shared.run_job(job).await;
+    // Bounded too: a task woken by a thread that then blocks sits in that
+    // worker's LIFO slot, which other workers cannot steal, so the lifecycle
+    // task may not run again until the blocking hook returns.
+    let mut lifecycle = running.lifecycle;
+    match tokio::time::timeout(config.shutdown_timeout, &mut lifecycle).await {
+        Ok(Ok((mut queue, in_flight))) => {
+            if let Some(job) = in_flight {
+                shared.run_job(job).await;
+            }
+            while let Ok(job) = queue.try_recv() {
+                shared.run_job(job).await;
+            }
         }
-        while let Ok(job) = queue.try_recv() {
-            shared.run_job(job).await;
+        Ok(Err(error)) => tracing::warn!(%error, "the lifecycle task failed"),
+        Err(_) => {
+            tracing::warn!(
+                timeout = ?config.shutdown_timeout,
+                "the lifecycle task did not stop; its queued removals are not delivered"
+            );
+            lifecycle.abort();
         }
     }
     for extension in shared.extensions.iter().rev() {

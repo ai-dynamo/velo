@@ -1410,3 +1410,74 @@ async fn a_hung_read_back_is_cut_off_and_fails_closed() {
         "reserved"
     );
 }
+
+/// A sync hook that blocks its thread (here `on_removed`, while DELETE
+/// holds the registration lock) breaks the extension rules, but it must not
+/// hang shutdown. The stop waits for the lock for `shutdown_timeout_ms` and
+/// then goes on without it. It bounds its join of the lifecycle task too:
+/// the removal DELETE queued woke that task onto the worker that then
+/// blocked, and tokio's other workers cannot steal it from that worker's
+/// LIFO slot, so it does not run until the hook returns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_blocking_sync_hook_does_not_hang_shutdown() {
+    let f = fixture(
+        |config| config.server.shutdown_timeout = Duration::from_millis(300),
+        false,
+    )
+    .await;
+    let peer = make_peer();
+    let owner = peer.instance_id();
+    let prior = seeded(&f, &peer).await;
+
+    let (entered, release) = f.ledger.block_next_removed();
+    let delete = tokio::spawn({
+        let hub = f.hub.clone();
+        async move { unregister_status(&hub, owner, Some(&prior.credential)).await }
+    });
+    tokio::task::spawn_blocking(move || entered.recv())
+        .await
+        .unwrap()
+        .expect("on_removed was reached");
+    let started = std::time::Instant::now();
+    let outcome = tokio::time::timeout(Duration::from_secs(5), f.hub.shutdown()).await;
+    drop(release);
+    assert!(outcome.is_ok(), "shutdown waited on a blocked sync hook");
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "shutdown took {:?}",
+        started.elapsed()
+    );
+    let _ = delete.await;
+}
+
+/// The HTTP heartbeat's store touch runs under `step_timeout_ms`, like
+/// every store call the hub awaits: a backend that never answers gets the
+/// client a 503 in bounded time, not a request that stays open.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_store_touch_answers_the_heartbeat_with_503() {
+    let f = fixture(
+        |config| config.server.step_timeout = Duration::from_millis(200),
+        false,
+    )
+    .await;
+    let peer = make_peer();
+    let response = register(&f.hub, &request(&peer), None).await;
+    let _gate = f.store.gate_next_touch();
+    let started = std::time::Instant::now();
+    let answer = tokio::time::timeout(
+        Duration::from_secs(5),
+        http()
+            .post(control(
+                &f.hub,
+                &velo_hub::protocol::instance_heartbeat(peer.instance_id()),
+            ))
+            .header(CREDENTIAL_HEADER, response.credential.to_header_value())
+            .send(),
+    )
+    .await
+    .expect("the heartbeat waited on a hung touch")
+    .unwrap();
+    assert_eq!(answer.status(), 503);
+    assert_eq!(error_code(answer).await, ErrorCode::Unavailable);
+    assert!(started.elapsed() < Duration::from_secs(2));
+}

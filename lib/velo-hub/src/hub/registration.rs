@@ -342,11 +342,13 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
     };
     let op = record.op;
     let expected = previous.map(|lease| lease.incarnation);
-    let written =
-        tokio::time::timeout(config.step_timeout, shared.store.put(record, expected)).await;
-    let incarnation = match written {
-        Ok(Ok(incarnation)) => incarnation,
-        Ok(Err(StoreError::Indeterminate(reason))) => match resolve(&shared, owner, op).await {
+    // A put that times out is indeterminate like one the backend reports
+    // as such: a remote write may still land after its future is dropped.
+    let incarnation = match super::bounded(config.step_timeout, shared.store.put(record, expected))
+        .await
+    {
+        Ok(incarnation) => incarnation,
+        Err(StoreError::Indeterminate(reason)) => match resolve(&shared, owner, op).await {
             Ok(Some(incarnation)) => {
                 txn.written = Some(incarnation);
                 let error =
@@ -366,39 +368,14 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
                 ));
             }
         },
-        Ok(Err(error @ StoreError::Stale { .. })) => {
+        Err(error @ StoreError::Stale { .. }) => {
             let error = HubError::new(
                 ErrorCode::RegisterAgain,
                 format!("the prior registration changed meanwhile; register again: {error}"),
             );
             return Err(txn.abort(error));
         }
-        Ok(Err(error)) => return Err(txn.abort(error.into())),
-        Err(_) => {
-            // The put future is gone, but a remote write may still land:
-            // treat it as indeterminate.
-            match resolve(&shared, owner, op).await {
-                Ok(Some(incarnation)) => {
-                    txn.written = Some(incarnation);
-                    let error = HubError::unavailable("store write timed out after it applied");
-                    return Err(txn.fail_after_write(incarnation, error).await);
-                }
-                Ok(None) => {
-                    let error = HubError::unavailable(format!(
-                        "store write did not complete within {:?}; retry",
-                        config.step_timeout
-                    ));
-                    return Err(txn.abort(error));
-                }
-                Err(error) => {
-                    return Err(fail_unresolved(
-                        &mut txn,
-                        previous.map(|lease| lease.incarnation),
-                        error,
-                    ));
-                }
-            }
-        }
+        Err(error) => return Err(txn.abort(error.into())),
     };
     txn.written = Some(incarnation);
 
@@ -478,13 +455,7 @@ async fn resolve(
     owner: InstanceId,
     op: OpId,
 ) -> Result<Option<Incarnation>, StoreError> {
-    match tokio::time::timeout(shared.config.step_timeout, shared.store.resolve(owner, op)).await {
-        Ok(result) => result,
-        Err(_) => Err(StoreError::Backend(anyhow::anyhow!(
-            "resolve did not complete within {:?}",
-            shared.config.step_timeout
-        ))),
-    }
+    super::bounded(shared.config.step_timeout, shared.store.resolve(owner, op)).await
 }
 
 /// The write's outcome cannot be learned. Neither the prior registration

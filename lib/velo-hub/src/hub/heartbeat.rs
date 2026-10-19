@@ -142,21 +142,9 @@ fn fan_out(
     }
 }
 
-/// One store call under `step_timeout`. The loop handles outcomes one at a
-/// time, so a call that never answered would stop every later probe and
-/// keep shutdown, which joins this task, waiting.
-async fn bounded(
-    step_timeout: Duration,
-    call: futures::future::BoxFuture<'_, Result<(), crate::store::StoreError>>,
-) -> Result<(), crate::store::StoreError> {
-    match tokio::time::timeout(step_timeout, call).await {
-        Ok(result) => result,
-        Err(_) => Err(crate::store::StoreError::Indeterminate(format!(
-            "did not complete within {step_timeout:?}"
-        ))),
-    }
-}
-
+/// The loop handles outcomes one at a time, so each store call here is
+/// bounded: one that never answered would stop every later probe and keep
+/// shutdown, which joins this task, waiting.
 async fn handle_outcome(
     outcome: ProbeOutcome,
     store: &dyn HubStore,
@@ -171,7 +159,7 @@ async fn handle_outcome(
             ack_seq,
         } => {
             failures.remove(&(id, incarnation));
-            match bounded(step_timeout, store.touch(id, incarnation)).await {
+            match super::bounded(step_timeout, store.touch(id, incarnation)).await {
                 Ok(()) => {
                     tracing::trace!(instance = %id, %incarnation, ack_seq, "heartbeat: refreshed")
                 }
@@ -193,7 +181,9 @@ async fn handle_outcome(
             tracing::warn!(instance = %id, %incarnation, failures = *count, error = %reason, "heartbeat: probe failed");
             if *count >= max_failures {
                 failures.remove(&key);
-                if let Err(error) = bounded(step_timeout, store.remove(id, incarnation)).await {
+                if let Err(error) =
+                    super::bounded(step_timeout, store.remove(id, incarnation)).await
+                {
                     tracing::warn!(instance = %id, %incarnation, %error, "heartbeat: conditional remove ignored");
                 }
             }

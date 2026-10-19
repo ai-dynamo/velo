@@ -306,18 +306,19 @@ async fn heartbeat(
 ) -> Result<Json<HeartbeatResponse>, HubError> {
     let presented = credential_from_headers(&headers)?;
     let lease = shared.authority.authorize(id, presented.as_ref())?;
-    shared
-        .store
-        .touch(id, lease.incarnation)
-        .await
-        .map_err(|error| match error {
-            // Authorized, but a replacement won the race: not this caller's
-            // registration any more.
-            StoreError::Stale { .. } => {
-                HubError::new(protocol::ErrorCode::Conflict, error.to_string())
-            }
-            other => other.into(),
-        })?;
+    // Bounded like every store call the hub awaits: a stalled backend would
+    // otherwise pile up one open request per registrant per heartbeat.
+    super::bounded(
+        shared.config.step_timeout,
+        shared.store.touch(id, lease.incarnation),
+    )
+    .await
+    .map_err(|error| match error {
+        // Authorized, but a replacement won the race: not this caller's
+        // registration any more.
+        StoreError::Stale { .. } => HubError::new(protocol::ErrorCode::Conflict, error.to_string()),
+        other => other.into(),
+    })?;
     Ok(Json(HeartbeatResponse { acknowledged: true }))
 }
 

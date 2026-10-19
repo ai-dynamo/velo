@@ -442,6 +442,8 @@ struct LedgerFaults {
     gate_next_prepare: Option<Arc<Gate>>,
     hang_next_prepare: bool,
     panic_next_admit: bool,
+    /// (entered, release): the next on_removed blocks its thread.
+    block_next_removed: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     panic_next_prepare: bool,
     panic_next_commit: bool,
     panic_next_registered: bool,
@@ -507,6 +509,18 @@ impl Ledger {
     /// The next prepare hides, then never finishes.
     pub fn hang_next_prepare(&self) {
         self.faults.lock().hang_next_prepare = true;
+    }
+
+    /// The next on_removed blocks its thread, which breaks the rule that
+    /// sync hooks do not block. The first receiver yields once it is
+    /// blocked; dropping the sender releases it.
+    pub fn block_next_removed(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.faults.lock().block_next_removed = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
     }
 
     /// The next admit panics.
@@ -768,6 +782,11 @@ impl Extension for Ledger {
     }
 
     fn on_removed(&self, removal: Removal) {
+        let block = self.faults.lock().block_next_removed.take();
+        if let Some((entered, release)) = block {
+            let _ = entered.send(());
+            let _ = release.recv();
+        }
         let mut state = self.state.lock();
         let held = state.owners.get(&removal.id).map(|owner| owner.incarnation);
         self.removals.lock().push((removal, held));
