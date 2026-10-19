@@ -26,6 +26,8 @@ use velo::{InstanceId, PeerDiscovery, PeerInfo, WorkerId};
 
 use crate::protocol::{Credential, RegistrationEpoch};
 
+#[cfg(feature = "etcd")]
+pub mod etcd;
 mod memory;
 
 #[cfg(any(test, feature = "test-support"))]
@@ -79,6 +81,12 @@ impl OpId {
 impl Default for OpId {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl std::fmt::Display for OpId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
     }
 }
 
