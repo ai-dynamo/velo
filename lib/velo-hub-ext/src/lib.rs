@@ -295,8 +295,12 @@ pub struct RegisterRequest {
 pub struct RegisterResponse {
     /// The registered instance, echoed.
     pub instance_id: InstanceId,
-    /// The hub's own velo instance, when the hub runs velo. Look it up with
-    /// [`peers_by_instance`] to reach the hub over velo.
+    /// The hub's own velo instance, when the hub runs velo.
+    /// `HubClient::register(&velo, ..)` in velo-hub registers this peer with
+    /// `velo` itself. A client that registers with `register_peer`, or
+    /// speaks the protocol without velo-hub, looks the peer up with
+    /// [`peers_by_instance`] and registers it with its velo to reach the
+    /// hub over velo.
     #[serde(default)]
     pub hub_instance_id: Option<InstanceId>,
     /// Authorizes this registration's mutations until the next registration.

@@ -376,6 +376,84 @@ async fn registering_with_a_restarted_hub_registers_the_new_hubs_peer() {
     hub_b.shutdown().await.unwrap();
 }
 
+/// A hub whose first probe comes long after any of these tests ends: the
+/// handshake of a probe also registers the hub with the client, so a
+/// probe would hide a client that did not.
+async fn hub_without_early_probes() -> Hub {
+    let mut config = config();
+    config.server.heartbeat_interval = Duration::from_secs(600);
+    Hub::builder(config)
+        .velo(velo_builder())
+        .serve()
+        .await
+        .unwrap()
+}
+
+/// One client, two velos in turn, one hub: the second velo has not
+/// registered the hub's peer, so `register` registers it there too. The
+/// client remembers the pair of ids (client velo, hub velo), not the hub
+/// id alone, which would skip the second velo.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_second_velo_on_the_same_client_gets_the_hubs_peer() {
+    let hub = hub_without_early_probes().await;
+    let hub_id = hub.velo().unwrap().instance_id();
+    install_echo(hub.velo().unwrap());
+    let client = client_for(&hub);
+    let first = client
+        .velo_builder()
+        .add_transport(tcp_transport())
+        .build()
+        .await
+        .unwrap();
+    client.register(&first, none()).await.unwrap();
+    assert_eq!(echo_to(&first, hub_id, 1).await.unwrap(), 2);
+    client.unregister().await.unwrap();
+
+    let second = client
+        .velo_builder()
+        .add_transport(tcp_transport())
+        .build()
+        .await
+        .unwrap();
+    client.register(&second, none()).await.unwrap();
+    assert_eq!(echo_to(&second, hub_id, 3).await.unwrap(), 4);
+    client.unregister().await.unwrap();
+    hub.shutdown().await.unwrap();
+}
+
+/// If the client cannot look up the hub's peer, `register` still succeeds,
+/// and the next `register` tries the lookup again: the client remembers a
+/// hub peer only after it registered that peer. Here the hub's own entry
+/// is out of the store for the first `register`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_hub_peer_lookup_keeps_the_registration_and_is_retried() {
+    let hub = hub_without_early_probes().await;
+    let hub_id = hub.velo().unwrap().instance_id();
+    install_echo(hub.velo().unwrap());
+    let own = hub.store().get(hub_id).expect("the hub's own entry");
+    hub.store().remove(hub_id, own.incarnation).await.unwrap();
+
+    let client = client_for(&hub);
+    let velo = client
+        .velo_builder()
+        .add_transport(tcp_transport())
+        .build()
+        .await
+        .unwrap();
+    client.register(&velo, none()).await.unwrap();
+    assert!(client.is_registered());
+    assert!(
+        echo_to(&velo, hub_id, 1).await.is_err(),
+        "the hub's peer was registered without its entry"
+    );
+
+    hub.store().put(own.record, None).await.unwrap();
+    client.register(&velo, none()).await.unwrap();
+    assert_eq!(echo_to(&velo, hub_id, 1).await.unwrap(), 2);
+    client.unregister().await.unwrap();
+    hub.shutdown().await.unwrap();
+}
+
 /// `register(&velo, ..)` installs the heartbeat handler, so the hub's velo
 /// probes reach the client and keep it registered. Replaces kvbm's
 /// `create_heartbeat_handler_builds`, which only built the handler.
