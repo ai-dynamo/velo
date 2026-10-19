@@ -167,7 +167,7 @@ impl EtcdStoreBuilder {
     /// prefix (default zero: fail at once with
     /// [`ConnectError::PrefixHeld`]). After a hub crashed, its lock lives
     /// one `lock_ttl` more; a hub that restarts in its place waits that
-    /// long.
+    /// long. A standby waits with `Duration::MAX`, which never gives up.
     pub fn wait_for_prefix(mut self, wait: Duration) -> Self {
         self.wait_for_prefix = wait;
         self
@@ -220,10 +220,13 @@ impl EtcdStoreBuilder {
     /// Connect, take the prefix's lock, delete the pinned entries of hubs
     /// before this one, load the prefix, and start the store's tasks.
     pub async fn connect(self) -> Result<EtcdStore, ConnectError> {
-        let until = tokio::time::Instant::now() + self.wait_for_prefix;
+        // `None` past the clock's range: wait without a limit.
+        let until = tokio::time::Instant::now().checked_add(self.wait_for_prefix);
         loop {
             match self.connect_once().await {
-                Err(ConnectError::PrefixHeld { .. }) if tokio::time::Instant::now() < until => {
+                Err(ConnectError::PrefixHeld { .. })
+                    if until.is_none_or(|until| tokio::time::Instant::now() < until) =>
+                {
                     tokio::time::sleep(PREFIX_RETRY).await;
                 }
                 other => return other,
