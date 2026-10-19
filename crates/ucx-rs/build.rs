@@ -50,7 +50,12 @@ fn main() {
     let want_ib = cfg!(feature = "ib");
     let want_rdmacm = cfg!(feature = "rdmacm");
 
-    if docsrs {
+    // UCX is Linux-only: its configure needs librt, and `ib` needs rdma-core.
+    // Stubbing other targets keeps `cargo build --workspace` working on macOS;
+    // velo already compiles its `ucx` transport only on Linux.
+    let linux = env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux");
+
+    if docsrs || !linux {
         // docs.rs: no network (fine — the tarball ships in the crate) but also
         // no rdma-core headers and a hard build timeout. Emit nothing; the
         // downstream `-sys` crate must be `#[cfg(docsrs)]`-stubbed.
