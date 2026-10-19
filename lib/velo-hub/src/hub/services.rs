@@ -28,7 +28,7 @@ use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 use velo::InstanceId;
 
-use super::extension::{Committed, Extension, Rejection, Txn};
+use super::extension::{Committed, Extension, RegistrationView, Rejection, Txn};
 use super::{Authorized, HubError, Lease};
 use crate::protocol::{
     self, RegistrationEpoch, WATCH_ADDED, WATCH_DISCONNECTED, WATCH_INITIAL, WATCH_REMOVED,
@@ -36,7 +36,7 @@ use crate::protocol::{
 use crate::store::{Incarnation, Removal};
 
 /// The directory's reserved extension name.
-pub(crate) const NAME: &str = "services";
+pub(crate) const NAME: &str = protocol::SERVICES_EXTENSION;
 
 /// Changes a watcher can fall behind by before its stream ends with
 /// `disconnected`. tokio allocates the whole ring for each watched name, so
@@ -271,34 +271,77 @@ impl Drop for Watch {
 
 impl Extension for ServiceDirectory {
     const NAME: &'static str = NAME;
-    type Registration = ();
-    type Staged = ();
+    /// The names the registrant serves. With a payload, the registration
+    /// sets the owner's services to exactly these, so a client that sends
+    /// its names on every registration never diverges from the hub.
+    type Registration = BTreeSet<String>;
+    type Staged = Option<BTreeSet<String>>;
 
     async fn shutdown(&self) {
         self.closed.cancel();
     }
 
-    async fn prepare(&self, _txn: &Txn<'_>, _payload: Option<()>) -> Result<(), Rejection> {
-        Ok(())
+    fn admit(
+        &self,
+        _view: &RegistrationView<'_>,
+        payload: Option<&BTreeSet<String>>,
+    ) -> Result<(), Rejection> {
+        match payload
+            .into_iter()
+            .flatten()
+            .find(|name| !protocol::is_valid_service_name(name))
+        {
+            Some(name) => Err(Rejection::bad_request(format!(
+                "{name:?} is not a service name: {}",
+                protocol::SERVICE_NAME_RULE
+            ))),
+            None => Ok(()),
+        }
     }
 
-    fn commit(&self, _staged: (), registration: &Committed<'_>) {
+    async fn prepare(
+        &self,
+        _txn: &Txn<'_>,
+        payload: Option<BTreeSet<String>>,
+    ) -> Result<Option<BTreeSet<String>>, Rejection> {
+        Ok(payload)
+    }
+
+    fn commit(&self, names: Option<BTreeSet<String>>, registration: &Committed<'_>) {
         let mut state = self.state.lock();
-        // A fresh registration (no credential presented) starts with no
-        // services; a re-registration with the credential keeps them.
-        if registration.previous.is_none() {
-            state.drop_owner(registration.owner);
-        }
-        let owner = state
+        let id = registration.owner;
+        // Without a payload, a fresh registration (no credential presented)
+        // starts with no services and a re-registration with the credential
+        // keeps them. With one, the owner serves exactly the names sent.
+        let keep = match &names {
+            Some(_) => BTreeSet::new(),
+            None if registration.previous.is_some() => state
+                .owners
+                .get(&id)
+                .map(|owner| owner.names.clone())
+                .unwrap_or_default(),
+            None => BTreeSet::new(),
+        };
+        let wanted = names.unwrap_or(keep);
+        let held = state
             .owners
-            .entry(registration.owner)
-            .or_insert_with(|| Owner {
+            .get(&id)
+            .map(|owner| owner.names.clone())
+            .unwrap_or_default();
+        for name in held.difference(&wanted) {
+            state.remove(name, id);
+        }
+        for name in wanted.difference(&held) {
+            state.add(name, id);
+        }
+        state.owners.insert(
+            id,
+            Owner {
                 epoch: registration.epoch,
                 incarnation: registration.incarnation,
-                names: BTreeSet::new(),
-            });
-        owner.epoch = registration.epoch;
-        owner.incarnation = registration.incarnation;
+                names: wanted,
+            },
+        );
     }
 
     fn on_removed(&self, removal: Removal) {
@@ -344,6 +387,16 @@ mod tests {
         incarnation: u64,
         fresh: bool,
     ) -> Lease {
+        commit_with(directory, owner, incarnation, fresh, None)
+    }
+
+    fn commit_with(
+        directory: &ServiceDirectory,
+        owner: InstanceId,
+        incarnation: u64,
+        fresh: bool,
+        names: Option<&[&str]>,
+    ) -> Lease {
         let peer = PeerInfo::new(owner, WorkerAddress::from_encoded(b"x".to_vec()));
         let epoch = RegistrationEpoch::new();
         let incarnation = Incarnation::from_u64(incarnation);
@@ -352,8 +405,9 @@ mod tests {
             epoch: RegistrationEpoch::new(),
         });
         let extensions = BTreeMap::new();
+        let names = names.map(|names| names.iter().map(|name| name.to_string()).collect());
         directory.commit(
-            (),
+            names,
             &Committed {
                 owner,
                 peer: &peer,
@@ -382,6 +436,24 @@ mod tests {
         assert_eq!(error.code(), protocol::ErrorCode::Conflict);
         directory.put("svc", &auth(owner, new)).unwrap();
         assert_eq!(directory.instances("svc"), [owner]);
+    }
+
+    /// A registration's payload is the owner's whole set: names it lacks are
+    /// removed, names it adds are added. Without one, a re-registration
+    /// keeps the set and a fresh registration starts empty.
+    #[test]
+    fn a_payload_replaces_the_set_and_none_keeps_or_clears_it() {
+        let directory = ServiceDirectory::default();
+        let owner = InstanceId::new_v4();
+        let lease = commit_with(&directory, owner, 1, true, Some(&["a", "b"]));
+        assert_eq!(directory.list(), ["a", "b"]);
+        commit_with(&directory, owner, 2, false, Some(&["b", "c"]));
+        assert_eq!(directory.list(), ["b", "c"]);
+        commit(&directory, owner, 3, false);
+        assert_eq!(directory.list(), ["b", "c"]);
+        commit(&directory, owner, 4, true);
+        assert!(directory.list().is_empty());
+        let _ = lease;
     }
 
     /// A removal of an older incarnation is stale and leaves a later

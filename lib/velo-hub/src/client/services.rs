@@ -3,11 +3,15 @@
 
 //! Service discovery through the hub, and the services a client serves.
 //!
-//! A client serves each name through one [`HubServiceRegistration`]. The
-//! names live in the client, not in the guard's registration: every
-//! successful `register` puts them again, so a fresh registration (which
-//! the hub starts with no services) and a hub that restarted get them
-//! back, and a guard never acts on another guard's entry.
+//! The client keeps two sets: `serving`, the names its guards hold, and
+//! `confirmed`, what the hub holds for its registration. Every registration
+//! carries `serving` and the hub takes it as the owner's whole set, so the
+//! two agree after any registration. Between registrations, guards change
+//! only `serving`, and `sync_services` is the one writer of the hub's set:
+//! it holds the client's operation lock (so it never runs beside a
+//! registration) and sends one request at a time until the sets agree. So
+//! two requests from one client never race, a failed one stays in the diff
+//! for the next pass, and a guard never acts on another guard's entry.
 
 use std::pin::Pin;
 use std::sync::{Arc, Weak};
@@ -19,7 +23,7 @@ use velo::InstanceId;
 use velo::discovery::{ServiceDiscovery, ServiceEvent, ServiceRegistrationGuard};
 
 use super::sse::parse_events;
-use super::{ClientError, Endpoints, HubClient, Route, Shared, decode, owns_nothing};
+use super::{ClientError, Endpoints, HubClient, Inner, Route, decode};
 use crate::protocol;
 
 fn check_name(name: &str) -> Result<(), ClientError> {
@@ -41,67 +45,85 @@ impl HubClient {
 
     /// Serve the service `name` with this client's instance. The client
     /// holds one guard per name ([`ClientError::AlreadyServing`] for a
-    /// second). The entry follows the client's registration: every
-    /// successful `register` puts it again. Dropping the guard removes it
-    /// in the background, best effort.
+    /// second). The name goes to the hub now if the client is registered,
+    /// and with every registration after. An error is the hub's answer to
+    /// that request; the name stays served, and the next pass retries.
+    /// Dropping the guard stops serving it, in the background.
     pub async fn register_service(
         &self,
         name: &str,
     ) -> Result<HubServiceRegistration, ClientError> {
         check_name(name)?;
-        let shared = &self.inner.shared;
-        if !shared.services.lock().insert(name.to_string()) {
+        if !self.inner.shared.serving.lock().insert(name.to_string()) {
             return Err(ClientError::AlreadyServing(name.to_string()));
         }
-        // From here the name is the guard's; it gives it back on drop.
         let guard = HubServiceRegistration {
-            endpoints: Arc::clone(&self.inner.endpoints),
-            registration: Arc::downgrade(shared),
+            client: Arc::downgrade(&self.inner),
             name: name.to_string(),
-            removed: false,
+            serving: true,
         };
-        put(&self.inner.endpoints, shared, name).await?;
+        self.sync_services().await?;
         Ok(guard)
     }
 
-    /// Put every name this client serves, after a registration.
-    pub(super) async fn put_services(&self) -> Result<(), ClientError> {
-        let names: Vec<String> = self.inner.shared.services.lock().iter().cloned().collect();
-        for name in names {
-            put(&self.inner.endpoints, &self.inner.shared, &name).await?;
+    /// Bring the hub's services for this registration to the names the
+    /// client serves, one request at a time. Without a registration there
+    /// is nothing to do: the next registration carries the names. Stops at
+    /// the first failure, which a later pass retries.
+    pub async fn sync_services(&self) -> Result<(), ClientError> {
+        let _op = self.inner.op.lock().await;
+        let shared = &self.inner.shared;
+        let endpoints = &self.inner.endpoints;
+        loop {
+            let Some((instance_id, _)) = shared.credential() else {
+                return Ok(());
+            };
+            let next = {
+                let serving = shared.serving.lock();
+                let confirmed = shared.confirmed.lock();
+                serving
+                    .difference(&confirmed)
+                    .next()
+                    .map(|name| (Method::PUT, name.clone()))
+                    .or_else(|| {
+                        confirmed
+                            .difference(&serving)
+                            .next()
+                            .map(|name| (Method::DELETE, name.clone()))
+                    })
+            };
+            let Some((method, name)) = next else {
+                return Ok(());
+            };
+            let url = Endpoints::join(
+                &endpoints.control,
+                &protocol::service_instance(&name, instance_id),
+            )?;
+            let put = method == Method::PUT;
+            // `credentialed` drops a rejected registration, which clears
+            // `confirmed`; the loop then ends for want of a credential.
+            shared
+                .credentialed::<(), ()>(endpoints, method, url, None, Route::Core)
+                .await?;
+            let mut confirmed = shared.confirmed.lock();
+            if put {
+                confirmed.insert(name);
+            } else {
+                confirmed.remove(&name);
+            }
         }
-        Ok(())
     }
 }
 
-async fn put(endpoints: &Endpoints, shared: &Shared, name: &str) -> Result<(), ClientError> {
-    service_call(endpoints, shared, Method::PUT, name).await
-}
-
-async fn service_call(
-    endpoints: &Endpoints,
-    shared: &Shared,
-    method: Method,
-    name: &str,
-) -> Result<(), ClientError> {
-    let (instance_id, _) = shared.credential().ok_or(ClientError::NotRegistered)?;
-    let url = Endpoints::join(
-        &endpoints.control,
-        &protocol::service_instance(name, instance_id),
-    )?;
-    shared
-        .credentialed::<(), ()>(endpoints, method, url, None, Route::Core)
-        .await
-}
-
-/// The client serving one service name. Holds the client weakly: once the
-/// client is gone, its registration's end removes the entry.
+/// The client serving one service name. Holds the client weakly: once every
+/// `HubClient` is gone, the registration ends, and the hub drops the entry
+/// with it.
 #[derive(Debug)]
 pub struct HubServiceRegistration {
-    endpoints: Arc<Endpoints>,
-    registration: Weak<Shared>,
+    client: Weak<Inner>,
     name: String,
-    removed: bool,
+    /// Whether the name is still in the client's set.
+    serving: bool,
 }
 
 impl HubServiceRegistration {
@@ -110,23 +132,18 @@ impl HubServiceRegistration {
         &self.name
     }
 
-    /// Stop serving: give the name back, then remove the entry. Without a
-    /// registration there is no entry to remove.
+    /// Stop serving the name, then bring the hub's set to the client's.
+    /// Retrying after a failure sends the remove again.
     async fn remove(&mut self) -> Result<(), ClientError> {
-        if self.removed {
-            return Ok(());
-        }
-        let Some(shared) = self.registration.upgrade() else {
-            self.removed = true;
+        let Some(inner) = self.client.upgrade() else {
+            self.serving = false;
             return Ok(());
         };
-        shared.services.lock().remove(&self.name);
-        self.removed = true;
-        match service_call(&self.endpoints, &shared, Method::DELETE, &self.name).await {
-            Err(ClientError::NotRegistered) => Ok(()),
-            Err(error) if owns_nothing(&error) => Ok(()),
-            other => other,
+        if self.serving {
+            inner.shared.serving.lock().remove(&self.name);
+            self.serving = false;
         }
+        HubClient { inner }.sync_services().await
     }
 }
 
@@ -138,23 +155,22 @@ impl ServiceRegistrationGuard for HubServiceRegistration {
 
 impl Drop for HubServiceRegistration {
     fn drop(&mut self) {
-        if self.removed {
+        if !self.serving {
             return;
         }
-        let Some(shared) = self.registration.upgrade() else {
+        let Some(inner) = self.client.upgrade() else {
             return;
         };
-        shared.services.lock().remove(&self.name);
-        if shared.credential().is_none() {
+        inner.shared.serving.lock().remove(&self.name);
+        if inner.shared.credential().is_none() {
             return;
         }
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
             return;
         };
-        let endpoints = Arc::clone(&self.endpoints);
-        let name = std::mem::take(&mut self.name);
+        let client = HubClient { inner };
         runtime.spawn(async move {
-            let _ = service_call(&endpoints, &shared, Method::DELETE, &name).await;
+            let _ = client.sync_services().await;
         });
     }
 }

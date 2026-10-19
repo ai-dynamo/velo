@@ -1007,16 +1007,11 @@ async fn a_slow_registration_after_an_orphan_keeps_its_entry() {
     );
     // Now the register that should succeed.
     let answer = client.register(&velo, slow_opt_in()).await;
-    println!("answer: {answer:?}");
     tokio::time::sleep(Duration::from_millis(500)).await;
     let held = hub.store().get(velo.instance_id()).is_some();
-    println!(
-        "client registered: {}, hub holds entry: {held}",
-        client.is_registered()
-    );
     assert!(
         answer.is_ok() && held,
-        "orphaned suppressed the acquiring grace: answer ok = {}, hub holds = {held}",
+        "the registration was evicted while it ran: answer ok = {}, hub holds = {held}",
         answer.is_ok()
     );
     let _ = client.unregister().await;

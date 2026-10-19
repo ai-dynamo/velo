@@ -347,9 +347,13 @@ impl State {
 #[derive(Debug, Default)]
 struct Shared {
     state: parking_lot::Mutex<State>,
-    /// The services this client serves, one guard each. They follow the
-    /// registration: every successful register puts them again.
-    services: parking_lot::Mutex<BTreeSet<String>>,
+    /// The services this client serves, one guard each.
+    serving: parking_lot::Mutex<BTreeSet<String>>,
+    /// The services the hub holds for the registration, as far as the
+    /// client knows: set by each registration (which carries `serving`),
+    /// then moved toward `serving` by `sync_services`, one request at a
+    /// time. Empty without a registration.
+    confirmed: parking_lot::Mutex<BTreeSet<String>>,
     seq: AtomicU64,
     at_unix_ms: AtomicU64,
 }
@@ -373,6 +377,7 @@ impl Shared {
             .is_some_and(|response| &response.credential == credential)
         {
             state.response = None;
+            self.confirmed.lock().clear();
         }
     }
 
@@ -449,6 +454,7 @@ impl Drop for Acquiring<'_> {
                 .is_some_and(|response| &response.credential == credential)
         {
             state.response = None;
+            self.shared.confirmed.lock().clear();
         }
         state.acquiring = false;
     }
@@ -597,6 +603,11 @@ impl HubClient {
     /// nothing (`unauthorized`, `register_again`) drops the registration
     /// the client held, so the next call registers afresh.
     ///
+    /// The registration carries the services the client serves (the
+    /// `services` payload; one the caller sets is replaced). It answers
+    /// `Ok` once the registration is held: a failure to sync services
+    /// changed during the call is left for [`sync_services`](Self::sync_services).
+    ///
     /// Cancellation: if this future is dropped, the hub may still commit
     /// the registration. The client then holds nothing, answers the hub's
     /// probes not ok, and the hub removes that registration after
@@ -604,53 +615,66 @@ impl HubClient {
     pub async fn register_peer(
         &self,
         peer: PeerInfo,
-        extensions: Extensions,
+        mut extensions: Extensions,
     ) -> Result<RegisterResponse, ClientError> {
-        let _op = self.inner.op.lock().await;
-        let presented = self.check_peer(peer.instance_id())?;
-        let endpoints = &self.inner.endpoints;
-        let url = Endpoints::join(&endpoints.control, protocol::paths::INSTANCES)?;
-        let request = RegisterRequest { peer, extensions };
-        // From here to the answer, no early return: a drop of `call` without
-        // an answer means "the request may have reached the hub".
-        let shared = &self.inner.shared;
-        let mut call = Acquiring::start(shared, presented.clone());
-        let answer: Result<RegisterResponse, ClientError> = endpoints
-            .call(Method::POST, url, presented.as_ref(), Some(&request))
-            .await;
-        // A transport error other than "could not connect" means the request
-        // may have reached the hub: that is no answer, so the guard fails
-        // closed, as for a dropped future.
-        call.answered = !matches!(
-            &answer,
-            Err(ClientError::Transport(error)) if !error.is_connect() && !error.is_builder()
-        );
-        match answer {
-            Ok(response) => {
-                // Set before `call` clears `acquiring`, so a probe never
-                // finds neither.
-                {
+        let response = {
+            let _op = self.inner.op.lock().await;
+            let presented = self.check_peer(peer.instance_id())?;
+            let shared = &self.inner.shared;
+            // The registration carries the names this client serves, and
+            // the hub sets the owner's services to exactly these: after any
+            // registration (fresh, re-registered, or on a restarted hub) the
+            // hub's set is the client's.
+            let serving: BTreeSet<String> = shared.serving.lock().clone();
+            extensions.insert(
+                protocol::SERVICES_EXTENSION.to_string(),
+                serde_json::to_value(&serving).expect("names serialize"),
+            );
+            let endpoints = &self.inner.endpoints;
+            let url = Endpoints::join(&endpoints.control, protocol::paths::INSTANCES)?;
+            let request = RegisterRequest { peer, extensions };
+            // From here to the answer, no early return: a drop of `call`
+            // without an answer means "the request may have reached the hub".
+            let mut call = Acquiring::start(shared, presented.clone());
+            let answer: Result<RegisterResponse, ClientError> = endpoints
+                .call(Method::POST, url, presented.as_ref(), Some(&request))
+                .await;
+            // Answered means the hub answered (any `ErrorBody`), or the
+            // request provably never left (could not connect). Anything else,
+            // a timeout, a broken connection, a proxy's 502 or 504, a body
+            // that does not decode, may hide a commit the client cannot read:
+            // that is no answer, and the guard fails closed.
+            call.answered = match &answer {
+                Ok(_) | Err(ClientError::Hub { .. }) => true,
+                Err(ClientError::Transport(error)) => error.is_connect() || error.is_builder(),
+                Err(_) => false,
+            };
+            match answer {
+                Ok(response) => {
+                    // Set before `call` clears `acquiring`, so a probe never
+                    // finds neither.
                     let mut state = shared.state.lock();
                     state.response = Some(response.clone());
                     state.orphaned = false;
+                    *shared.confirmed.lock() = serving;
+                    response
                 }
-                drop(call);
-                // The services this client serves follow the registration:
-                // a fresh one starts with none on the hub, and a hub that
-                // restarted has none.
-                self.put_services().await?;
-                Ok(response)
-            }
-            Err(error) => {
-                if credential_rejected(&error) {
-                    match &presented {
-                        Some(credential) => shared.forget(credential),
-                        None => shared.state.lock().orphaned = true,
+                Err(error) => {
+                    if credential_rejected(&error) {
+                        match &presented {
+                            Some(credential) => shared.forget(credential),
+                            None => shared.state.lock().orphaned = true,
+                        }
                     }
+                    return Err(error);
                 }
-                Err(error)
             }
-        }
+        };
+        // Names added or dropped while the request ran. The registration is
+        // held either way; a failure here stays in the diff for the next
+        // pass (`sync_services`).
+        let _ = self.sync_services().await;
+        Ok(response)
     }
 
     /// Unregister. Without a registration this does nothing. On failure the

@@ -76,6 +76,11 @@ pub fn service_instance(name: &str, id: InstanceId) -> String {
     format!("/v1/services/{name}/instances/{id}")
 }
 
+/// The name of the hub's built-in service directory. A registration's
+/// payload under this name is the set of service names the registrant
+/// serves; the hub sets the owner's services to exactly that set.
+pub const SERVICES_EXTENSION: &str = "services";
+
 /// The rule for service names, as error messages state it.
 pub const SERVICE_NAME_RULE: &str = "1 to 128 of A-Z a-z 0-9 . _ -";
 

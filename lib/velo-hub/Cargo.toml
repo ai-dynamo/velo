@@ -118,3 +118,8 @@ required-features = ["test-support", "client"]
 name = "services"
 path = "tests/services.rs"
 required-features = ["test-support", "client"]
+
+[[test]]
+name = "services_sync"
+path = "tests/services_sync.rs"
+required-features = ["test-support", "client"]

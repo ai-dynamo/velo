@@ -532,7 +532,6 @@ Ported: rows 6, 26-37 of the M1 ledger; the drop half of 38; `client_unregister.
 - **R2-12. A dropped re-registration fails closed** (pass 2 A1): the `Acquiring` guard carries the presented credential and forgets it when the call ends without an answer. Cost: a re-registration cancelled before it reached the hub also drops the registration; the caller registers again.
 - **R2-13. `ExtClient` forgets a rejected credential** (pass 2 A2): `credential_rejected` (unauthorized, register_again, raw 401) on any call; `owns_nothing` adds `not_found` for core routes only.
 - **R2-14. Orphan flag** (pass 2 A3): a credential-free register refused `unauthorized` sets `orphaned`; the handler then ignores `acquiring` until a register succeeds, so a tight retry loop cannot reset the hub's failure counter. The tight-loop test failed 3 of 4 runs before, passes 5 of 5 after.
-||||||| parent of 720a7ba (feat(velo-hub): service discovery through the hub)
 
 ## 16. M3 plan: services and watch, 2026-10-19
 
@@ -559,3 +558,9 @@ watch order (initial then deltas, no gap or duplicate under concurrent puts); en
 - **R3-8. One credentialed-call path** (pass 1 A3): `Shared::credentialed` applies the forget rule (core routes: rejected or not_found; extension routes: rejected) for every call that presents the credential; the client module is split (`client/{mod,services,sse}.rs`).
 - **R3-9. No answer includes a timed-out or broken request** (pass 1 A4): only a connect or builder error proves the request never left.
 - Also: the directory is moved to the front of the start order after `plan`; reads sort outside the directory lock; the watch ring is 128; `Acquiring::drop` takes one lock; the 50 s bound counts the built-in.
+
+### 16.4 After review pass 2, 2026-10-19 (record: /tmp/m3r2/report.md)
+
+- **R3-10. The registration carries the services; one writer between registrations** (pass 2 A1, proven four ways: a dropped guard's detached DELETE removed the next guard's entry in 34 of 40 rounds; a guard dropped or unregistered during a re-registration left its entry; a busy refusal could not be retried). The directory's payload is the owner's whole set (`Registration = BTreeSet<String>`; `commit` replaces); the client sends its `serving` set on every registration and records it as `confirmed`; between registrations `sync_services` (under the client's `op` lock) is the only code that sends service requests, one at a time, until `serving == confirmed`. This is pass 1's S6 plus the reconciler.
+- **R3-11. "Answered" is positive** (pass 2 A2): only the hub's own response or a connect/builder error; a proxy's 502/504, a timeout, a broken body are no answer and fail closed.
+- **R3-12. `register` answers Ok once the registration is held** (pass 2 A3); a later service-sync failure is left for `sync_services`.
