@@ -1740,28 +1740,22 @@ mod tests {
         stream.shutdown().await;
     }
 
-    /// Clones of a `Velo` are one instance, not copies of one.
+    /// A `Velo` is one pointer, so a clone is one reference-count increment
+    /// and carries no state of its own. Per-clone state added beside `inner`
+    /// would make clones diverge and the clone cost grow; this size check is
+    /// what fails when that happens.
     ///
     /// Dropping a clone while another lives must not cancel streaming; that
-    /// half is covered by `final_velo_drop_stops_streaming_but_keeps_a_retained_messenger`,
+    /// is covered by `final_velo_drop_stops_streaming_but_keeps_a_retained_messenger`,
     /// which drops one owner, drives a stream through the other, and only then
     /// drops the last.
-    #[tokio::test]
-    async fn clones_share_one_instance() {
-        let velo = tcp_stream_node(None).await;
-        let clone = velo.clone();
-
-        assert_eq!(velo.instance_id(), clone.instance_id());
-        assert!(Arc::ptr_eq(&velo.inner, &clone.inner));
-        assert!(Arc::ptr_eq(velo.messenger(), clone.messenger()));
-        // Handler state registered through one clone is visible through the other.
-        velo.register_handler(
-            Handler::unary_handler("shared", |ctx| Ok(Some(ctx.payload))).build(),
-        )
-        .unwrap();
-        assert!(clone.list_local_handlers().iter().any(|n| n == "shared"));
-
-        velo.shutdown(ShutdownPolicy::WaitForever).await;
+    #[test]
+    fn velo_is_one_pointer() {
+        assert_eq!(std::mem::size_of::<Velo>(), std::mem::size_of::<usize>());
+        assert_eq!(
+            std::mem::size_of::<WeakVelo>(),
+            std::mem::size_of::<usize>()
+        );
     }
 
     /// A handler lives in its own instance's registry. If it held a `Velo`
@@ -1820,8 +1814,13 @@ mod tests {
         );
     }
 
-    /// Shutdown through one clone is shutdown of the instance, and it runs
-    /// once: a call through another clone returns without tearing down again.
+    /// Shutdown through one clone is shutdown of the instance: the other clone
+    /// sees it as done, and a repeat call through the other clone returns.
+    ///
+    /// This test cannot tell one teardown from two, because a second pass over
+    /// a TCP-only node is idempotent. The once-only guarantee is proven by
+    /// `rendezvous::rdma::tests::concurrent_graceful_shutdowns_are_serialised`,
+    /// which counts one RDMA sweep across eight clones.
     #[tokio::test]
     async fn shutdown_through_one_clone_is_seen_by_the_other() {
         let velo = tcp_stream_node(None).await;
