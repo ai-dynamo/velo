@@ -4,16 +4,21 @@
 //! The in-memory store: maps behind one `parking_lot::RwLock`, and a TTL
 //! reaper task.
 //!
-//! Reads (`get`, discovery lookups) take the read lock for one hash lookup
-//! and a clone of the record. Writes are control-plane rare. The removal
+//! Writes take the write lock; they are control-plane rare. The removal
 //! hook is always called after the lock is released, so a hook may read
-//! the store.
+//! the store. Discovery lookups, which are on the request path, read two
+//! sharded maps of peers that each write updates while it holds the lock:
+//! one shard read lock and a clone of the `PeerInfo`. Measured by
+//! `store::memory::tests::lookup_cost` (release, 10,000 peers, 20-core
+//! host): see `docs/src/concepts/hub.md`. `get` and `list` copy whole
+//! records, payloads included, and are not on the request path.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::anyhow;
+use dashmap::DashMap;
 use futures::future::BoxFuture;
 use parking_lot::RwLock;
 use tokio::sync::watch;
@@ -24,7 +29,7 @@ use velo::{InstanceId, PeerDiscovery, PeerInfo, WorkerId};
 
 use super::{
     Continuity, HubStore, Incarnation, OpId, RegistrationRecord, Removal, RemovalHook, StoreError,
-    StoredRegistration,
+    StoredPeer, StoredRegistration,
 };
 
 /// Default time after which an entry that was not touched expires.
@@ -36,6 +41,9 @@ pub const DEFAULT_PRUNE_INTERVAL: Duration = Duration::from_secs(10);
 /// The in-memory [`HubStore`]. Starts empty on every process start.
 pub struct InMemoryStore {
     inner: RwLock<Inner>,
+    /// Read views for discovery, written only under `inner`'s write lock.
+    peers: DashMap<InstanceId, PeerInfo>,
+    workers: DashMap<WorkerId, PeerInfo>,
     ttl: Duration,
     prune_interval: Duration,
     continuity: watch::Sender<Continuity>,
@@ -50,11 +58,14 @@ struct Inner {
     hook: Option<RemovalHook>,
 }
 
-impl Inner {
-    fn remove_entry(&mut self, id: InstanceId) -> Option<StoredRegistration> {
-        let stored = self.by_instance.remove(&id)?;
-        self.by_worker.retain(|_, owner| *owner != id);
-        self.last_seen.remove(&id);
+impl InMemoryStore {
+    /// Remove `id` from every map. Call with the write lock held.
+    fn remove_entry(&self, inner: &mut Inner, id: InstanceId) -> Option<StoredRegistration> {
+        let stored = inner.by_instance.remove(&id)?;
+        inner.by_worker.retain(|_, owner| *owner != id);
+        inner.last_seen.remove(&id);
+        self.peers.remove(&id);
+        self.workers.retain(|_, peer| peer.instance_id() != id);
         Some(stored)
     }
 }
@@ -112,7 +123,7 @@ impl InMemoryStore {
             let removals: Vec<Removal> = stale
                 .into_iter()
                 .filter_map(|id| {
-                    inner.remove_entry(id).map(|stored| Removal {
+                    self.remove_entry(&mut inner, id).map(|stored| Removal {
                         id,
                         incarnation: stored.incarnation,
                     })
@@ -162,6 +173,9 @@ impl InMemoryStore {
         // keeps the index right if that ever changes.
         inner.by_worker.retain(|_, owner| *owner != id);
         inner.by_worker.insert(worker, id);
+        self.workers.retain(|_, peer| peer.instance_id() != id);
+        self.workers.insert(worker, record.peer.clone());
+        self.peers.insert(id, record.peer.clone());
         inner.by_instance.insert(
             id,
             StoredRegistration {
@@ -188,7 +202,7 @@ impl InMemoryStore {
                     current: Some(current),
                 });
             }
-            inner.remove_entry(id);
+            self.remove_entry(&mut inner, id);
             inner.hook.clone()
         };
         if let Some(hook) = hook {
@@ -264,6 +278,8 @@ impl InMemoryStoreBuilder {
     pub fn build(self) -> InMemoryStore {
         InMemoryStore {
             inner: RwLock::new(Inner::default()),
+            peers: DashMap::new(),
+            workers: DashMap::new(),
             ttl: self.ttl,
             prune_interval: self.prune_interval,
             continuity: watch::Sender::new(Continuity::Live),
@@ -276,32 +292,19 @@ impl PeerDiscovery for InMemoryStore {
         &self,
         worker_id: WorkerId,
     ) -> BoxFuture<'_, anyhow::Result<PeerInfo>> {
-        let result = {
-            let inner = self.inner.read();
-            match inner.by_worker.get(&worker_id) {
-                Some(id) => inner
-                    .by_instance
-                    .get(id)
-                    .map(|stored| stored.record.peer.clone())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "worker {} maps to missing instance {id}",
-                            worker_id.as_u64()
-                        )
-                    }),
-                None => Err(anyhow!("worker {} not registered", worker_id.as_u64())),
-            }
-        };
+        let result = self
+            .workers
+            .get(&worker_id)
+            .map(|peer| peer.clone())
+            .ok_or_else(|| anyhow!("worker {} not registered", worker_id.as_u64()));
         Box::pin(async move { result })
     }
 
     fn discover_by_instance_id(&self, id: InstanceId) -> BoxFuture<'_, anyhow::Result<PeerInfo>> {
         let result = self
-            .inner
-            .read()
-            .by_instance
+            .peers
             .get(&id)
-            .map(|stored| stored.record.peer.clone())
+            .map(|peer| peer.clone())
             .ok_or_else(|| anyhow!("instance {id} not registered"));
         Box::pin(async move { result })
     }
@@ -364,6 +367,19 @@ impl HubStore for InMemoryStore {
 
     fn list(&self) -> Vec<StoredRegistration> {
         self.inner.read().by_instance.values().cloned().collect()
+    }
+
+    fn peers(&self) -> Vec<StoredPeer> {
+        self.inner
+            .read()
+            .by_instance
+            .values()
+            .map(|stored| StoredPeer {
+                peer: stored.record.peer.clone(),
+                incarnation: stored.incarnation,
+                pinned: stored.record.pinned,
+            })
+            .collect()
     }
 
     fn install_removal_hook(

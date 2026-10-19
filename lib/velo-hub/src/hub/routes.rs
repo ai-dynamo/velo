@@ -208,15 +208,13 @@ async fn peer_by_instance(
     State(shared): HubState,
     HubPath(id): HubPath<InstanceId>,
 ) -> Result<Json<PeerLookupResponse>, HubError> {
+    // Discovery, not `get`: it copies the peer only, never the payloads.
     shared
         .store
-        .get(id)
-        .map(|stored| {
-            Json(PeerLookupResponse {
-                peer: stored.record.peer,
-            })
-        })
-        .ok_or_else(|| HubError::not_found(format!("instance {id} not found")))
+        .discover_by_instance_id(id)
+        .await
+        .map(|peer| Json(PeerLookupResponse { peer }))
+        .map_err(|_| HubError::not_found(format!("instance {id} not found")))
 }
 
 async fn peer_by_worker(

@@ -263,6 +263,10 @@ impl HubStore for FaultStore {
         self.inner.list()
     }
 
+    fn peers(&self) -> Vec<super::StoredPeer> {
+        self.inner.peers()
+    }
+
     fn install_removal_hook(
         &self,
         hook: RemovalHook,

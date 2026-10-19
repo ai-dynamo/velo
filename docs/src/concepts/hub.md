@@ -140,6 +140,19 @@ If a step fails, the hub undoes each earlier step in reverse order. The removal 
 
 `Hub::shutdown` stops new registrations, waits for the registration that holds the lock, stops extension background work, delivers the queued removals, shuts each extension down in reverse order, stops the heartbeat and the reaper, closes both listeners, removes the pinned entry, and shuts the hub's velo instance down. When it returns, the listener ports are free.
 
+## Cost of the request paths
+
+Two reads are on the request path: `Authority::authorize`, for each owner-scoped mutation, and the peer lookup. Both read a sharded copy of the state, and the writers update that copy while they hold the one lock that orders all writes. A design with the readers on the writers' `RwLock` was measured first and rejected: every read writes the lock's cache line, so more threads gave fewer calls in total.
+
+Setup: release build, 10,000 owners or peers, 2,000,000 calls spread over the owners, a 20-core host. The tests are `authorize_cost` and `lookup_cost`, run with `--ignored --release`.
+
+| Read | 1 thread | 8 threads | 8 threads, one `RwLock` |
+|---|---|---|---|
+| `authorize` | 37 ns per call | 153 ns per call, 52 M calls/s in total | 847 ns per call, 9.4 M calls/s in total |
+| `discover_by_instance_id` | 58 ns per call | 207 ns per call, 39 M calls/s in total | 995 ns per call, 8.0 M calls/s in total |
+
+`get` and `list` copy each record with its payloads. With a 2 KiB payload, `get` took 248 ns, and `list` took 14 to 19 ms for 10,000 entries. The heartbeat uses `peers()`, which does not copy payloads: 0.3 ms for 10,000 entries.
+
 ## Versioning
 
 `velo-hub` takes the workspace version and depends on `velo` with a caret on that version. See [Versioning](../development/versioning.md#velo-hub).

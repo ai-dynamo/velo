@@ -21,7 +21,7 @@ use tokio_util::sync::CancellationToken;
 use velo::{InstanceId, WeakVelo};
 
 use crate::protocol::{HEARTBEAT_HANDLER, HeartbeatAck, HeartbeatRequest};
-use crate::store::{HubStore, Incarnation, StoredRegistration};
+use crate::store::{HubStore, Incarnation, StoredPeer};
 
 type FailureKey = (InstanceId, Incarnation);
 
@@ -61,7 +61,7 @@ pub(crate) fn spawn(
                 _ = tick.tick() => {
                     let Some(velo) = velo.upgrade() else { return };
                     seq = seq.wrapping_add(1);
-                    let registrations = store.list();
+                    let registrations = store.peers();
                     retain_current_failures(&mut failures, &registrations);
                     fan_out(&velo, registrations, seq, interval, &tx);
                 }
@@ -73,30 +73,27 @@ pub(crate) fn spawn(
     })
 }
 
-fn retain_current_failures(
-    failures: &mut HashMap<FailureKey, u32>,
-    registrations: &[StoredRegistration],
-) {
+fn retain_current_failures(failures: &mut HashMap<FailureKey, u32>, registrations: &[StoredPeer]) {
     failures.retain(|(id, incarnation), _| {
         registrations
             .iter()
-            .any(|stored| stored.instance_id() == *id && stored.incarnation == *incarnation)
+            .any(|stored| stored.peer.instance_id() == *id && stored.incarnation == *incarnation)
     });
 }
 
 fn fan_out(
     velo: &velo::Velo,
-    registrations: Vec<StoredRegistration>,
+    registrations: Vec<StoredPeer>,
     seq: u64,
     interval: Duration,
     tx: &mpsc::UnboundedSender<ProbeOutcome>,
 ) {
     for stored in registrations {
         // Pinned entries are the hub's own; it does not probe itself.
-        if stored.record.pinned {
+        if stored.pinned {
             continue;
         }
-        let id = stored.instance_id();
+        let id = stored.peer.instance_id();
         let incarnation = stored.incarnation;
         let velo = velo.downgrade();
         let tx = tx.clone();

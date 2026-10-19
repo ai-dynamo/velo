@@ -246,6 +246,15 @@ pub async fn reads_agree_with_writes<S: HubStore>(store: &S) {
     assert!(store.is_current(id, incarnation));
     assert_eq!(store.current_incarnation(id), Some(incarnation));
     assert_eq!(store.list().len(), 1);
+    assert_eq!(
+        store.peers(),
+        vec![super::StoredPeer {
+            peer: peer.clone(),
+            incarnation,
+            pinned: true
+        }],
+        "peers() agrees with list()"
+    );
     assert_eq!(store.discover_by_instance_id(id).await.unwrap(), peer);
     assert_eq!(
         store.discover_by_worker_id(peer.worker_id()).await.unwrap(),
@@ -255,6 +264,7 @@ pub async fn reads_agree_with_writes<S: HubStore>(store: &S) {
     store.remove(id, incarnation).await.unwrap();
     assert!(store.get(id).is_none());
     assert!(store.list().is_empty());
+    assert!(store.peers().is_empty());
     assert!(store.discover_by_instance_id(id).await.is_err());
     assert!(store.discover_by_worker_id(peer.worker_id()).await.is_err());
 }

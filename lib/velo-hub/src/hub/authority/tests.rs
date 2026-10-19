@@ -275,3 +275,42 @@ fn authorize_distinguishes_unknown_from_unauthorized() {
         Err(AuthorityError::Unauthorized { .. })
     ));
 }
+
+/// Cost of `authorize` on the request path. Not a gate: run it with
+/// `cargo test --release -p velo-hub --features server authorize_cost -- --ignored --nocapture`.
+#[test]
+#[ignore = "measurement, not a check"]
+fn authorize_cost() {
+    const OWNERS: u64 = 10_000;
+    const CALLS: u64 = 2_000_000;
+    let authority = Authority::default();
+    let mut owners = Vec::new();
+    for value in 1..=OWNERS {
+        let peer = make_peer();
+        let credential = register(&authority, &peer, None, value);
+        owners.push((peer.instance_id(), credential));
+    }
+    for threads in [1usize, 8] {
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for thread in 0..threads {
+                let (authority, owners) = (&authority, &owners);
+                scope.spawn(move || {
+                    for call in 0..CALLS / threads as u64 {
+                        let (owner, credential) =
+                            &owners[((call as usize) * 7919 + thread) % owners.len()];
+                        std::hint::black_box(
+                            authority.authorize(*owner, Some(credential)).unwrap(),
+                        );
+                    }
+                });
+            }
+        });
+        let elapsed = started.elapsed();
+        println!(
+            "authorize: {threads} thread(s), {OWNERS} owners, {CALLS} calls: {:.1} ns/call per thread, {:.1} M calls/s total",
+            elapsed.as_nanos() as f64 * threads as f64 / CALLS as f64,
+            CALLS as f64 / elapsed.as_secs_f64() / 1e6
+        );
+    }
+}

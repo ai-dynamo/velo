@@ -328,3 +328,64 @@ async fn pinned_entry_is_exempt_from_prune() {
 async fn in_memory_store_passes_the_conformance_suite() {
     crate::store::conformance::run_all(|| Arc::new(InMemoryStore::default())).await;
 }
+
+/// Cost of a peer lookup on the request path. Not a gate: run it with
+/// `cargo test --release -p velo-hub --features server lookup_cost -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "measurement, not a check"]
+async fn lookup_cost() {
+    const PEERS: usize = 10_000;
+    const CALLS: usize = 2_000_000;
+    let store = Arc::new(InMemoryStore::default());
+    let mut ids = Vec::new();
+    for _ in 0..PEERS {
+        let peer = make_peer();
+        let mut record = RegistrationRecord::bare(peer.clone());
+        // A payload the size of a small manifest, which `get` would copy.
+        record.extensions.insert(
+            "probe".to_string(),
+            serde_json::json!({ "blob": "x".repeat(2048) }),
+        );
+        store.put(record, None).await.unwrap();
+        ids.push(peer.instance_id());
+    }
+    for threads in [1usize, 8] {
+        let started = std::time::Instant::now();
+        std::thread::scope(|scope| {
+            for thread in 0..threads {
+                let (store, ids) = (&store, &ids);
+                scope.spawn(move || {
+                    for call in 0..CALLS / threads {
+                        let id = ids[(call * 7919 + thread) % ids.len()];
+                        std::hint::black_box(
+                            futures::executor::block_on(store.discover_by_instance_id(id)).unwrap(),
+                        );
+                    }
+                });
+            }
+        });
+        let elapsed = started.elapsed();
+        println!(
+            "discover_by_instance_id: {threads} thread(s), {PEERS} peers: {:.1} ns/call per thread, {:.1} M calls/s total",
+            elapsed.as_nanos() as f64 * threads as f64 / CALLS as f64,
+            CALLS as f64 / elapsed.as_secs_f64() / 1e6
+        );
+        let started = std::time::Instant::now();
+        for call in 0..CALLS / 10 {
+            std::hint::black_box(store.get(ids[call % ids.len()]).unwrap());
+        }
+        println!(
+            "get (copies the 2 KiB payload): 1 thread: {:.1} ns/call",
+            started.elapsed().as_nanos() as f64 / (CALLS / 10) as f64
+        );
+        let started = std::time::Instant::now();
+        std::hint::black_box(store.list());
+        let list = started.elapsed();
+        let started = std::time::Instant::now();
+        std::hint::black_box(store.peers());
+        println!(
+            "list(): {list:?}, peers(): {:?} for {PEERS} entries",
+            started.elapsed()
+        );
+    }
+}

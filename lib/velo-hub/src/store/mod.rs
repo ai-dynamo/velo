@@ -197,6 +197,17 @@ impl StoredRegistration {
     }
 }
 
+/// One entry without its payloads: what the heartbeat needs on each tick.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StoredPeer {
+    /// The registrant.
+    pub peer: PeerInfo,
+    /// The incarnation of its entry.
+    pub incarnation: Incarnation,
+    /// The hub's own entry.
+    pub pinned: bool,
+}
+
 /// The exact store entry that left: removed by the hub or expired by the
 /// backend.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -340,6 +351,20 @@ pub trait HubStore: PeerDiscovery + Send + Sync + 'static {
 
     /// Every entry, each paired with its incarnation from the same snapshot.
     fn list(&self) -> Vec<StoredRegistration>;
+
+    /// Every entry's peer, incarnation, and pinned flag, without the
+    /// payloads. The hub calls this on every heartbeat tick; a backend
+    /// should avoid copying payloads for it.
+    fn peers(&self) -> Vec<StoredPeer> {
+        self.list()
+            .into_iter()
+            .map(|stored| StoredPeer {
+                incarnation: stored.incarnation,
+                pinned: stored.record.pinned,
+                peer: stored.record.peer,
+            })
+            .collect()
+    }
 
     /// Install the hook that hears every later removal, and return the
     /// entries present at the same linearization point. Fails with
