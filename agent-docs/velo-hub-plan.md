@@ -741,7 +741,7 @@ Record: `/tmp/m7r1/report.md`, probes in `/tmp/m7r1/scratch/lib/velo-hub/tests/h
 
 ### 18.9 Implementation, 2026-10-19
 
-Branch `bb/m7-velo-hub-ha`, rebased onto `bb/m4-velo-hub-etcd` (picks up its port-pick test fix). All of 18.7/18.8 is done. Tests were written first; each fix was reverted (or its rule inverted) and its test failed, as each commit message records.
+Branch `bb/m7-velo-hub-ha`, rebased onto `bb/m4-velo-hub-etcd` at the coordinator's request (picks up its port-pick test fix); the new multi-hub tests use the same rule (the first hub binds (0, 0), the next reuses its ports). All of 18.7/18.8 is done. Tests were written first; each fix was reverted (or its rule inverted) and its test failed, as each commit message records.
 
 - **Lease deadline (H-1..H-4, H-7).** `tasks::Renewals` takes the send time of each lock renewal that etcd answers with TTL > 0 (the stream open counts: etcd-client's `keep_alive` sends one and checks its TTL). A separate task, `tasks::lease_deadline`, sleeps until `send + lock_deadline` against a watch of that value and sets `Health::lease_stale`; a later answer clears it. The first deadline counts from the lock grant's send time. TTL 0, a failed compare, and the lock key leaving still fence. H-4: every continuity change already went through `Shared::update_health` (no other `continuity.send`); the lease is one more input. Knob: `EtcdStoreBuilder::lock_deadline` (test-support), with the lock's renewal interval and the request-deadline check taken from the deadline, not the granted TTL. Hold: `EtcdStore::hold_lock_renewals` (test-support). Hot path: nothing on touch or heartbeat; one watch send per renewal.
 - **Readiness (H-6).** `GET /v1/ready` (`paths::READY`) on both listeners, as `/v1/health`.
@@ -749,9 +749,11 @@ Branch `bb/m7-velo-hub-ha`, rebased onto `bb/m4-velo-hub-etcd` (picks up its por
 - **Standby wait.** One client for every try; read `P/hub` first and grant a lease only when it is absent; while held, watch `P/hub` from the read's revision and try again on a delete (or after one lock TTL); any other error retries after `PREFIX_RETRY`; log on change only. Zero wait still fails at once.
 - **Client, replaced ids (H-5).** `State::hubs` keeps the last 8 hub ids the client registered with, also across a dropped registration (custody expiry, then a fresh `register`, would otherwise flap again). `recovered` rises only for an id not in the list.
 - **Client, host list.** `HubClientBuilder::hosts`; `host` is the list of one. A call goes to the host that answered last and moves on only on a connect error or a 503 with the new `ErrorBody::not_ready` (serde default false, skipped when false; code stays `unavailable`). Departure: the error code cannot tell a no-write 503 from an indeterminate one, so the hub marks the sites that answer before acting because it is not ready: admission closed (register, unregister), `AuthorityError::Unavailable` (all pre-write), `/v1/ready`, a watch on a non-live hub. `public_url`/`control_url` now return `Url` by value (the current host).
+- **Connect timeouts rotate.** A lost host drops SYNs, so the client hits its connect timeout rather than a refusal. Checked with reqwest 0.12.28 against 10.255.255.1 and a 500 ms connect timeout: `is_connect()` is true (`hyper_util` wraps the connector's `TimedOut` as a connect error), so the host list moves on, and the `Acquiring` answered rule counts it as "never left". Not a suite test: it needs an address that drops packets.
+- **Admission.** `a_stopping_hub_is_not_ready_and_refuses_registrations_as_not_ready` holds a stop at the registration lock (a gated put) and checks `/v1/ready` and the register refusal; the unregister refusal ("the hub is stopping") is marked too but not tested, because it waits for the same lock.
 - **Tests and book.** `ha_etcd.rs`: cut-off takeover (black hole, F2 window closed), local-deadline recovery (b), cut past the TTL fences on reconnect (c), standby outlives a 600 ms outage, registrant settles on B while A probes (host list). `store_etcd.rs`: a reconnected watch does not report `Live` over a stale lease (d). `integration.rs`: readiness. `services.rs`: watch ends. `client.rs`: dead first host, not-ready host, no resend after a hub answer (401, indeterminate 503); unit tests of the probe rule. The proxy is `tests/common/proxy.rs`. Book: "High availability" section, host list in "Client", `/v1/ready` in the route tables.
 
-Measured (local etcd 3.5.13, loopback, lock TTL 3 s, request deadline 1 s, heartbeat 200 ms):
+Measured (local etcd 3.5.13, loopback, lock TTL 3 s, request deadline 1 s, heartbeat 200 ms). Some runs came before the rebase; the code under test was the same.
 
 | | Before (M4) | After |
 |---|---|---|
@@ -769,6 +771,7 @@ Measured (local etcd 3.5.13, loopback, lock TTL 3 s, request deadline 1 s, heart
 Not done or open:
 
 - No test that the standby no longer grants a lease per poll (only the code shows it); the cost before was a connect, a grant, a txn and a revoke per 250 ms.
-- No test of `/v1/ready` with admission closed (no seam shows it between `shutdown` start and the listener close).
+- The book's HA section says Raft "was rejected for now"; that wording needs the H-8 ruling.
+- The `not_ready` field on `ErrorBody` is a wire addition in place of a new error code (old clients ignore it; the code stays `unavailable` as H-6 says). Open for the user to accept.
 - H-8 still stands: none of this lands until the user rules on option A against decision 7.
 - `scripts/build-book.sh` not run here: `mdbook` is not installed in this environment.
