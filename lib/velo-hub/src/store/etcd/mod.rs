@@ -110,7 +110,8 @@ pub use etcd_client;
 pub use hold::{WatchHold, WatchHoldGuard};
 
 /// The etcd [`HubStore`]. Built by [`EtcdStore::builder`]; owns its tasks
-/// (watch, keep-alives, reaper), so [`spawn_liveness_task`] is `None`.
+/// (watch, keep-alives, reaper); its [`spawn_liveness_task`] only stops
+/// the reaper when the hub stops its probes.
 ///
 /// [`spawn_liveness_task`]: HubStore::spawn_liveness_task
 pub struct EtcdStore {
@@ -153,16 +154,20 @@ impl EtcdStore {
     pub async fn close(&self) {
         self.shared.closing.cancel();
         self.cancel.cancel();
-        let tasks = std::mem::take(&mut *self.tasks.lock());
         let deadline = self.shared.settings.request_deadline;
+        // The lock first, and marked released only once the revoke
+        // returned: if this future is dropped part-way (the hub bounds it),
+        // `Drop` revokes again, and the next hub need not wait out the TTL.
+        if !self.shared.lock_released.load(Ordering::Acquire) {
+            builder::revoke(&self.shared.client, &[self.shared.lock_lease], deadline).await;
+            self.shared.lock_released.store(true, Ordering::Release);
+        }
+        let tasks = std::mem::take(&mut *self.tasks.lock());
         for task in tasks {
             let abort = task.abort_handle();
             if tokio::time::timeout(deadline, task).await.is_err() {
                 abort.abort();
             }
-        }
-        if !self.shared.lock_released.swap(true, Ordering::AcqRel) {
-            builder::revoke(&self.shared.client, &[self.shared.lock_lease], deadline).await;
         }
     }
 
@@ -234,6 +239,17 @@ impl PeerDiscovery for EtcdStore {
 }
 
 impl HubStore for EtcdStore {
+    /// The store runs its own tasks; this one only stops the reaper when the
+    /// hub stops its probes, so a long stop does not delete registrations
+    /// that nobody can refresh any more.
+    fn spawn_liveness_task(self: Arc<Self>, cancel: CancellationToken) -> Option<JoinHandle<()>> {
+        let shared = Arc::clone(&self.shared);
+        Some(tokio::spawn(async move {
+            cancel.cancelled().await;
+            shared.reaper_stopped.cancel();
+        }))
+    }
+
     fn put(
         &self,
         record: RegistrationRecord,

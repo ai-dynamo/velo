@@ -327,7 +327,7 @@ fn any_removal_of_a_reserved_owner_clears_the_reservation() {
     authority.synchronize_reservations(&[stored(&peer, 1)]);
     assert_eq!(
         authority.begin_revocation(removal(&peer, 2)),
-        RevocationAction::Ignore
+        RevocationAction::ForgetPeer
     );
     authority
         .begin_registration(peer.instance_id(), None, None)

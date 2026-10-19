@@ -189,3 +189,42 @@ async fn a_fenced_hub_stops_itself() {
     assert!(closed, "a fenced hub kept serving");
     drop(hub);
 }
+
+/// The hub tells its velo about each recovered peer, so its probes reach
+/// them; when a recovered entry goes (here deleted out of band, as an
+/// expiry would), the hub forgets that peer in velo too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recovered_peer_is_forgotten_in_velo_when_its_entry_goes() {
+    use velo_hub::store::etcd::etcd_client::Client;
+    let prefix = format!("/velo-hub-test/{}", uuid::Uuid::new_v4());
+    let ports = (free_port(), free_port());
+    let hub_a = hub_on(&prefix, ports).await;
+    let peer = make_peer_for_velo().await;
+    let owner = peer.instance_id();
+    let _ = register(&hub_a, &request(&peer), None).await;
+    hub_a.shutdown().await.unwrap();
+
+    let hub_b = hub_on(&prefix, ports).await;
+    let velo = hub_b.velo().expect("the hub runs velo");
+    assert!(
+        velo.primary_transport_key(owner).is_some(),
+        "the hub's velo knows the recovered peer"
+    );
+    let mut etcd = Client::connect([etcd_url()], None).await.unwrap();
+    etcd.delete(format!("{prefix}/i/{owner}"), None)
+        .await
+        .unwrap();
+    let mut forgotten = false;
+    for _ in 0..100 {
+        if velo.primary_transport_key(owner).is_none() {
+            forgotten = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        forgotten,
+        "velo kept the peer of a recovered entry that went"
+    );
+    hub_b.shutdown().await.unwrap();
+}

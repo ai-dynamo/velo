@@ -773,8 +773,9 @@ impl HubClient {
     /// before the restart, and its routes answer `recovered`; call
     /// [`register`](Self::register) again, which presents the credential,
     /// starts a new epoch on the new hub and puts the services back. The
-    /// flag clears when a registration succeeds. Await a change with the
-    /// receiver's `changed`.
+    /// flag clears when a registration succeeds. Wait for it with the
+    /// receiver's `wait_for(|restarted| *restarted)` (`changed` would miss a
+    /// flag set before the subscription).
     pub fn recovered(&self) -> tokio::sync::watch::Receiver<bool> {
         self.inner.shared.recovered.subscribe()
     }
@@ -831,19 +832,22 @@ fn heartbeat_handler(shared: Weak<Shared>) -> Handler {
                     .map_or(1, |since| since.as_millis().max(1) as u64);
                 shared.seq.store(seq, Ordering::Release);
                 shared.at_unix_ms.store(now, Ordering::Release);
-                let (ok, restarted) = {
+                let ok = {
                     let state = shared.state.lock();
                     let restarted = matches!(
                         (&state.response, ctx.input.hub_id),
                         (Some(response), Some(hub)) if response.hub_id != hub
                     );
-                    (state.answer_ok(), restarted)
+                    // Under the state lock, as a registration clears it, so
+                    // a late probe cannot set it on a fresh registration.
+                    // Still ok: the hub holds the registration from before
+                    // the restart, and the app re-registers with its
+                    // credential.
+                    if restarted {
+                        shared.recovered.send_replace(true);
+                    }
+                    state.answer_ok()
                 };
-                // Still ok: the hub holds the registration from before the
-                // restart, and the app re-registers with its credential.
-                if restarted {
-                    shared.recovered.send_replace(true);
-                }
                 Ok(HeartbeatAck { seq, ok })
             }
         },

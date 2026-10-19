@@ -189,6 +189,9 @@ pub(super) struct Shared {
     /// Cancelled when the store closes: calls fail without reaching etcd,
     /// and a call waiting on the barrier returns its txn's outcome.
     pub(super) closing: CancellationToken,
+    /// Cancelled when the hub stops its core tasks (its probes, which keep
+    /// entries fresh): the reaper stops then, not at `close`.
+    pub(super) reaper_stopped: CancellationToken,
     pub(super) holds: Holds,
     /// Set once the lock lease is revoked (or about to be), so a drop
     /// after `close` does not revoke it again.
@@ -265,6 +268,7 @@ impl Shared {
             health: Mutex::new(Health::default()),
             continuity: watch::Sender::new(Continuity::Live),
             closing: CancellationToken::new(),
+            reaper_stopped: CancellationToken::new(),
             holds: Holds::default(),
             lock_released: AtomicBool::new(false),
             epoch: std::time::Instant::now(),
@@ -636,7 +640,13 @@ impl Shared {
                 current: Some(entry.stored.incarnation),
             });
         }
-        entry.last_seen.store(self.now(), Ordering::Release);
+        // SeqCst with the reaper's claim: either the reaper sees this touch
+        // when it re-checks after claiming the entry, or this touch sees the
+        // claim and does not report a refresh the delete would undo.
+        entry.last_seen.store(self.now(), Ordering::SeqCst);
+        if entry.reaping.load(Ordering::SeqCst) {
+            return Err(StoreError::NotFound(id));
+        }
         Ok(())
     }
 
@@ -651,23 +661,32 @@ impl Shared {
         const BATCH: usize = 64;
         /// Requests in flight at once.
         const CONCURRENCY: usize = 8;
-        if self.ensure_open().is_err() {
+        if self.ensure_open().is_err() || self.reaper_stopped.is_cancelled() {
             return 0;
         }
         let ttl = u64::try_from(self.settings.registrant_ttl.as_nanos()).unwrap_or(u64::MAX);
         let now = self.now();
+        let stale_at =
+            |entry: &Entry| now.saturating_sub(entry.last_seen.load(Ordering::SeqCst)) > ttl;
         let stale: Vec<(InstanceId, Incarnation)> = {
             let cache = self.cache.read();
-            cache
-                .entries
-                .iter()
-                .filter(|(_, entry)| {
-                    !entry.stored.record.pinned
-                        && now.saturating_sub(entry.last_seen.load(Ordering::Acquire)) > ttl
-                        && !entry.reaping.swap(true, Ordering::AcqRel)
-                })
-                .map(|(id, entry)| (*id, entry.stored.incarnation))
-                .collect()
+            let mut stale = Vec::new();
+            for (id, entry) in &cache.entries {
+                if entry.stored.record.pinned || !stale_at(entry) {
+                    continue;
+                }
+                if entry.reaping.swap(true, Ordering::SeqCst) {
+                    continue;
+                }
+                // Re-check after the claim: a touch that landed in between
+                // keeps the entry (see `touch`).
+                if !stale_at(entry) {
+                    entry.reaping.store(false, Ordering::SeqCst);
+                    continue;
+                }
+                stale.push((*id, entry.stored.incarnation));
+            }
+            stale
         };
         if stale.is_empty() {
             return 0;
@@ -709,6 +728,12 @@ impl Shared {
             .when([self.lock_compare()])
             .and_then(deletes)
             .or_else([TxnOp::get(self.keys.lock.as_str(), None)]);
+        // The hub stops its probes before it closes the store; reaping after
+        // that would delete registrations nobody can touch any more.
+        if self.reaper_stopped.is_cancelled() {
+            self.release_claims(&batch);
+            return 0;
+        }
         let deadline = Instant::now() + self.settings.request_deadline;
         let result = self.send(txn, deadline, "reaper delete").await;
         let applied: Vec<bool> = match &result {
@@ -730,15 +755,24 @@ impl Shared {
         };
         // A delete that did not apply (the entry changed, or the request
         // failed) is tried again on the next pass, if it is still stale.
+        let undone: Vec<(InstanceId, Incarnation)> = batch
+            .iter()
+            .zip(&applied)
+            .filter(|(_, done)| !**done)
+            .map(|(claim, _)| *claim)
+            .collect();
+        self.release_claims(&undone);
+        applied.iter().filter(|done| **done).count()
+    }
+
+    fn release_claims(&self, claims: &[(InstanceId, Incarnation)]) {
         let cache = self.cache.read();
-        for ((id, incarnation), done) in batch.iter().zip(&applied) {
-            if !done
-                && let Some(entry) = cache.entries.get(id)
+        for (id, incarnation) in claims {
+            if let Some(entry) = cache.entries.get(id)
                 && entry.stored.incarnation == *incarnation
             {
-                entry.reaping.store(false, Ordering::Release);
+                entry.reaping.store(false, Ordering::SeqCst);
             }
         }
-        applied.iter().filter(|done| **done).count()
     }
 }

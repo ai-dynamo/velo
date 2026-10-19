@@ -303,6 +303,10 @@ pub(crate) enum RevocationAction {
     /// Authority is revoked; deliver the removal, then
     /// [`Authority::finish_revocation`].
     Cleanup,
+    /// A reserved entry went: no extension holds state for it, but the hub
+    /// may have told its velo about the peer (a recovered entry); forget it
+    /// there.
+    ForgetPeer,
 }
 
 impl Authority {
@@ -660,7 +664,7 @@ impl Authority {
             // `expected: None`, which fails while the store holds any entry.
             Some(State::Reserved(_)) => {
                 states.remove(&owner);
-                RevocationAction::Ignore
+                RevocationAction::ForgetPeer
             }
             Some(State::Active(registration) | State::Unregistering(registration))
                 if registration.incarnation == incarnation =>

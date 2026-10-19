@@ -402,6 +402,12 @@ impl HubBuilder {
             let cancel = core_cancel.clone();
             let fenced = fenced.clone();
             async move {
+                // The first value was read before this task ran; a store
+                // already fenced by then never changes again.
+                if *continuity.borrow() == Continuity::Fenced {
+                    fenced.cancel();
+                    return;
+                }
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => return,

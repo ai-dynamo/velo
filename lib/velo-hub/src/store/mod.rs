@@ -422,11 +422,13 @@ pub trait HubStore: PeerDiscovery + Send + Sync + 'static {
 
     /// Spawn the backend's liveness task (a TTL reaper), if the hub should
     /// run it. A backend that runs its own tasks (started when it is built,
-    /// stopped when it is closed or dropped, as the etcd store does) returns
-    /// `None`: the hub cancels its tasks before it removes its own entry at
-    /// shutdown, and that last remove still needs the backend's watch. At
-    /// shutdown the hub cancels `cancel`, waits up to its shutdown timeout
-    /// for the task, then aborts it.
+    /// stopped when it is closed or dropped, as the etcd store does) must
+    /// not stop its watch here: the hub cancels this task before it removes
+    /// its own entry at shutdown, and that last remove still needs the
+    /// watch. It may return a task that stops its expiry when `cancel`
+    /// fires, because the hub's probes, which keep entries fresh, stop
+    /// then too. At shutdown the hub cancels `cancel`, waits up to its
+    /// shutdown timeout for the task, then aborts it.
     fn spawn_liveness_task(self: Arc<Self>, _cancel: CancellationToken) -> Option<JoinHandle<()>> {
         None
     }
