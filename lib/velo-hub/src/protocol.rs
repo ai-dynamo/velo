@@ -6,8 +6,10 @@
 //!
 //! A hub serves two listeners. The **public** listener carries peer
 //! discovery. The **control** listener also carries registration, heartbeat
-//! and probe. Extension routes live under [`paths::EXT`]`/{name}` on either.
-//! All bodies are JSON.
+//! and probe. Extension routes live under [`paths::EXT`]`/{name}`, on the
+//! listener the extension puts them on. Request and response bodies are
+//! JSON, except the `ok` text of [`paths::HEALTH`] and the empty 204 of a
+//! successful unregister. Every error body is an [`ErrorBody`].
 
 use std::collections::BTreeMap;
 

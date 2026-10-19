@@ -281,7 +281,10 @@ pub enum StoreError {
 
 /// The hub's registration backend.
 ///
-/// Contract, checked by the conformance suite:
+/// Contract. The conformance suite checks each rule except liveness
+/// (expiry, and that a pinned record never expires), which is specific to
+/// each backend, and checks the linearization of the hook only
+/// sequentially; a backend must show its own concurrent evidence for that.
 ///
 /// - Every `put` of an instance yields a new [`Incarnation`], never reused
 ///   for that instance.

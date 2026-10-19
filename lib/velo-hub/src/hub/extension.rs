@@ -20,7 +20,8 @@
 //! commit(staged, reg)       infallible; makes the new registration visible
 //! on_registered(reg)        must not block; spawn long work
 //! -- unlock --
-//! on_removed(removal)       later, under the lock, once per removed incarnation
+//! on_removed(removal)       later, under the lock, for each removed incarnation
+//!                           (can arrive twice; see the trait rules)
 //! ```
 //!
 //! Every extension sees every registration; `payload` is `None` when the

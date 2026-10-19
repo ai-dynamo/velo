@@ -2,7 +2,7 @@
 
 The `velo-hub` crate builds a hub: one service that is the peer discovery for a velo application and also hosts extensions. A program builds the hub in `main`, adds extensions or bundles of extensions, picks a store, and serves it. `velo` does not depend on `velo-hub`. An application that does not use a hub picks any velo discovery backend, as before.
 
-The crate has two cargo features. `server` builds the hub. `client` is reserved for the hub client, which is not in the crate yet. The `protocol` module (paths, request and response types, ids) builds under either feature, and with no feature.
+The crate has three cargo features. `server` builds the hub. `client` is reserved for the hub client, which is not in the crate yet. `test-support` adds the store conformance suite and `FaultStore`, a store that fails on request. The `protocol` module (paths, request and response types, ids) builds under either feature, and with no feature.
 
 ```rust,ignore
 use velo_hub::{Hub, HubConfig};
@@ -25,9 +25,9 @@ A hub serves two HTTP listeners:
 | Listener | Default port | Routes |
 |---|---|---|
 | public | 1337 | `GET /v1/health`, `GET /v1/hub`, peer lookups |
-| control | 8337 | everything on the public listener, plus registration, unregistration, heartbeat, and probe |
+| control | 8337 | the core routes of the public listener, plus registration, unregistration, heartbeat, and probe |
 
-Extension routes are under `/v1/ext/{name}/` on either listener. The hub checks that each extension name is one URL segment of `[a-z0-9_-]`, so an extension cannot add a route to a core path.
+Extension routes are under `/v1/ext/{name}/`. An extension's `public_routes` go on the public listener and its `control_routes` on the control listener. The hub checks that each extension name is one URL segment of `[a-z0-9_-]`, so an extension cannot add a route to a core path.
 
 | Path | Purpose |
 |---|---|
@@ -148,7 +148,7 @@ The stop runs as its own task. A caller that stops waiting does not stop it, and
 
 Two reads are on the request path: `Authority::authorize`, for each owner-scoped mutation, and the peer lookup. Both read a sharded copy of the state, and the writers update that copy while they hold the one lock that orders all writes. A design with the readers on the writers' `RwLock` was measured first and rejected: every read writes the lock's cache line, so more threads gave fewer calls in total.
 
-Setup: release build, 10,000 owners or peers, 2,000,000 calls spread over the owners, a 20-core host. The tests are `authorize_cost` and `lookup_cost`, run with `--ignored --release`.
+Setup: release build, 10,000 owners or peers, 2,000,000 calls spread over the owners, a 20-core host. The tests are `authorize_cost` and `lookup_cost`, run with `--ignored --release --test-threads=1`. The "one `RwLock`" column is the same two tests run on the code before the sharded copy existed.
 
 | Read | 1 thread | 8 threads | 8 threads, one `RwLock` |
 |---|---|---|---|
