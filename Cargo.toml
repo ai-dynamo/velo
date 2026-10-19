@@ -5,6 +5,11 @@
 members = [
     "lib/velo",
     "lib/velo-ext",
+    # velo-hub is the second documented exception: it shares types with velo,
+    # so it versions in lockstep with the workspace and requires velo with a
+    # caret on the workspace version (see the `velo` entry below and the
+    # version-sync check in scripts/check-semver.sh).
+    "lib/velo-hub",
     # ucx-rs is the documented exception to the "only velo and velo-ext are
     # publishable" rule: it is a leaf FFI/vendoring crate (bindings + a
     # vendored C build of UCX) that exports NO types shared with velo or
@@ -31,6 +36,12 @@ keywords = ["nvidia", "distributed"]
 # future "compatible" patch silently re-resolve downstream lockfiles, which
 # is exactly the bug that motivated the velo / velo-ext split.
 velo-ext = { path = "lib/velo-ext", version = "=0.5.6" }
+# Caret, not `=`: velo-hub takes the workspace version, so a velo minor bump is
+# always a velo-hub minor bump, and pre-1.0 a caret on 0.Y.Z never admits a
+# second minor. `=` would only stop a velo patch reaching velo-hub users.
+# scripts/check-semver.sh fails if this major.minor differs from
+# [workspace.package] version. Features are left to each dependent.
+velo = { path = "lib/velo", version = "0.21.0", default-features = false }
 
 # External dependencies.
 #
