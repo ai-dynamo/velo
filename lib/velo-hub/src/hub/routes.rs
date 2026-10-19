@@ -261,7 +261,18 @@ async fn unregister(
     headers: HeaderMap,
 ) -> Result<StatusCode, HubError> {
     let presented = credential_from_headers(&headers)?;
-    registration::unregister(&shared, id, presented).await?;
+    // A hub-owned task, as for registration: hyper drops this handler when
+    // the client closes its socket, and an unregistration dropped after
+    // `begin_unregister` would leave the owner Busy.
+    let task = tokio::spawn(async move { registration::unregister(&shared, id, presented).await });
+    match task.await {
+        Ok(result) => result?,
+        Err(error) => {
+            return Err(HubError::internal(format!(
+                "unregistration task failed: {error}"
+            )));
+        }
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

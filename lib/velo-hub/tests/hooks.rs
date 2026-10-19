@@ -352,9 +352,10 @@ async fn authorize_is_busy_mid_registration() {
     assert_eq!(attempt.await.unwrap(), 200);
 }
 
-/// The client gives up while the transaction waits on the store. hyper
-/// drops the handler, but the transaction is the hub's own task, so it
-/// finishes: the owner ends Active with a credential nobody holds, not
+/// The client closes its socket while the transaction waits on the store.
+/// hyper drops the handler, but the transaction is the hub's own task, so
+/// it finishes. (A reqwest timeout is not enough to show this: hyper keeps
+/// polling the handler until it writes, so the socket must close.) It ends: the owner ends Active with a credential nobody holds, not
 /// Busy. A fresh registration is refused as unauthorized until the entry
 /// expires, then accepted.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -368,17 +369,14 @@ async fn client_disconnect_mid_transaction_does_not_leave_the_owner_busy() {
     let hub = builder().store(store.clone()).serve().await.unwrap();
     let peer = make_peer();
     let gate = store.gate_next_put();
-    let impatient = reqwest::Client::builder()
-        .timeout(Duration::from_millis(100))
-        .build()
-        .unwrap();
     let attempt = tokio::spawn({
-        let url = control(&hub, paths::INSTANCES);
-        let body = request(&peer);
-        async move { impatient.post(url).json(&body).send().await }
+        let hub = hub.clone();
+        let body = serde_json::to_value(request(&peer)).unwrap();
+        async move { send_and_abandon(&hub, "POST", paths::INSTANCES, None, Some(&body)).await }
     });
     gate.entered().await;
-    assert!(attempt.await.unwrap().is_err(), "the client gave up");
+    drop(attempt.await.unwrap());
+    tokio::time::sleep(Duration::from_millis(100)).await;
     gate.release();
 
     let owner = peer.instance_id();
@@ -768,4 +766,39 @@ async fn a_panic_after_the_write_never_shows_the_prior_state_again() {
         eventually(Duration::from_secs(1), || !store.contains(owner)).await,
         "the written entry is retired"
     );
+}
+
+/// The client gives up while DELETE waits on the store. Whatever the HTTP
+/// stack does with the handler, the unregistration must settle: the owner
+/// ends unregistered, not Busy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn client_disconnect_mid_unregister_does_not_leave_the_owner_busy() {
+    let store = Arc::new(FaultStore::default());
+    let hub = builder().store(store.clone()).serve().await.unwrap();
+    let peer = make_peer();
+    let owner = peer.instance_id();
+    let credential = register_plain(&hub, &peer, None).await.credential;
+    let gate = store.gate_next_remove();
+    let attempt = tokio::spawn({
+        let hub = hub.clone();
+        let credential = credential.clone();
+        async move {
+            let path = velo_hub::protocol::instance_by_id(owner);
+            send_and_abandon(&hub, "DELETE", &path, Some(&credential), None).await
+        }
+    });
+    gate.entered().await;
+    drop(attempt.await.unwrap());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.release();
+    assert!(
+        eventually(Duration::from_secs(2), || matches!(
+            hub.authority().authorize(owner, Some(&credential)),
+            Err(AuthorityError::NotFound { .. })
+        ))
+        .await,
+        "the unregistration must finish, not leave the owner Busy: {:?}",
+        hub.authority().authorize(owner, Some(&credential))
+    );
+    assert!(!store.contains(owner));
 }

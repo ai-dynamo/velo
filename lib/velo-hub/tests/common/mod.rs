@@ -801,3 +801,35 @@ pub async fn query(hub: &Hub, owner: InstanceId, key: &str) -> Option<Hit> {
         None
     }
 }
+
+/// Send a request on a raw socket and return the socket without reading
+/// the answer. Dropping it closes the connection outright, which makes
+/// hyper drop the handler. (A client-side timeout in reqwest does not: the
+/// handler keeps running.)
+pub async fn send_and_abandon(
+    hub: &Hub,
+    method: &str,
+    path: &str,
+    credential: Option<&Credential>,
+    body: Option<&serde_json::Value>,
+) -> tokio::net::TcpStream {
+    use tokio::io::AsyncWriteExt;
+    let body = body.map(|value| value.to_string()).unwrap_or_default();
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nhost: hub\r\ncontent-type: application/json\r\ncontent-length: {}\r\n",
+        body.len()
+    );
+    if let Some(credential) = credential {
+        request.push_str(&format!(
+            "{CREDENTIAL_HEADER}: {}\r\n",
+            credential.to_header_value().to_str().unwrap()
+        ));
+    }
+    request.push_str("\r\n");
+    request.push_str(&body);
+    let mut socket = tokio::net::TcpStream::connect(hub.control_addr())
+        .await
+        .unwrap();
+    socket.write_all(request.as_bytes()).await.unwrap();
+    socket
+}
