@@ -118,16 +118,10 @@ fn fan_out(
                 let velo = velo
                     .upgrade()
                     .ok_or_else(|| anyhow::anyhow!("hub velo is gone"))?;
-                let ack: HeartbeatAck = velo
-                    .typed_unary(HEARTBEAT_HANDLER)?
-                    .payload(&HeartbeatRequest { seq })?
-                    .instance(id)
-                    .send()
-                    .await?;
-                Ok::<HeartbeatAck, anyhow::Error>(ack)
+                probe(&velo, id, seq, interval).await
             };
-            let outcome = match tokio::time::timeout(interval, probe).await {
-                Ok(Ok(ack)) => {
+            let outcome = match probe.await {
+                Ok(ack) => {
                     // Conditional on the incarnation probed, so a late touch
                     // cannot refresh a replacement.
                     match super::bounded(step_timeout, store.touch(id, incarnation)).await {
@@ -140,20 +134,34 @@ fn fan_out(
                     }
                     ProbeOutcome::Ok { id, incarnation }
                 }
-                Ok(Err(error)) => ProbeOutcome::Failed {
+                Err(error) => ProbeOutcome::Failed {
                     id,
                     incarnation,
                     reason: format!("{error:#}"),
-                },
-                Err(_) => ProbeOutcome::Failed {
-                    id,
-                    incarnation,
-                    reason: format!("probe timed out after {interval:?}"),
                 },
             };
             let _ = tx.send(outcome);
         });
     }
+}
+
+/// Send one heartbeat to `id` over velo and wait up to `deadline` for the
+/// ack. A peer that never answers must not hold a probe task, or the probe
+/// route's request, open.
+pub(crate) async fn probe(
+    velo: &velo::Velo,
+    id: InstanceId,
+    seq: u64,
+    deadline: Duration,
+) -> anyhow::Result<HeartbeatAck> {
+    let send = velo
+        .typed_unary(HEARTBEAT_HANDLER)?
+        .payload(&HeartbeatRequest { seq })?
+        .instance(id)
+        .send();
+    tokio::time::timeout(deadline, send)
+        .await
+        .map_err(|_| anyhow::anyhow!("no answer within {deadline:?}"))?
 }
 
 /// The loop handles outcomes one at a time, so its store call is bounded:

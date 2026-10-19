@@ -456,8 +456,8 @@ async fn remove_pinned(
     incarnation: Incarnation,
 ) -> Result<(), StoreError> {
     match store.remove(id, incarnation).await {
-        Ok(()) | Err(StoreError::NotFound(_) | StoreError::Stale { .. }) => Ok(()),
-        Err(error) => Err(error),
+        Err(error) if !error.is_gone() => Err(error),
+        _ => Ok(()),
     }
 }
 
@@ -687,7 +687,7 @@ async fn stop(shared: &Shared, running: Running) -> anyhow::Result<()> {
     let mut result = Ok(());
     if let Some((id, incarnation)) = running.pinned
         && let Err(error) = shared.remove_bounded(id, incarnation).await
-        && !matches!(error, StoreError::NotFound(_) | StoreError::Stale { .. })
+        && !error.is_gone()
     {
         result = Err(anyhow::Error::new(error).context("removing the hub's own entry"));
     }

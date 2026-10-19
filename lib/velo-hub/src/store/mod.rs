@@ -282,6 +282,14 @@ pub enum StoreError {
     Backend(#[from] anyhow::Error),
 }
 
+impl StoreError {
+    /// The entry the call named is gone already: removed, or replaced by a
+    /// later incarnation. A remove that answers this has nothing left to do.
+    pub fn is_gone(&self) -> bool {
+        matches!(self, Self::NotFound(_) | Self::Stale { .. })
+    }
+}
+
 /// The hub's registration backend.
 ///
 /// Contract. The conformance suite checks each rule except liveness

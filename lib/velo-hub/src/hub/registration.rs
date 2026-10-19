@@ -50,20 +50,27 @@ pub(crate) async fn register(
     if !shared.admitting() {
         return Err(HubError::unavailable("the hub is not taking registrations"));
     }
-    // The task owns the transaction: hyper drops this handler's future when
-    // the client disconnects, and an abandoned transaction would leave the
-    // owner Busy forever. Decoding runs in the task too, so a panic in an
-    // extension's `decode` or `admit` meets the same boundary as one in
-    // `prepare` and answers 500 instead of dropping the connection.
-    let task = tokio::spawn(async move {
+    // Decoding runs in the task too, so a panic in an extension's `decode`
+    // or `admit` meets the same boundary as one in `prepare` and answers 500
+    // instead of dropping the connection.
+    hub_task("registration", async move {
         let request = decode(&shared, presented, request)?;
         transact(shared, request).await
-    });
-    match task.await {
+    })
+    .await
+}
+
+/// Run `work` as a task of the hub and wait for it. hyper drops a handler's
+/// future when its client closes the socket; work that holds an owner's
+/// permit must outlive that, or the owner stays Busy for ever. A panic in
+/// the task answers 500.
+async fn hub_task<T: Send + 'static>(
+    what: &str,
+    work: impl Future<Output = Result<T, HubError>> + Send + 'static,
+) -> Result<T, HubError> {
+    match tokio::spawn(work).await {
         Ok(result) => result,
-        Err(error) => Err(HubError::internal(format!(
-            "registration task failed: {error}"
-        ))),
+        Err(error) => Err(HubError::internal(format!("{what} task failed: {error}"))),
     }
 }
 
@@ -249,20 +256,37 @@ impl Transaction<'_> {
         error
     }
 
+    /// The write's outcome cannot be learned. Neither the prior registration
+    /// nor the attempted one can be trusted, so drop both: deliver the prior's
+    /// removal, forget the velo peer, and reserve whatever the store holds
+    /// until it expires.
+    fn fail_unresolved(&mut self, prior: Option<Incarnation>, error: StoreError) -> HubError {
+        let removal = prior.map(|incarnation| Removal {
+            id: self.owner,
+            incarnation,
+        });
+        let reservation = self.shared.store.current_incarnation(self.owner);
+        self.settle_after_write(removal, reservation);
+        HubError::unavailable(format!(
+            "store write outcome is unknown and could not be resolved ({error}); the registration is dropped and its entry reserved until it expires"
+        ))
+    }
+
     /// Fail after the store write. One path for every such failure: remove
     /// the new entry, deliver its removal, forget the velo peer, and fail
     /// the credential closed.
     async fn fail_after_write(&mut self, incarnation: Incarnation, error: HubError) -> HubError {
         let shared = self.shared;
         let owner = self.owner;
-        match shared.remove_bounded(owner, incarnation).await {
-            Ok(()) | Err(StoreError::NotFound(_) | StoreError::Stale { .. }) => {}
-            Err(remove_error) => tracing::warn!(
+        if let Err(remove_error) = shared.remove_bounded(owner, incarnation).await
+            && !remove_error.is_gone()
+        {
+            tracing::warn!(
                 instance = %owner,
                 %incarnation,
                 %remove_error,
                 "could not remove the failed registration's entry; it stays reserved until it expires"
-            ),
+            );
         }
         // The new incarnation replaced the prior one in the store, so this
         // removal covers both: the extensions drop whatever the owner had.
@@ -354,26 +378,25 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
         .await
     {
         Ok(incarnation) => incarnation,
-        Err(StoreError::Indeterminate(reason)) => match resolve(&shared, owner, op).await {
-            Ok(Some(incarnation)) => {
-                txn.written = Some(incarnation);
-                let error =
-                    HubError::unavailable(format!("store write was indeterminate: {reason}"));
-                return Err(txn.fail_after_write(incarnation, error).await);
+        Err(StoreError::Indeterminate(reason)) => {
+            match super::bounded(config.step_timeout, shared.store.resolve(owner, op)).await {
+                Ok(Some(incarnation)) => {
+                    txn.written = Some(incarnation);
+                    let error =
+                        HubError::unavailable(format!("store write was indeterminate: {reason}"));
+                    return Err(txn.fail_after_write(incarnation, error).await);
+                }
+                Ok(None) => {
+                    let error = HubError::unavailable(format!(
+                        "store write did not apply: {reason}; retry"
+                    ));
+                    return Err(txn.abort(error));
+                }
+                Err(error) => {
+                    return Err(txn.fail_unresolved(previous.map(|lease| lease.incarnation), error));
+                }
             }
-            Ok(None) => {
-                let error =
-                    HubError::unavailable(format!("store write did not apply: {reason}; retry"));
-                return Err(txn.abort(error));
-            }
-            Err(error) => {
-                return Err(fail_unresolved(
-                    &mut txn,
-                    previous.map(|lease| lease.incarnation),
-                    error,
-                ));
-            }
-        },
+        }
         Err(error @ StoreError::Stale { .. }) => {
             let error = HubError::new(
                 ErrorCode::RegisterAgain,
@@ -456,38 +479,21 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
     })
 }
 
-async fn resolve(
-    shared: &Shared,
-    owner: InstanceId,
-    op: OpId,
-) -> Result<Option<Incarnation>, StoreError> {
-    super::bounded(shared.config.step_timeout, shared.store.resolve(owner, op)).await
-}
-
-/// The write's outcome cannot be learned. Neither the prior registration
-/// nor the attempted one can be trusted, so drop both: deliver the prior's
-/// removal, forget the velo peer, and reserve whatever the store holds
-/// until it expires.
-fn fail_unresolved(
-    txn: &mut Transaction<'_>,
-    prior: Option<Incarnation>,
-    error: StoreError,
-) -> HubError {
-    let removal = prior.map(|incarnation| Removal {
-        id: txn.owner,
-        incarnation,
-    });
-    let reservation = txn.shared.store.current_incarnation(txn.owner);
-    txn.settle_after_write(removal, reservation);
-    HubError::unavailable(format!(
-        "store write outcome is unknown and could not be resolved ({error}); the registration is dropped and its entry reserved until it expires"
-    ))
-}
-
 /// `DELETE /v1/instances/{id}`. Takes the registration lock and delivers
 /// the removal itself, so the extensions have dropped the owner when it
 /// answers. The hook also queues the delivery; that second one is a no-op.
 pub(crate) async fn unregister(
+    shared: Arc<Shared>,
+    owner: InstanceId,
+    presented: Option<Credential>,
+) -> Result<(), HubError> {
+    hub_task("unregistration", async move {
+        unregister_now(&shared, owner, presented).await
+    })
+    .await
+}
+
+async fn unregister_now(
     shared: &Shared,
     owner: InstanceId,
     presented: Option<Credential>,
@@ -510,7 +516,7 @@ pub(crate) async fn unregister(
             shared.deliver_removal(removal);
             Ok(())
         }
-        Err(error @ (StoreError::NotFound(_) | StoreError::Stale { .. })) => {
+        Err(error) if error.is_gone() => {
             // Gone already (expired meanwhile): make sure its removal is
             // delivered, then report what the store said.
             shared.authority.begin_revocation(removal);

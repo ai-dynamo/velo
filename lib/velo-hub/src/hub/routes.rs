@@ -18,11 +18,10 @@ use super::authority::{Authority, Lease};
 use super::error::HubError;
 use super::registration;
 use crate::protocol::{
-    self, CREDENTIAL_HEADER, Credential, ExtensionDescriptor, HEARTBEAT_HANDLER, HeartbeatAck,
-    HeartbeatRequest, HeartbeatResponse, HubDescriptor, InstanceEntry, ListInstancesResponse,
-    PeerLookupResponse, ProbeResponse, RegisterRequest, RegisterResponse, paths,
+    self, CREDENTIAL_HEADER, Credential, ExtensionDescriptor, HeartbeatResponse, HubDescriptor,
+    InstanceEntry, ListInstancesResponse, PeerLookupResponse, ProbeResponse, RegisterRequest,
+    RegisterResponse, paths,
 };
-use crate::store::StoreError;
 
 /// The credential in a request's [`CREDENTIAL_HEADER`], if any. A header
 /// that is present but malformed is a 400, not a missing credential.
@@ -285,18 +284,7 @@ async fn unregister(
     headers: HeaderMap,
 ) -> Result<StatusCode, HubError> {
     let presented = credential_from_headers(&headers)?;
-    // A hub-owned task, as for registration: hyper drops this handler when
-    // the client closes its socket, and an unregistration dropped after
-    // `begin_unregister` would leave the owner Busy.
-    let task = tokio::spawn(async move { registration::unregister(&shared, id, presented).await });
-    match task.await {
-        Ok(result) => result?,
-        Err(error) => {
-            return Err(HubError::internal(format!(
-                "unregistration task failed: {error}"
-            )));
-        }
-    }
+    registration::unregister(shared, id, presented).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -308,18 +296,13 @@ async fn heartbeat(
     let presented = credential_from_headers(&headers)?;
     let lease = shared.authority.authorize(id, presented.as_ref())?;
     // Bounded like every store call the hub awaits: a stalled backend would
-    // otherwise pile up one open request per registrant per heartbeat.
+    // otherwise pile up one open request per registrant per heartbeat. A
+    // `Stale` answer (a replacement won the race) is a 409.
     super::bounded(
         shared.config.step_timeout,
         shared.store.touch(id, lease.incarnation),
     )
-    .await
-    .map_err(|error| match error {
-        // Authorized, but a replacement won the race: not this caller's
-        // registration any more.
-        StoreError::Stale { .. } => HubError::new(protocol::ErrorCode::Conflict, error.to_string()),
-        other => other.into(),
-    })?;
+    .await?;
     Ok(Json(HeartbeatResponse { acknowledged: true }))
 }
 
@@ -334,26 +317,16 @@ async fn probe(
         .velo
         .as_ref()
         .ok_or_else(|| HubError::internal("the hub runs no velo instance"))?;
-    let gateway = |error: anyhow::Error| {
-        HubError::new(
-            protocol::ErrorCode::BadGateway,
-            format!("probe failed: {error:#}"),
-        )
-    };
-    let send = velo
-        .typed_unary(HEARTBEAT_HANDLER)
-        .map_err(gateway)?
-        .payload(&HeartbeatRequest { seq: 0 })
-        .map_err(gateway)?
-        .instance(id)
-        .send();
     // Bounded like a heartbeat probe: a peer that never answers must not
     // hold the request, or shutdown's listener drain, open.
-    let deadline = shared.config.heartbeat_interval;
-    let ack: HeartbeatAck = tokio::time::timeout(deadline, send)
+    let ack = super::heartbeat::probe(velo, id, 0, shared.config.heartbeat_interval)
         .await
-        .map_err(|_| gateway(anyhow::anyhow!("no answer within {deadline:?}")))?
-        .map_err(gateway)?;
+        .map_err(|error| {
+            HubError::new(
+                protocol::ErrorCode::BadGateway,
+                format!("probe failed: {error:#}"),
+            )
+        })?;
     Ok(Json(ProbeResponse {
         seq: ack.seq,
         ok: ack.ok,
