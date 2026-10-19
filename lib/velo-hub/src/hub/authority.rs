@@ -463,25 +463,35 @@ impl Authority {
         })
     }
 
-    /// Abort before the store write. The prior registration becomes active
-    /// again unless its incarnation was removed meanwhile.
+    /// The removals recorded against `permit`'s registration, if the owner
+    /// is still in it.
+    fn removed_during<'s>(
+        states: &'s HashMap<InstanceId, State>,
+        permit: &RegistrationPermit,
+    ) -> Result<&'s HashSet<Incarnation>, AuthorityError> {
+        match states.get(&permit.owner) {
+            Some(State::Registering(progress)) if progress.credential == permit.credential => {
+                Ok(&progress.removed)
+            }
+            _ => Err(AuthorityError::StateChanged {
+                owner: permit.owner,
+            }),
+        }
+    }
+
+    /// Abort a registration whose write did not apply, as far as the hub
+    /// knows. The prior registration becomes active again unless it was
+    /// removed meanwhile, or replaced: a recorded removal of a later
+    /// incarnation is the transaction's own write, which applied after all
+    /// and then left the store, taking the prior's place with it.
     pub(crate) fn abort_registration(
         &self,
         permit: RegistrationPermit,
     ) -> Result<AbortOutcome, AuthorityError> {
         let mut states = self.inner.transition(permit.owner);
-        let Some(State::Registering(progress)) = states.get(&permit.owner) else {
-            return Err(AuthorityError::StateChanged {
-                owner: permit.owner,
-            });
-        };
-        if progress.credential != permit.credential {
-            return Err(AuthorityError::StateChanged {
-                owner: permit.owner,
-            });
-        }
+        let removed = Self::removed_during(&states, &permit)?;
         match permit.previous {
-            Some(previous) if !progress.removed.contains(&previous.incarnation) => {
+            Some(previous) if !removed.iter().any(|gone| *gone >= previous.incarnation) => {
                 states.insert(permit.owner, State::Active(previous));
                 Ok(AbortOutcome::Restored)
             }
@@ -505,16 +515,11 @@ impl Authority {
         reservation: Option<Incarnation>,
     ) -> Result<(), AuthorityError> {
         let mut states = self.inner.transition(permit.owner);
-        let Some(State::Registering(progress)) = states.get(&permit.owner) else {
-            return Err(AuthorityError::StateChanged {
-                owner: permit.owner,
-            });
-        };
-        if progress.credential != permit.credential {
-            return Err(AuthorityError::StateChanged {
-                owner: permit.owner,
-            });
-        }
+        let removed = Self::removed_during(&states, &permit)?;
+        // The caller read `reservation` from the store before it settled; an
+        // entry that left since then was recorded here, and nothing would
+        // ever clear a reservation of it.
+        let reservation = reservation.filter(|incarnation| !removed.contains(incarnation));
         match reservation {
             Some(incarnation) => {
                 states.insert(permit.owner, State::Reserved(incarnation));

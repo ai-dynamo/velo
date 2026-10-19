@@ -1481,3 +1481,76 @@ async fn a_hung_store_touch_answers_the_heartbeat_with_503() {
     assert_eq!(error_code(answer).await, ErrorCode::Unavailable);
     assert!(started.elapsed() < Duration::from_secs(2));
 }
+
+/// A re-registration's write applies but answers `Indeterminate`, and the
+/// entry it wrote leaves the store before the read-back. The read-back then
+/// finds nothing, which looks like "did not apply". It did apply, and it
+/// replaced the prior registration, so the prior must not come back as
+/// active over an empty store. The hook recorded the removal of the
+/// transaction's own write, and that is the signal. Restoring the prior
+/// would leave its credential authorized for good, and the owner could never
+/// register again: 409 with the credential, 401 without.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_that_applied_then_left_before_the_read_back_does_not_lock_the_owner_out() {
+    let f = plain().await;
+    let peer = make_peer();
+    let owner = peer.instance_id();
+    let prior = seeded(&f, &peer).await;
+    f.store.fault_next_put(PutFault::IndeterminateWritten);
+    let gate = f.store.gate_next_resolve();
+    let attempt = tokio::spawn({
+        let hub = f.hub.clone();
+        let body = request_with(&peer, &[ledger_opt_in()]);
+        let credential = prior.credential.clone();
+        async move { post_register(&hub, &body, Some(&credential)).await }
+    });
+    gate.entered().await;
+    f.store.expire(owner);
+    gate.release();
+    let _ = attempt.await.unwrap();
+    assert!(f.store.current_incarnation(owner).is_none());
+    assert_ne!(
+        heartbeat_status(&f.hub, owner, Some(&prior.credential)).await,
+        200,
+        "the prior credential still authorizes over an empty store"
+    );
+    assert!(
+        !f.ledger.has_owner(owner),
+        "the prior's removal was not delivered"
+    );
+    let again = post_register(&f.hub, &request(&peer), None).await;
+    assert_eq!(again.status(), 200, "the owner is locked out");
+}
+
+/// A registration fails after its write and settles: the remove fails, so
+/// it reserves the entry. The entry expires while the settle delivers its
+/// removal, before the reservation is made. The hook found the owner
+/// `Registering` and only recorded the removal, so nothing would ever clear
+/// a reservation of that entry. The owner must not be reserved for the
+/// hub's lifetime.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entry_that_expires_while_a_failed_registration_settles_is_not_reserved() {
+    let f = plain().await;
+    let peer = make_peer();
+    let owner = peer.instance_id();
+    let prior = seeded(&f, &peer).await;
+    f.store.fault_next_put(PutFault::IndeterminateWritten);
+    f.store.fail_next_remove();
+    let (entered, release) = f.ledger.block_next_removed();
+    let attempt = tokio::spawn({
+        let hub = f.hub.clone();
+        let body = request_with(&peer, &[ledger_opt_in()]);
+        let credential = prior.credential.clone();
+        async move { post_register(&hub, &body, Some(&credential)).await }
+    });
+    tokio::task::spawn_blocking(move || entered.recv())
+        .await
+        .unwrap()
+        .expect("on_removed was reached");
+    f.store.expire(owner);
+    drop(release);
+    let _ = attempt.await.unwrap();
+    assert!(f.store.current_incarnation(owner).is_none());
+    let again = post_register(&f.hub, &request(&peer), None).await;
+    assert_eq!(again.status(), 200, "the owner is reserved for good");
+}
