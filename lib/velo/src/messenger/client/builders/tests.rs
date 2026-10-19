@@ -40,18 +40,21 @@ fn fire_result(dispatched: Dispatched) -> FireResult {
 fn sync_result(dispatched: Dispatched) -> SyncResult {
     SyncResult {
         stage: SendStage::Dispatched(dispatched),
+        deadline: None,
     }
 }
 
 fn unary_result(dispatched: Dispatched) -> UnaryResult {
     UnaryResult {
         stage: SendStage::Dispatched(dispatched),
+        deadline: None,
     }
 }
 
 fn typed_result<R>(dispatched: Dispatched) -> TypedUnaryResult<R> {
     TypedUnaryResult {
         stage: SendStage::Dispatched(dispatched),
+        deadline: None,
         _marker: std::marker::PhantomData,
     }
 }
@@ -365,6 +368,7 @@ async fn an_acquiring_send_reads_pending_and_then_resolves() {
     let deferred = Box::pin(async move { Dispatched::issued(SendOutcome::Admitted, awaiter) });
     let mut result = SyncResult {
         stage: SendStage::Acquiring(deferred),
+        deadline: None,
     };
 
     // Nothing has been offered to a transport yet.
@@ -383,6 +387,7 @@ async fn admitted_drives_the_acquisition_stage() {
     let deferred = Box::pin(async move { Dispatched::issued(SendOutcome::Admitted, awaiter) });
     let mut result = UnaryResult {
         stage: SendStage::Acquiring(deferred),
+        deadline: None,
     };
 
     tokio::time::timeout(RESOLVES, result.admitted())
@@ -403,6 +408,7 @@ async fn an_acquiring_send_waits_for_its_slot() {
     });
     let result = SyncResult {
         stage: SendStage::Acquiring(deferred),
+        deadline: None,
     };
 
     assert!(
@@ -531,6 +537,158 @@ async fn fire_result_failed_admission_is_err() {
         .expect("a failed admission resolves the result")
         .expect_err("a frame that never reached the channel is a failed send");
     assert!(err.to_string().contains("Send failed"), "{err}");
+}
+
+// ── Deadline ─────────────────────────────────────────────────────────
+//
+// `.timeout` bounds the wait for the answer. The wire-level cases (a handler
+// that holds its reply, a receiver that forgot the caller) are in
+// `tests/request_timeout.rs`; these pin the state machine.
+
+/// Short enough to keep the suite quick, long enough that the result is
+/// genuinely parked on its slot before the timer fires.
+const DEADLINE: Duration = Duration::from_millis(50);
+
+fn with_deadline(timeout: Duration) -> Option<Deadline> {
+    Some(Deadline::starting_now(timeout).expect("a representable deadline"))
+}
+
+fn timed_out(error: &anyhow::Error) -> RequestTimeout {
+    *error
+        .downcast_ref::<RequestTimeout>()
+        .unwrap_or_else(|| panic!("expected RequestTimeout, got: {error}"))
+}
+
+#[tokio::test]
+async fn an_unanswered_call_times_out_and_releases_its_slot_while_held() {
+    // The result is held across the timeout on purpose. Dropping it would
+    // release the slot through `ResponseAwaiter`'s `Drop` whatever the timeout
+    // path did, and a caller may keep a timed-out result as long as it likes.
+    let (awaiter, id, rm) = make_awaiter();
+    let mut result = UnaryResult {
+        stage: SendStage::Dispatched(Dispatched::issued(SendOutcome::Admitted, awaiter)),
+        deadline: with_deadline(DEADLINE),
+    };
+    assert_eq!(rm.pending_outcome_count(), 1);
+
+    let err = tokio::time::timeout(RESOLVES, &mut result)
+        .await
+        .expect("the deadline resolves the result")
+        .expect_err("no answer came");
+    assert_eq!(timed_out(&err).timeout(), DEADLINE);
+    assert_eq!(
+        rm.pending_outcome_count(),
+        0,
+        "the slot went back at expiry"
+    );
+    assert!(result.deadline.is_none(), "the timer went with it");
+    // The frame was sent; timing out does not rewrite that.
+    assert_eq!(result.admission_state(), AdmissionState::Admitted);
+
+    // A late reply finds its slot released and is discarded.
+    assert!(!rm.complete_outcome(id, Ok(Some(Bytes::from_static(b"late")))));
+
+    // Polling a finished result again is a caller bug, reported as an error.
+    let again = (&mut result).now_or_never().expect("resolves at once");
+    let again = again.expect_err("a finished result stays finished");
+    assert!(again.downcast_ref::<RequestTimeout>().is_none(), "{again}");
+}
+
+#[tokio::test]
+async fn sync_and_typed_results_time_out_with_the_same_error() {
+    let (awaiter, _id, rm) = make_awaiter();
+    let mut sync = SyncResult {
+        stage: SendStage::Dispatched(Dispatched::issued(SendOutcome::Admitted, awaiter)),
+        deadline: with_deadline(DEADLINE),
+    };
+    let err = tokio::time::timeout(RESOLVES, &mut sync)
+        .await
+        .expect("resolves")
+        .expect_err("no answer came");
+    timed_out(&err);
+    assert_eq!(rm.pending_outcome_count(), 0);
+
+    let (awaiter, _id, rm) = make_awaiter();
+    let mut typed = TypedUnaryResult::<u32> {
+        stage: SendStage::Dispatched(Dispatched::issued(SendOutcome::Admitted, awaiter)),
+        deadline: with_deadline(DEADLINE),
+        _marker: std::marker::PhantomData,
+    };
+    let err = tokio::time::timeout(RESOLVES, &mut typed)
+        .await
+        .expect("resolves")
+        .expect_err("no answer came");
+    timed_out(&err);
+    assert_eq!(rm.pending_outcome_count(), 0);
+}
+
+#[tokio::test]
+async fn an_answer_in_time_resolves_ok_and_drops_the_timer() {
+    let (awaiter, id, rm) = make_awaiter();
+    let mut result = UnaryResult {
+        stage: SendStage::Dispatched(Dispatched::issued(SendOutcome::Admitted, awaiter)),
+        deadline: with_deadline(RESOLVES),
+    };
+    // Poll once so the timer exists before the answer arrives.
+    assert!((&mut result).now_or_never().is_none());
+    assert!(
+        result.deadline.as_ref().is_some_and(Deadline::is_armed),
+        "the first poll arms the timer"
+    );
+
+    assert!(rm.complete_outcome(id, Ok(Some(Bytes::from_static(b"pong")))));
+    let bytes = tokio::time::timeout(RESOLVES, &mut result)
+        .await
+        .expect("resolves")
+        .expect("the answer came in time");
+    assert_eq!(bytes, Bytes::from_static(b"pong"));
+    assert!(result.deadline.is_none(), "a finished call holds no timer");
+    assert_eq!(rm.pending_outcome_count(), 0);
+}
+
+#[tokio::test]
+async fn an_answer_ready_when_the_deadline_fires_still_wins() {
+    // The send is polled before the timer, so a reply that is already in the
+    // slot is not thrown away for a deadline that passed at the same moment.
+    let (awaiter, id, rm) = make_awaiter();
+    let mut result = SyncResult {
+        stage: SendStage::Dispatched(Dispatched::issued(SendOutcome::Admitted, awaiter)),
+        deadline: with_deadline(Duration::ZERO),
+    };
+    assert!(rm.complete_outcome(id, Ok(None)));
+    tokio::time::timeout(RESOLVES, &mut result)
+        .await
+        .expect("resolves")
+        .expect("a ready answer beats an expired deadline");
+}
+
+#[tokio::test]
+async fn a_timeout_while_waiting_for_a_slot_fails_the_admission() {
+    // Under `await_capacity` with a full arena the send has not been issued,
+    // so expiry ends it there: it never will be.
+    let (awaiter, _id, _rm) = make_awaiter();
+    let deferred = Box::pin(async {
+        futures::future::pending::<()>().await;
+        Dispatched::issued(SendOutcome::Admitted, awaiter)
+    });
+    let mut result = UnaryResult {
+        stage: SendStage::Acquiring(deferred),
+        deadline: with_deadline(DEADLINE),
+    };
+
+    let err = tokio::time::timeout(RESOLVES, &mut result)
+        .await
+        .expect("the deadline resolves the result")
+        .expect_err("no slot came");
+    timed_out(&err);
+    assert_eq!(result.admission_state(), AdmissionState::Failed);
+}
+
+#[test]
+fn a_timeout_too_large_to_represent_is_no_deadline() {
+    // `Instant + Duration::MAX` overflows. That is a deadline that never comes,
+    // not a panic in `send()`.
+    assert!(Deadline::starting_now(Duration::MAX).is_none());
 }
 
 // ── stage_from_send ──────────────────────────────────────────────────

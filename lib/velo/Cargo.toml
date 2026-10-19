@@ -257,6 +257,13 @@ path = "tests/rendezvous_rdma.rs"
 required-features = ["ucx", "test-helpers"]
 
 [[test]]
+name = "request_timeout"
+path = "tests/request_timeout.rs"
+# test-helpers: `Velo::response_slots_in_use`, to see that a timed-out call
+# gives its response slot back.
+required-features = ["test-helpers"]
+
+[[test]]
 name = "observability_scenarios"
 path = "tests/observability_scenarios.rs"
 required-features = ["test-helpers"]
