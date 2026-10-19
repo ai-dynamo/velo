@@ -204,10 +204,22 @@ jobs:
     - name: Check velo-hub feature sets
       if: matrix.features == 'test-helpers'
       run: |
-        # protocol builds alone; the client builds without the server.
+        # The protocol is its own crate; the client builds without the server.
         for features in "" client server "client,server" etcd "client,etcd"; do
           cargo check --locked -p velo-hub --lib --no-default-features --features "$features"
         done
+    - name: Check velo-hub-ext has no velo runtime
+      if: matrix.features == 'test-helpers'
+      run: |
+        # velo-hub-ext is for programs that speak the hub protocol without the
+        # velo runtime. It may depend on velo-ext, never on velo or prometheus.
+        cargo check --locked -p velo-hub-ext --lib
+        tree=$(cargo tree --locked -p velo-hub-ext -e normal --prefix none)
+        if offending=$(printf '%s\n' "$tree" | grep -E '^(velo v|prometheus)'); then
+          echo "::error::velo-hub-ext pulls in the velo runtime or prometheus:"
+          printf '%s\n' "$offending"
+          exit 1
+        fi
 
   soak-smoke:
     name: Soak smoke
