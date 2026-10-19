@@ -12,7 +12,6 @@
 pub mod client;
 #[cfg(feature = "server")]
 mod hub;
-pub mod protocol;
 #[cfg(feature = "server")]
 pub mod store;
 
@@ -22,3 +21,4 @@ pub use hub::*;
 #[cfg(feature = "server")]
 pub use axum;
 pub use velo;
+pub use velo_hub_ext as protocol;

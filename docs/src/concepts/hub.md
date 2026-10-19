@@ -2,7 +2,7 @@
 
 The `velo-hub` crate builds a hub: one service that is the peer discovery for a velo application and also hosts extensions. A program builds the hub in `main`, adds extensions or bundles of extensions, picks a store, and serves it. `velo` does not depend on `velo-hub`. An application that does not use a hub picks any velo discovery backend, as before.
 
-The crate has three cargo features. `server` builds the hub. `client` builds the hub client, `velo_hub::client`, without the server. `test-support` adds the store conformance suite and `FaultStore`, a store that fails on request. The `protocol` module (paths, request and response types, ids) builds under either feature, and with no feature.
+The crate has three cargo features. `server` builds the hub. `client` builds the hub client, `velo_hub::client`, without the server. `test-support` adds the store conformance suite and `FaultStore`, a store that fails on request. `velo_hub::protocol` (paths, request and response types, ids) builds under either feature, and with no feature. It is the `velo-hub-ext` crate, re-exported. `velo-hub-ext` depends on `velo-ext` and not on `velo`, so a program that only speaks the hub's wire protocol can depend on it and skip the velo runtime.
 
 ```rust,ignore
 use velo_hub::{Hub, HubConfig};
@@ -230,4 +230,4 @@ A write holds the store's write lock and a shard of the copy, so its cost must n
 
 ## Versioning
 
-`velo-hub` takes the workspace version and depends on `velo` with a caret on that version. See [Versioning](../development/versioning.md#velo-hub).
+`velo-hub` and `velo-hub-ext` take the workspace version and depend on each other and on `velo` with a caret on that version. See [Versioning](../development/versioning.md#velo-hub).

@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Workspace layout
 
-Two crates only, plus the two documented exceptions below:
+Two crates only, plus the documented exceptions below:
 
 - **`lib/velo`** — the runtime. All concrete transport / discovery / streaming / messenger / queue / rendezvous / observability code lives here as modules (`velo::transports::tcp`, `velo::discovery::etcd`, `velo::streaming`, etc.). This is what application authors depend on.
 - **`lib/velo-ext`** — the extension trait surface. Out-of-tree implementors of `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, or `TransportObservability` depend only on this crate. It must remain small, free of heavy deps (especially `prometheus`), and stable.
@@ -20,9 +20,18 @@ A second documented exception: **`lib/velo-hub`** — a crate for building a hub
 1. `lib/velo-hub/Cargo.toml` uses `version.workspace = true` and `velo = { workspace = true }`, so a velo minor bump is always a velo-hub minor bump.
 2. `[workspace.dependencies]` requires velo with a **caret** on the workspace version (`velo = { path = "lib/velo", version = "0.21.0", ... }`), not `=`. Pre-1.0 a caret on `0.Y.Z` never admits a second minor; `=` would only stop a velo patch reaching velo-hub users. `scripts/check-semver.sh` fails if the requirement's major.minor differs from `[workspace.package] version`, even under `semver:skip`.
 3. velo and velo-hub publish together, from one commit.
-4. velo-hub re-exports what its API exposes (`velo_hub::velo`, `velo_hub::axum`); downstream hub crates use those re-exports and depend on `velo-hub` with a caret.
+4. velo-hub re-exports what its API exposes (`velo_hub::velo`, `velo_hub::axum`, `velo_hub::protocol`); downstream hub crates use those re-exports and depend on `velo-hub` with a caret.
 
 velo-hub carries `publish = false` until a real port (kvbm's indexer and p2p as extensions) passes kvbm's lifecycle suite against it.
+
+A third documented exception: **`lib/velo-hub-ext`** — the wire protocol of velo-hub, on `velo-ext` alone. It is for crates that speak the hub's wire protocol without the velo runtime. It depends on `velo-ext`, `serde`, `serde_json`, `uuid`, and `http`, and never on `velo`; CI fails if `cargo tree -p velo-hub-ext` shows `velo` or `prometheus`. It shares types with velo-hub, so the same four rules apply:
+
+1. `lib/velo-hub-ext/Cargo.toml` uses `version.workspace = true`, so a velo minor bump is always a velo-hub-ext minor bump.
+2. `[workspace.dependencies]` requires it with a **caret** on the workspace version (`velo-hub-ext = { path = "lib/velo-hub-ext", version = "0.21.0" }`), not `=`. `scripts/check-semver.sh` fails if the requirement's major.minor differs from `[workspace.package] version`, even under `semver:skip`.
+3. velo, velo-hub, and velo-hub-ext publish together, from one commit.
+4. velo-hub re-exports it as `velo_hub::protocol`; downstream hub crates use that re-export.
+
+velo-hub-ext carries `publish = false` and publishes with velo-hub, once velo-hub's publish gate clears.
 
 Anything else under `lib/` or as a workspace member is a mistake — there used to be 9 sibling crates (`velo-messenger`, `velo-transports`, `velo-streaming`, …). They were collapsed into `lib/velo/src/` because independent versioning between them silently shipped broken releases. Do not reintroduce them.
 
@@ -66,7 +75,7 @@ The bug class that motivated the workspace collapse: a 0.1.1 "patch" of an inter
 
 ### Hard rules
 
-1. **Only `velo` and `velo-ext` are publishable** (plus `ucx-rs` and, once its publish gate clears, `velo-hub` — the two documented exceptions above). Any new crate added to the workspace must have `publish = false` in its `Cargo.toml` unless there is a deliberate, documented reason to publish it. Adding a third publishable crate reopens the bug class.
+1. **Only `velo` and `velo-ext` are publishable** (plus `ucx-rs` and, once its publish gate clears, `velo-hub` and `velo-hub-ext` — the documented exceptions above). Any new crate added to the workspace must have `publish = false` in its `Cargo.toml` unless there is a deliberate, documented reason to publish it. Adding a third publishable crate reopens the bug class.
 2. **`velo-ext` is `=`-pinned in `[workspace.dependencies]`.** The line is:
    ```toml
    velo-ext = { path = "lib/velo-ext", version = "=0.5.6" }

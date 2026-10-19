@@ -49,9 +49,11 @@ test-support = ["server"]
 
 [dependencies]
 velo = { workspace = true }
+# The wire protocol, built under every feature and re-exported as
+# `velo_hub::protocol`.
+velo-hub-ext = { workspace = true }
 
-# protocol: serde types only, built under every feature.
-http = { version = "1" }
+# The store and client types built on the wire types in velo-hub-ext.
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true, features = ["v4", "serde"] }

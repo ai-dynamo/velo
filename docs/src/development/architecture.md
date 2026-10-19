@@ -1,12 +1,13 @@
 # Workspace crates
 
-The workspace has two runtime crates, one hub crate, and one FFI crate.
+The workspace has two runtime crates, two hub crates, and one FFI crate.
 
 | Path | Crate | Published | Contents |
 |---|---|---|---|
 | `lib/velo` | `velo` | yes | The runtime. All transports, discovery backends, streaming, the messenger, queues, rendezvous, and metrics are modules here. |
 | `lib/velo-ext` | `velo-ext` | yes | The trait surface for out-of-tree plugins, and the value types these traits use |
 | `lib/velo-hub` | `velo-hub` | not yet; versions with the workspace | A hub: peer discovery for a velo application, plus hosted extensions. See [The hub](../concepts/hub.md). |
+| `lib/velo-hub-ext` | `velo-hub-ext` | not yet; versions with the workspace | The wire protocol of the hub, on `velo-ext` alone. `velo-hub` re-exports it as `velo_hub::protocol`. For programs that speak the protocol without the velo runtime. |
 | `crates/ucx-rs` | `ucx-rs` | yes, versioned alone | Rust bindings and a vendored static build of UCX, for the `ucx` feature |
 | `examples` | `velo-examples` | no | Examples. Not a workspace member. |
 
@@ -18,7 +19,7 @@ The fix was structural. All runtime code moved into `lib/velo/src/`. Do not add 
 
 `ucx-rs` is one exception. It is a leaf FFI crate. It exports no types that `velo` or `velo-ext` share, so it cannot cause two copies of a shared type. It must be on crates.io before a `velo` release with the `ucx` feature can ship.
 
-`velo-hub` is the other exception. It does share types with `velo`, so it takes the workspace version and requires velo with a caret on that version. See [Versioning](versioning.md#velo-hub). A separate trait crate for hub extensions was rejected: an extension gets a `Velo` and returns axum routes, so that crate would still depend on velo and axum, and it would be one more crate that can cause two copies of a type.
+`velo-hub` and `velo-hub-ext` are the other exceptions. They do share types with `velo` and with each other, so they take the workspace version and require velo and each other with a caret on that version. See [Versioning](versioning.md#velo-hub). A separate trait crate for hub extensions was rejected: an extension gets a `Velo` and returns axum routes, so that crate would still depend on velo and axum, and it would be one more crate that can cause two copies of a type.
 
 ## What goes in `velo-ext`
 

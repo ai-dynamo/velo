@@ -10,6 +10,10 @@ members = [
     # caret on the workspace version (see the `velo` entry below and the
     # version-sync check in scripts/check-semver.sh).
     "lib/velo-hub",
+    # velo-hub-ext is the wire protocol of velo-hub, on velo-ext alone. It
+    # shares types with velo-hub (velo-hub re-exports it as
+    # `velo_hub::protocol`), so it follows the same rules as velo-hub.
+    "lib/velo-hub-ext",
     # ucx-rs is the documented exception to the "only velo and velo-ext are
     # publishable" rule: it is a leaf FFI/vendoring crate (bindings + a
     # vendored C build of UCX) that exports NO types shared with velo or
@@ -42,6 +46,9 @@ velo-ext = { path = "lib/velo-ext", version = "=0.5.6" }
 # scripts/check-semver.sh fails if this major.minor differs from
 # [workspace.package] version. Features are left to each dependent.
 velo = { path = "lib/velo", version = "0.21.0", default-features = false }
+# Caret on the workspace version for the same reason, and guarded by the same
+# check in scripts/check-semver.sh. velo-hub re-exports this crate.
+velo-hub-ext = { path = "lib/velo-hub-ext", version = "0.21.0" }
 
 # External dependencies.
 #

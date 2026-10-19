@@ -13,14 +13,15 @@ set -euo pipefail
 BASE_REF="${BASE_REF:-origin/main}"
 SEMVER_INDEX_URL="${SEMVER_INDEX_URL:-https://index.crates.io}"
 
-# ── Version sync: the velo requirement tracks the workspace version ─────────
-# velo-hub takes the workspace version and requires velo through
-# [workspace.dependencies] with a caret. Its public API names velo types, so
-# moving it to another velo minor is a breaking change cargo-semver-checks
-# cannot see. Lockstep closes that only if the requirement's major.minor is
-# the workspace version's. This runs before the semver:skip escape hatch and
-# before the "nothing changed" exits: the label skips the API check, not this
-# invariant, and a change outside lib/ can still break it.
+# ── Version sync: the velo and velo-hub-ext requirements track the workspace version ──
+# velo-hub takes the workspace version and requires velo and velo-hub-ext
+# through [workspace.dependencies] with a caret. Its public API names velo
+# types and re-exports velo-hub-ext, so moving it to another velo minor is a
+# breaking change cargo-semver-checks cannot see. Lockstep closes that only if
+# each requirement's major.minor is the workspace version's. This runs before
+# the semver:skip escape hatch and before the "nothing changed" exits: the
+# label skips the API check, not this invariant, and a change outside lib/ can
+# still break it.
 # Prints one quoted value from Cargo.toml, comments stripped. $1 is the
 # section the value is in, $2 the key inside it, $3 (optional) a sub-table
 # that holds the key instead. For the velo requirement that covers every
@@ -45,16 +46,18 @@ toml_value() {
         }
     ' Cargo.toml
 }
-check_velo_requirement() {
-    local ws_version requirement
+# $1 is the dependency name: velo, or velo-hub-ext, which velo-hub re-exports
+# as `velo_hub::protocol`. Both ride the workspace version the same way.
+check_workspace_requirement() {
+    local name="$1" ws_version requirement
     ws_version=$(toml_value workspace.package version)
-    requirement=$(toml_value workspace.dependencies velo velo)
+    requirement=$(toml_value workspace.dependencies "$name" "$name")
     if [[ -z "$requirement" ]]; then
-        # Fail closed: a crate that inherits velo means a requirement exists
-        # in a form this check cannot read.
+        # Fail closed: a crate that inherits the dependency means a
+        # requirement exists in a form this check cannot read.
         # grep exits 2 when one glob matches no file, so test its output.
-        if [[ -n "$(grep -lsE '^[[:space:]]*velo[[:space:]]*=[[:space:]]*\{[^}]*workspace[[:space:]]*=[[:space:]]*true|^[[:space:]]*velo\.workspace[[:space:]]*=[[:space:]]*true' lib/*/Cargo.toml crates/*/Cargo.toml 2>/dev/null)" ]]; then
-            echo "::error::could not find the velo requirement in [workspace.dependencies] of Cargo.toml, but a crate inherits it"
+        if [[ -n "$(grep -lsE "^[[:space:]]*${name}[[:space:]]*=[[:space:]]*\{[^}]*workspace[[:space:]]*=[[:space:]]*true|^[[:space:]]*${name}\.workspace[[:space:]]*=[[:space:]]*true" lib/*/Cargo.toml crates/*/Cargo.toml 2>/dev/null)" ]]; then
+            echo "::error::could not find the ${name} requirement in [workspace.dependencies] of Cargo.toml, but a crate inherits it"
             exit 1
         fi
         return 0
@@ -65,19 +68,20 @@ check_velo_requirement() {
     fi
     requirement="${requirement#^}"
     if [[ ! "$requirement" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
-        echo "::error::the velo requirement in [workspace.dependencies] must be a caret requirement such as \"${ws_version}\", found \"${requirement}\""
+        echo "::error::the ${name} requirement in [workspace.dependencies] must be a caret requirement such as \"${ws_version}\", found \"${requirement}\""
         exit 1
     fi
     local req_mm ws_mm
     req_mm=$(printf '%s\n' "$requirement" | cut -d. -f1-2)
     ws_mm=$(printf '%s\n' "${ws_version%%[-+]*}" | cut -d. -f1-2)
     if [[ "$req_mm" != "$ws_mm" ]]; then
-        echo "::error::the velo requirement ${requirement} in [workspace.dependencies] does not match the workspace version ${ws_version} (major.minor ${req_mm} vs ${ws_mm}); bump it with the workspace version"
+        echo "::error::the ${name} requirement ${requirement} in [workspace.dependencies] does not match the workspace version ${ws_version} (major.minor ${req_mm} vs ${ws_mm}); bump it with the workspace version"
         exit 1
     fi
-    echo "velo requirement ${requirement} tracks workspace version ${ws_version}."
+    echo "${name} requirement ${requirement} tracks workspace version ${ws_version}."
 }
-check_velo_requirement
+check_workspace_requirement velo
+check_workspace_requirement velo-hub-ext
 
 # ── Escape hatch: semver:skip label ──────────────────────────────────────────
 if [[ "${SEMVER_SKIP:-false}" == "true" ]]; then
