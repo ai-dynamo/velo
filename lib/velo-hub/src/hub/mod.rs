@@ -342,6 +342,7 @@ impl HubBuilder {
                 Arc::clone(&store),
                 server.heartbeat_interval,
                 server.heartbeat_max_failures,
+                server.step_timeout,
                 core_cancel.clone(),
             )),
             None => tracing::info!(
@@ -514,8 +515,20 @@ async fn stop(shared: &Shared, running: Running) -> anyhow::Result<()> {
         extension.shutdown().await;
     }
     running.core_cancel.cancel();
+    // Each core task stops at its next await once cancelled; the bound only
+    // guards against a backend call that ignores its own deadline.
     for task in running.tasks {
-        let _ = task.await;
+        let abort = task.abort_handle();
+        if tokio::time::timeout(config.shutdown_timeout, task)
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "a hub task did not stop within {:?}; aborting it",
+                config.shutdown_timeout
+            );
+            abort.abort();
+        }
     }
     // Release the lock before draining the listeners: a request queued on
     // it would otherwise hold the drain for its whole lock timeout. Admission

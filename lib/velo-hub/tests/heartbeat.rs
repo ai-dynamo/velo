@@ -164,3 +164,46 @@ async fn a_successful_probe_refreshes_liveness() {
     );
     hub.shutdown().await.unwrap();
 }
+
+/// A store touch that never answers cannot stop the heartbeat or hang
+/// shutdown: the heartbeat's store calls run under `step_timeout_ms`, and
+/// the other peers keep being probed meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_store_touch_does_not_stop_the_heartbeat_or_hang_shutdown() {
+    let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::new(
+        velo_hub::store::InMemoryStore::builder()
+            .ttl(Duration::from_millis(800))
+            .prune_interval(Duration::from_millis(50))
+            .build(),
+    ));
+    let mut config = config();
+    config.server.heartbeat_interval = Duration::from_millis(100);
+    config.server.step_timeout = Duration::from_millis(200);
+    config.server.shutdown_timeout = Duration::from_millis(500);
+    let hub = Hub::builder(config)
+        .store(store.clone())
+        .velo(velo_builder())
+        .serve()
+        .await
+        .unwrap();
+    let peer = new_velo().await;
+    install_heartbeat(&peer);
+    wire_mutual(&hub, &peer).await;
+    let _gate = store.gate_next_touch();
+    // Two TTLs: the peer stays only if later probes still touch it.
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    assert!(
+        registered_ids(&hub).contains(&peer.instance_id()),
+        "the heartbeat stopped behind one hung touch"
+    );
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), hub.shutdown())
+        .await
+        .expect("shutdown hung behind a hung store touch")
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "shutdown took {:?}",
+        started.elapsed()
+    );
+}

@@ -46,6 +46,7 @@ pub(crate) fn spawn(
     store: Arc<dyn HubStore>,
     interval: Duration,
     max_failures: u32,
+    step_timeout: Duration,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ProbeOutcome>();
@@ -66,7 +67,7 @@ pub(crate) fn spawn(
                     fan_out(&velo, registrations, seq, interval, &tx);
                 }
                 Some(outcome) = rx.recv() => {
-                    handle_outcome(outcome, store.as_ref(), &mut failures, max_failures).await;
+                    handle_outcome(outcome, store.as_ref(), &mut failures, max_failures, step_timeout).await;
                 }
             }
         }
@@ -132,11 +133,27 @@ fn fan_out(
     }
 }
 
+/// One store call under `step_timeout`. The loop handles outcomes one at a
+/// time, so a call that never answered would stop every later probe and
+/// keep shutdown, which joins this task, waiting.
+async fn bounded(
+    step_timeout: Duration,
+    call: futures::future::BoxFuture<'_, Result<(), crate::store::StoreError>>,
+) -> Result<(), crate::store::StoreError> {
+    match tokio::time::timeout(step_timeout, call).await {
+        Ok(result) => result,
+        Err(_) => Err(crate::store::StoreError::Indeterminate(format!(
+            "did not complete within {step_timeout:?}"
+        ))),
+    }
+}
+
 async fn handle_outcome(
     outcome: ProbeOutcome,
     store: &dyn HubStore,
     failures: &mut HashMap<FailureKey, u32>,
     max_failures: u32,
+    step_timeout: Duration,
 ) {
     match outcome {
         ProbeOutcome::Ok {
@@ -145,7 +162,7 @@ async fn handle_outcome(
             ack_seq,
         } => {
             failures.remove(&(id, incarnation));
-            match store.touch(id, incarnation).await {
+            match bounded(step_timeout, store.touch(id, incarnation)).await {
                 Ok(()) => {
                     tracing::trace!(instance = %id, %incarnation, ack_seq, "heartbeat: refreshed")
                 }
@@ -167,7 +184,7 @@ async fn handle_outcome(
             tracing::warn!(instance = %id, %incarnation, failures = *count, error = %reason, "heartbeat: probe failed");
             if *count >= max_failures {
                 failures.remove(&key);
-                if let Err(error) = store.remove(id, incarnation).await {
+                if let Err(error) = bounded(step_timeout, store.remove(id, incarnation)).await {
                     tracing::warn!(instance = %id, %incarnation, %error, "heartbeat: conditional remove ignored");
                 }
             }
@@ -217,6 +234,7 @@ mod tests {
             &store,
             &mut failures,
             1,
+            Duration::from_secs(1),
         )
         .await;
 
@@ -245,6 +263,7 @@ mod tests {
                 &store,
                 &mut failures,
                 2,
+                Duration::from_secs(1),
             )
             .await;
         }
