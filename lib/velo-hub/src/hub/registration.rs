@@ -224,7 +224,9 @@ impl Transaction<'_> {
         error
     }
 
-    /// Fail after the store write (R4). One path for every such failure.
+    /// Fail after the store write. One path for every such failure: remove
+    /// the new entry, deliver its removal, forget the velo peer, and fail
+    /// the credential closed.
     async fn fail_after_write(&mut self, incarnation: Incarnation, error: HubError) -> HubError {
         let shared = self.shared;
         let owner = self.owner;
@@ -396,7 +398,7 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
     };
     txn.written = Some(incarnation);
 
-    // Everything below fails through R4.
+    // Everything below fails through `fail_after_write`.
     if let Err(error) = shared.authority.record_write(txn.permit(), incarnation) {
         return Err(txn.fail_after_write(incarnation, error.into()).await);
     }

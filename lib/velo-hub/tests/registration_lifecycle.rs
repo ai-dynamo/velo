@@ -4,8 +4,8 @@
 //! Ported from kvbm-hub `tests/registration_lifecycle.rs`. kvbm drove these
 //! with a custom registry and its indexer manager; here `FaultStore` is the
 //! custom backend and the `Ledger` toy (common/mod.rs) has the indexer's
-//! lifecycle semantics. Every assertion is classified in
-//! `agent-docs/velo-hub-m1-ledger.md`; the two that changed say so inline.
+//! lifecycle semantics. Every kvbm assertion is kept except two, and the
+//! tests that carry those two say what changed and why.
 
 mod common;
 

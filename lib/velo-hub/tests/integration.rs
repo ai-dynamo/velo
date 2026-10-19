@@ -3,9 +3,8 @@
 
 //! Ported from kvbm-hub `tests/integration.rs`: the HTTP behavior of the
 //! core routes. kvbm's observed behavior is the spec; where an assertion
-//! changed, the test says why. Tests of kvbm's HubClient move to the
-//! client milestone; tests of kvbm's own features stay with kvbm. The
-//! ledger in `agent-docs/velo-hub-m1-ledger.md` places every one.
+//! changed, the test says why. kvbm's tests of its HubClient wait for the
+//! hub client, and its tests of its own features stay with kvbm.
 
 mod common;
 

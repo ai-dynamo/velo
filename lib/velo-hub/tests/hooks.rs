@@ -651,7 +651,7 @@ async fn continuity_lost_closes_authorization_and_keeps_discovery() {
     );
 }
 
-// ---- the extension fence (R2) ------------------------------------------
+// ---- the extension fence: a lease's epoch against the committed one ------
 
 /// A publish is authorized with the old lease, then stalls before it takes
 /// the ledger lock. A re-registration commits a new epoch meanwhile. The
@@ -1119,7 +1119,7 @@ async fn a_hung_on_registered_is_dropped_at_the_deadline() {
     assert_eq!(next.status(), 200);
 }
 
-/// The remove after a failed write (R4) is bounded: a store that never
+/// The remove after a failed write is bounded: a store that never
 /// answers it does not hold the lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_hung_remove_after_a_failed_write_is_bounded() {

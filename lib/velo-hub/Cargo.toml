@@ -32,7 +32,7 @@ server = [
     "dep:tokio-util",
     "dep:tracing",
 ]
-# The hub client (reqwest). The client itself lands in a later milestone;
+# The hub client (reqwest). The client is not written yet;
 # the feature exists now so `protocol` is proven to build without `server`.
 client = []
 # The store conformance suite and a fault-injecting store, for backends and

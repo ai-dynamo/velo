@@ -12,8 +12,8 @@
 //!   and anyone may query them. `prepare` hides the owner's entries and
 //!   closes its publish path (owned by `Staged`, undone on drop, fenced by
 //!   epoch), and every publish is fenced by the lease's epoch under the
-//!   ledger's own lock. That is rules R1 and R2 of the plan, and the shape
-//!   kvbm's indexer takes as an extension.
+//!   ledger's own lock. Those are the hiding and fencing rules of
+//!   `Extension`, in the shape kvbm's indexer takes as an extension.
 
 #![allow(dead_code)]
 
@@ -399,10 +399,10 @@ pub struct Hit {
 struct Owner {
     epoch: RegistrationEpoch,
     incarnation: Incarnation,
-    /// Cleared by `prepare` (R1): queries miss while a registration is in
+    /// Cleared by `prepare`: queries miss while a registration is in
     /// flight.
     visible: bool,
-    /// Cleared by `prepare` (R1): publishes fail while a registration is in
+    /// Cleared by `prepare`: publishes fail while a registration is in
     /// flight, whatever the authority says.
     publish_open: bool,
     entries: BTreeMap<String, (u64, bool)>,
@@ -556,7 +556,7 @@ impl Ledger {
             .owners
             .get_mut(&auth.owner)
             .ok_or_else(|| HubError::not_found("owner has no ledger"))?;
-        // R2: the fence. The lease must name the epoch this ledger
+        // The fence: the lease must name the epoch this ledger
         // committed, checked under the ledger lock together with the write.
         if !owner.publish_open || owner.epoch != auth.lease.epoch {
             return Err(HubError::new(
@@ -651,7 +651,7 @@ impl Extension for Ledger {
                 std::mem::take(&mut faults.panic_next_prepare),
             )
         };
-        // R1: hide the owner's entries and close its publish path. The
+        // Hide the owner's entries and close its publish path. The
         // guard exists before the first await, so a deadline that drops
         // this future still undoes the hide.
         let unhide = {

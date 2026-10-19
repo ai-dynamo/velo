@@ -63,9 +63,10 @@ pub struct ServerConfig {
     /// hung extension or backend cannot hold the lock forever.
     #[serde(rename = "step_timeout_ms", with = "millis")]
     pub step_timeout: Duration,
-    /// Shutdown budget, used three times: for the HTTP requests in flight
-    /// to finish (then they are ended with 503), for each hub task to stop,
-    /// and for draining the hub's velo instance.
+    /// Shutdown budget, applied to each wait in turn: each extension
+    /// `shutdown`; each hub task to stop; the HTTP requests in flight to
+    /// finish, then, after they are ended with 503, their connections to
+    /// close; and the drain of the hub's velo instance.
     #[serde(rename = "shutdown_timeout_ms", with = "millis")]
     pub shutdown_timeout: Duration,
 }
