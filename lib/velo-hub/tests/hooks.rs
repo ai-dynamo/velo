@@ -1282,3 +1282,41 @@ async fn a_panic_before_the_write_delivers_a_removal_before_undoing_hides() {
         "the removed owner's entries showed again"
     );
 }
+
+/// An unresolved write reserves the prior entry; the lost write then lands
+/// late and replaces it (a replacement is not a removal), and the
+/// replacement expires. The owner must be able to register again.
+#[tokio::test]
+async fn a_late_landing_write_does_not_strand_a_reservation() {
+    let f = plain().await;
+    let peer = make_peer();
+    let owner = peer.instance_id();
+    let credential = register_plain(&f.hub, &peer, None).await.credential;
+    let prior = f.store.current_incarnation(owner).unwrap();
+    f.store.fault_next_put(PutFault::IndeterminateNotWritten);
+    f.store.fail_next_resolve();
+    assert_eq!(
+        post_register(&f.hub, &request(&peer), Some(&credential))
+            .await
+            .status(),
+        503
+    );
+    assert_eq!(
+        post_register(&f.hub, &request(&peer), None).await.status(),
+        401,
+        "reserved"
+    );
+    // The lost write lands late, then expires.
+    f.store
+        .put(
+            velo_hub::store::RegistrationRecord::bare(peer.clone()),
+            Some(prior),
+        )
+        .await
+        .unwrap();
+    f.store.expire(owner);
+    assert_eq!(
+        post_register(&f.hub, &request(&peer), None).await.status(),
+        200
+    );
+}

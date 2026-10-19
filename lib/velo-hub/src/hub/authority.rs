@@ -574,7 +574,12 @@ impl Authority {
                 states.insert(owner, State::Removed(incarnation));
                 RevocationAction::Ignore
             }
-            Some(State::Reserved(current)) if *current == incarnation => {
+            // Any removal, not only of the reserved incarnation: a store holds
+            // one entry per instance, so the reserved entry is gone even if a
+            // write the hub lost track of replaced it first. Clearing cannot
+            // hand an entry over: a claim without a credential writes with
+            // `expected: None`, which fails while the store holds any entry.
+            Some(State::Reserved(_)) => {
                 states.remove(&owner);
                 RevocationAction::Ignore
             }

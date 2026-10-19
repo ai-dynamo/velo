@@ -314,3 +314,22 @@ fn authorize_cost() {
         );
     }
 }
+
+/// A reservation is for an entry the hub did not register. Any removal of
+/// that owner means the entry left the store (a store holds one entry per
+/// instance), even when it names another incarnation: a write the hub lost
+/// track of may have replaced the reserved one before it expired. Keeping
+/// the reservation would lock the owner out with no entry to clear it.
+#[test]
+fn any_removal_of_a_reserved_owner_clears_the_reservation() {
+    let authority = Authority::default();
+    let peer = make_peer();
+    authority.synchronize_reservations(&[stored(&peer, 1)]);
+    assert_eq!(
+        authority.begin_revocation(removal(&peer, 2)),
+        RevocationAction::Ignore
+    );
+    authority
+        .begin_registration(peer.instance_id(), None)
+        .expect("the reservation must go with the entry");
+}
