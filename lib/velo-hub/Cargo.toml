@@ -39,6 +39,7 @@ client = [
     "dep:reqwest",
     "dep:thiserror",
     "dep:tokio",
+    "dep:tracing",
 ]
 # The etcd store (`velo_hub::store::etcd`): registrations that survive a
 # hub restart.

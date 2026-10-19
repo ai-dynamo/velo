@@ -164,6 +164,44 @@ pub trait Extension: Send + Sync + 'static {
     fn on_removed(&self, removal: Removal);
 }
 
+/// An extension, or an `Arc` of one, as [`HubBuilder::extension`](crate::HubBuilder::extension)
+/// and [`BundleInstaller::extension`](crate::BundleInstaller::extension)
+/// take it. Pass an `Arc` to keep a handle to the instance that the hub
+/// runs. The trait is sealed: velo-hub implements it for `E` and for
+/// `Arc<E>` only, so it can change these impls without a break.
+///
+/// `impl Into<Arc<E>>` was the alternative. With it, an `Arc<E>` argument
+/// converts into `Arc<E>` and into `Arc<Arc<E>>`, so inference cannot
+/// choose `E`, and each caller must name the type. This trait has two
+/// impls, and `Arc<E>` is not an extension, so an `Arc<E>` argument can
+/// only mean `E`.
+pub trait IntoExtension<E: Extension>: sealed::Sealed<E> {
+    /// The shared instance.
+    fn into_extension(self) -> Arc<E>;
+}
+
+impl<E: Extension> IntoExtension<E> for E {
+    fn into_extension(self) -> Arc<E> {
+        Arc::new(self)
+    }
+}
+
+impl<E: Extension> IntoExtension<E> for Arc<E> {
+    fn into_extension(self) -> Arc<E> {
+        self
+    }
+}
+
+mod sealed {
+    use std::sync::Arc;
+
+    use super::Extension;
+
+    pub trait Sealed<E> {}
+    impl<E: Extension> Sealed<E> for E {}
+    impl<E: Extension> Sealed<E> for Arc<E> {}
+}
+
 /// Why an extension refused a registration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rejection {

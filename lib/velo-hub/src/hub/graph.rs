@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use serde::de::DeserializeOwned;
 
-use super::extension::{DynExtension, Erased, Extension};
+use super::extension::{DynExtension, Erased, Extension, IntoExtension};
 
 /// A set of extensions that ships together, such as everything kvbm adds
 /// to a hub.
@@ -46,10 +46,13 @@ impl BundleInstaller<'_> {
         self.bundle
     }
 
-    /// Add an extension.
-    pub fn extension<E: Extension>(&mut self, extension: impl Into<Arc<E>>) -> &mut Self {
-        self.extensions
-            .push(PendingExtension::new(extension.into(), self.bundle));
+    /// Add an extension. Pass an `Arc` to keep a handle to the instance
+    /// that the hub runs.
+    pub fn extension<E: Extension>(&mut self, extension: impl IntoExtension<E>) -> &mut Self {
+        self.extensions.push(PendingExtension::new(
+            extension.into_extension(),
+            self.bundle,
+        ));
         self
     }
 

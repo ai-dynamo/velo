@@ -187,6 +187,35 @@ pub fn install_wedged_heartbeat(velo: &Velo, delay: Duration) {
     .unwrap();
 }
 
+/// The handler [`echo_to`] calls: answers its input plus one.
+pub const ECHO_HANDLER: &str = "echo-plus-one";
+
+/// Install [`ECHO_HANDLER`] on `velo`.
+pub fn install_echo(velo: &Velo) {
+    velo.register_handler(
+        Handler::typed_unary_async::<u64, u64, _, _>(ECHO_HANDLER, |ctx| async move {
+            Ok(ctx.input + 1)
+        })
+        .build(),
+    )
+    .unwrap();
+}
+
+/// One unary from `from` to the instance `to`, by instance id. velo does
+/// not ask discovery for such a call, so it reaches only a peer that
+/// `from` registered before.
+pub async fn echo_to(from: &Velo, to: InstanceId, value: u64) -> anyhow::Result<u64> {
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        from.typed_unary::<u64>(ECHO_HANDLER)?
+            .payload(value)?
+            .instance(to)
+            .send(),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("the unary to {to} did not answer within 5 s"))?
+}
+
 // ---- HTTP ---------------------------------------------------------------
 
 pub fn http() -> reqwest::Client {

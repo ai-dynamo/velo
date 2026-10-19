@@ -233,6 +233,7 @@ impl HubClientBuilder {
                 endpoints,
                 op: tokio::sync::Mutex::new(()),
                 shared: Arc::new(Shared::default()),
+                hub_peer: parking_lot::Mutex::new(None),
             }),
         })
     }
@@ -512,6 +513,9 @@ struct Inner {
     /// Serializes register and unregister calls; holds no data.
     op: tokio::sync::Mutex<()>,
     shared: Arc<Shared>,
+    /// The (client velo, hub velo) instance ids of the hub peer that
+    /// [`HubClient::register`] last registered.
+    hub_peer: parking_lot::Mutex<Option<(InstanceId, InstanceId)>>,
 }
 
 impl Drop for Inner {
@@ -604,7 +608,10 @@ impl HubClient {
     /// Register `velo` with the hub. First installs the heartbeat handler
     /// on `velo` (replacing one installed before), so the hub's probes are
     /// answered as soon as the hub answers this call. Then as
-    /// [`register_peer`](Self::register_peer).
+    /// [`register_peer`](Self::register_peer). Then registers the hub's velo
+    /// peer with `velo`, so that `velo` can call the hub by instance id at
+    /// once. velo does not ask discovery for such a call. If this step
+    /// fails, the client logs a warning and keeps the registration.
     pub async fn register(
         &self,
         velo: &Velo,
@@ -613,7 +620,46 @@ impl HubClient {
         self.check_peer(velo.instance_id())?;
         velo.register_handler(heartbeat_handler(Arc::downgrade(&self.inner.shared)))
             .map_err(ClientError::Velo)?;
-        self.register_peer(velo.peer_info(), extensions).await
+        let response = self.register_peer(velo.peer_info(), extensions).await?;
+        if let Some(hub) = response.hub_instance_id {
+            self.register_hub_peer(velo, hub).await;
+        }
+        Ok(response)
+    }
+
+    /// Register the hub's velo peer `hub` with `velo`, once for each pair of
+    /// ids. One velo instance id names one process, so the same pair has
+    /// the same address. A transport can reset its state for a peer that is
+    /// registered again (UCX revalidates its endpoints). A hub that
+    /// restarted has a new id, so the client registers its peer. The
+    /// register answer has the id of the hub but not its address, so this
+    /// looks up the address on the public listener. The hub puts its own
+    /// entry there when it starts.
+    async fn register_hub_peer(&self, velo: &Velo, hub: InstanceId) {
+        let pair = (velo.instance_id(), hub);
+        if *self.inner.hub_peer.lock() == Some(pair) {
+            return;
+        }
+        let registered = match self
+            .inner
+            .endpoints
+            .lookup(protocol::peers_by_instance(hub))
+            .await
+        {
+            Ok(peer) => velo.register_peer(peer),
+            Err(error) => Err(error.into()),
+        };
+        match registered {
+            Ok(()) => *self.inner.hub_peer.lock() = Some(pair),
+            // Keep the registration. It is good, and the hub's first probe
+            // registers the hub's peer with `velo` (the velo handshake
+            // registers the sender). The next `register` tries again.
+            Err(error) => tracing::warn!(
+                hub = %hub,
+                error = %format!("{error:#}"),
+                "registered with the hub, but could not register the hub's velo peer"
+            ),
+        }
     }
 
     /// Refuse a peer other than the one the client holds.
