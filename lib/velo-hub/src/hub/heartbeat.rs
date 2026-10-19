@@ -42,8 +42,6 @@ enum ProbeOutcome {
     },
 }
 
-/// Spawn the heartbeat manager. It holds a [`WeakVelo`]: a strong clone in
-/// a task that only the hub cancels would keep a dropped hub's velo alive.
 /// What the heartbeat needs from the hub's config, and the hub's id, which
 /// every probe carries.
 #[derive(Clone, Copy)]
@@ -54,6 +52,8 @@ pub(crate) struct Settings {
     pub(crate) step_timeout: Duration,
 }
 
+/// Spawn the heartbeat manager. It holds a [`WeakVelo`]: a strong clone in
+/// a task that only the hub cancels would keep a dropped hub's velo alive.
 pub(crate) fn spawn(
     velo: WeakVelo,
     store: Arc<dyn HubStore>,

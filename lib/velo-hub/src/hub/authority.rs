@@ -249,6 +249,9 @@ pub(crate) struct RegistrationPermit {
     credential: Credential,
     epoch: RegistrationEpoch,
     previous: Option<Committed>,
+    /// `previous` is a stored registration this hub recovered, not one it
+    /// issued: an abort returns the owner to `Reserved`, not `Active`.
+    recovered: bool,
 }
 
 impl RegistrationPermit {
@@ -343,7 +346,9 @@ impl Authority {
 
     /// Reserve every store entry the hub did not register, so no client can
     /// claim it without a credential. A removal delivered between hook
-    /// installation and this call suppresses its reservation.
+    /// installation and this call suppresses its reservation. Call it once,
+    /// with the hook's snapshot: only then does every removal since the
+    /// snapshot reach it as a recorded `Removed`.
     pub(crate) fn synchronize_reservations(&self, snapshot: &[StoredRegistration]) {
         let current: HashMap<InstanceId, Incarnation> = snapshot
             .iter()
@@ -396,6 +401,7 @@ impl Authority {
     ) -> Result<RegistrationPermit, AuthorityError> {
         self.ensure_live()?;
         let mut states = self.inner.transition(owner);
+        let recovered = matches!(states.get(&owner), Some(State::Reserved(_)));
         let previous = match states.get(&owner) {
             Some(State::Reserved(reserved)) => match Self::recovers(*reserved, presented, stored) {
                 Some(previous) => Some(previous),
@@ -431,6 +437,7 @@ impl Authority {
             credential,
             epoch,
             previous,
+            recovered,
         })
     }
 
@@ -546,6 +553,16 @@ impl Authority {
         let mut states = self.inner.transition(permit.owner);
         let removed = Self::removed_during(&states, &permit)?;
         match permit.previous {
+            // A recovered registration was never this hub's to restore: the
+            // owner goes back to reserved, where its credential still lets
+            // it in by a registration that succeeds.
+            Some(previous)
+                if permit.recovered
+                    && !removed.iter().any(|gone| *gone >= previous.incarnation) =>
+            {
+                states.insert(permit.owner, State::Reserved(previous.incarnation));
+                Ok(AbortOutcome::Restored)
+            }
             Some(previous) if !removed.iter().any(|gone| *gone >= previous.incarnation) => {
                 states.insert(permit.owner, State::Active(previous));
                 Ok(AbortOutcome::Restored)

@@ -289,10 +289,15 @@ pub(super) async fn keep_alive(
                 continue;
             }
         };
+        // The first keep-alive on a (re)opened stream goes out at once: after
+        // a broken stream, waiting a whole interval first would leave room
+        // for only one more lost answer before a short lease expires.
+        let mut first = true;
         loop {
-            if !pause(&cancel, interval).await {
+            if !first && !pause(&cancel, interval).await {
                 return;
             }
+            first = false;
             if role == LeaseRole::Adopted && !referenced(&shared, lease) {
                 tracing::debug!(
                     lease,

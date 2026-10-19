@@ -399,11 +399,9 @@ impl HubBuilder {
         let fenced = CancellationToken::new();
         tasks.push(tokio::spawn({
             let authority = authority.clone();
-            let store = Arc::clone(&store);
             let cancel = core_cancel.clone();
             let fenced = fenced.clone();
             async move {
-                let mut lost = false;
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => return,
@@ -411,16 +409,13 @@ impl HubBuilder {
                             if changed.is_err() {
                                 return;
                             }
+                            // No resync after `Lost`: the store reports
+                            // every entry that vanished in the gap as a
+                            // removal before it is live again, and with the
+                            // store fenced to this hub nothing else wrote
+                            // one. A second sync would only race the hook.
                             let now = *continuity.borrow_and_update();
-                            // Back after losing history: the store has
-                            // reported the gap's removals; reserve whatever
-                            // it holds that the hub did not register, before
-                            // authorization opens again.
-                            if now == Continuity::Live && lost {
-                                authority.synchronize_reservations(&store.list());
-                            }
                             authority.set_continuity(now);
-                            lost = now == Continuity::Lost || (lost && now != Continuity::Live);
                             if now == Continuity::Fenced {
                                 fenced.cancel();
                                 return;
@@ -462,6 +457,7 @@ impl HubBuilder {
         shared.admission.store(true, Ordering::Release);
         tracing::info!(%public_addr, %control_addr, hub_id = %shared.hub_id, "hub serving");
 
+        let hub_core_cancel = core_cancel.clone();
         let hub = Hub {
             inner: Arc::new(HubInner {
                 runtime: tokio::runtime::Handle::current(),
@@ -483,8 +479,14 @@ impl HubBuilder {
         };
         // A fenced store cannot be written again: stop, in order.
         let weak = Arc::downgrade(&hub.inner);
+        let stopping = hub_core_cancel;
         tokio::spawn(async move {
-            fenced.cancelled().await;
+            // Ends with the hub's core tasks too, so a normal stop leaves
+            // no task behind.
+            tokio::select! {
+                _ = fenced.cancelled() => {}
+                _ = stopping.cancelled() => return,
+            }
             if let Some(inner) = weak.upgrade() {
                 tracing::error!("the store is fenced: another hub holds it; stopping");
                 let mut stage = inner.stage.lock().await;

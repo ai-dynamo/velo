@@ -159,11 +159,11 @@ pub struct RegistrationRecord {
     /// holds until it reads the response to this registration.
     pub accepted: Option<CredentialDigest>,
     /// Digest of the credential this registration minted. With
-    /// `accepted`, it is what a hub that takes the record over needs to
-    /// let the registrant back in after a crash between the write and the
-    /// response. The hub does not read either digest yet: an owner whose
-    /// entry it did not write is reserved, and can register again only
-    /// after that entry expires.
+    /// `accepted`, it lets the registrant back in after a hub restart: a
+    /// hub that finds the record reserves the instance, and a registration
+    /// presenting a credential with either digest proceeds as a
+    /// re-registration (a crash between the write and the response cannot
+    /// lock the registrant out).
     pub pending: Option<CredentialDigest>,
     /// The extension payloads as committed, keyed by extension name.
     pub extensions: BTreeMap<String, serde_json::Value>,

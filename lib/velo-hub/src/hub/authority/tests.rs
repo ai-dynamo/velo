@@ -333,3 +333,44 @@ fn any_removal_of_a_reserved_owner_clears_the_reservation() {
         .begin_registration(peer.instance_id(), None, None)
         .expect("the reservation must go with the entry");
 }
+
+/// A recovery registration that aborts before its write (an extension
+/// rejected it, the write did not apply) leaves the owner reserved: the
+/// stored registration is not one this hub issued, so a failed attempt must
+/// not make its credential authorize anything.
+#[test]
+fn an_aborted_recovery_registration_returns_the_owner_to_reserved() {
+    let authority = Authority::default();
+    let peer = make_peer();
+    let owner = peer.instance_id();
+    let credential = Credential::generate();
+    let mut record = RegistrationRecord::bare(peer.clone());
+    record.epoch = Some(RegistrationEpoch::new());
+    record.accepted = Some(crate::store::CredentialDigest::of(&credential));
+    let stored = StoredRegistration {
+        record,
+        incarnation: incarnation(1),
+    };
+    authority.synchronize_reservations(std::slice::from_ref(&stored));
+    let permit = authority
+        .begin_registration(owner, Some(&credential), Some(&stored))
+        .unwrap();
+    assert_eq!(
+        authority.abort_registration(permit).unwrap(),
+        AbortOutcome::Restored
+    );
+    assert!(matches!(
+        authority.authorize(owner, Some(&credential)),
+        Err(AuthorityError::Recovered { .. })
+    ));
+    assert!(matches!(
+        authority.begin_unregister(owner, Some(&credential)),
+        Err(AuthorityError::Unauthorized { .. })
+    ));
+    // Still recoverable afterwards.
+    assert!(
+        authority
+            .begin_registration(owner, Some(&credential), Some(&stored))
+            .is_ok()
+    );
+}
