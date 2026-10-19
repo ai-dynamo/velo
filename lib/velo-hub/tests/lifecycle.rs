@@ -1265,3 +1265,41 @@ fn dropping_a_hub_after_its_runtime_shut_down_does_not_panic() {
     runtime.shutdown_background();
     drop(hub);
 }
+
+/// `shutdown` called from another runtime (a signal handler on the main
+/// runtime stopping a hub served on a dedicated one) runs the stop on the
+/// runtime that served the hub. Spawned on the caller's runtime, the stop
+/// would die with it: the stage is already `Stopping`, so every later
+/// `shutdown` would fail and the hub would never stop.
+#[test]
+fn a_shutdown_from_another_runtime_runs_on_the_serving_one() {
+    let serving = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (store, log) = (Arc::new(FaultStore::default()), Log::default());
+    let hub = serving
+        .block_on(unruly_builder(&store, &log, Misbehave::None).serve())
+        .unwrap();
+    let caller = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    // Start the stop, give up at once, then lose the caller's runtime
+    // before it ever runs another task.
+    caller.block_on(async {
+        let shutdown = std::pin::pin!(hub.shutdown());
+        assert!(futures::poll!(shutdown).is_pending());
+    });
+    drop(caller);
+    let outcome = serving
+        .block_on(async { tokio::time::timeout(Duration::from_secs(5), hub.shutdown()).await });
+    assert!(
+        matches!(outcome, Ok(Ok(()))),
+        "{outcome:?}, log: {:?}",
+        log.lock()
+    );
+    assert!(store.list().is_empty());
+    assert!(log.lock().iter().any(|event| event == "shutdown witness"));
+}

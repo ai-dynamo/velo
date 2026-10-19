@@ -730,11 +730,10 @@ impl Hub {
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         let mut result = {
             let mut stage = self.inner.stage.lock().await;
-            HubInner::begin_stop(
-                &mut stage,
-                &self.inner.shared,
-                &tokio::runtime::Handle::current(),
-            )
+            // The serving runtime, not the caller's: a stop spawned on a
+            // caller's runtime dies with it, and the stage is already
+            // `Stopping`, so the hub would never stop.
+            HubInner::begin_stop(&mut stage, &self.inner.shared, &self.inner.runtime)
         };
         let outcome = result
             .wait_for(Option::is_some)
