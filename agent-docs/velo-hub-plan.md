@@ -653,3 +653,55 @@ Hub (here): D-7 (`Authority::recovers`: a Reserved owner presenting a credential
 ### 17.8 Review pass 3 (final)
 
 One finding, proven and fixed: **A1** `fail_after_write` answered `register_again` for an entry it could not remove, whose record names the presented credential, so the client dropped the one credential that recovers it and was locked out until the heartbeat evicted the entry. It now answers `recovered` in that case, as `fail_unresolved` does. The pass's probes for the pass-2 fixes (reconnect replay, `prior_gone` narrowing, unresolved write not applied, fenced stop) were mutation-checked and are kept as tests. Below the bar, not done: `reconnect` fencing without checking `closing` (a spurious log line on a closed store), and `fail_closed_registration` dropping the reservation after the code was chosen (one extra round trip).
+
+## 18. M7 design note: high availability, 2026-10-19
+
+### 18.1 Question
+
+Decision 7 and the M7 row say "Raft between hubs" for HA. M4 shipped an etcd store with a prefix lock, fencing, and credential recovery. This note asks what HA still needs on top of M4, and whether Raft is the way to get it.
+
+Failure model: a hub process dies, its node is lost, or it is cut off from etcd. etcd itself is a highly available cluster and is not in scope; losing etcd stops the hub, as it stops every other etcd user.
+
+### 18.2 Measured: active/standby already works on M4
+
+`tests/ha_etcd.rs` runs hub A, a standby hub B that waits on the same prefix and ports (`wait_for_prefix`), and a registrant. A goes away; B's `connect` takes the lock, loads the prefix, reserves each registration, and serves; B's heartbeat carries a new hub id; the registrant re-registers with its credential and gets a new epoch. No new code. Local etcd 3.5.13, loopback, `heartbeat_interval` 200 ms:
+
+| How A goes | lock TTL | B serving | registrant back | runs |
+|---|---|---|---|---|
+| `Hub::shutdown` (lock revoked) | 3 s | 57-70 ms | 278-288 ms | 4 |
+| crash (lease expires) | 3 s | 2.74-3.05 s | 2.95-3.26 s | 4 |
+| crash (lease expires) | 10 s (default) | 9.80 s | 10.02 s | 1 |
+
+So takeover time is about one lock TTL after a crash and one heartbeat after a stop. B's reaper starts each loaded entry's clock at load (`store/etcd/shared.rs:502`), so a takeover spends none of the registrant TTL.
+
+```
+standby B: connect(wait_for_prefix = MAX) ......... blocked on P/hub ........ lock taken -> load -> reserve all -> bind -> serve
+active A:  serving ---- dies -------------------- lease expires (lock_ttl)
+registrant:          heartbeat from B (new hub_id) -> recovered() -> register(credential) -> new epoch
+```
+
+The fencing that makes this safe was built in M4: every write compares A's lock lease, so a partitioned A cannot write once B holds the prefix, fails closed while its store is not `Live`, and stops itself when fenced (`a_fenced_hub_stops_itself`).
+
+### 18.3 What a deployment needs that M4 lacks
+
+1. **One address for the hub.** The measurement used the same host and ports for A and B. A standby has not bound its ports until it holds the lock, so a Kubernetes Service (or any VIP or DNS name with a readiness check) in front of both reaches only the active hub, and the client needs no change. Without a shared address the client needs a list: `HubClientBuilder::hosts([...])`, moving to the next host only on a connect error (the request never reached a hub), never on a hub's answer.
+2. **A standby that never gives up.** `wait_for_prefix(Duration::MAX)` panicked on the deadline arithmetic; fixed in M4 (`a_store_can_wait_for_the_prefix_without_a_limit`).
+3. **Calls during the gap fail.** Discovery reads and registrations get connect errors for up to one lock TTL; a service watch ends with `Disconnected` (the M3 contract) and the caller watches again. That is the same as a hub restart today. Callers that cannot tolerate it lower `lock_ttl` (the builder keeps `request_deadline` under two thirds of it).
+4. **Extension state is not carried over.** As after a restart (R5), extensions see each owner as new when it re-registers. An extension that needs state across a failover stores it itself.
+
+### 18.4 Options
+
+| Option | What it costs | What it buys |
+|---|---|---|
+| **A. Active/standby on etcd** (recommended) | items 1-2 above: a host list in the client, docs, the HA test in CI | HA wherever etcd runs; reuses M4's lock, fencing and recovery; measured above |
+| B. Raft between hubs (e.g. openraft) | a replicated log, snapshots, membership changes, three or more hubs, leader redirects, its own fencing and recovery; extension state still not replicated unless extensions become state machines (a much larger API) | HA without etcd |
+| C. Active/active on one prefix | registration is serialized under one hub's lock, authority and extension state are in one hub's memory; all of it would need per-owner distributed locks and replicated extension state | rejected: cost far above the gain for a service that registrations reach rarely |
+
+Recommendation: do A as M7 and drop B from the plan until a deployment must run without etcd. A's client part (the host list) is what B's client would need too, so none of A is thrown away if B comes later.
+
+### 18.5 M7 scope if A is ratified
+
+- `HubClientBuilder::hosts`: an ordered list of `(host, public port, control port)`; one host stays the common case. Rotation rule above. Tests: a client with a dead first host registers through the second; a hub error from the first host is not retried on the second.
+- `tests/ha_etcd.rs` in CI (it needs etcd, which CI has): stop and crash takeover, with the registrant back on the new hub.
+- Book: an "HA" section in the hub chapter with the table above, the one-address rule, and what callers see during the gap.
+- Not in scope: automatic re-registration on `recovered()` (the application owns that loop today and the M4 test shows it is a few lines), Raft.
