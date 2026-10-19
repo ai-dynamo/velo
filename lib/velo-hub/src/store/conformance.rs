@@ -38,6 +38,7 @@ where
     hook_snapshot_and_removals_agree(factory().as_ref()).await;
     hook_runs_outside_store_locks(factory()).await;
     reads_agree_with_writes(factory().as_ref()).await;
+    replacement_is_what_discovery_serves(factory().as_ref()).await;
     resolve_names_the_writing_op(factory().as_ref()).await;
     continuity_starts_live(factory().as_ref());
 }
@@ -267,6 +268,31 @@ pub async fn reads_agree_with_writes<S: HubStore>(store: &S) {
     assert!(store.peers().is_empty());
     assert!(store.discover_by_instance_id(id).await.is_err());
     assert!(store.discover_by_worker_id(peer.worker_id()).await.is_err());
+}
+
+/// After a replacement with a new address, every read serves the new one.
+/// A backend whose local view keeps the first write fails here.
+pub async fn replacement_is_what_discovery_serves<S: HubStore>(store: &S) {
+    let id = InstanceId::new_v4();
+    let first = PeerInfo::new(id, WorkerAddress::from_encoded(b"first-address".to_vec()));
+    let second = PeerInfo::new(id, WorkerAddress::from_encoded(b"second-address".to_vec()));
+    let incarnation = store.put(record(&first), None).await.unwrap();
+    store.put(record(&second), Some(incarnation)).await.unwrap();
+    assert_eq!(store.get(id).unwrap().record.peer, second);
+    assert_eq!(
+        store.discover_by_instance_id(id).await.unwrap(),
+        second,
+        "instance lookup serves the replacement"
+    );
+    assert_eq!(
+        store
+            .discover_by_worker_id(second.worker_id())
+            .await
+            .unwrap(),
+        second,
+        "worker lookup serves the replacement"
+    );
+    assert_eq!(store.peers()[0].peer, second);
 }
 
 /// `resolve` names the incarnation of the op that wrote the current record,

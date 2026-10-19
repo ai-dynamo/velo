@@ -389,3 +389,67 @@ async fn lookup_cost() {
         );
     }
 }
+
+/// A re-registration replaces the discovery views in place: a peer that
+/// stays registered is never missing from a lookup, by worker or by
+/// instance, while another thread re-puts it.
+#[test]
+fn discovery_never_misses_a_peer_while_it_is_re_registered() {
+    let store = Arc::new(InMemoryStore::default());
+    let peer = make_peer();
+    futures::executor::block_on(store.put(RegistrationRecord::bare(peer.clone()), None)).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let misses = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let readers: Vec<_> = (0..3)
+        .map(|_| {
+            let (store, stop, misses, peer) = (
+                Arc::clone(&store),
+                Arc::clone(&stop),
+                Arc::clone(&misses),
+                peer.clone(),
+            );
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if futures::executor::block_on(store.discover_by_worker_id(peer.worker_id()))
+                        .is_err()
+                        || futures::executor::block_on(
+                            store.discover_by_instance_id(peer.instance_id()),
+                        )
+                        .is_err()
+                    {
+                        misses.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+    for _ in 0..20_000 {
+        let expected = store.current_incarnation(peer.instance_id());
+        futures::executor::block_on(store.put(RegistrationRecord::bare(peer.clone()), expected))
+            .unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    for reader in readers {
+        reader.join().unwrap();
+    }
+    assert_eq!(misses.load(std::sync::atomic::Ordering::Relaxed), 0);
+}
+
+/// After a replacement with a new address, discovery serves the new one.
+#[tokio::test]
+async fn discovery_serves_the_replacement_address() {
+    let store = InMemoryStore::default();
+    let id = InstanceId::new_v4();
+    let first = peer_with_address(id, b"address-a");
+    let second = peer_with_address(id, b"address-b");
+    put(&store, &first).await;
+    put(&store, &second).await;
+    assert_eq!(store.discover_by_instance_id(id).await.unwrap(), second);
+    assert_eq!(
+        store
+            .discover_by_worker_id(second.worker_id())
+            .await
+            .unwrap(),
+        second
+    );
+}

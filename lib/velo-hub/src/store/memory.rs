@@ -173,8 +173,11 @@ impl InMemoryStore {
         // keeps the index right if that ever changes.
         inner.by_worker.retain(|_, owner| *owner != id);
         inner.by_worker.insert(worker, id);
-        self.workers.retain(|_, peer| peer.instance_id() != id);
+        // Overwrite in place, then drop stale keys: a remove-then-insert
+        // would let a lock-free reader miss a peer that never left.
         self.workers.insert(worker, record.peer.clone());
+        self.workers
+            .retain(|key, peer| *key == worker || peer.instance_id() != id);
         self.peers.insert(id, record.peer.clone());
         inner.by_instance.insert(
             id,
