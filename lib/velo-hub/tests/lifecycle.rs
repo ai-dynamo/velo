@@ -1247,3 +1247,21 @@ async fn shutdown_delivers_the_removals_still_queued() {
         );
     }
 }
+
+/// A hub that outlives the runtime that served it: dropping it must not
+/// panic. Its stop is spawned on a runtime that is gone, which does
+/// nothing, and the tasks it would stop are gone with that runtime.
+#[test]
+fn dropping_a_hub_after_its_runtime_shut_down_does_not_panic() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (store, log) = (Arc::new(FaultStore::default()), Log::default());
+    let hub = runtime
+        .block_on(unruly_builder(&store, &log, Misbehave::None).serve())
+        .unwrap();
+    runtime.shutdown_background();
+    drop(hub);
+}
