@@ -205,7 +205,7 @@ jobs:
       if: matrix.features == 'test-helpers'
       run: |
         # protocol builds alone; the client builds without the server.
-        for features in "" client server "client,server"; do
+        for features in "" client server "client,server" etcd "client,etcd"; do
           cargo check --locked -p velo-hub --lib --no-default-features --features "$features"
         done
 
