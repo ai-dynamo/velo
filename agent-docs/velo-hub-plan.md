@@ -705,3 +705,25 @@ Recommendation: do A as M7 and drop B from the plan until a deployment must run 
 - `tests/ha_etcd.rs` in CI (it needs etcd, which CI has): stop and crash takeover, with the registrant back on the new hub.
 - Book: an "HA" section in the hub chapter with the table above, the one-address rule, and what callers see during the gap.
 - Not in scope: automatic re-registration on `recovered()` (the application owns that loop today and the M4 test shows it is a few lines), Raft.
+
+### 18.6 After the note's review (Fable, adversarial, read-only), 2026-10-19
+
+Record: `/tmp/m7r1/report.md`, probes in `/tmp/m7r1/scratch/lib/velo-hub/tests/ha_partition_probe.rs` (hub A reaches etcd through a proxy that can refuse, black-hole, or forward). The recommendation (A over Raft) stands: a Raft leader cut off from its quorum has the same stale-leader problem and needs the same lease fencing. The claim "M4 already gives a working standby" holds for a stop and a crash, **not for a hub cut off from etcd**. Corrections:
+
+- **F1. Fencing is reactive.** Every path to `Fenced` is an answer from etcd. A hub cut off from etcd stays `Degraded` for the whole partition: `/v1/health` answers 200, discovery reads come from a frozen cache, credentialed calls answer 503, and it keeps probing its registrants. It fences 130-250 ms after etcd is reachable again. M4's book and module doc now say so.
+- **F2. On a black hole, A is `Live` after B serves** (B at 3.05 s, A leaves `Live` at 5.5 s: the h2 keep-alive is 5 s, hard-coded). In that window A accepts the old credential and answers 401 to B's, and a 401 on a core route makes the client drop its registration. Lowering `lock_ttl` widens this window, so 18.3 item 3's advice is wrong without F1's fix.
+- **F3. Registrant flapping.** The store cannot split (the lock compare is on every txn), but the client raises `recovered` on any probe from a hub id it did not register with: A's probes raised it 8 times in 1.5 s after the registrant moved to B, 9 epochs minted.
+- **F4. No readiness signal.** `/v1/health` is static. The one-address rule holds for a stop and a crash only.
+- **F5. The standby gives up on any error but `PrefixHeld`** (a 600 ms etcd outage killed a `Duration::MAX` waiter), and each poll costs a connect, a lease grant, a txn and a revoke every 250 ms.
+- **F6.** Timings are consistent and the crash simulation is faithful (no revoke on that path). Crash takeover is two thirds to one lock TTL plus up to 250 ms. "Registrant back" adds one heartbeat interval: 200 ms in the test, 10 s by default. etcd raises a TTL below its minimum (about 2 s), and a lock TTL in the low seconds turns an etcd leader election or a long pause into a failover.
+- **F7.** Reaper clocks start at load, and custody leases are adopted (correct). Past the custody TTL (default 5 min unattended) the records are gone: no `recovered` signal arrives, the old credential answers `unauthorized`, the client drops it, and a fresh `register` succeeds. The application loop must treat that as "register without the credential".
+- **F8.** SSE watchers on a `Degraded` hub stay open and silent. The host-list rule "never rotate on a hub's answer" pins a client to a hub that answers 503 for the whole partition; a 503 that wrote nothing (admission, `begin_registration`) is safe to rotate on, an `Indeterminate` 503 is not.
+
+### 18.7 M7 scope, revised (supersedes 18.5)
+
+1. **Local fencing.** The lock keep-alive records the last acknowledged renewal and fences when `lock_ttl` passes without one; etcd counts the TTL from the last renewal it processed, so the holder gives up no later than anyone else can take the lock. Closes F1 and F2, and stops F3 at the source. Test: cut A from etcd (proxy), assert A is `Fenced` and stopped within `lock_ttl` while etcd stays unreachable.
+2. **Readiness.** A route that answers 503 unless the store is `Live` and the hub admits; the one-address rule is stated as depending on it (F4).
+3. **Client.** Ignore probes from a hub id the client has already replaced (F3), so a slow old hub cannot churn epochs; `HubClientBuilder::hosts` with rotation on a connect error or a 503 that wrote nothing (F8).
+4. **Standby wait.** Retry every error until `wait_for_prefix`; watch the lock key instead of polling with a lease grant and revoke per attempt (F5).
+5. **SSE.** A watch ends with `Disconnected` when continuity leaves `Live` (F8).
+6. **Tests and book.** `tests/ha_etcd.rs` in CI with stop, crash, and cut-off takeovers, and a registrant that settles on B while A is still up. The book's HA section: the measured table with the heartbeat default, the readiness rule, the custody TTL as the longest unattended gap, and the application loop (wait for `recovered` or heartbeat silence; on `unauthorized`, register without the credential).
