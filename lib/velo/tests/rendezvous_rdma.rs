@@ -1283,6 +1283,21 @@ async fn get_into_a_pinned_writer_takes_the_zero_copy_path() {
 /// The pool is sized so exactly one of these allocations fits, which turns
 /// "the space is still reserved" into an observable: the retry has to fail
 /// while the abandoned transfer is running, and succeed once it is not.
+///
+/// The caller is dropped only once the transfer is seen to hold its
+/// destination, never after a fixed wait. Before that point there is nothing
+/// to keep: a timeout that fires during the acquire round trip, or while the
+/// pool is still cutting the buffer, cancels a transfer that never reserved
+/// anything, and the allocation then succeeds for an honest reason. On a slow
+/// CI runner a 60 ms timeout lost that race, and the test reported a
+/// use-after-release that had not happened. The signal is the in-flight
+/// count: the hold that raises it is taken right after the allocation, and
+/// moves into the detached transfer task with no `await` in between, so a drop
+/// after it is seen can only land once the task owns the reservation.
+///
+/// `SlowGet` sleeps inside that task before the GET is issued, so the drop
+/// lands before the NIC is asked to write. The hold covers that window and
+/// the write itself alike: it is released only after the backend returns.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_transfer_does_not_release_its_destination() {
     const ARENA: u64 = 1 << 20;
@@ -1307,15 +1322,29 @@ async fn a_cancelled_transfer_does_not_release_its_destination() {
         .rendezvous_manager()
         .arm_rdma_hook(RdmaTestHook::SlowGet(Duration::from_millis(700)));
 
-    // Dropped while the transfer is still running.
-    let cancelled = tokio::time::timeout(
-        Duration::from_millis(60),
-        pair.consumer.velo.get_pinned(handle),
+    // Dropped while the transfer is still running, and only once it holds its
+    // destination.
+    let consumer = pair.consumer.velo.clone();
+    let getter = tokio::spawn(async move { consumer.get_pinned(handle).await });
+    wait_until(
+        "the transfer holds its destination",
+        || async { pair.consumer.velo.rdma_in_flight_transfers() > 0 },
+        || {
+            format!(
+                "in_flight={}",
+                pair.consumer.velo.rdma_in_flight_transfers()
+            )
+        },
     )
     .await;
+    getter.abort();
+    // Wait for the abort to land. Until it does, the caller's own `PinnedBuf`
+    // is still alive and would refuse the allocation below by itself, which
+    // would prove nothing about the transfer.
+    let cancelled = getter.await;
     assert!(
-        cancelled.is_err(),
-        "the transfer finished too fast to cancel"
+        cancelled.as_ref().is_err_and(|e| e.is_cancelled()),
+        "the transfer finished too fast to cancel; got {cancelled:?}"
     );
 
     // The abandoned transfer still owns the destination, and the pool has room
