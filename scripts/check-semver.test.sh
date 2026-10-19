@@ -164,6 +164,17 @@ resolver = "3"
 version = "${root_version}"
 edition = "2024"
 EOF
+    # VELO_DEP_BLOCK appends literal TOML (printf %b escapes), for other
+    # spellings of the velo requirement. VELO_HUB=1 adds a crate that
+    # inherits it, as lib/velo-hub does.
+    if [[ -n "${VELO_DEP_BLOCK:-}" ]]; then
+        printf '\n%b\n' "$VELO_DEP_BLOCK" >> Cargo.toml
+    fi
+    if [[ "${VELO_HUB:-0}" == "1" ]]; then
+        mkdir -p lib/velo-hub/src
+        printf '[package]\nname = "velo-hub"\nversion.workspace = true\nedition.workspace = true\n\n[dependencies]\nvelo = { workspace = true }\n' > lib/velo-hub/Cargo.toml
+        echo "pub fn touch() {} // ${marker}" > lib/velo-hub/src/lib.rs
+    fi
     # VELO_REQ adds the workspace velo requirement velo-hub inherits.
     if [[ -n "${VELO_REQ:-}" ]]; then
         printf '\n[workspace.dependencies]\nvelo-ext = { path = "lib/velo-ext", version = "=%s" }\nvelo = { path = "lib/velo", version = "%s", default-features = false }\n' \
@@ -528,6 +539,28 @@ if [[ "$(cat "$TMP_ROOT/r.exit")" == "1" ]] \
     ok=0
 fi
 report "(r) an exact velo requirement fails" "$ok" "$out"
+
+# ── (s)-(w) other spellings of a stale velo requirement fail ──────────────
+# The check must read every form Cargo accepts, or fail closed; a stale
+# requirement written another way must never pass silently.
+stale_case() {
+    local name="$1" block="$2" expect="$3"
+    reset_index
+    publish velo 0.10.0
+    publish velo-ext 0.5.0
+    VELO_DEP_BLOCK="$block" VELO_HUB="${4:-0}" SEMVER_SKIP=true run_case "$name" 0.10.0 0.5.0 0.11.0 0.5.0
+    out=$(cat "$TMP_ROOT/$name.out")
+    ok=1
+    if [[ "$(cat "$TMP_ROOT/$name.exit")" == "1" ]] && echo "$out" | grep -qF "$expect"; then
+        ok=0
+    fi
+    report "($name) a stale velo requirement as $5 fails" "$ok" "$out"
+}
+stale_case s '[workspace.dependencies.velo]\npath = "lib/velo"\nversion = "0.10.0"' 'does not match the workspace version 0.11.0' 0 'a sub-table'
+stale_case t '[workspace.dependencies]\nvelo.path = "lib/velo"\nvelo.version = "0.10.0"' 'does not match the workspace version 0.11.0' 0 'dotted keys'
+stale_case u '[workspace.dependencies] # deps\nvelo = { path = "lib/velo", version = "0.10.0" }' 'does not match the workspace version 0.11.0' 0 'a table header with a comment'
+stale_case v '[workspace.dependencies]\nvelo = { path = "lib/velo", version = "0.10.0" } # was version = "0.11.0"' 'does not match the workspace version 0.11.0' 0 'a line with a comment'
+stale_case w '[workspace.dependencies]\n"velo" = { path = "lib/velo", version = "0.10.0" }' 'could not find the velo requirement' 1 'a form the check cannot read, with a crate that inherits it'
 
 echo ""
 

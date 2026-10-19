@@ -21,26 +21,46 @@ SEMVER_INDEX_URL="${SEMVER_INDEX_URL:-https://index.crates.io}"
 # the workspace version's. This runs before the semver:skip escape hatch and
 # before the "nothing changed" exits: the label skips the API check, not this
 # invariant, and a change outside lib/ can still break it.
-section_line() {
-    # The first line in [$1] that starts with $2.
-    awk -v section="[$1]" -v key="$2" '
-        /^\[/ { in_section = ($0 == section) }
-        in_section && index($0, key) == 1 { print; exit }
+# Prints one quoted value from Cargo.toml, comments stripped. $1 is the
+# section the value is in, $2 the key inside it, $3 (optional) a sub-table
+# that holds the key instead. For the velo requirement that covers every
+# spelling Cargo accepts: `velo = { version = "..." }`, `velo.version = "..."`,
+# and a [workspace.dependencies.velo] table.
+toml_value() {
+    awk -v section="[$1]" -v key="$2" -v subtable="${3:+[$1.$3]}" '
+        { line = $0; sub(/^[[:space:]]*#.*$/, "", line); sub(/[[:space:]]+#.*$/, "", line) }
+        line ~ /^[[:space:]]*\[/ {
+            header = line; gsub(/[[:space:]]/, "", header)
+            in_section = (header == section); in_subtable = (subtable != "" && header == subtable)
+            next
+        }
+        function quoted(text) { sub(/^[^"]*"/, "", text); sub(/".*$/, "", text); return text }
+        in_subtable && match(line, /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]*"/) { print quoted(substr(line, RSTART, RLENGTH)); exit }
+        in_section && key == "version" && match(line, /^[[:space:]]*version[[:space:]]*=[[:space:]]*"[^"]*"/) { print quoted(substr(line, RSTART, RLENGTH)); exit }
+        in_section && key != "version" {
+            dotted = "^[[:space:]]*" key "\\.version[[:space:]]*=[[:space:]]*\"[^\"]*\""
+            inline = "^[[:space:]]*" key "[[:space:]]*="
+            if (match(line, dotted)) { print quoted(substr(line, RSTART, RLENGTH)); exit }
+            if (line ~ inline && match(line, /version[[:space:]]*=[[:space:]]*"[^"]*"/)) { print quoted(substr(line, RSTART, RLENGTH)); exit }
+        }
     ' Cargo.toml
 }
 check_velo_requirement() {
-    local ws_line dep_line ws_version requirement
-    ws_line=$(section_line workspace.package 'version')
-    ws_version=$(printf '%s\n' "$ws_line" | sed -n 's/^version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p')
-    # `velo ` or `velo=`, never `velo-ext`.
-    dep_line=$(section_line workspace.dependencies 'velo ')
-    [[ -n "$dep_line" ]] || dep_line=$(section_line workspace.dependencies 'velo=')
-    if [[ -z "$dep_line" ]]; then
+    local ws_version requirement
+    ws_version=$(toml_value workspace.package version)
+    requirement=$(toml_value workspace.dependencies velo velo)
+    if [[ -z "$requirement" ]]; then
+        # Fail closed: a crate that inherits velo means a requirement exists
+        # in a form this check cannot read.
+        # grep exits 2 when one glob matches no file, so test its output.
+        if [[ -n "$(grep -lsE '^[[:space:]]*velo[[:space:]]*=[[:space:]]*\{[^}]*workspace[[:space:]]*=[[:space:]]*true|^[[:space:]]*velo\.workspace[[:space:]]*=[[:space:]]*true' lib/*/Cargo.toml crates/*/Cargo.toml 2>/dev/null)" ]]; then
+            echo "::error::could not find the velo requirement in [workspace.dependencies] of Cargo.toml, but a crate inherits it"
+            exit 1
+        fi
         return 0
     fi
-    requirement=$(printf '%s\n' "$dep_line" | sed -n 's/.*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p')
-    if [[ -z "$requirement" || -z "$ws_version" ]]; then
-        echo "::error::could not read the velo requirement ('${requirement}') or the workspace version ('${ws_version}') from Cargo.toml"
+    if [[ -z "$ws_version" ]]; then
+        echo "::error::could not read the workspace version ([workspace.package] version) from Cargo.toml"
         exit 1
     fi
     requirement="${requirement#^}"
