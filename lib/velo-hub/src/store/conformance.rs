@@ -7,14 +7,16 @@
 //! ```ignore
 //! #[tokio::test]
 //! async fn my_store_conforms() {
-//!     velo_hub::store::conformance::run_all(|| Arc::new(MyStore::new())).await;
+//!     velo_hub::store::conformance::run_all(|| async { Arc::new(MyStore::new()) }).await;
 //! }
 //! ```
 //!
 //! Each check takes a fresh store from the factory and panics with the rule
-//! it found broken. Liveness (TTL, leases) is backend-specific and is not
-//! checked here.
+//! it found broken. The factory is async because a remote backend connects
+//! before it can serve. Liveness (TTL, leases) is backend-specific and is
+//! not checked here.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -26,20 +28,22 @@ use super::{
 use crate::protocol::RegistrationEpoch;
 
 /// Run every check, each against a fresh store.
-pub async fn run_all<S, F>(factory: F)
+pub async fn run_all<S, F, Fut>(factory: F)
 where
     S: HubStore,
-    F: Fn() -> Arc<S>,
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<S>>,
 {
-    incarnations_increase(factory().as_ref()).await;
-    put_is_conditional(factory().as_ref()).await;
-    remove_and_touch_are_conditional(factory().as_ref()).await;
-    hook_snapshot_and_removals_agree(factory().as_ref()).await;
-    hook_runs_outside_store_locks(factory()).await;
-    reads_agree_with_writes(factory().as_ref()).await;
-    replacement_is_what_discovery_serves(factory().as_ref()).await;
-    resolve_names_the_writing_op(factory().as_ref()).await;
-    continuity_starts_live(factory().as_ref());
+    incarnations_increase(factory().await.as_ref()).await;
+    put_is_conditional(factory().await.as_ref()).await;
+    remove_and_touch_are_conditional(factory().await.as_ref()).await;
+    hook_snapshot_and_removals_agree(factory().await.as_ref()).await;
+    hook_runs_outside_store_locks(factory().await).await;
+    removals_are_reported_before_the_call_returns(factory().await.as_ref()).await;
+    reads_agree_with_writes(factory().await.as_ref()).await;
+    replacement_is_what_discovery_serves(factory().await.as_ref()).await;
+    resolve_names_the_writing_op(factory().await.as_ref()).await;
+    continuity_starts_live(factory().await.as_ref());
 }
 
 fn peer() -> PeerInfo {
@@ -230,6 +234,57 @@ pub async fn hook_runs_outside_store_locks<S: HubStore>(store: Arc<S>) {
     );
 }
 
+/// A call's removals are reported before the call returns. The hub reads
+/// its own state right after `remove` and `resolve` (for example, the
+/// owner it just unregistered must already be revoked), so a hook that runs
+/// later can revoke an owner the hub has already handed back. The check
+/// reads the hook's record right after each call, with no yield in
+/// between: a backend that defers the hook to another task fails here even
+/// if the hook would run a moment later. A failed remove reports nothing,
+/// and returns at all: a backend that waits for its own write to show up
+/// in a watch must not hang on a write that changed nothing.
+pub async fn removals_are_reported_before_the_call_returns<S: HubStore>(store: &S) {
+    let (hook, removals) = recording_hook();
+    store.install_removal_hook(hook).unwrap();
+    let peer = peer();
+    let id = peer.instance_id();
+
+    let first = store.put(record(&peer), None).await.unwrap();
+    let second = store.put(record(&peer), Some(first)).await.unwrap();
+    assert!(
+        removals.lock().unwrap().is_empty(),
+        "a replacement is not a removal"
+    );
+    assert!(matches!(
+        store.remove(id, first).await,
+        Err(StoreError::Stale { .. })
+    ));
+    assert!(
+        removals.lock().unwrap().is_empty(),
+        "a failed remove reports nothing"
+    );
+
+    store.remove(id, second).await.unwrap();
+    assert_eq!(
+        removals.lock().unwrap().as_slice(),
+        &[Removal {
+            id,
+            incarnation: second
+        }],
+        "the hook must have run for a removal when remove returns"
+    );
+    assert!(
+        !store.contains(id),
+        "sync reads must reflect the remove when it returns"
+    );
+    assert_eq!(store.resolve(id, OpId::new()).await.unwrap(), None);
+    assert_eq!(
+        removals.lock().unwrap().len(),
+        1,
+        "the removal is reported once"
+    );
+}
+
 /// Sync reads and discovery agree with the writes before them.
 pub async fn reads_agree_with_writes<S: HubStore>(store: &S) {
     let peer = peer();
@@ -320,4 +375,101 @@ pub async fn resolve_names_the_writing_op<S: HubStore>(store: &S) {
 /// A fresh store is current.
 pub fn continuity_starts_live<S: HubStore>(store: &S) {
     assert_eq!(*store.continuity().borrow(), Continuity::Live);
+}
+
+#[cfg(test)]
+mod tests {
+    use futures::future::BoxFuture;
+    use tokio::sync::watch;
+    use velo::{PeerDiscovery, WorkerId};
+
+    use super::*;
+    use crate::store::{InMemoryStore, StoredRegistration};
+
+    /// An in-memory store whose hook runs on a spawned task, as a backend
+    /// that reports removals from a watch without waiting for it would.
+    #[derive(Default)]
+    struct DeferredHookStore(InMemoryStore);
+
+    impl PeerDiscovery for DeferredHookStore {
+        fn discover_by_worker_id(
+            &self,
+            worker_id: WorkerId,
+        ) -> BoxFuture<'_, anyhow::Result<PeerInfo>> {
+            self.0.discover_by_worker_id(worker_id)
+        }
+
+        fn discover_by_instance_id(
+            &self,
+            id: InstanceId,
+        ) -> BoxFuture<'_, anyhow::Result<PeerInfo>> {
+            self.0.discover_by_instance_id(id)
+        }
+    }
+
+    impl HubStore for DeferredHookStore {
+        fn put(
+            &self,
+            record: RegistrationRecord,
+            expected: Option<Incarnation>,
+        ) -> BoxFuture<'_, Result<Incarnation, StoreError>> {
+            self.0.put(record, expected)
+        }
+
+        fn remove(
+            &self,
+            id: InstanceId,
+            incarnation: Incarnation,
+        ) -> BoxFuture<'_, Result<(), StoreError>> {
+            self.0.remove(id, incarnation)
+        }
+
+        fn touch(
+            &self,
+            id: InstanceId,
+            incarnation: Incarnation,
+        ) -> BoxFuture<'_, Result<(), StoreError>> {
+            self.0.touch(id, incarnation)
+        }
+
+        fn resolve(
+            &self,
+            id: InstanceId,
+            op: OpId,
+        ) -> BoxFuture<'_, Result<Option<Incarnation>, StoreError>> {
+            self.0.resolve(id, op)
+        }
+
+        fn get(&self, id: InstanceId) -> Option<StoredRegistration> {
+            self.0.get(id)
+        }
+
+        fn list(&self) -> Vec<StoredRegistration> {
+            self.0.list()
+        }
+
+        fn install_removal_hook(
+            &self,
+            hook: RemovalHook,
+        ) -> Result<Vec<StoredRegistration>, StoreError> {
+            self.0.install_removal_hook(Arc::new(move |removal| {
+                let hook = Arc::clone(&hook);
+                tokio::spawn(async move { hook(removal) });
+            }))
+        }
+
+        fn continuity(&self) -> watch::Receiver<Continuity> {
+            self.0.continuity()
+        }
+    }
+
+    /// The control for `removals_are_reported_before_the_call_returns`: a
+    /// hook that runs a moment after the call fails it, so the in-memory
+    /// store passes because it runs the hook inside `remove`, not because
+    /// the check cannot see a late hook.
+    #[tokio::test]
+    #[should_panic(expected = "the hook must have run for a removal when remove returns")]
+    async fn a_deferred_hook_fails_the_barrier_check() {
+        removals_are_reported_before_the_call_returns(&DeferredHookStore::default()).await;
+    }
 }

@@ -304,7 +304,7 @@ async fn pinned_entry_is_exempt_from_prune() {
 
 #[tokio::test]
 async fn in_memory_store_passes_the_conformance_suite() {
-    crate::store::conformance::run_all(|| Arc::new(InMemoryStore::default())).await;
+    crate::store::conformance::run_all(|| async { Arc::new(InMemoryStore::default()) }).await;
 }
 
 /// Cost of a peer lookup on the request path. Not a gate: run it with

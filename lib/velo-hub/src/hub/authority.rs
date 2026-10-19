@@ -42,7 +42,7 @@ use parking_lot::Mutex;
 use velo::InstanceId;
 
 use crate::protocol::{Credential, RegistrationEpoch};
-use crate::store::{Continuity, Incarnation, Removal, StoredRegistration};
+use crate::store::{Continuity, CredentialDigest, Incarnation, Removal, StoredRegistration};
 
 /// What a valid credential grants: the registration it belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -84,6 +84,13 @@ pub enum AuthorityError {
         /// The owner.
         owner: InstanceId,
     },
+    /// The hub restarted and holds the owner's registration from before.
+    /// The presented credential may own it: register again presenting it.
+    #[error("the hub restarted; register instance {owner} again with its credential")]
+    Recovered {
+        /// The owner named in the request.
+        owner: InstanceId,
+    },
     /// The store is not [`Continuity::Live`], so cached authority may be
     /// stale. Fails closed until it is.
     #[error("the hub's store is not live; authority is unavailable")]
@@ -104,6 +111,11 @@ struct Inner {
     /// after a transition, so each owner's view is a state it was in.
     views: DashMap<InstanceId, View>,
     live: AtomicBool,
+    /// Set by the first `synchronize_reservations`. Before it, a removal of
+    /// an owner the hub has no state for is recorded, so the sync does not
+    /// reserve an entry already gone; after it, such a removal (an entry
+    /// the hub never held) changes nothing and leaves no record.
+    synced: AtomicBool,
 }
 
 impl Default for Inner {
@@ -112,6 +124,7 @@ impl Default for Inner {
             states: Mutex::new(HashMap::new()),
             views: DashMap::new(),
             live: AtomicBool::new(true),
+            synced: AtomicBool::new(false),
         }
     }
 }
@@ -236,6 +249,9 @@ pub(crate) struct RegistrationPermit {
     credential: Credential,
     epoch: RegistrationEpoch,
     previous: Option<Committed>,
+    /// `previous` is a stored registration this hub recovered, not one it
+    /// issued: an abort returns the owner to `Reserved`, not `Active`.
+    recovered: bool,
 }
 
 impl RegistrationPermit {
@@ -287,6 +303,10 @@ pub(crate) enum RevocationAction {
     /// Authority is revoked; deliver the removal, then
     /// [`Authority::finish_revocation`].
     Cleanup,
+    /// A reserved entry went: no extension holds state for it, but the hub
+    /// may have told its velo about the peer (a recovered entry); forget it
+    /// there.
+    ForgetPeer,
 }
 
 impl Authority {
@@ -299,9 +319,11 @@ impl Authority {
         self.ensure_live()?;
         match self.inner.views.get(&owner).as_deref() {
             Some(View::Active { credential, lease }) if Some(credential) == presented => Ok(*lease),
-            Some(View::Active { .. } | View::Reserved) => {
-                Err(AuthorityError::Unauthorized { owner })
-            }
+            Some(View::Active { .. }) => Err(AuthorityError::Unauthorized { owner }),
+            // No hashing here, on the hot path: the registration that
+            // follows checks the credential against the stored record.
+            Some(View::Reserved) if presented.is_some() => Err(AuthorityError::Recovered { owner }),
+            Some(View::Reserved) => Err(AuthorityError::Unauthorized { owner }),
             Some(View::Busy) => Err(AuthorityError::Busy { owner }),
             None => Err(AuthorityError::NotFound { owner }),
         }
@@ -328,18 +350,26 @@ impl Authority {
 
     /// Reserve every store entry the hub did not register, so no client can
     /// claim it without a credential. A removal delivered between hook
-    /// installation and this call suppresses its reservation.
+    /// installation and this call suppresses its reservation. Call it once,
+    /// with the hook's snapshot: only then does every removal since the
+    /// snapshot reach it as a recorded `Removed`.
     pub(crate) fn synchronize_reservations(&self, snapshot: &[StoredRegistration]) {
         let current: HashMap<InstanceId, Incarnation> = snapshot
             .iter()
             .map(|stored| (stored.instance_id(), stored.incarnation))
             .collect();
         let mut states = self.inner.states.lock();
-        let removed_before_sync: HashSet<(InstanceId, Incarnation)> = states
+        // A removal of the snapshot's incarnation or a later one: the entry
+        // the snapshot names is gone.
+        let removed_before_sync: HashSet<InstanceId> = states
             .iter()
             .filter_map(|(owner, state)| match state {
-                State::Removed(incarnation) if current.get(owner) == Some(incarnation) => {
-                    Some((*owner, *incarnation))
+                State::Removed(incarnation)
+                    if current
+                        .get(owner)
+                        .is_some_and(|current| current <= incarnation) =>
+                {
+                    Some(*owner)
                 }
                 _ => None,
             })
@@ -350,7 +380,7 @@ impl Authority {
             _ => true,
         });
         for (owner, incarnation) in current {
-            if removed_before_sync.contains(&(owner, incarnation)) {
+            if removed_before_sync.contains(&owner) {
                 continue;
             }
             states.entry(owner).or_insert(State::Reserved(incarnation));
@@ -361,21 +391,30 @@ impl Authority {
         for owner in states.keys() {
             self.inner.publish(&states, *owner);
         }
+        self.inner.synced.store(true, Ordering::Release);
     }
 
+    /// `stored` is the store's record of `owner`, read under the
+    /// registration lock; it lets a reserved owner back in (see
+    /// [`recovers`](Self::recovers)).
     pub(crate) fn begin_registration(
         &self,
         owner: InstanceId,
         presented: Option<&Credential>,
+        stored: Option<&StoredRegistration>,
     ) -> Result<RegistrationPermit, AuthorityError> {
         self.ensure_live()?;
         let mut states = self.inner.transition(owner);
+        let recovered = matches!(states.get(&owner), Some(State::Reserved(_)));
         let previous = match states.get(&owner) {
+            Some(State::Reserved(reserved)) => match Self::recovers(*reserved, presented, stored) {
+                Some(previous) => Some(previous),
+                None => return Err(AuthorityError::Unauthorized { owner }),
+            },
             Some(State::Active(registration)) if Some(&registration.credential) != presented => {
                 return Err(AuthorityError::Unauthorized { owner });
             }
             Some(State::Active(registration)) => Some(registration.clone()),
-            Some(State::Reserved(_)) => return Err(AuthorityError::Unauthorized { owner }),
             Some(State::Removed(_)) if presented.is_some() => {
                 return Err(AuthorityError::Unauthorized { owner });
             }
@@ -402,6 +441,33 @@ impl Authority {
             credential,
             epoch,
             previous,
+            recovered,
+        })
+    }
+
+    /// A reserved owner's way back in after a hub restart: the store holds
+    /// its registration from before (`reserved`), and the presented
+    /// credential's digest is one the record kept, either the one the
+    /// registrant presented or the one that registration minted (its
+    /// response may have been lost). The registration then proceeds as a
+    /// re-registration of that one, and mints a new credential and epoch,
+    /// so recovery works once. A bare or pinned record never recovers.
+    fn recovers(
+        reserved: Incarnation,
+        presented: Option<&Credential>,
+        stored: Option<&StoredRegistration>,
+    ) -> Option<Committed> {
+        let (presented, stored) = (presented?, stored?);
+        let epoch = stored.record.epoch?;
+        if stored.incarnation != reserved || stored.record.pinned {
+            return None;
+        }
+        let digest = CredentialDigest::of(presented);
+        let known = [stored.record.accepted, stored.record.pending];
+        known.contains(&Some(digest)).then(|| Committed {
+            credential: presented.clone(),
+            epoch,
+            incarnation: reserved,
         })
     }
 
@@ -491,6 +557,16 @@ impl Authority {
         let mut states = self.inner.transition(permit.owner);
         let removed = Self::removed_during(&states, &permit)?;
         match permit.previous {
+            // A recovered registration was never this hub's to restore: the
+            // owner goes back to reserved, where its credential still lets
+            // it in by a registration that succeeds.
+            Some(previous)
+                if permit.recovered
+                    && !removed.iter().any(|gone| *gone >= previous.incarnation) =>
+            {
+                states.insert(permit.owner, State::Reserved(previous.incarnation));
+                Ok(AbortOutcome::Restored)
+            }
             Some(previous) if !removed.iter().any(|gone| *gone >= previous.incarnation) => {
                 states.insert(permit.owner, State::Active(previous));
                 Ok(AbortOutcome::Restored)
@@ -576,7 +652,9 @@ impl Authority {
         let incarnation = removal.incarnation;
         match states.get_mut(&owner) {
             None => {
-                states.insert(owner, State::Removed(incarnation));
+                if !self.inner.synced.load(Ordering::Acquire) {
+                    states.insert(owner, State::Removed(incarnation));
+                }
                 RevocationAction::Ignore
             }
             // Any removal, not only of the reserved incarnation: a store holds
@@ -586,7 +664,7 @@ impl Authority {
             // `expected: None`, which fails while the store holds any entry.
             Some(State::Reserved(_)) => {
                 states.remove(&owner);
-                RevocationAction::Ignore
+                RevocationAction::ForgetPeer
             }
             Some(State::Active(registration) | State::Unregistering(registration))
                 if registration.incarnation == incarnation =>
