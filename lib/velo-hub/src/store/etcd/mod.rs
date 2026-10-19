@@ -455,4 +455,8 @@ impl HubStore for EtcdStore {
     fn continuity(&self) -> watch::Receiver<Continuity> {
         self.shared.continuity.subscribe()
     }
+
+    fn close(&self) -> BoxFuture<'_, ()> {
+        Box::pin(EtcdStore::close(self))
+    }
 }

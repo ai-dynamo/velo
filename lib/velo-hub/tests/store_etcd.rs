@@ -334,6 +334,46 @@ async fn remove_then_close_frees_the_prefix() {
     connect(&prefix).await;
 }
 
+/// A store dropped without `close` stops its tasks and releases the lock
+/// (D-4): the next store on the prefix starts well inside the lock TTL.
+/// The release is spawned by drop, so the connect is retried briefly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dropped_store_releases_the_prefix() {
+    let prefix = prefix();
+    let first = builder(&prefix)
+        .lock_ttl(Duration::from_secs(30))
+        .custody_ttl(Duration::from_secs(30))
+        .connect()
+        .await
+        .unwrap();
+    first
+        .put(RegistrationRecord::bare(peer()), None)
+        .await
+        .unwrap();
+    drop(first);
+    let started = Instant::now();
+    let second = loop {
+        match builder(&prefix).connect().await {
+            Ok(store) => break store,
+            Err(ConnectError::PrefixHeld { .. }) if started.elapsed() < Duration::from_secs(2) => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("the dropped store kept the prefix: {error}"),
+        }
+    };
+    assert_eq!(second.list().len(), 1, "the record survives the drop");
+}
+
+/// The hub reaches `close` through the trait object it holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn close_through_the_trait_frees_the_prefix() {
+    let prefix = prefix();
+    let store: Arc<dyn HubStore> = Arc::new(connect(&prefix).await);
+    store.close().await;
+    assert!(!raw_exists(&mut raw().await, &format!("{prefix}/hub")).await);
+    connect(&prefix).await;
+}
+
 /// One hub per prefix: the second store cannot start while the first
 /// holds the lock.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -637,12 +677,12 @@ async fn a_new_store_adopts_the_custody_lease_and_drops_the_old_pinned_entry() {
 async fn streams_outlive_the_request_deadline() {
     let prefix = prefix();
     let store = builder(&prefix)
-        .request_deadline(Duration::from_millis(500))
+        .request_deadline(Duration::from_secs(1))
         .lock_ttl(Duration::from_secs(2))
         .connect()
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    tokio::time::sleep(Duration::from_secs(4)).await;
     let peer = peer();
     let incarnation = store
         .put(RegistrationRecord::bare(peer.clone()), None)

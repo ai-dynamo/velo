@@ -5,10 +5,10 @@
 //!
 //! [`HubStore`] is the backend contract. The hub's HTTP routes, its
 //! registration transaction, and its own velo instance (through
-//! [`PeerDiscovery`]) all read and write the same store. [`InMemoryStore`]
-//! is the backend that ships; remote backends implement the same trait and
-//! must pass the same conformance suite (`store::conformance`, feature
-//! `test-support`).
+//! [`PeerDiscovery`]) all read and write the same store. Two backends ship:
+//! [`InMemoryStore`], and the etcd store (`store::etcd`, feature `etcd`),
+//! whose registrations outlive the hub process. Every backend must pass the
+//! same conformance suite (`store::conformance`, feature `test-support`).
 //!
 //! The stored record is complete enough for another hub to take over: the
 //! peer, a digest of the credentials that may claim it, its epoch, and the
@@ -429,5 +429,15 @@ pub trait HubStore: PeerDiscovery + Send + Sync + 'static {
     /// for the task, then aborts it.
     fn spawn_liveness_task(self: Arc<Self>, _cancel: CancellationToken) -> Option<JoinHandle<()>> {
         None
+    }
+
+    /// Stop the backend's own tasks and release what it holds for this
+    /// hub (the etcd store's prefix lock), so the next hub can start at
+    /// once. The hub calls this last at shutdown, after it removed its own
+    /// entry. Later calls fail; a call already waiting on the backend
+    /// returns its outcome without running the hook. Idempotent. The
+    /// in-memory store has nothing to release.
+    fn close(&self) -> BoxFuture<'_, ()> {
+        Box::pin(async {})
     }
 }
