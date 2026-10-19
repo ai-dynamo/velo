@@ -33,6 +33,6 @@ let worker = velo.clone();
 
 - Clones share one instance and one set of handlers, streams, and rendezvous state.
 - The final drop of the last clone cancels the streaming services. Dropping any other clone does not.
-- `graceful_shutdown` runs its teardown once, even when you call it through different clones. A later call waits for the first and then returns.
+- `graceful_shutdown` runs its teardown once, even when you call it through different clones. A later call waits for the first and then returns, unless the first teardown failed. Then a later call panics at once.
 - `shutdown` calls `graceful_shutdown`, then closes the streaming services. It does the streaming step again on each call.
 - Wire formats and `velo-ext` traits do not change.

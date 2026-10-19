@@ -413,12 +413,7 @@ async fn run_stream(
 // Display
 // ---------------------------------------------------------------------------
 
-async fn wait_done(
-    velo: &Velo,
-    target: InstanceId,
-    done: &Done,
-    limit: Duration,
-) -> Result<()> {
+async fn wait_done(velo: &Velo, target: InstanceId, done: &Done, limit: Duration) -> Result<()> {
     match done {
         Done::Local(rx) => {
             tokio::time::timeout(limit, rx.recv_async())
@@ -772,8 +767,7 @@ async fn run_client(args: &Args, peer: PeerSource, done: Done) -> Result<Vec<Cel
                     format_payload(size)
                 );
                 all_results.push(
-                    run_concurrent(velo.clone(), target, payload.clone(), args.count, c)
-                        .await?,
+                    run_concurrent(velo.clone(), target, payload.clone(), args.count, c).await?,
                 );
             }
         }

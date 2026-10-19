@@ -209,9 +209,27 @@ impl WeakVelo {
     }
 }
 
+/// Prints no state, as `std::sync::Weak` does: reading the instance would
+/// need an upgrade, and a `Debug` call must not extend its life.
+impl std::fmt::Debug for WeakVelo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WeakVelo")
+    }
+}
+
+/// A handle that points at no instance; [`upgrade`](WeakVelo::upgrade)
+/// returns `None`, as it does for `std::sync::Weak::new()`.
+impl Default for WeakVelo {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Weak::new(),
+        }
+    }
+}
+
 /// The state every [`Velo`] clone shares. One `Arc` around it makes a clone a
 /// single increment and makes the final drop of the last clone the one place
-/// the streaming services are cancelled.
+/// a drop cancels the streaming services.
 struct VeloInner {
     messenger: Arc<Messenger>,
     anchor_manager: Arc<crate::streaming::AnchorManager>,
@@ -1756,6 +1774,21 @@ mod tests {
             std::mem::size_of::<WeakVelo>(),
             std::mem::size_of::<usize>()
         );
+    }
+
+    /// `WeakVelo` replaces `std::sync::Weak<Velo>`, which is `Debug` and
+    /// `Default` for every target. A type that holds a weak handle and derives
+    /// either trait compiled against `Weak<Velo>`; it must keep compiling. The
+    /// default handle points at nothing, as `Weak::new()` does.
+    #[test]
+    fn weak_velo_keeps_the_debug_and_default_of_weak() {
+        #[derive(Debug, Default)]
+        struct Holder {
+            velo: WeakVelo,
+        }
+        let holder = Holder::default();
+        assert!(holder.velo.upgrade().is_none());
+        assert!(format!("{holder:?}").contains("WeakVelo"));
     }
 
     /// A handler lives in its own instance's registry. If it held a `Velo`
