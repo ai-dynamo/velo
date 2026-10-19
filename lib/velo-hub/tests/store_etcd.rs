@@ -723,6 +723,17 @@ async fn etcd_store_cost() {
     }
     let remove = per_op(started.elapsed());
     println!("sequential: put {put:.0} us, touch {touch:.2} us, remove {remove:.0} us");
+    // The floor: one plain etcd write, no txn, no wait for the watch.
+    let mut client = raw().await;
+    let key = format!("{}raw", store.prefix());
+    let started = Instant::now();
+    for _ in 0..OPS {
+        client.put(key.as_str(), "x", None).await.unwrap();
+    }
+    println!(
+        "sequential raw etcd put: {:.0} us",
+        per_op(started.elapsed())
+    );
 
     // Fill concurrently; only the reaper pass is measured.
     let started = Instant::now();
