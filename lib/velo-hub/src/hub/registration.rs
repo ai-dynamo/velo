@@ -343,9 +343,11 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
     }
     let locked_at = Instant::now();
 
+    // Read under the lock: the record a reserved owner recovers from.
+    let stored = presented.as_ref().and_then(|_| shared.store.get(owner));
     let permit = shared
         .authority
-        .begin_registration(owner, presented.as_ref())?;
+        .begin_registration(owner, presented.as_ref(), stored.as_ref())?;
     let mut txn = Transaction {
         _in_flight: shared.in_flight.enter(owner),
         shared: &shared,
@@ -500,6 +502,7 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
         hub_instance_id: shared.velo.as_ref().map(|velo| velo.instance_id()),
         credential,
         epoch: lease.epoch,
+        hub_id: shared.hub_id,
     })
 }
 

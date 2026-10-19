@@ -72,7 +72,9 @@ use graph::{HUB_OWNER, PendingBundle, PendingExtension};
 use lifecycle::Job;
 
 use crate::protocol::HubId;
-use crate::store::{HubStore, InMemoryStore, Incarnation, RegistrationRecord, StoreError};
+use crate::store::{
+    Continuity, HubStore, InMemoryStore, Incarnation, RegistrationRecord, StoreError,
+};
 
 /// What every route and hub task shares.
 pub(crate) struct Shared {
@@ -363,7 +365,22 @@ impl HubBuilder {
         let mut continuity = store.continuity();
         authority.set_continuity(*continuity.borrow_and_update());
         match store.install_removal_hook(lifecycle::removal_hook(authority.clone(), jobs)) {
-            Ok(snapshot) => authority.synchronize_reservations(&snapshot),
+            Ok(snapshot) => {
+                authority.synchronize_reservations(&snapshot);
+                // A persistent store hands the hub registrations from
+                // before it started. Tell velo about them, so the probes
+                // reach them; a probe of a peer velo does not know fails,
+                // and every recovered entry would be evicted.
+                if let Some(velo) = &shared.velo {
+                    for stored in snapshot.iter().filter(|stored| {
+                        !stored.record.pinned && stored.instance_id() != velo.instance_id()
+                    }) {
+                        if let Err(error) = velo.register_peer(stored.record.peer.clone()) {
+                            tracing::warn!(instance = %stored.instance_id(), %error, "could not register a recovered peer with velo");
+                        }
+                    }
+                }
+            }
             Err(error) => {
                 return Err(unwind
                     .run(anyhow::Error::new(error).context("installing the store's removal hook"))
@@ -377,10 +394,16 @@ impl HubBuilder {
         let lifecycle_cancel = CancellationToken::new();
         let http_cancel = CancellationToken::new();
         let mut tasks = Vec::new();
+        // Cancelled when the store reports `Fenced`: another hub holds the
+        // store, and this one stops.
+        let fenced = CancellationToken::new();
         tasks.push(tokio::spawn({
             let authority = authority.clone();
+            let store = Arc::clone(&store);
             let cancel = core_cancel.clone();
+            let fenced = fenced.clone();
             async move {
+                let mut lost = false;
                 loop {
                     tokio::select! {
                         _ = cancel.cancelled() => return,
@@ -388,7 +411,20 @@ impl HubBuilder {
                             if changed.is_err() {
                                 return;
                             }
-                            authority.set_continuity(*continuity.borrow_and_update());
+                            let now = *continuity.borrow_and_update();
+                            // Back after losing history: the store has
+                            // reported the gap's removals; reserve whatever
+                            // it holds that the hub did not register, before
+                            // authorization opens again.
+                            if now == Continuity::Live && lost {
+                                authority.synchronize_reservations(&store.list());
+                            }
+                            authority.set_continuity(now);
+                            lost = now == Continuity::Lost || (lost && now != Continuity::Live);
+                            if now == Continuity::Fenced {
+                                fenced.cancel();
+                                return;
+                            }
                         }
                     }
                 }
@@ -401,9 +437,12 @@ impl HubBuilder {
             Some(velo) => tasks.push(heartbeat::spawn(
                 velo.downgrade(),
                 Arc::clone(&store),
-                server.heartbeat_interval,
-                server.heartbeat_max_failures,
-                server.step_timeout,
+                heartbeat::Settings {
+                    hub_id: shared.hub_id,
+                    interval: server.heartbeat_interval,
+                    max_failures: server.heartbeat_max_failures,
+                    step_timeout: server.step_timeout,
+                },
                 core_cancel.clone(),
                 Arc::clone(&shared.in_flight),
             )),
@@ -423,7 +462,7 @@ impl HubBuilder {
         shared.admission.store(true, Ordering::Release);
         tracing::info!(%public_addr, %control_addr, hub_id = %shared.hub_id, "hub serving");
 
-        Ok(Hub {
+        let hub = Hub {
             inner: Arc::new(HubInner {
                 runtime: tokio::runtime::Handle::current(),
                 shared,
@@ -441,7 +480,18 @@ impl HubBuilder {
                     pinned,
                 })),
             }),
-        })
+        };
+        // A fenced store cannot be written again: stop, in order.
+        let weak = Arc::downgrade(&hub.inner);
+        tokio::spawn(async move {
+            fenced.cancelled().await;
+            if let Some(inner) = weak.upgrade() {
+                tracing::error!("the store is fenced: another hub holds it; stopping");
+                let mut stage = inner.stage.lock().await;
+                HubInner::begin_stop(&mut stage, &inner.shared, &inner.runtime);
+            }
+        });
+        Ok(hub)
     }
 }
 
@@ -721,6 +771,17 @@ async fn stop(shared: &Shared, running: Running) -> anyhow::Result<()> {
         && !error.is_gone()
     {
         result = Err(anyhow::Error::new(error).context("removing the hub's own entry"));
+    }
+    // Last store call: a store that holds a lock or a lease (etcd) frees
+    // it, so the next hub can take the store over.
+    if tokio::time::timeout(config.shutdown_timeout, shared.store.close())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "the store did not close within {:?}",
+            config.shutdown_timeout
+        );
     }
     if let Some(velo) = &shared.velo {
         velo.shutdown(ShutdownPolicy::Timeout(config.shutdown_timeout))

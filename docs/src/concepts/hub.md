@@ -49,12 +49,32 @@ The store contract:
 - Each write of an instance gets a new incarnation, greater than every earlier one of that instance. The hub and the extensions compare incarnations to tell a stale removal from a current one.
 - Writes, removals, and touches are conditional on the current incarnation. Work that runs later carries the incarnation that it saw, so it cannot change a later registration of the same instance.
 - The removal hook and its snapshot share one point in time. Each entry present at that point is in the snapshot, and the hook hears each later removal once.
-- The store reports its continuity. When the store is not `Live`, the hub refuses every credential with 503 and refuses new registrations. Peer lookups continue from the store's local view.
+- The store reports its continuity. When the store is not `Live`, the hub refuses every credential with 503 and refuses new registrations. Peer lookups continue from the store's local view. A `Fenced` store (another hub holds it) stops the hub.
+- Every removal that a call causes or races reaches the removal hook before the call returns. The hub reads the hook's record right after a write, a read-back, or a remove.
 - A write can answer `Indeterminate`: a remote write can apply even when its answer is lost. The hub then asks the store which write produced the current record, by the write's op id.
 
 The record holds the peer, the epoch, the extension payloads, a pinned flag for the hub's own entry, and SHA-256 digests of the credentials. The store never holds a credential, so a copy of the store does not give authority.
 
 Each backend runs the conformance suite in `velo_hub::store::conformance` (feature `test-support`). `FaultStore` in `velo_hub::store::testing` is an in-memory store that fails, stops at a gate, or answers `Indeterminate` on request. It passes the same suite when no fault is set.
+
+## The etcd store
+
+`EtcdStore` (feature `etcd`) keeps the registrations in etcd, under a prefix (`/velo-hub/default` by default), so they survive a hub restart.
+
+- An entry's incarnation is the etcd revision of its key. etcd revisions only grow, so incarnations do too.
+- Every write is one etcd transaction, conditional on the incarnation. When a write's answer is lost, the hub's read-back first writes a tombstone for the write's op id, and every write requires that tombstone to be absent. So a read-back that finds nothing is final: the write will not apply later.
+- The store watches its prefix and keeps a local copy, which serves the sync reads and the peer lookups. A call waits until the watch has applied its own transaction and run the removal hook for it, so the hook rule above holds.
+- One hub per prefix. The store takes a lock key on a short lease (10 s) when it connects, and every transaction checks that the lock is still its own. If the lock is lost, for example after a partition, the store is `Fenced` and the hub stops. A clean stop frees the lock. After a crash, the next hub waits for the lock with `wait_for_prefix`.
+- Liveness does not use a lease per entry. A `touch` updates the local copy, and the store's reaper removes an entry that nobody touched for the registrant TTL (30 s). Every key of a hub is on one custody lease (5 min), kept alive by the store. So the entries of a hub that crashed stay for the custody TTL, which is how long a restarted hub can recover them. A lease per entry was rejected: it needs one etcd keep-alive stream per touch (about 1,000 a second for 10,000 registrants at the default interval), and a healthy registrant could expire after one late probe.
+- A watch that falls behind etcd's compaction loses history. The store is then `Lost`, reloads the prefix, reports every entry that went away in the gap as a removal, and is `Live` again; the hub then reserves again what the store holds.
+
+Measured against a local etcd 3.5 in Docker (release build, one call at a time): a put takes 2.8 ms and a remove 2.5 ms, against 2.2 ms for a plain etcd put; a touch takes 0.17 µs, because it does not reach etcd; a reaper pass that expires 10,000 entries takes 165 to 187 ms.
+
+## Recovery after a restart
+
+A hub that starts on a store with registrations in it reserves each of them: nobody can claim the instance without a credential, and peer lookups keep working. It also tells its velo instance about each peer, so its probes reach them.
+
+The registrant gets back in with its credential. The hub's heartbeat carries the hub's id, and the client notices that the id changed (`HubClient::recovered()`); a route the registrant calls with its credential answers `recovered`. The client then registers again presenting its credential. The hub checks the credential's digest against the stored record (the credential the registrant presented, or the one that registration minted, whose answer may have been lost), and the registration proceeds as a re-registration of the stored one, with a new credential and a new epoch. Extension state is not replayed: extensions see the owner as new. The registration carries the client's services, so they come back with it.
 
 ## Authority
 
@@ -172,7 +192,7 @@ A watch takes its snapshot and subscribes in one step, under the directory's loc
 
 The client implements velo's `ServiceDiscovery` with `client.services()`. `client.register_service(name)` returns a guard; the client holds one guard per name and refuses a second. The client keeps the names it serves, and every registration carries them, so after any registration (fresh, re-registered, or on a hub that restarted) the hub's set is the client's, with no request per name. Between registrations, guards change only the client's set, and one writer, `sync_services`, sends the changes one request at a time while no registration runs. So two requests from one client never race. A request the hub refused is answered; one with no answer from the hub (a dropped future, a timeout, a proxy's 504) leaves its name unsettled, and the next pass sends it again as the client's set says. So a guard never removes another guard's entry, and the hub does not keep an entry nobody serves. `register` answers `Ok` once the registration is held. A failure to send a change made during the call is left for `sync_services`, which the caller can also run to retry. Dropping a guard stops serving the name, in the background.
 
-Services are kept in the hub's memory, like extension state. A hub that restarts with a persistent store restores peer discovery only, and the instances add their services again when they register again.
+Services are kept in the hub's memory, like extension state. A hub that restarts with a persistent store restores peer discovery only; the client's next registration carries its services back.
 
 ## Startup and shutdown
 

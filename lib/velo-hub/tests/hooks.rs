@@ -470,7 +470,11 @@ async fn indeterminate_put_that_applied_fails_closed() {
 }
 
 /// Neither outcome can be learned. The hub drops the prior registration's
-/// extension state and reserves whatever the store holds until it expires.
+/// extension state and reserves whatever the store holds. Nobody can claim
+/// it without a credential, but the record the unresolved write stored
+/// holds the presented credential's digest, so the registrant gets back in
+/// with that credential (the route answers `recovered`), without waiting
+/// for the entry to expire.
 #[tokio::test]
 async fn indeterminate_put_that_cannot_be_resolved_drops_and_reserves() {
     let f = plain().await;
@@ -492,18 +496,19 @@ async fn indeterminate_put_that_cannot_be_resolved_drops_and_reserves() {
     assert!(f.store.contains(owner), "the written entry is still there");
     assert_eq!(
         heartbeat_status(&f.hub, owner, Some(&prior.credential)).await,
-        401,
-        "reserved"
+        409,
+        "reserved, and the credential may recover it"
     );
     assert_eq!(
         post_register(&f.hub, &request(&peer), None).await.status(),
         401
     );
-
-    f.store.expire(owner);
     assert_eq!(
-        post_register(&f.hub, &request(&peer), None).await.status(),
-        200
+        post_register(&f.hub, &request(&peer), Some(&prior.credential))
+            .await
+            .status(),
+        200,
+        "the presented credential recovers the reserved entry"
     );
 }
 

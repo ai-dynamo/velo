@@ -17,7 +17,8 @@ use velo_hub::axum::routing::{delete, post};
 use velo_hub::axum::{Json, Router};
 use velo_hub::client::HubClient;
 use velo_hub::protocol::{
-    Credential, ErrorBody, ErrorCode, RegisterRequest, RegisterResponse, RegistrationEpoch, paths,
+    Credential, ErrorBody, ErrorCode, HubId, RegisterRequest, RegisterResponse, RegistrationEpoch,
+    paths,
 };
 use velo_hub::velo::{InstanceId, PeerInfo, WorkerAddress};
 
@@ -102,6 +103,7 @@ async fn register(Json(request): Json<RegisterRequest>) -> Json<RegisterResponse
         hub_instance_id: None,
         credential: Credential::from_header_str("00000000-0000-4000-8000-000000000001").unwrap(),
         epoch: RegistrationEpoch::new(),
+        hub_id: HubId::new(),
     })
 }
 

@@ -350,14 +350,20 @@ async fn probe(
         .ok_or_else(|| HubError::internal("the hub runs no velo instance"))?;
     // Bounded like a heartbeat probe: a peer that never answers must not
     // hold the request, or shutdown's listener drain, open.
-    let ack = super::heartbeat::probe(velo, id, 0, shared.config.heartbeat_interval)
-        .await
-        .map_err(|error| {
-            HubError::new(
-                protocol::ErrorCode::BadGateway,
-                format!("probe failed: {error:#}"),
-            )
-        })?;
+    let ack = super::heartbeat::probe(
+        velo,
+        id,
+        0,
+        Some(shared.hub_id),
+        shared.config.heartbeat_interval,
+    )
+    .await
+    .map_err(|error| {
+        HubError::new(
+            protocol::ErrorCode::BadGateway,
+            format!("probe failed: {error:#}"),
+        )
+    })?;
     Ok(Json(ProbeResponse {
         seq: ack.seq,
         ok: ack.ok,

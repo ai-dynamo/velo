@@ -133,3 +133,8 @@ required-features = ["test-support", "client"]
 name = "store_etcd"
 path = "tests/store_etcd.rs"
 required-features = ["test-support", "etcd"]
+
+[[test]]
+name = "recovery_etcd"
+path = "tests/recovery_etcd.rs"
+required-features = ["test-support", "client", "etcd"]

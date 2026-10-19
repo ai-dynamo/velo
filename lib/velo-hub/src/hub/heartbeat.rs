@@ -23,7 +23,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use velo::{InstanceId, WeakVelo};
 
-use crate::protocol::{HEARTBEAT_HANDLER, HeartbeatAck, HeartbeatRequest};
+use crate::protocol::{HEARTBEAT_HANDLER, HeartbeatAck, HeartbeatRequest, HubId};
 use crate::store::{HubStore, Incarnation, StoredPeer};
 
 type FailureKey = (InstanceId, Incarnation);
@@ -44,15 +44,29 @@ enum ProbeOutcome {
 
 /// Spawn the heartbeat manager. It holds a [`WeakVelo`]: a strong clone in
 /// a task that only the hub cancels would keep a dropped hub's velo alive.
+/// What the heartbeat needs from the hub's config, and the hub's id, which
+/// every probe carries.
+#[derive(Clone, Copy)]
+pub(crate) struct Settings {
+    pub(crate) hub_id: HubId,
+    pub(crate) interval: Duration,
+    pub(crate) max_failures: u32,
+    pub(crate) step_timeout: Duration,
+}
+
 pub(crate) fn spawn(
     velo: WeakVelo,
     store: Arc<dyn HubStore>,
-    interval: Duration,
-    max_failures: u32,
-    step_timeout: Duration,
+    settings: Settings,
     cancel: CancellationToken,
     in_flight: Arc<InFlight>,
 ) -> JoinHandle<()> {
+    let Settings {
+        interval,
+        max_failures,
+        step_timeout,
+        ..
+    } = settings;
     let (tx, mut rx) = mpsc::unbounded_channel::<ProbeOutcome>();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
@@ -73,7 +87,7 @@ pub(crate) fn spawn(
                     let mut registrations = store.peers();
                     retain_current_failures(&mut failures, &registrations);
                     in_flight.skip(&mut registrations);
-                    fan_out(&velo, &store, registrations, seq, interval, step_timeout, &tx);
+                    fan_out(&velo, &store, registrations, seq, &settings, &tx);
                 }
                 Some(outcome) = rx.recv() => {
                     handle_outcome(outcome, store.as_ref(), &mut failures, max_failures, step_timeout).await;
@@ -136,10 +150,15 @@ fn fan_out(
     store: &Arc<dyn HubStore>,
     registrations: Vec<StoredPeer>,
     seq: u64,
-    interval: Duration,
-    step_timeout: Duration,
+    settings: &Settings,
     tx: &mpsc::UnboundedSender<ProbeOutcome>,
 ) {
+    let Settings {
+        hub_id,
+        interval,
+        step_timeout,
+        ..
+    } = *settings;
     for stored in registrations {
         // Pinned entries are the hub's own; it does not probe itself.
         if stored.pinned {
@@ -155,7 +174,7 @@ fn fan_out(
                 let velo = velo
                     .upgrade()
                     .ok_or_else(|| anyhow::anyhow!("hub velo is gone"))?;
-                probe(&velo, id, seq, interval).await
+                probe(&velo, id, seq, Some(hub_id), interval).await
             };
             let outcome = match probe.await {
                 // The registrant holds no registration with this hub (its
@@ -198,11 +217,12 @@ pub(crate) async fn probe(
     velo: &velo::Velo,
     id: InstanceId,
     seq: u64,
+    hub_id: Option<HubId>,
     deadline: Duration,
 ) -> anyhow::Result<HeartbeatAck> {
     let send = velo
         .typed_unary(HEARTBEAT_HANDLER)?
-        .payload(&HeartbeatRequest { seq })?
+        .payload(&HeartbeatRequest { seq, hub_id })?
         .instance(id)
         .send();
     tokio::time::timeout(deadline, send)

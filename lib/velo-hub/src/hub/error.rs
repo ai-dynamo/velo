@@ -69,6 +69,7 @@ impl From<AuthorityError> for HubError {
             AuthorityError::Busy { .. } => ErrorCode::Busy,
             AuthorityError::NotFound { .. } => ErrorCode::NotFound,
             AuthorityError::StateChanged { .. } => ErrorCode::RegisterAgain,
+            AuthorityError::Recovered { .. } => ErrorCode::Recovered,
             AuthorityError::Unavailable => ErrorCode::Unavailable,
         };
         Self::new(code, error.to_string())

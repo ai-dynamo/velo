@@ -76,7 +76,11 @@ pub struct EtcdStoreBuilder {
     custody_ttl: Duration,
     lock_ttl: Duration,
     request_deadline: Duration,
+    wait_for_prefix: Duration,
 }
+
+/// Pause between attempts while another store holds the prefix.
+const PREFIX_RETRY: Duration = Duration::from_millis(250);
 
 impl std::fmt::Debug for EtcdStoreBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -107,6 +111,7 @@ impl EtcdStoreBuilder {
             custody_ttl: DEFAULT_CUSTODY_TTL,
             lock_ttl: DEFAULT_LOCK_TTL,
             request_deadline: DEFAULT_REQUEST_DEADLINE,
+            wait_for_prefix: Duration::ZERO,
         }
     }
 
@@ -158,6 +163,16 @@ impl EtcdStoreBuilder {
         self
     }
 
+    /// How long `connect` keeps trying while another store holds the
+    /// prefix (default zero: fail at once with
+    /// [`ConnectError::PrefixHeld`]). After a hub crashed, its lock lives
+    /// one `lock_ttl` more; a hub that restarts in its place waits that
+    /// long.
+    pub fn wait_for_prefix(mut self, wait: Duration) -> Self {
+        self.wait_for_prefix = wait;
+        self
+    }
+
     fn settings(&self) -> Result<(String, Settings), ConnectError> {
         let invalid = |why: &str| Err(ConnectError::InvalidConfig(why.to_string()));
         let prefix = self.prefix.trim_end_matches('/');
@@ -199,6 +214,18 @@ impl EtcdStoreBuilder {
     /// Connect, take the prefix's lock, delete the pinned entries of hubs
     /// before this one, load the prefix, and start the store's tasks.
     pub async fn connect(self) -> Result<EtcdStore, ConnectError> {
+        let until = tokio::time::Instant::now() + self.wait_for_prefix;
+        loop {
+            match self.connect_once().await {
+                Err(ConnectError::PrefixHeld { .. }) if tokio::time::Instant::now() < until => {
+                    tokio::time::sleep(PREFIX_RETRY).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn connect_once(&self) -> Result<EtcdStore, ConnectError> {
         let (prefix, settings) = self.settings()?;
         let deadline = settings.request_deadline;
         let options = self

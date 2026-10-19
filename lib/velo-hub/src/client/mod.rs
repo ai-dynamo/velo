@@ -344,9 +344,13 @@ impl State {
 /// What the client's handles share: the registration and what the
 /// heartbeat handler records. The heartbeat handler and [`ExtClient`] hold
 /// it weakly, so neither keeps the registration alive.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Shared {
     state: parking_lot::Mutex<State>,
+    /// Set when a heartbeat comes from a hub other than the one that
+    /// answered the registration: the hub restarted. Cleared by the next
+    /// successful registration.
+    recovered: tokio::sync::watch::Sender<bool>,
     /// The services this client serves, one guard each.
     serving: parking_lot::Mutex<BTreeSet<String>>,
     /// The services the hub holds for the registration, as far as the
@@ -360,6 +364,20 @@ struct Shared {
     unsettled: parking_lot::Mutex<BTreeSet<String>>,
     seq: AtomicU64,
     at_unix_ms: AtomicU64,
+}
+
+impl Default for Shared {
+    fn default() -> Self {
+        Self {
+            state: parking_lot::Mutex::default(),
+            recovered: tokio::sync::watch::Sender::new(false),
+            serving: parking_lot::Mutex::default(),
+            confirmed: parking_lot::Mutex::default(),
+            unsettled: parking_lot::Mutex::default(),
+            seq: AtomicU64::default(),
+            at_unix_ms: AtomicU64::default(),
+        }
+    }
 }
 
 impl Shared {
@@ -402,6 +420,11 @@ impl Shared {
         let (_, credential) = self.credential().ok_or(ClientError::NotRegistered)?;
         let answer = endpoints.call(method, url, Some(&credential), body).await;
         if let Err(error) = &answer {
+            // The hub restarted and holds this registration from before:
+            // not a rejection; the app registers again with the credential.
+            if error.code() == Some(ErrorCode::Recovered) {
+                self.recovered.send_replace(true);
+            }
             let dead = match route {
                 Route::Core => owns_nothing(error),
                 Route::Extension => credential_rejected(error),
@@ -664,6 +687,7 @@ impl HubClient {
                     state.orphaned = false;
                     *shared.confirmed.lock() = serving;
                     shared.unsettled.lock().clear();
+                    shared.recovered.send_replace(false);
                     response
                 }
                 Err(error) => {
@@ -744,6 +768,17 @@ impl HubClient {
         Ok(())
     }
 
+    /// Whether the hub restarted since this client registered: a heartbeat
+    /// came from another hub id. The hub then holds the registration from
+    /// before the restart, and its routes answer `recovered`; call
+    /// [`register`](Self::register) again, which presents the credential,
+    /// starts a new epoch on the new hub and puts the services back. The
+    /// flag clears when a registration succeeds. Await a change with the
+    /// receiver's `changed`.
+    pub fn recovered(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.inner.shared.recovered.subscribe()
+    }
+
     /// The last hub heartbeat the handler installed by
     /// [`register`](Self::register) answered: its sequence number and when
     /// it arrived. `None` before the first.
@@ -796,7 +831,19 @@ fn heartbeat_handler(shared: Weak<Shared>) -> Handler {
                     .map_or(1, |since| since.as_millis().max(1) as u64);
                 shared.seq.store(seq, Ordering::Release);
                 shared.at_unix_ms.store(now, Ordering::Release);
-                let ok = shared.state.lock().answer_ok();
+                let (ok, restarted) = {
+                    let state = shared.state.lock();
+                    let restarted = matches!(
+                        (&state.response, ctx.input.hub_id),
+                        (Some(response), Some(hub)) if response.hub_id != hub
+                    );
+                    (state.answer_ok(), restarted)
+                };
+                // Still ok: the hub holds the registration from before the
+                // restart, and the app re-registers with its credential.
+                if restarted {
+                    shared.recovered.send_replace(true);
+                }
                 Ok(HeartbeatAck { seq, ok })
             }
         },

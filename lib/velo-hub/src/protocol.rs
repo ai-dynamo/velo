@@ -301,6 +301,8 @@ pub struct RegisterResponse {
     pub credential: Credential,
     /// This registration's epoch.
     pub epoch: RegistrationEpoch,
+    /// The hub that answered. Its heartbeat probes carry the same id.
+    pub hub_id: HubId,
 }
 
 /// Body of a successful peer lookup.
@@ -375,6 +377,11 @@ pub struct HubDescriptor {
 pub struct HeartbeatRequest {
     /// Sequence number, echoed in the ack.
     pub seq: u64,
+    /// The probing hub. A registrant that registered with another hub id
+    /// learns from it that the hub restarted, and registers again
+    /// presenting its credential.
+    #[serde(default)]
+    pub hub_id: Option<HubId>,
 }
 
 /// A registrant's answer to a [`HeartbeatRequest`].
@@ -445,6 +452,11 @@ pub enum ErrorCode {
     /// hub removed it, including the previous registration. Register again
     /// without a credential.
     RegisterAgain,
+    /// 409: the hub restarted and holds this instance's registration from
+    /// before, which the presented credential may own. Register again
+    /// presenting the credential: the hub checks it against the stored
+    /// record and starts a new epoch.
+    Recovered,
     /// 503: the hub is starting, stopping, overloaded, or its store has
     /// lost continuity. Retry later.
     Unavailable,
@@ -463,7 +475,9 @@ impl ErrorCode {
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::NotFound => StatusCode::NOT_FOUND,
             Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
-            Self::Conflict | Self::Busy | Self::RegisterAgain => StatusCode::CONFLICT,
+            Self::Conflict | Self::Busy | Self::RegisterAgain | Self::Recovered => {
+                StatusCode::CONFLICT
+            }
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::BadGateway => StatusCode::BAD_GATEWAY,
             Self::Internal => StatusCode::INTERNAL_SERVER_ERROR,
@@ -527,9 +541,14 @@ mod tests {
 
     #[test]
     fn heartbeat_messages_round_trip() {
-        let request: HeartbeatRequest =
-            serde_json::from_str(&serde_json::to_string(&HeartbeatRequest { seq: 99 }).unwrap())
-                .unwrap();
+        let request: HeartbeatRequest = serde_json::from_str(
+            &serde_json::to_string(&HeartbeatRequest {
+                seq: 99,
+                hub_id: None,
+            })
+            .unwrap(),
+        )
+        .unwrap();
         assert_eq!(request.seq, 99);
         let ack: HeartbeatAck = serde_json::from_str(
             &serde_json::to_string(&HeartbeatAck { seq: 7, ok: true }).unwrap(),

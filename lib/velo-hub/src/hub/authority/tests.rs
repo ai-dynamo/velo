@@ -45,7 +45,7 @@ fn register(
     value: u64,
 ) -> Credential {
     let permit = authority
-        .begin_registration(peer.instance_id(), presented)
+        .begin_registration(peer.instance_id(), presented, None)
         .unwrap();
     authority.record_write(&permit, incarnation(value)).unwrap();
     authority
@@ -61,7 +61,7 @@ fn reserved_registry_occupant_cannot_begin_client_registration() {
     authority.synchronize_reservations(&[stored(&peer, 1)]);
 
     assert!(matches!(
-        authority.begin_registration(peer.instance_id(), None),
+        authority.begin_registration(peer.instance_id(), None, None),
         Err(AuthorityError::Unauthorized { .. })
     ));
 }
@@ -78,7 +78,7 @@ fn removal_before_startup_snapshot_sync_does_not_leave_phantom_reservation() {
     authority.synchronize_reservations(&[stored(&peer, 1)]);
 
     authority
-        .begin_registration(peer.instance_id(), None)
+        .begin_registration(peer.instance_id(), None, None)
         .expect("a removal delivered before snapshot sync must suppress that stale reservation");
 }
 
@@ -111,7 +111,7 @@ fn removal_of_attempted_incarnation_prevents_registration_commit() {
     let authority = Authority::default();
     let peer = make_peer();
     let permit = authority
-        .begin_registration(peer.instance_id(), None)
+        .begin_registration(peer.instance_id(), None, None)
         .unwrap();
     authority.record_write(&permit, incarnation(1)).unwrap();
 
@@ -127,7 +127,7 @@ fn removal_of_attempted_incarnation_prevents_registration_commit() {
     ));
     authority.fail_closed_registration(permit, None).unwrap();
     authority
-        .begin_registration(peer.instance_id(), None)
+        .begin_registration(peer.instance_id(), None, None)
         .expect("a failed-closed owner registers afresh");
 }
 
@@ -136,7 +136,7 @@ fn fail_closed_rollback_reserves_a_registry_entry_that_could_not_be_removed() {
     let authority = Authority::default();
     let peer = make_peer();
     let permit = authority
-        .begin_registration(peer.instance_id(), None)
+        .begin_registration(peer.instance_id(), None, None)
         .unwrap();
     authority.record_write(&permit, incarnation(7)).unwrap();
 
@@ -145,7 +145,7 @@ fn fail_closed_rollback_reserves_a_registry_entry_that_could_not_be_removed() {
         .unwrap();
 
     assert!(matches!(
-        authority.begin_registration(peer.instance_id(), None),
+        authority.begin_registration(peer.instance_id(), None, None),
         Err(AuthorityError::Unauthorized { .. })
     ));
 }
@@ -161,13 +161,13 @@ fn replacement_is_busy_until_matching_removal_cleanup_finishes() {
         RevocationAction::Cleanup
     );
     assert!(matches!(
-        authority.begin_registration(peer.instance_id(), None),
+        authority.begin_registration(peer.instance_id(), None, None),
         Err(AuthorityError::Busy { .. })
     ));
 
     authority.finish_revocation(removal(&peer, 1));
     authority
-        .begin_registration(peer.instance_id(), None)
+        .begin_registration(peer.instance_id(), None, None)
         .expect("a fresh lifecycle may begin only after cleanup completes");
 }
 
@@ -184,7 +184,7 @@ fn abort_restores_the_prior_registration_unless_it_was_removed() {
     let credential = register(&authority, &peer, None, 1);
 
     let permit = authority
-        .begin_registration(owner, Some(&credential))
+        .begin_registration(owner, Some(&credential), None)
         .unwrap();
     assert_eq!(permit.previous().unwrap().incarnation, incarnation(1));
     assert_eq!(
@@ -200,7 +200,7 @@ fn abort_restores_the_prior_registration_unless_it_was_removed() {
     );
 
     let permit = authority
-        .begin_registration(owner, Some(&credential))
+        .begin_registration(owner, Some(&credential), None)
         .unwrap();
     assert_eq!(
         authority.begin_revocation(removal(&peer, 1)),
@@ -224,7 +224,7 @@ fn authorize_is_busy_mid_registration() {
     let peer = make_peer();
     let credential = register(&authority, &peer, None, 1);
     let _permit = authority
-        .begin_registration(peer.instance_id(), Some(&credential))
+        .begin_registration(peer.instance_id(), Some(&credential), None)
         .unwrap();
     assert!(matches!(
         authority.authorize(peer.instance_id(), Some(&credential)),
@@ -247,7 +247,7 @@ fn authority_fails_closed_while_the_store_is_not_live() {
             Err(AuthorityError::Unavailable)
         );
         assert!(matches!(
-            authority.begin_registration(peer.instance_id(), Some(&credential)),
+            authority.begin_registration(peer.instance_id(), Some(&credential), None),
             Err(AuthorityError::Unavailable)
         ));
         assert!(matches!(
@@ -330,6 +330,6 @@ fn any_removal_of_a_reserved_owner_clears_the_reservation() {
         RevocationAction::Ignore
     );
     authority
-        .begin_registration(peer.instance_id(), None)
+        .begin_registration(peer.instance_id(), None, None)
         .expect("the reservation must go with the entry");
 }
