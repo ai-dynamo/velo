@@ -970,3 +970,215 @@ async fn a_hung_pinned_removal_does_not_hang_shutdown() {
         .expect("shutdown hung on the pinned entry's removal");
     assert!(outcome.is_err(), "the unresolved removal is reported");
 }
+
+// ---- extension failures in startup and shutdown -----------------------------
+
+#[derive(Clone, Copy, PartialEq)]
+enum Misbehave {
+    None,
+    PanicInShutdown,
+    HangInShutdown,
+    PanicInStart,
+    PanicInRoutes,
+}
+
+/// An extension that misbehaves in one place, and a witness that records
+/// its own shutdown.
+struct Unruly {
+    how: Misbehave,
+}
+
+impl Extension for Unruly {
+    const NAME: &'static str = "unruly";
+    type Registration = ();
+    type Staged = ();
+
+    async fn start(&self, _ctx: &StartContext<'_>) -> anyhow::Result<()> {
+        if self.how == Misbehave::PanicInStart {
+            panic!("injected start panic");
+        }
+        Ok(())
+    }
+
+    async fn shutdown(&self) {
+        match self.how {
+            Misbehave::PanicInShutdown => panic!("injected shutdown panic"),
+            Misbehave::HangInShutdown => std::future::pending::<()>().await,
+            _ => {}
+        }
+    }
+
+    fn public_routes(self: Arc<Self>) -> Router {
+        if self.how == Misbehave::PanicInRoutes {
+            // axum rejects the old capture syntax with a panic.
+            return Router::new().route("/a/:id", get(|| async { "x" }));
+        }
+        Router::new()
+    }
+
+    async fn prepare(&self, _txn: &Txn<'_>, _payload: Option<()>) -> Result<(), Rejection> {
+        Ok(())
+    }
+
+    fn commit(&self, _staged: (), _registration: &Committed<'_>) {}
+
+    fn on_removed(&self, _removal: Removal) {}
+}
+
+struct Witness {
+    log: Log,
+}
+
+impl Extension for Witness {
+    const NAME: &'static str = "witness";
+    type Registration = ();
+    type Staged = ();
+
+    async fn shutdown(&self) {
+        self.log.lock().push("shutdown witness".to_string());
+    }
+
+    async fn prepare(&self, _txn: &Txn<'_>, _payload: Option<()>) -> Result<(), Rejection> {
+        Ok(())
+    }
+
+    fn commit(&self, _staged: (), _registration: &Committed<'_>) {}
+
+    fn on_removed(&self, _removal: Removal) {}
+}
+
+fn unruly_builder(store: &Arc<FaultStore>, log: &Log, how: Misbehave) -> velo_hub::HubBuilder {
+    let mut config = config();
+    config.server.shutdown_timeout = Duration::from_millis(300);
+    Hub::builder(config)
+        .store(store.clone())
+        .velo(velo_builder())
+        .extension(Witness {
+            log: Arc::clone(log),
+        })
+        .extension(Unruly { how })
+}
+
+/// What a finished stop leaves: ports free, no pinned entry, the witness
+/// shut down.
+fn assert_fully_stopped(hub: &Hub, store: &FaultStore, log: &Log) {
+    for addr in [hub.public_addr(), hub.control_addr()] {
+        std::net::TcpListener::bind(addr)
+            .unwrap_or_else(|error| panic!("{addr} still bound: {error}"));
+    }
+    assert!(store.list().is_empty(), "the pinned entry is gone");
+    assert!(
+        log.lock().iter().any(|event| event == "shutdown witness"),
+        "the witness shut down"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicking_extension_shutdown_does_not_leave_the_hub_half_stopped() {
+    let (store, log) = (Arc::new(FaultStore::default()), Log::default());
+    let hub = unruly_builder(&store, &log, Misbehave::PanicInShutdown)
+        .serve()
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), hub.shutdown())
+        .await
+        .expect("shutdown hung");
+    assert_fully_stopped(&hub, &store, &log);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_extension_shutdown_is_bounded() {
+    let (store, log) = (Arc::new(FaultStore::default()), Log::default());
+    let hub = unruly_builder(&store, &log, Misbehave::HangInShutdown)
+        .serve()
+        .await
+        .unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(5), hub.shutdown())
+        .await
+        .expect("shutdown hung");
+    assert_fully_stopped(&hub, &store, &log);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_in_start_unwinds_like_an_error() {
+    let (store, log) = (Arc::new(FaultStore::default()), Log::default());
+    assert!(
+        unruly_builder(&store, &log, Misbehave::PanicInStart)
+            .serve()
+            .await
+            .is_err()
+    );
+    assert!(store.list().is_empty(), "the pinned entry is removed");
+    assert!(log.lock().iter().any(|event| event == "shutdown witness"));
+    builder()
+        .store(store.clone())
+        .serve()
+        .await
+        .expect("the store is reusable");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_while_building_routes_unwinds_and_leaves_the_store_reusable() {
+    let (store, log) = (Arc::new(FaultStore::default()), Log::default());
+    assert!(
+        unruly_builder(&store, &log, Misbehave::PanicInRoutes)
+            .serve()
+            .await
+            .is_err()
+    );
+    assert!(store.list().is_empty(), "the pinned entry is removed");
+    assert!(log.lock().iter().any(|event| event == "shutdown witness"));
+    builder()
+        .store(store.clone())
+        .serve()
+        .await
+        .expect("the removal hook was not consumed");
+}
+
+/// Dropping the last `Hub` on a thread outside the runtime still stops it
+/// in order, on the runtime that served it.
+#[test]
+fn dropping_the_hub_off_the_runtime_still_stops_it_in_order() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (store, log) = (Arc::new(FaultStore::default()), Log::default());
+    let hub = runtime
+        .block_on(unruly_builder(&store, &log, Misbehave::None).serve())
+        .unwrap();
+    assert!(tokio::runtime::Handle::try_current().is_err());
+    drop(hub);
+    let stopped = runtime.block_on(eventually(Duration::from_secs(3), || {
+        store.list().is_empty() && log.lock().iter().any(|event| event == "shutdown witness")
+    }));
+    assert!(
+        stopped,
+        "entries: {}, log: {:?}",
+        store.list().len(),
+        log.lock()
+    );
+}
+
+#[tokio::test]
+async fn zero_intervals_are_rejected_before_binding() {
+    for field in [
+        "heartbeat_interval",
+        "prune_interval",
+        "step_timeout",
+        "lock_timeout",
+        "shutdown_timeout",
+    ] {
+        let mut config = config();
+        match field {
+            "heartbeat_interval" => config.server.heartbeat_interval = Duration::ZERO,
+            "prune_interval" => config.server.prune_interval = Duration::ZERO,
+            "step_timeout" => config.server.step_timeout = Duration::ZERO,
+            "lock_timeout" => config.server.lock_timeout = Duration::ZERO,
+            _ => config.server.shutdown_timeout = Duration::ZERO,
+        }
+        let error = Hub::builder(config).serve().await.unwrap_err();
+        assert!(format!("{error:#}").contains(field), "{field}: {error:#}");
+    }
+}

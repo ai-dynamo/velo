@@ -110,6 +110,24 @@ impl ServerConfig {
     }
 }
 
+impl ServerConfig {
+    /// Refuse values that would make a hub task panic or every step expire.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        for (field, value) in [
+            ("heartbeat_interval_ms", self.heartbeat_interval),
+            ("prune_interval_ms", self.prune_interval),
+            ("lock_timeout_ms", self.lock_timeout),
+            ("step_timeout_ms", self.step_timeout),
+            ("shutdown_timeout_ms", self.shutdown_timeout),
+        ] {
+            if value.is_zero() {
+                anyhow::bail!("server.{field} must be more than 0");
+            }
+        }
+        Ok(())
+    }
+}
+
 mod millis {
     use std::time::Duration;
 

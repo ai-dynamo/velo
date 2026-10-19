@@ -172,6 +172,7 @@ impl HubBuilder {
         let server = config.server.clone();
 
         // 1. Graph and config, before any I/O.
+        server.validate()?;
         let extensions = graph::plan(bundles, direct, &config.bundles)?;
 
         // 2. Listeners.
@@ -257,7 +258,7 @@ impl HubBuilder {
                 attached: &attached,
                 services: &services,
             };
-            if let Err(error) = extension.attach(&ctx).await {
+            if let Err(error) = caught(extension.attach(&ctx)).await {
                 let error = error.context(format!("attaching extension {:?}", extension.name()));
                 return Err(unwind.run(error).await);
             }
@@ -277,19 +278,50 @@ impl HubBuilder {
                 public_addr,
                 control_addr,
             };
-            if let Err(error) = extension.start(&ctx).await {
+            if let Err(error) = caught(extension.start(&ctx)).await {
                 let error = error.context(format!("starting extension {:?}", extension.name()));
                 return Err(unwind.run(error).await);
             }
         }
+
+        // The shared state and both routers, before the hook: building a
+        // router runs extension code (`public_routes`, `control_routes`)
+        // that can panic, and nothing after the hook may fail.
+        let (jobs, job_queue) = mpsc::unbounded_channel();
+        let shared = Arc::new(Shared {
+            hub_id: services.hub_id,
+            config: server.clone(),
+            store: Arc::clone(&store),
+            authority: authority.clone(),
+            velo: unwind.velo.clone(),
+            by_name: attached,
+            extensions,
+            lock: tokio::sync::Mutex::new(()),
+            admission: AtomicBool::new(false),
+            jobs: jobs.clone(),
+        });
+        let request_cancel = CancellationToken::new();
+        let routers = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            (
+                routes::public_router(&shared, &request_cancel),
+                routes::control_router(&shared, &request_cancel),
+            )
+        }));
+        let (public_routes, control_routes) = match routers {
+            Ok(routers) => routers,
+            Err(panic) => {
+                let error =
+                    anyhow::anyhow!("building the routes panicked: {}", panic_message(&panic));
+                return Err(unwind.run(error).await);
+            }
+        };
 
         // 7. The removal hook: irreversible, so last. Its queue exists
         //    before the hook so no removal between here and the lifecycle
         //    task's spawn is lost.
         let mut continuity = store.continuity();
         authority.set_continuity(*continuity.borrow_and_update());
-        let (jobs, job_queue) = mpsc::unbounded_channel();
-        match store.install_removal_hook(lifecycle::removal_hook(authority.clone(), jobs.clone())) {
+        match store.install_removal_hook(lifecycle::removal_hook(authority.clone(), jobs)) {
             Ok(snapshot) => authority.synchronize_reservations(&snapshot),
             Err(error) => {
                 return Err(unwind
@@ -299,23 +331,10 @@ impl HubBuilder {
         }
 
         // 8. Serve.
-        let Unwind { velo, pinned, .. } = unwind;
-        let shared = Arc::new(Shared {
-            hub_id: services.hub_id,
-            config: server.clone(),
-            store: Arc::clone(&store),
-            authority: authority.clone(),
-            velo,
-            by_name: attached,
-            extensions,
-            lock: tokio::sync::Mutex::new(()),
-            admission: AtomicBool::new(false),
-            jobs,
-        });
+        let Unwind { pinned, .. } = unwind;
         let core_cancel = CancellationToken::new();
         let lifecycle_cancel = CancellationToken::new();
         let http_cancel = CancellationToken::new();
-        let request_cancel = CancellationToken::new();
         let mut tasks = Vec::new();
         tasks.push(tokio::spawn({
             let authority = authority.clone();
@@ -356,22 +375,15 @@ impl HubBuilder {
             lifecycle_cancel.clone(),
         ));
         let servers = vec![
-            spawn_server(
-                public,
-                routes::public_router(&shared, &request_cancel),
-                http_cancel.clone(),
-            ),
-            spawn_server(
-                control,
-                routes::control_router(&shared, &request_cancel),
-                http_cancel.clone(),
-            ),
+            spawn_server(public, public_routes, http_cancel.clone()),
+            spawn_server(control, control_routes, http_cancel.clone()),
         ];
         shared.admission.store(true, Ordering::Release);
         tracing::info!(%public_addr, %control_addr, hub_id = %shared.hub_id, "hub serving");
 
         Ok(Hub {
             inner: Arc::new(HubInner {
+                runtime: tokio::runtime::Handle::current(),
                 shared,
                 public_addr,
                 control_addr,
@@ -405,11 +417,22 @@ impl Unwind {
     async fn run(self, error: anyhow::Error) -> anyhow::Error {
         self.cancel.cancel();
         for extension in self.attached.iter().rev() {
-            extension.shutdown().await;
+            shutdown_extension(extension.as_ref(), self.shutdown_timeout).await;
         }
         let mut error = error;
         if let Some((id, incarnation)) = self.pinned
-            && let Err(cleanup) = remove_pinned(self.store.as_ref(), id, incarnation).await
+            && let Err(cleanup) = match tokio::time::timeout(
+                self.shutdown_timeout,
+                remove_pinned(self.store.as_ref(), id, incarnation),
+            )
+            .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(StoreError::Indeterminate(format!(
+                    "did not complete within {:?}",
+                    self.shutdown_timeout
+                ))),
+            }
         {
             error = error.context(format!(
                 "and removing the hub's own entry failed: {cleanup}"
@@ -431,6 +454,49 @@ async fn remove_pinned(
     match store.remove(id, incarnation).await {
         Ok(()) | Err(StoreError::NotFound(_) | StoreError::Stale { .. }) => Ok(()),
         Err(error) => Err(error),
+    }
+}
+
+/// Run `future`, turning a panic into an error, so a panicking extension
+/// hook takes the same unwind path as one that returned an error.
+async fn caught<T>(
+    future: impl std::future::Future<Output = anyhow::Result<T>>,
+) -> anyhow::Result<T> {
+    use futures::FutureExt;
+    match std::panic::AssertUnwindSafe(future).catch_unwind().await {
+        Ok(result) => result,
+        Err(panic) => Err(anyhow::anyhow!("panicked: {}", panic_message(&panic))),
+    }
+}
+
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    panic
+        .downcast_ref::<&str>()
+        .map(|text| text.to_string())
+        .or_else(|| panic.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "a non-text panic".to_string())
+}
+
+/// One extension's `shutdown`, under `within` and with its panic caught: a
+/// misbehaving extension must not stop the rest of the shutdown.
+async fn shutdown_extension(extension: &dyn DynExtension, within: std::time::Duration) {
+    use futures::FutureExt;
+    match tokio::time::timeout(
+        within,
+        std::panic::AssertUnwindSafe(extension.shutdown()).catch_unwind(),
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(panic)) => tracing::error!(
+            extension = extension.name(),
+            "shutdown panicked: {}",
+            panic_message(&panic)
+        ),
+        Err(_) => tracing::error!(
+            extension = extension.name(),
+            "shutdown did not finish within {within:?}"
+        ),
     }
 }
 
@@ -485,6 +551,9 @@ enum Stage {
 
 struct HubInner {
     shared: Arc<Shared>,
+    /// The runtime that served the hub, so a drop on any thread can still
+    /// run the ordered stop there.
+    runtime: tokio::runtime::Handle,
     public_addr: SocketAddr,
     control_addr: SocketAddr,
     stage: tokio::sync::Mutex<Stage>,
@@ -535,7 +604,7 @@ async fn stop(shared: &Shared, running: Running) -> anyhow::Result<()> {
         }
     }
     for extension in shared.extensions.iter().rev() {
-        extension.shutdown().await;
+        shutdown_extension(extension.as_ref(), config.shutdown_timeout).await;
     }
     running.core_cancel.cancel();
     // Each core task stops at its next await once cancelled; the bound only
@@ -590,8 +659,8 @@ async fn stop(shared: &Shared, running: Running) -> anyhow::Result<()> {
 /// A running hub. Cheap to clone; every clone is the same hub.
 ///
 /// Call [`shutdown`](Self::shutdown) to stop it in order. Dropping the last
-/// clone without it runs the same stop in the background (with no runtime
-/// left, it only cancels the hub's tasks).
+/// clone without it runs the same stop in the background, on the runtime
+/// that served the hub.
 #[derive(Clone)]
 pub struct Hub {
     inner: Arc<HubInner>,
@@ -689,25 +758,11 @@ impl Drop for HubInner {
         let Stage::Running(_) = self.stage.get_mut() else {
             return;
         };
-        match tokio::runtime::Handle::try_current() {
-            // The same ordered stop as `shutdown`, in the background.
-            Ok(runtime) => {
-                let _ = HubInner::begin_stop(self.stage.get_mut(), &self.shared, &runtime);
-            }
-            // No runtime to stop on: cancel everything at once.
-            Err(_) => {
-                if let Stage::Running(running) = std::mem::replace(
-                    self.stage.get_mut(),
-                    Stage::Stopping(tokio::sync::watch::channel(None).1),
-                ) {
-                    self.shared.admission.store(false, Ordering::Release);
-                    running.extension_cancel.cancel();
-                    running.lifecycle_cancel.cancel();
-                    running.core_cancel.cancel();
-                    running.http_cancel.cancel();
-                    running.request_cancel.cancel();
-                }
-            }
-        }
+        // The same ordered stop as `shutdown`, in the background, on the
+        // runtime that served the hub, whichever thread drops it. If that
+        // runtime has shut down, the spawn does nothing, and its tasks,
+        // which this would stop, are gone already.
+        let runtime = self.runtime.clone();
+        let _ = HubInner::begin_stop(self.stage.get_mut(), &self.shared, &runtime);
     }
 }
