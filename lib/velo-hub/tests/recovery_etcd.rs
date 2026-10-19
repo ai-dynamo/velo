@@ -22,14 +22,6 @@ fn etcd_url() -> String {
     std::env::var("ETCD_URL").unwrap_or_else(|_| "http://127.0.0.1:2379".into())
 }
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
-}
-
 async fn hub_on(prefix: &str, ports: (u16, u16)) -> Hub {
     let store = EtcdStore::builder([etcd_url()])
         .prefix(prefix)
@@ -47,6 +39,10 @@ async fn hub_on(prefix: &str, ports: (u16, u16)) -> Hub {
         .serve()
         .await
         .expect("start hub")
+}
+
+fn ports_of(hub: &Hub) -> (u16, u16) {
+    (hub.public_addr().port(), hub.control_addr().port())
 }
 
 fn client_for(ports: (u16, u16)) -> HubClient {
@@ -67,9 +63,10 @@ fn client_for(ports: (u16, u16)) -> HubClient {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_hub_lets_its_registrant_back_in() {
     let prefix = format!("/velo-hub-test/{}", uuid::Uuid::new_v4());
-    let ports = (free_port(), free_port());
-
-    let hub_a = hub_on(&prefix, ports).await;
+    // The first hub picks its ports and a restart reuses them: two
+    // probe-and-release picks can return the same port.
+    let hub_a = hub_on(&prefix, (0, 0)).await;
+    let ports = ports_of(&hub_a);
     let client = client_for(ports);
     let velo = client
         .velo_builder()
@@ -131,8 +128,10 @@ async fn a_restarted_hub_lets_its_registrant_back_in() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_restarted_hub_refuses_a_credential_the_record_does_not_hold() {
     let prefix = format!("/velo-hub-test/{}", uuid::Uuid::new_v4());
-    let ports = (free_port(), free_port());
-    let hub_a = hub_on(&prefix, ports).await;
+    // The first hub picks its ports and a restart reuses them: two
+    // probe-and-release picks can return the same port.
+    let hub_a = hub_on(&prefix, (0, 0)).await;
+    let ports = ports_of(&hub_a);
     let peer = make_peer_for_velo().await;
     let first = register(&hub_a, &request(&peer), None).await;
     let second = register(&hub_a, &request(&peer), Some(&first.credential)).await;
@@ -170,8 +169,8 @@ async fn make_peer_for_velo() -> velo_hub::velo::PeerInfo {
 async fn a_fenced_hub_stops_itself() {
     use velo_hub::store::etcd::etcd_client::Client;
     let prefix = format!("/velo-hub-test/{}", uuid::Uuid::new_v4());
-    let ports = (free_port(), free_port());
-    let hub = hub_on(&prefix, ports).await;
+    let hub = hub_on(&prefix, (0, 0)).await;
+    let ports = ports_of(&hub);
     let mut etcd = Client::connect([etcd_url()], None).await.unwrap();
     let lock = etcd.get(format!("{prefix}/hub"), None).await.unwrap();
     let lease = lock.kvs().first().expect("the hub holds its lock").lease();
@@ -197,8 +196,10 @@ async fn a_fenced_hub_stops_itself() {
 async fn a_recovered_peer_is_forgotten_in_velo_when_its_entry_goes() {
     use velo_hub::store::etcd::etcd_client::Client;
     let prefix = format!("/velo-hub-test/{}", uuid::Uuid::new_v4());
-    let ports = (free_port(), free_port());
-    let hub_a = hub_on(&prefix, ports).await;
+    // The first hub picks its ports and a restart reuses them: two
+    // probe-and-release picks can return the same port.
+    let hub_a = hub_on(&prefix, (0, 0)).await;
+    let ports = ports_of(&hub_a);
     let peer = make_peer_for_velo().await;
     let owner = peer.instance_id();
     let _ = register(&hub_a, &request(&peer), None).await;
@@ -235,8 +236,7 @@ async fn a_recovered_peer_is_forgotten_in_velo_when_its_entry_goes() {
 async fn a_fenced_hub_stop_reports_ok() {
     use velo_hub::store::etcd::etcd_client::Client;
     let prefix = format!("/velo-hub-test/{}", uuid::Uuid::new_v4());
-    let ports = (free_port(), free_port());
-    let hub = hub_on(&prefix, ports).await;
+    let hub = hub_on(&prefix, (0, 0)).await;
     let mut etcd = Client::connect([etcd_url()], None).await.unwrap();
     let lock = etcd.get(format!("{prefix}/hub"), None).await.unwrap();
     let lease = lock.kvs().first().expect("the hub holds its lock").lease();
