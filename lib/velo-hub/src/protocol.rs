@@ -452,6 +452,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!((ack.seq, ack.ok), (7, true));
+        assert_eq!(HeartbeatRequest::default().seq, 0);
+        assert_eq!(HeartbeatAck::default().seq, 0);
         assert!(!HeartbeatAck::default().ok);
     }
 
