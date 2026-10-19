@@ -629,3 +629,52 @@ async fn reaper_eviction_reaches_extensions_and_clears_the_credential() {
         "TTL eviction must also remove the credential"
     );
 }
+
+// ---- every error is an ErrorBody ------------------------------------------
+
+/// A client acts on `ErrorBody.code`, so every failure the hub answers,
+/// including a body or path axum cannot parse and a route that does not
+/// exist, must be one. axum's own rejections are plain text.
+#[tokio::test]
+async fn malformed_requests_and_unknown_routes_answer_with_an_error_body() {
+    let hub = start().await;
+    let cases = [
+        http()
+            .post(control(&hub, paths::INSTANCES))
+            .header("content-type", "application/json")
+            .body("{not json"),
+        http()
+            .post(control(&hub, paths::INSTANCES))
+            .header("content-type", "application/json")
+            .body("{}"),
+        http().post(control(&hub, paths::INSTANCES)).body("{}"),
+        http().delete(control(&hub, "/v1/instances/not-a-uuid")),
+        http().get(public(&hub, "/v1/peers/worker/not-a-number")),
+    ];
+    for case in cases {
+        let response = case.send().await.unwrap();
+        assert_eq!(response.status(), 400, "{}", response.url());
+        let body: velo_hub::protocol::ErrorBody = response.json().await.expect("an ErrorBody");
+        assert_eq!(body.code, ErrorCode::BadRequest);
+    }
+    for path in ["/v1/nope", "/v1/ext/nope/x"] {
+        let missing = http().get(public(&hub, path)).send().await.unwrap();
+        assert_eq!(missing.status(), 404);
+        assert_eq!(error_code(missing).await, ErrorCode::NotFound);
+    }
+    let (with_role, _) = start_with_role().await;
+    let under_extension = http()
+        .get(public(&with_role, "/v1/ext/role/nope"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(under_extension.status(), 404);
+    assert_eq!(error_code(under_extension).await, ErrorCode::NotFound);
+    let wrong_method = http()
+        .put(control(&hub, paths::INSTANCES))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong_method.status(), 405);
+    assert_eq!(error_code(wrong_method).await, ErrorCode::MethodNotAllowed);
+}

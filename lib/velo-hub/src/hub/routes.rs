@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use axum::extract::{FromRequestParts, Path, RawPathParams, State};
+use axum::extract::{FromRequest, FromRequestParts, Path, RawPathParams, Request, State};
 use axum::http::{HeaderMap, StatusCode, request::Parts};
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
@@ -81,6 +81,46 @@ impl<S: Send + Sync> FromRequestParts<S> for Authorized {
     }
 }
 
+/// [`axum::Json`] whose rejection is a [`HubError`], so a body the hub
+/// cannot parse still answers with an [`ErrorBody`](crate::protocol::ErrorBody).
+/// Extension routes can use it too.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HubJson<T>(pub T);
+
+impl<T, S> FromRequest<S> for HubJson<T>
+where
+    axum::Json<T>: FromRequest<S, Rejection = axum::extract::rejection::JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = HubError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        axum::Json::<T>::from_request(request, state)
+            .await
+            .map(|axum::Json(value)| Self(value))
+            .map_err(|rejection| HubError::bad_request(rejection.body_text()))
+    }
+}
+
+/// [`axum::extract::Path`] whose rejection is a [`HubError`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HubPath<T>(pub T);
+
+impl<T, S> FromRequestParts<S> for HubPath<T>
+where
+    T: serde::de::DeserializeOwned + Send,
+    S: Send + Sync,
+{
+    type Rejection = HubError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        Path::<T>::from_request_parts(parts, state)
+            .await
+            .map(|Path(value)| Self(value))
+            .map_err(|rejection| HubError::bad_request(rejection.body_text()))
+    }
+}
+
 type HubState = State<Arc<Shared>>;
 
 /// The public listener: discovery and the extensions' public routes.
@@ -124,7 +164,15 @@ fn mount(
             routes(extension.as_ref()),
         );
     }
-    router.layer(Extension(shared.authority.clone()))
+    router
+        .fallback(|| async { HubError::not_found("no such route") })
+        .method_not_allowed_fallback(|| async {
+            HubError::new(
+                protocol::ErrorCode::MethodNotAllowed,
+                "the route does not take this method",
+            )
+        })
+        .layer(Extension(shared.authority.clone()))
 }
 
 async fn health() -> &'static str {
@@ -158,7 +206,7 @@ async fn describe(State(shared): HubState) -> Json<HubDescriptor> {
 
 async fn peer_by_instance(
     State(shared): HubState,
-    Path(id): Path<InstanceId>,
+    HubPath(id): HubPath<InstanceId>,
 ) -> Result<Json<PeerLookupResponse>, HubError> {
     shared
         .store
@@ -173,7 +221,7 @@ async fn peer_by_instance(
 
 async fn peer_by_worker(
     State(shared): HubState,
-    Path(worker): Path<u64>,
+    HubPath(worker): HubPath<u64>,
 ) -> Result<Json<PeerLookupResponse>, HubError> {
     shared
         .store
@@ -201,7 +249,7 @@ async fn list(State(shared): HubState) -> Json<ListInstancesResponse> {
 async fn register(
     State(shared): HubState,
     headers: HeaderMap,
-    Json(request): Json<RegisterRequest>,
+    HubJson(request): HubJson<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, HubError> {
     let presented = credential_from_headers(&headers)?;
     registration::register(shared, presented, request)
@@ -211,7 +259,7 @@ async fn register(
 
 async fn unregister(
     State(shared): HubState,
-    Path(id): Path<InstanceId>,
+    HubPath(id): HubPath<InstanceId>,
     headers: HeaderMap,
 ) -> Result<StatusCode, HubError> {
     let presented = credential_from_headers(&headers)?;
@@ -221,7 +269,7 @@ async fn unregister(
 
 async fn heartbeat(
     State(shared): HubState,
-    Path(id): Path<InstanceId>,
+    HubPath(id): HubPath<InstanceId>,
     headers: HeaderMap,
 ) -> Result<Json<HeartbeatResponse>, HubError> {
     let presented = credential_from_headers(&headers)?;
@@ -243,7 +291,7 @@ async fn heartbeat(
 
 async fn probe(
     State(shared): HubState,
-    Path(id): Path<InstanceId>,
+    HubPath(id): HubPath<InstanceId>,
 ) -> Result<Json<ProbeResponse>, HubError> {
     if !shared.store.contains(id) {
         return Err(HubError::not_found(format!("instance {id} not registered")));

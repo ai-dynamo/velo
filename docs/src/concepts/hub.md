@@ -38,7 +38,7 @@ Extension routes are under `/v1/ext/{name}/` on either listener. The hub checks 
 | `POST /v1/instances/{id}/probe` | the hub sends a heartbeat to the instance over velo |
 | `GET /v1/peers/instance/{id}`, `GET /v1/peers/worker/{id}` | peer discovery |
 
-A successful registration returns a credential and an epoch. The credential goes in the `x-velo-hub-credential` header of every mutation that the registration owns. Each registration gets a new credential and a new epoch, and the previous credential stops working. Every error body has a stable `code`. A client acts on the code: `busy` means retry, and `register_again` means register again without a credential.
+A successful registration returns a credential and an epoch. The credential goes in the `x-velo-hub-credential` header of every mutation that the registration owns. Each registration gets a new credential and a new epoch, and the previous credential stops working. Every error that a core route answers is an `ErrorBody` with a stable `code`, also for a body or a path that the hub cannot parse, and for a route that does not exist. A client acts on the code: `busy` means retry, and `register_again` means register again without a credential. Extension routes get the same behavior when they use the `HubJson`, `HubPath`, and `Authorized` extractors and return `HubError`.
 
 ## Store
 

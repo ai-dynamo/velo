@@ -349,8 +349,11 @@ pub enum ErrorCode {
     BadRequest,
     /// 401: the credential is missing, stale, or another instance's.
     Unauthorized,
-    /// 404: the instance or worker is not registered.
+    /// 404: the instance or worker is not registered, or the route does
+    /// not exist.
     NotFound,
+    /// 405: the route exists, but not for this method.
+    MethodNotAllowed,
     /// 409: the request conflicts with the hub's state, for example a
     /// worker id another instance holds, or an extension's rule. Retrying
     /// the same request does not help.
@@ -379,6 +382,7 @@ impl ErrorCode {
             Self::BadRequest => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::NotFound => StatusCode::NOT_FOUND,
+            Self::MethodNotAllowed => StatusCode::METHOD_NOT_ALLOWED,
             Self::Conflict | Self::Busy | Self::RegisterAgain => StatusCode::CONFLICT,
             Self::Unavailable => StatusCode::SERVICE_UNAVAILABLE,
             Self::BadGateway => StatusCode::BAD_GATEWAY,

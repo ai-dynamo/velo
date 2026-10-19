@@ -57,7 +57,7 @@ pub use context::{AttachContext, StartContext};
 pub use error::HubError;
 pub use extension::{Committed, Extension, RegistrationView, Rejection, Txn};
 pub use graph::{Bundle, BundleInstaller, GraphError};
-pub use routes::{Authorized, credential_from_headers};
+pub use routes::{Authorized, HubJson, HubPath, credential_from_headers};
 
 use context::{Attached, Services};
 use extension::DynExtension;

@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use velo_hub::axum::extract::{Path, State};
+use velo_hub::axum::extract::State;
 use velo_hub::axum::http::StatusCode;
 use velo_hub::axum::routing::{get, post};
 use velo_hub::axum::{Json, Router};
@@ -38,8 +38,8 @@ use velo_hub::store::{Incarnation, Removal};
 use velo_hub::velo::transports::tcp::{TcpTransport, TcpTransportBuilder};
 use velo_hub::velo::{Handler, InstanceId, PeerInfo, Velo, WorkerAddress};
 use velo_hub::{
-    Authorized, Committed, Extension, Hub, HubBuilder, HubConfig, HubError, Rejection,
-    ServerConfig, Txn,
+    Authorized, Committed, Extension, Hub, HubBuilder, HubConfig, HubError, HubJson, HubPath,
+    Rejection, ServerConfig, Txn,
 };
 
 pub fn init_tracing() {
@@ -573,7 +573,7 @@ impl Ledger {
 async fn publish_route(
     State(ledger): State<Arc<Ledger>>,
     auth: Authorized,
-    Json(body): Json<Publish>,
+    HubJson(body): HubJson<Publish>,
 ) -> Result<StatusCode, HubError> {
     let gate = ledger.faults.lock().gate_next_publish.take();
     if let Some(gate) = gate {
@@ -586,14 +586,14 @@ async fn publish_route(
 async fn invalidate_route(
     State(ledger): State<Arc<Ledger>>,
     auth: Authorized,
-    Json(body): Json<Publish>,
+    HubJson(body): HubJson<Publish>,
 ) -> Result<Json<bool>, HubError> {
     ledger.invalidate(auth, &body).map(Json)
 }
 
 async fn query_route(
     State(ledger): State<Arc<Ledger>>,
-    Path((owner, key)): Path<(InstanceId, String)>,
+    HubPath((owner, key)): HubPath<(InstanceId, String)>,
 ) -> Result<Json<Hit>, HubError> {
     ledger
         .query(owner, &key)
