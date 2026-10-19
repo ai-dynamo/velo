@@ -483,6 +483,31 @@ async fn start_with_role() -> (velo_hub::Hub, Arc<Role>) {
     (hub, role)
 }
 
+/// `HubBuilder::extension` takes `impl Into<Arc<E>>`, as
+/// `BundleInstaller::extension` does, so the program can keep an `Arc` to
+/// its extension: the hub runs that same instance, not a copy. An `Arc`
+/// argument needs the type: `Arc<Role>` converts into `Arc<Role>` and
+/// into `Arc<Arc<Role>>`, and inference does not choose between them.
+#[tokio::test]
+async fn the_builder_takes_an_extension_the_caller_keeps() {
+    let role = Arc::new(Role::default());
+    let hub = builder()
+        .extension::<Role>(Arc::clone(&role))
+        .serve()
+        .await
+        .unwrap();
+    let peer = make_peer();
+    register(
+        &hub,
+        &request_with(&peer, &[role_payload(RoleKind::Decode)]),
+        None,
+    )
+    .await;
+    assert_eq!(role.snapshot().decode, [peer.instance_id()]);
+    assert!(Arc::ptr_eq(&role, &hub.extension::<Role>().unwrap()));
+    hub.shutdown().await.unwrap();
+}
+
 /// kvbm: "feature_register_without_manager_rejects". A payload for an
 /// extension the hub does not host is a 400 before anything is written.
 #[tokio::test]

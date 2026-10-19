@@ -163,10 +163,13 @@ impl HubBuilder {
         self
     }
 
-    /// Add one extension directly, without a bundle.
-    pub fn extension<E: Extension>(mut self, extension: E) -> Self {
+    /// Add one extension directly, without a bundle. To keep a handle to
+    /// the instance that the hub runs, pass an `Arc` and name the type:
+    /// `.extension::<E>(arc)`. Without the type, inference cannot choose
+    /// between `E` and `Arc<E>`.
+    pub fn extension<E: Extension>(mut self, extension: impl Into<Arc<E>>) -> Self {
         self.direct
-            .push(PendingExtension::new(Arc::new(extension), HUB_OWNER));
+            .push(PendingExtension::new(extension.into(), HUB_OWNER));
         self
     }
 
