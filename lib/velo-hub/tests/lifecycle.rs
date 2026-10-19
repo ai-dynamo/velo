@@ -739,7 +739,14 @@ async fn shutdown_does_not_wait_forever_for_a_stuck_request() {
         "shutdown took {:?}",
         started.elapsed()
     );
-    drop(probe);
+    // The stuck request itself ends: it does not outlive the hub.
+    let answer = tokio::time::timeout(Duration::from_secs(2), probe)
+        .await
+        .expect("the stuck request outlived shutdown")
+        .unwrap();
+    if let Ok(response) = answer {
+        assert_eq!(response.status(), 503);
+    }
 }
 
 /// The hub's own probe of a peer has a deadline: one heartbeat interval.

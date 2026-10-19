@@ -11,6 +11,8 @@ use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use velo::{InstanceId, WorkerId};
 
+use tokio_util::sync::CancellationToken;
+
 use super::Shared;
 use super::authority::{Authority, Lease};
 use super::error::HubError;
@@ -124,18 +126,18 @@ where
 type HubState = State<Arc<Shared>>;
 
 /// The public listener: discovery and the extensions' public routes.
-pub(crate) fn public_router(shared: &Arc<Shared>) -> Router {
+pub(crate) fn public_router(shared: &Arc<Shared>, stop: &CancellationToken) -> Router {
     let core = Router::new()
         .route(paths::HEALTH, get(health))
         .route(paths::HUB, get(describe))
         .route(paths::PEERS_BY_INSTANCE, get(peer_by_instance))
         .route(paths::PEERS_BY_WORKER, get(peer_by_worker))
         .with_state(Arc::clone(shared));
-    mount(core, shared, |extension| extension.public_routes())
+    mount(core, shared, stop, |extension| extension.public_routes())
 }
 
 /// The control listener: everything public, plus registration.
-pub(crate) fn control_router(shared: &Arc<Shared>) -> Router {
+pub(crate) fn control_router(shared: &Arc<Shared>, stop: &CancellationToken) -> Router {
     let core = Router::new()
         .route(paths::HEALTH, get(health))
         .route(paths::HUB, get(describe))
@@ -146,7 +148,7 @@ pub(crate) fn control_router(shared: &Arc<Shared>) -> Router {
         .route(paths::INSTANCE_HEARTBEAT, post(heartbeat))
         .route(paths::INSTANCE_PROBE, post(probe))
         .with_state(Arc::clone(shared));
-    mount(core, shared, |extension| extension.control_routes())
+    mount(core, shared, stop, |extension| extension.control_routes())
 }
 
 /// Nest each extension under `/v1/ext/{name}`. Names are validated as
@@ -155,6 +157,7 @@ pub(crate) fn control_router(shared: &Arc<Shared>) -> Router {
 fn mount(
     core: Router,
     shared: &Arc<Shared>,
+    stop: &CancellationToken,
     routes: impl Fn(&dyn super::extension::DynExtension) -> Router,
 ) -> Router {
     let mut router = core;
@@ -173,6 +176,26 @@ fn mount(
             )
         })
         .layer(Extension(shared.authority.clone()))
+        .layer(axum::middleware::from_fn_with_state(
+            stop.clone(),
+            end_at_stop,
+        ))
+}
+
+/// Ends a request still running when shutdown gives up waiting. axum
+/// serves each connection in a task of its own that outlives the listener,
+/// so without this a stuck handler would keep the hub's state alive after
+/// `shutdown` returned.
+async fn end_at_stop(
+    State(stop): State<CancellationToken>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    tokio::select! {
+        response = next.run(request) => response,
+        _ = stop.cancelled() => HubError::unavailable("the hub stopped").into_response(),
+    }
 }
 
 async fn health() -> &'static str {

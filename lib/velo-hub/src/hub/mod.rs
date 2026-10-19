@@ -315,6 +315,7 @@ impl HubBuilder {
         let core_cancel = CancellationToken::new();
         let lifecycle_cancel = CancellationToken::new();
         let http_cancel = CancellationToken::new();
+        let request_cancel = CancellationToken::new();
         let mut tasks = Vec::new();
         tasks.push(tokio::spawn({
             let authority = authority.clone();
@@ -355,10 +356,14 @@ impl HubBuilder {
             lifecycle_cancel.clone(),
         ));
         let servers = vec![
-            spawn_server(public, routes::public_router(&shared), http_cancel.clone()),
+            spawn_server(
+                public,
+                routes::public_router(&shared, &request_cancel),
+                http_cancel.clone(),
+            ),
             spawn_server(
                 control,
-                routes::control_router(&shared),
+                routes::control_router(&shared, &request_cancel),
                 http_cancel.clone(),
             ),
         ];
@@ -375,6 +380,7 @@ impl HubBuilder {
                     core_cancel,
                     lifecycle_cancel,
                     http_cancel,
+                    request_cancel,
                     lifecycle,
                     tasks,
                     servers,
@@ -428,6 +434,21 @@ async fn remove_pinned(
     }
 }
 
+/// Await each handle until `within` passes; true if all finished. A handle
+/// that finished is taken out, so a second call does not poll it again.
+async fn join_within(handles: &mut [Option<JoinHandle<()>>], within: std::time::Duration) -> bool {
+    tokio::time::timeout(within, async {
+        for slot in handles.iter_mut() {
+            if let Some(handle) = slot.as_mut() {
+                let _ = handle.await;
+                *slot = None;
+            }
+        }
+    })
+    .await
+    .is_ok()
+}
+
 fn spawn_server(
     listener: TcpListener,
     router: axum::Router,
@@ -447,6 +468,8 @@ struct Running {
     core_cancel: CancellationToken,
     lifecycle_cancel: CancellationToken,
     http_cancel: CancellationToken,
+    /// Ends the requests still in flight when the listener drain times out.
+    request_cancel: CancellationToken,
     lifecycle: JoinHandle<(mpsc::UnboundedReceiver<Job>, Option<Job>)>,
     tasks: Vec<JoinHandle<()>>,
     servers: Vec<JoinHandle<()>>,
@@ -535,21 +558,19 @@ async fn stop(shared: &Shared, running: Running) -> anyhow::Result<()> {
     // is closed, so it answers 503 as soon as it gets the lock.
     drop(guard);
     running.http_cancel.cancel();
-    let mut servers = running.servers;
-    if tokio::time::timeout(config.shutdown_timeout, async {
-        for server in &mut servers {
-            let _ = server.await;
-        }
-    })
-    .await
-    .is_err()
-    {
+    let mut servers: Vec<Option<JoinHandle<()>>> = running.servers.into_iter().map(Some).collect();
+    if !join_within(&mut servers, config.shutdown_timeout).await {
         tracing::warn!(
-            "listeners did not drain within {:?}; dropping the requests still in flight",
+            "listeners did not drain within {:?}; ending the requests still in flight",
             config.shutdown_timeout
         );
-        for server in &servers {
-            server.abort();
+        // Each in-flight request answers 503 and its handler is dropped;
+        // then the connections close and the servers finish.
+        running.request_cancel.cancel();
+        if !join_within(&mut servers, config.shutdown_timeout).await {
+            for server in servers.iter().flatten() {
+                server.abort();
+            }
         }
     }
     let mut result = Ok(());
@@ -683,6 +704,7 @@ impl Drop for HubInner {
                     running.lifecycle_cancel.cancel();
                     running.core_cancel.cancel();
                     running.http_cancel.cancel();
+                    running.request_cancel.cancel();
                 }
             }
         }
