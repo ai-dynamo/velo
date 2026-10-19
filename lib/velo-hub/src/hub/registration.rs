@@ -161,9 +161,16 @@ impl Drop for Transaction<'_> {
                 self.drop_staged();
             }
             Some(incarnation) => {
+                // Reserve only what the store still holds: a removal can have
+                // taken the entry already, and nothing would clear a
+                // reservation for an entry that is gone.
+                let reservation = shared
+                    .store
+                    .current_incarnation(self.owner)
+                    .filter(|current| *current == incarnation);
                 let _ = shared
                     .authority
-                    .fail_closed_registration(permit, Some(incarnation));
+                    .fail_closed_registration(permit, reservation);
                 let removal = Removal {
                     id: self.owner,
                     incarnation,

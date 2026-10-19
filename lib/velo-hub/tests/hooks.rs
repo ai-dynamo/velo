@@ -802,3 +802,69 @@ async fn client_disconnect_mid_unregister_does_not_leave_the_owner_busy() {
     );
     assert!(!store.contains(owner));
 }
+
+/// Expires the owner's new entry from inside `commit`, then panics: a
+/// removal that lands after the write, then a dead transaction.
+struct ExpiresThenPanics {
+    store: Arc<FaultStore>,
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl Extension for ExpiresThenPanics {
+    const NAME: &'static str = "expires-then-panics";
+    type Registration = ();
+    type Staged = ();
+
+    async fn prepare(
+        &self,
+        _txn: &velo_hub::Txn<'_>,
+        _payload: Option<()>,
+    ) -> Result<(), Rejection> {
+        Ok(())
+    }
+
+    fn commit(&self, _staged: (), registration: &velo_hub::Committed<'_>) {
+        if self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            self.store.expire(registration.owner);
+            panic!("injected commit panic after a removal");
+        }
+    }
+
+    fn on_removed(&self, _removal: velo_hub::store::Removal) {}
+}
+
+/// The settling of a dead transaction must not reserve an entry that is
+/// already gone: nothing would ever clear that reservation, and the owner
+/// could not register again until the hub restarts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dead_transaction_whose_entry_was_removed_does_not_lock_the_owner_out() {
+    let store = Arc::new(FaultStore::default());
+    let hub = builder()
+        .store(store.clone())
+        .extension(ExpiresThenPanics {
+            store: store.clone(),
+            armed: std::sync::atomic::AtomicBool::new(true),
+        })
+        .serve()
+        .await
+        .unwrap();
+    let peer = make_peer();
+    assert_eq!(
+        post_register(&hub, &request(&peer), None).await.status(),
+        500
+    );
+    assert!(!store.contains(peer.instance_id()));
+    let mut fresh = post_register(&hub, &request(&peer), None).await;
+    for _ in 0..50 {
+        if fresh.status() != 409 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        fresh = post_register(&hub, &request(&peer), None).await;
+    }
+    assert_eq!(
+        fresh.status(),
+        200,
+        "the owner was left reserved with no entry to clear it"
+    );
+}
