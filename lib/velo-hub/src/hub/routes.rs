@@ -141,6 +141,7 @@ type HubState = State<Arc<Shared>>;
 fn core_routes() -> Router<Arc<Shared>> {
     Router::new()
         .route(paths::HEALTH, get(health))
+        .route(paths::READY, get(ready))
         .route(paths::HUB, get(describe))
         .route(paths::PEERS_BY_INSTANCE, get(peer_by_instance))
         .route(paths::PEERS_BY_WORKER, get(peer_by_worker))
@@ -219,6 +220,25 @@ async fn end_at_stop(
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Ready while the store is `Live` and the hub admits registrations: only
+/// then can it act on a credential. A `Degraded` hub behind a shared
+/// address that checks only health would hold clients that another hub
+/// could serve.
+async fn ready(State(shared): HubState) -> Result<&'static str, HubError> {
+    let continuity = *shared.store.continuity().borrow();
+    if continuity != crate::store::Continuity::Live {
+        return Err(HubError::unavailable(format!(
+            "the hub is not ready: its store is {continuity:?}"
+        )));
+    }
+    if !shared.admitting() {
+        return Err(HubError::unavailable(
+            "the hub is not ready: it is not taking registrations",
+        ));
+    }
+    Ok("ok")
 }
 
 async fn describe(State(shared): HubState) -> Result<Json<HubDescriptor>, HubError> {

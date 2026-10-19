@@ -24,7 +24,7 @@ A hub serves two HTTP listeners:
 
 | Listener | Default port | Routes |
 |---|---|---|
-| public | 1337 | `GET /v1/health`, `GET /v1/hub`, peer lookups |
+| public | 1337 | `GET /v1/health`, `GET /v1/ready`, `GET /v1/hub`, peer lookups, service lookups and watches |
 | control | 8337 | the core routes of the public listener, plus registration, unregistration, heartbeat, and probe |
 
 Extension routes are under `/v1/ext/{name}/`. An extension's `public_routes` go on the public listener and its `control_routes` on the control listener. The hub checks that each extension name is one URL segment of `[a-z0-9_-]`, so an extension cannot add a route to a core path.
@@ -37,6 +37,8 @@ Extension routes are under `/v1/ext/{name}/`. An extension's `public_routes` go 
 | `POST /v1/instances/{id}/heartbeat` | refresh liveness, with the credential |
 | `POST /v1/instances/{id}/probe` | the hub sends a heartbeat to the instance over velo |
 | `GET /v1/peers/instance/{id}`, `GET /v1/peers/worker/{id}` | peer discovery |
+| `GET /v1/health` | liveness: `ok` while the process serves |
+| `GET /v1/ready` | readiness: `ok` while the store is `Live` and the hub takes registrations, else 503 `unavailable` |
 
 A successful registration returns a credential and an epoch. The credential goes in the `x-velo-hub-credential` header of every mutation that the registration owns. Each registration gets a new credential and a new epoch, and the previous credential stops working. Every error that a core route answers is an `ErrorBody` with a stable `code`, also for a body or a path that the hub cannot parse, and for a route that does not exist. A client acts on the code: `busy` means retry, and `register_again` means register again without a credential. Extension routes get the same behavior when they use the `HubJson`, `HubPath`, and `Authorized` extractors and return `HubError`.
 

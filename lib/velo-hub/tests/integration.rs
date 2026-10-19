@@ -16,7 +16,8 @@ use velo_hub::protocol::{
     ErrorCode, HeartbeatResponse, ListInstancesResponse, PeerLookupResponse, ProbeResponse,
     instance_probe, paths, peers_by_instance, peers_by_worker,
 };
-use velo_hub::store::InMemoryStore;
+use velo_hub::store::testing::FaultStore;
+use velo_hub::store::{Continuity, InMemoryStore};
 use velo_hub::velo::{InstanceId, Transport};
 
 // ---- HTTP-direct server tests ------------------------------------------
@@ -41,6 +42,36 @@ async fn health_check_control_port() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
+}
+
+/// Readiness is not liveness. A hub whose store is not `Live` answers
+/// `/v1/ready` 503 (`unavailable`) on both listeners, while `/v1/health`
+/// stays 200. A VIP or a Kubernetes Service that checks `/v1/health`
+/// keeps sending clients to a hub that is cut off from its store and
+/// refuses every credential; one that checks `/v1/ready` moves them to a
+/// hub that can serve them.
+#[tokio::test]
+async fn ready_answers_503_while_the_store_is_not_live() {
+    let store = Arc::new(FaultStore::default());
+    let hub = builder()
+        .store(Arc::clone(&store) as Arc<dyn velo_hub::store::HubStore>)
+        .serve()
+        .await
+        .unwrap();
+    let status = |url: String| async move { http().get(url).send().await.unwrap() };
+    for url in [public(&hub, paths::READY), control(&hub, paths::READY)] {
+        assert_eq!(status(url).await.status(), 200);
+    }
+    store.set_continuity(Continuity::Degraded);
+    for url in [public(&hub, paths::READY), control(&hub, paths::READY)] {
+        let response = status(url).await;
+        assert_eq!(response.status(), 503);
+        assert_eq!(error_code(response).await, ErrorCode::Unavailable);
+    }
+    assert_eq!(status(public(&hub, paths::HEALTH)).await.status(), 200);
+    store.set_continuity(Continuity::Live);
+    assert_eq!(status(public(&hub, paths::READY)).await.status(), 200);
+    hub.shutdown().await.unwrap();
 }
 
 #[tokio::test]

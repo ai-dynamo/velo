@@ -8,8 +8,9 @@
 //! discovery. The **control** listener also carries registration, heartbeat
 //! and probe. Extension routes live under [`paths::EXT`]`/{name}`, on the
 //! listener the extension puts them on. Request and response bodies are
-//! JSON, except the `ok` text of [`paths::HEALTH`] and the empty 204 of a
-//! successful unregister. Every error body is an [`ErrorBody`].
+//! JSON, except the `ok` text of [`paths::HEALTH`] and [`paths::READY`]
+//! and the empty 204 of a successful unregister. Every error body is an
+//! [`ErrorBody`].
 
 use std::collections::BTreeMap;
 
@@ -33,6 +34,10 @@ pub const HEARTBEAT_HANDLER: &str = "velo_hub_heartbeat";
 pub mod paths {
     /// `GET`: liveness of the hub process. Both listeners.
     pub const HEALTH: &str = "/v1/health";
+    /// `GET`: readiness: `ok` while the hub's store is live and the hub
+    /// takes registrations, else 503 `unavailable`. Both listeners. Put
+    /// this, not [`HEALTH`], behind a shared address.
+    pub const READY: &str = "/v1/ready";
     /// `GET`: the hub's ids and its extensions. Both listeners.
     pub const HUB: &str = "/v1/hub";
     /// `GET`: look a peer up by instance id. Both listeners.
