@@ -16,6 +16,8 @@
 //!   under this directory's lock with the write (the extension fence).
 //! - A watch takes its snapshot and subscribes under that lock, so no
 //!   change between the two is lost or seen twice.
+//! - A watch ends with `disconnected` when the store leaves `Live`: the
+//!   store may then miss removals, so the watcher's set may be stale.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::convert::Infallible;
@@ -33,7 +35,7 @@ use super::{Authorized, HubError, Lease};
 use crate::protocol::{
     self, RegistrationEpoch, WATCH_ADDED, WATCH_DISCONNECTED, WATCH_INITIAL, WATCH_REMOVED,
 };
-use crate::store::{Incarnation, Removal};
+use crate::store::{Continuity, Incarnation, Removal};
 
 /// The directory's reserved extension name.
 pub(crate) const NAME: &str = protocol::SERVICES_EXTENSION;
@@ -190,10 +192,12 @@ impl ServiceDirectory {
         Ok(())
     }
 
-    /// An SSE stream of `name`: `initial`, then `added` / `removed`.
+    /// An SSE stream of `name`: `initial`, then `added` / `removed`, until
+    /// `continuity` leaves `Live`.
     pub(crate) fn watch(
         self: &Arc<Self>,
         name: &str,
+        continuity: tokio::sync::watch::Receiver<Continuity>,
     ) -> Sse<impl Stream<Item = Result<Event, Infallible>> + Send + use<>> {
         let (initial, changes) = {
             let mut state = self.state.lock();
@@ -211,6 +215,7 @@ impl ServiceDirectory {
             changes: Some(changes),
             initial: Some(initial),
             closed: self.closed.clone(),
+            continuity,
         };
         let stream = futures::stream::unfold(watch, |mut watch| async move {
             let event = watch.next().await?;
@@ -228,6 +233,7 @@ struct Watch {
     changes: Option<broadcast::Receiver<Change>>,
     initial: Option<Vec<InstanceId>>,
     closed: CancellationToken,
+    continuity: tokio::sync::watch::Receiver<Continuity>,
 }
 
 fn event(name: &str, data: &impl serde::Serialize) -> Event {
@@ -243,8 +249,14 @@ impl Watch {
             return Some(event(WATCH_INITIAL, &initial));
         }
         let changes = self.changes.as_mut()?;
+        let continuity = &mut self.continuity;
         let received = tokio::select! {
             _ = self.closed.cancelled() => None,
+            // A dropped sender means the store is gone: stale too.
+            _ = continuity.wait_for(|now| *now != Continuity::Live) => {
+                self.changes = None;
+                return Some(event(WATCH_DISCONNECTED, &()));
+            }
             received = changes.recv() => Some(received),
         };
         match received {
@@ -486,6 +498,7 @@ mod tests {
         let directory = Arc::new(ServiceDirectory::default());
         let owner = InstanceId::new_v4();
         let lease = commit(&directory, owner, 1, true);
+        let (_live, continuity) = tokio::sync::watch::channel(Continuity::Live);
         let watch = Watch {
             directory: Arc::clone(&directory),
             name: "svc".into(),
@@ -501,6 +514,7 @@ mod tests {
             ),
             initial: None,
             closed: directory.closed.clone(),
+            continuity,
         };
         for _ in 0..=WATCH_BUFFER {
             directory.put("svc", &auth(owner, lease)).unwrap();

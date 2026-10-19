@@ -412,7 +412,15 @@ async fn watch_service(
 ) -> Result<axum::response::Response, HubError> {
     use axum::response::IntoResponse;
     super::services::check_name(&service)?;
-    Ok(shared.services.watch(&service).into_response())
+    // The first event would be a snapshot the hub cannot vouch for.
+    let continuity = shared.store.continuity();
+    let now = *continuity.borrow();
+    if now != crate::store::Continuity::Live {
+        return Err(HubError::unavailable(format!(
+            "the hub's store is {now:?}; its services may be stale"
+        )));
+    }
+    Ok(shared.services.watch(&service, continuity).into_response())
 }
 
 async fn put_service_instance(

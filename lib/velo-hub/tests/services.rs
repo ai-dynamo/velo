@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use velo_hub::Hub;
 use velo_hub::client::{ClientError, HubClient};
 use velo_hub::protocol::{CREDENTIAL_HEADER, ErrorCode, service_instance};
+use velo_hub::store::Continuity;
 use velo_hub::store::testing::FaultStore;
 use velo_hub::velo::discovery::{
     PeerDiscovery, ServiceDiscovery, ServiceEvent, ServiceRegistrationGuard,
@@ -243,6 +244,41 @@ async fn a_watch_ends_at_shutdown_without_delaying_it() {
     );
     assert_eq!(next(&mut watch).await, ServiceEvent::Disconnected);
     assert!(watch.next().await.is_none());
+}
+
+/// A watch ends with `Disconnected` when the hub's store leaves `Live`,
+/// and a hub whose store is not `Live` refuses a new watch with 503. A
+/// store that is not live may miss removals, so the watcher's set may be
+/// stale; a stream left open would stay silent until the hub stops (for a
+/// hub cut off from etcd, for the whole partition). Ended, the watcher
+/// watches again, through a shared address, at a hub that can serve it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_watch_ends_when_the_store_leaves_live() {
+    let store = std::sync::Arc::new(FaultStore::default());
+    let hub = builder()
+        .store(std::sync::Arc::clone(&store) as std::sync::Arc<dyn velo_hub::store::HubStore>)
+        .serve()
+        .await
+        .unwrap();
+    let services = client_for(&hub).services();
+    let mut watch = services.watch_instances("svc").await.unwrap();
+    assert_eq!(next(&mut watch).await, ServiceEvent::Initial(vec![]));
+    store.set_continuity(Continuity::Degraded);
+    assert_eq!(next(&mut watch).await, ServiceEvent::Disconnected);
+    assert!(watch.next().await.is_none());
+    let refused = services
+        .watch_instances("svc")
+        .await
+        .err()
+        .expect("a watch on a degraded hub");
+    let code = refused
+        .downcast_ref::<ClientError>()
+        .and_then(ClientError::code);
+    assert_eq!(code, Some(ErrorCode::Unavailable), "{refused:#}");
+    store.set_continuity(Continuity::Live);
+    let mut again = services.watch_instances("svc").await.unwrap();
+    assert_eq!(next(&mut again).await, ServiceEvent::Initial(vec![]));
+    hub.shutdown().await.unwrap();
 }
 
 #[tokio::test]
