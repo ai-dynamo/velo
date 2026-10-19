@@ -84,7 +84,7 @@ impl Shared {
         match job {
             Job::Removal(removal) => self.deliver_removal(removal),
             Job::Retire(removal) => {
-                if let Err(error) = self.store.remove(removal.id, removal.incarnation).await {
+                if let Err(error) = self.remove_bounded(removal.id, removal.incarnation).await {
                     tracing::warn!(
                         instance = %removal.id,
                         incarnation = %removal.incarnation,

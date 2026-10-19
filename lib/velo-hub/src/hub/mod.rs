@@ -19,10 +19,12 @@
 //!    open admission
 //! ```
 //!
-//! Shutdown: close admission; take the registration lock (waits for the
-//! registration in flight); stop extension background work; drain removal
-//! delivery; shut extensions down in reverse order; stop the heartbeat and
-//! reaper; drain both listeners; remove the pinned entry; shut velo down.
+//! Shutdown runs as its own task, so a caller that stops waiting cannot
+//! leave the hub half stopped: close admission; take the registration lock
+//! (waits for the registration in flight); stop extension background work;
+//! drain removal delivery; shut extensions down in reverse order; stop the
+//! heartbeat and reaper; release the lock; drain both listeners, for at
+//! most `shutdown_timeout_ms`; remove the pinned entry; shut velo down.
 
 mod authority;
 mod config;
@@ -88,6 +90,26 @@ impl Shared {
     pub(crate) fn admitting(&self) -> bool {
         self.admission.load(Ordering::Acquire)
     }
+
+    /// A store remove under `step_timeout_ms`. Every remove that runs under
+    /// the registration lock goes through this, so a backend that never
+    /// answers cannot hold the lock. Expiry reads as `Indeterminate`: a
+    /// remote remove can still apply after its future is dropped.
+    pub(crate) async fn remove_bounded(
+        &self,
+        id: InstanceId,
+        incarnation: Incarnation,
+    ) -> Result<(), StoreError> {
+        match tokio::time::timeout(self.config.step_timeout, self.store.remove(id, incarnation))
+            .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(StoreError::Indeterminate(format!(
+                "remove did not complete within {:?}",
+                self.config.step_timeout
+            ))),
+        }
+    }
 }
 
 /// Builds a [`Hub`]. See the module docs for what [`serve`](Self::serve) does.
@@ -129,7 +151,17 @@ impl HubBuilder {
     }
 
     /// Validate, bind, start, and serve. See the module docs.
+    ///
+    /// Startup runs as its own task. If this future is dropped part-way,
+    /// startup still finishes, and the hub it built stops in order.
     pub async fn serve(self) -> anyhow::Result<Hub> {
+        match tokio::spawn(self.serve_in_task()).await {
+            Ok(result) => result,
+            Err(error) => Err(anyhow::anyhow!("hub startup task failed: {error}")),
+        }
+    }
+
+    async fn serve_in_task(self) -> anyhow::Result<Hub> {
         let HubBuilder {
             config,
             store,
@@ -337,7 +369,7 @@ impl HubBuilder {
                 shared,
                 public_addr,
                 control_addr,
-                running: tokio::sync::Mutex::new(Some(Running {
+                stage: tokio::sync::Mutex::new(Stage::Running(Running {
                     extension_cancel,
                     core_cancel,
                     lifecycle_cancel,
@@ -420,18 +452,112 @@ struct Running {
     pinned: Option<(InstanceId, Incarnation)>,
 }
 
+/// Where the hub is in its life.
+enum Stage {
+    Running(Running),
+    /// A stop task runs or ran; its result arrives here.
+    Stopping(tokio::sync::watch::Receiver<Option<Result<(), String>>>),
+}
+
 struct HubInner {
     shared: Arc<Shared>,
     public_addr: SocketAddr,
     control_addr: SocketAddr,
-    running: tokio::sync::Mutex<Option<Running>>,
+    stage: tokio::sync::Mutex<Stage>,
+}
+
+impl HubInner {
+    /// Start the stop task if none started yet, and return where its
+    /// result arrives.
+    fn begin_stop(
+        stage: &mut Stage,
+        shared: &Arc<Shared>,
+        runtime: &tokio::runtime::Handle,
+    ) -> tokio::sync::watch::Receiver<Option<Result<(), String>>> {
+        if let Stage::Stopping(result) = stage {
+            return result.clone();
+        }
+        let (done, result) = tokio::sync::watch::channel(None);
+        let Stage::Running(running) = std::mem::replace(stage, Stage::Stopping(result.clone()))
+        else {
+            unreachable!("the stage was Running");
+        };
+        // Admission closes before the task is even scheduled.
+        shared.admission.store(false, Ordering::Release);
+        let shared = Arc::clone(shared);
+        runtime.spawn(async move {
+            let outcome = stop(&shared, running)
+                .await
+                .map_err(|error| format!("{error:#}"));
+            let _ = done.send(Some(outcome));
+        });
+        result
+    }
+}
+
+/// The ordered stop. Runs as its own task, so a caller that stops waiting
+/// cannot leave the hub half stopped.
+async fn stop(shared: &Shared, running: Running) -> anyhow::Result<()> {
+    let config = &shared.config;
+    let guard = shared.lock.lock().await;
+    running.extension_cancel.cancel();
+    running.lifecycle_cancel.cancel();
+    if let Ok((mut queue, in_flight)) = running.lifecycle.await {
+        if let Some(job) = in_flight {
+            shared.run_job(job).await;
+        }
+        while let Ok(job) = queue.try_recv() {
+            shared.run_job(job).await;
+        }
+    }
+    for extension in shared.extensions.iter().rev() {
+        extension.shutdown().await;
+    }
+    running.core_cancel.cancel();
+    for task in running.tasks {
+        let _ = task.await;
+    }
+    // Release the lock before draining the listeners: a request queued on
+    // it would otherwise hold the drain for its whole lock timeout. Admission
+    // is closed, so it answers 503 as soon as it gets the lock.
+    drop(guard);
+    running.http_cancel.cancel();
+    let mut servers = running.servers;
+    if tokio::time::timeout(config.shutdown_timeout, async {
+        for server in &mut servers {
+            let _ = server.await;
+        }
+    })
+    .await
+    .is_err()
+    {
+        tracing::warn!(
+            "listeners did not drain within {:?}; dropping the requests still in flight",
+            config.shutdown_timeout
+        );
+        for server in &servers {
+            server.abort();
+        }
+    }
+    let mut result = Ok(());
+    if let Some((id, incarnation)) = running.pinned
+        && let Err(error) = shared.remove_bounded(id, incarnation).await
+        && !matches!(error, StoreError::NotFound(_) | StoreError::Stale { .. })
+    {
+        result = Err(anyhow::Error::new(error).context("removing the hub's own entry"));
+    }
+    if let Some(velo) = &shared.velo {
+        velo.shutdown(ShutdownPolicy::Timeout(config.shutdown_timeout))
+            .await;
+    }
+    result
 }
 
 /// A running hub. Cheap to clone; every clone is the same hub.
 ///
 /// Call [`shutdown`](Self::shutdown) to stop it in order. Dropping the last
-/// clone without it cancels everything at once and removes the hub's own
-/// entry in the background.
+/// clone without it runs the same stop in the background (with no runtime
+/// left, it only cancels the hub's tasks).
 #[derive(Clone)]
 pub struct Hub {
     inner: Arc<HubInner>,
@@ -497,45 +623,21 @@ impl Hub {
 
     /// Stop in order (see the module docs). A second call returns at once.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
-        let Some(running) = self.inner.running.lock().await.take() else {
-            return Ok(());
+        let mut result = {
+            let mut stage = self.inner.stage.lock().await;
+            HubInner::begin_stop(
+                &mut stage,
+                &self.inner.shared,
+                &tokio::runtime::Handle::current(),
+            )
         };
-        let shared = &self.inner.shared;
-        shared.admission.store(false, Ordering::Release);
-        let guard = shared.lock.lock().await;
-        running.extension_cancel.cancel();
-        running.lifecycle_cancel.cancel();
-        if let Ok((mut queue, in_flight)) = running.lifecycle.await {
-            if let Some(job) = in_flight {
-                shared.run_job(job).await;
-            }
-            while let Ok(job) = queue.try_recv() {
-                shared.run_job(job).await;
-            }
-        }
-        for extension in shared.extensions.iter().rev() {
-            extension.shutdown().await;
-        }
-        running.core_cancel.cancel();
-        for task in running.tasks {
-            let _ = task.await;
-        }
-        running.http_cancel.cancel();
-        for server in running.servers {
-            let _ = server.await;
-        }
-        drop(guard);
-        let mut result = Ok(());
-        if let Some((id, incarnation)) = running.pinned
-            && let Err(error) = remove_pinned(shared.store.as_ref(), id, incarnation).await
-        {
-            result = Err(anyhow::Error::new(error).context("removing the hub's own entry"));
-        }
-        if let Some(velo) = &shared.velo {
-            velo.shutdown(ShutdownPolicy::Timeout(shared.config.shutdown_timeout))
-                .await;
-        }
-        result
+        let outcome = result
+            .wait_for(Option::is_some)
+            .await
+            .map_err(|_| anyhow::anyhow!("the hub's stop task ended without a result"))?
+            .clone()
+            .expect("wait_for returned a result");
+        outcome.map_err(|error| anyhow::anyhow!(error))
     }
 
     /// Serve until Ctrl-C, then [`shutdown`](Self::shutdown).
@@ -549,21 +651,27 @@ impl Hub {
 
 impl Drop for HubInner {
     fn drop(&mut self) {
-        let Some(running) = self.running.get_mut().take() else {
+        let Stage::Running(_) = self.stage.get_mut() else {
             return;
         };
-        self.shared.admission.store(false, Ordering::Release);
-        running.extension_cancel.cancel();
-        running.lifecycle_cancel.cancel();
-        running.core_cancel.cancel();
-        running.http_cancel.cancel();
-        if let Some((id, incarnation)) = running.pinned
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
-        {
-            let store = Arc::clone(&self.shared.store);
-            runtime.spawn(async move {
-                let _ = remove_pinned(store.as_ref(), id, incarnation).await;
-            });
+        match tokio::runtime::Handle::try_current() {
+            // The same ordered stop as `shutdown`, in the background.
+            Ok(runtime) => {
+                let _ = HubInner::begin_stop(self.stage.get_mut(), &self.shared, &runtime);
+            }
+            // No runtime to stop on: cancel everything at once.
+            Err(_) => {
+                if let Stage::Running(running) = std::mem::replace(
+                    self.stage.get_mut(),
+                    Stage::Stopping(tokio::sync::watch::channel(None).1),
+                ) {
+                    self.shared.admission.store(false, Ordering::Release);
+                    running.extension_cancel.cancel();
+                    running.lifecycle_cancel.cancel();
+                    running.core_cancel.cancel();
+                    running.http_cancel.cancel();
+                }
+            }
         }
     }
 }

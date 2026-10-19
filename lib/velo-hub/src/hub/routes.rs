@@ -315,14 +315,19 @@ async fn probe(
             format!("probe failed: {error:#}"),
         )
     };
-    let ack: HeartbeatAck = velo
+    let send = velo
         .typed_unary(HEARTBEAT_HANDLER)
         .map_err(gateway)?
         .payload(&HeartbeatRequest { seq: 0 })
         .map_err(gateway)?
         .instance(id)
-        .send()
+        .send();
+    // Bounded like a heartbeat probe: a peer that never answers must not
+    // hold the request, or shutdown's listener drain, open.
+    let deadline = shared.config.heartbeat_interval;
+    let ack: HeartbeatAck = tokio::time::timeout(deadline, send)
         .await
+        .map_err(|_| gateway(anyhow::anyhow!("no answer within {deadline:?}")))?
         .map_err(gateway)?;
     Ok(Json(ProbeResponse {
         seq: ack.seq,

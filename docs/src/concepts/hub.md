@@ -101,7 +101,9 @@ task      take the lock (503 after lock_timeout_ms); begin               401, 40
             refuse the credential                                        409 register_again
 ```
 
-The transaction is a task of the hub. A web server drops a request handler when its client disconnects. If the handler ran the transaction, a disconnect could leave the owner `Busy` for ever.
+The transaction is a task of the hub. hyper drops a request handler when its client closes the connection. If the handler ran the transaction, a disconnect could leave the owner `busy` for ever.
+
+Each store write and remove under the lock, and each `on_registered`, runs under `step_timeout_ms`. A store or an extension that never answers cannot hold the lock. A remove that times out counts as indeterminate: the hub reads the store to learn whether it applied.
 
 A failure before the store write leaves the prior registration exactly as it was. A failure after the write removes the registration, including the prior one, and the client registers again. The alternative is to write the prior registration back. kvbm-hub did that, but the restore is a second write that can fail too, and it gives the registration a new incarnation.
 
@@ -115,7 +117,7 @@ The store calls the hub's removal hook when an entry leaves: an unregistration, 
 
 The lifecycle task forgets the velo peer only if no later incarnation replaced it. So a late delivery does not disconnect a replacement.
 
-`DELETE /v1/instances/{id}` takes the lock and delivers the removal itself. When it answers, each extension has dropped the owner. The hook also queued a delivery, and that second delivery changes nothing.
+`DELETE /v1/instances/{id}` takes the lock and delivers the removal itself. When it answers, each extension has dropped the owner. The hook also queued a delivery, and that second delivery changes nothing. Like a registration, the unregistration runs as a task of the hub, so a client that disconnects cannot leave the owner `busy`.
 
 ## Heartbeat
 
@@ -138,7 +140,9 @@ The heartbeat task holds a `WeakVelo`. Extension handlers and tasks that use the
 
 If a step fails, the hub undoes each earlier step in reverse order. The removal hook cannot be removed, so the hub installs it last. A store given to a hub that failed to start can go to another hub.
 
-`Hub::shutdown` stops new registrations, waits for the registration that holds the lock, stops extension background work, delivers the queued removals, shuts each extension down in reverse order, stops the heartbeat and the reaper, closes both listeners, removes the pinned entry, and shuts the hub's velo instance down. When it returns, the listener ports are free.
+`Hub::shutdown` stops new registrations, waits for the registration that holds the lock, stops extension background work, delivers the queued removals, shuts each extension down in reverse order, and stops the heartbeat and the reaper. Then it releases the lock, so a request that waits for it answers 503 at once. It closes both listeners and waits up to `shutdown_timeout_ms` for the requests in flight, then drops the rest. Last, it removes the pinned entry and shuts the hub's velo instance down. When it returns, the listener ports are free.
+
+The stop runs as its own task. A caller that stops waiting does not stop it, and a second call waits for the same stop. Dropping the last `Hub` clone runs the same stop in the background. `serve` also runs as its own task: if its caller stops waiting, startup finishes and the new hub stops in order.
 
 ## Cost of the request paths
 

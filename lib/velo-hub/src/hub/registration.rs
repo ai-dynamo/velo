@@ -228,7 +228,7 @@ impl Transaction<'_> {
     async fn fail_after_write(&mut self, incarnation: Incarnation, error: HubError) -> HubError {
         let shared = self.shared;
         let owner = self.owner;
-        match shared.store.remove(owner, incarnation).await {
+        match shared.remove_bounded(owner, incarnation).await {
             Ok(()) | Err(StoreError::NotFound(_) | StoreError::Stale { .. }) => {}
             Err(remove_error) => tracing::warn!(
                 instance = %owner,
@@ -434,7 +434,19 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
     };
     let credential = txn.permit().credential().clone();
     for extension in &shared.extensions {
-        extension.on_registered(&committed).await;
+        // The contract says on_registered must not block; the deadline
+        // keeps one that does from holding the lock.
+        if tokio::time::timeout(config.step_timeout, extension.on_registered(&committed))
+            .await
+            .is_err()
+        {
+            tracing::error!(
+                extension = extension.name(),
+                instance = %owner,
+                "on_registered did not return within {:?}; it must spawn slow work",
+                config.step_timeout
+            );
+        }
     }
     // Disarm only now: if an on_registered panics, Drop retires the entry,
     // whose removal then revokes the credential that was just committed.
@@ -509,6 +521,9 @@ pub(crate) async fn unregister(
     let _guard = tokio::time::timeout(shared.config.lock_timeout, shared.lock.lock())
         .await
         .map_err(|_| HubError::unavailable("timed out waiting for the registration lock"))?;
+    if !shared.admitting() {
+        return Err(HubError::unavailable("the hub is stopping"));
+    }
     let permit = shared
         .authority
         .begin_unregister(owner, presented.as_ref())?;
@@ -516,7 +531,7 @@ pub(crate) async fn unregister(
         id: owner,
         incarnation: permit.incarnation(),
     };
-    match shared.store.remove(owner, removal.incarnation).await {
+    match shared.remove_bounded(owner, removal.incarnation).await {
         Ok(()) => {
             shared.deliver_removal(removal);
             Ok(())

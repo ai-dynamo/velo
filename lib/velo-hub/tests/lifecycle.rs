@@ -15,6 +15,8 @@ use velo_hub::axum::routing::get;
 use velo_hub::protocol::{HubDescriptor, paths};
 use velo_hub::store::testing::FaultStore;
 use velo_hub::store::{HubStore, Removal};
+#[allow(unused_imports)]
+use velo_hub::velo::PeerDiscovery;
 use velo_hub::{
     AttachContext, Bundle, BundleInstaller, Committed, Extension, GraphError, Hub, Rejection,
     StartContext, Txn,
@@ -644,4 +646,213 @@ async fn registrations_are_refused_once_shutdown_closes_admission() {
         .send()
         .await;
     assert!(after.is_err(), "the listener is closed");
+}
+
+// ---- shutdown under load ------------------------------------------------
+
+/// A DELETE queued on the registration lock behind shutdown must not hold
+/// shutdown for its lock timeout: shutdown releases the lock before it
+/// drains the listeners, and the DELETE answers 503 at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_does_not_wait_out_the_lock_timeout_of_queued_requests() {
+    let mut config = config();
+    config.server.lock_timeout = Duration::from_secs(5);
+    let hub = Hub::builder(config)
+        .extension(Ledger::default())
+        .serve()
+        .await
+        .unwrap();
+    let ledger = hub.extension::<Ledger>().unwrap();
+    let victim = make_peer();
+    let victim_credential = register_plain(&hub, &victim, None).await.credential;
+    let gate = ledger.gate_next_prepare();
+    let held = tokio::spawn({
+        let hub = hub.clone();
+        let body = request(&make_peer());
+        async move { post_register(&hub, &body, None).await.status() }
+    });
+    gate.entered().await;
+    let started = std::time::Instant::now();
+    let shutdown = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.shutdown().await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let delete = tokio::spawn({
+        let hub = hub.clone();
+        async move { unregister_status(&hub, victim.instance_id(), Some(&victim_credential)).await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.release();
+    assert_eq!(held.await.unwrap(), 200);
+    shutdown.await.unwrap().unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "shutdown took {:?}",
+        started.elapsed()
+    );
+    assert_eq!(delete.await.unwrap(), 503);
+}
+
+/// A request that never finishes (a probe to a peer that never answers)
+/// cannot hold shutdown forever: the listener drain is bounded by
+/// `shutdown_timeout_ms`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_does_not_wait_forever_for_a_stuck_request() {
+    let mut config = config();
+    config.server.shutdown_timeout = Duration::from_millis(500);
+    config.server.heartbeat_interval = Duration::from_secs(60);
+    let hub = Hub::builder(config)
+        .velo(velo_builder())
+        .serve()
+        .await
+        .unwrap();
+    let client = new_velo().await;
+    install_wedged_heartbeat(&client, Duration::from_secs(120));
+    wire_mutual(&hub, &client).await;
+    let probe = tokio::spawn({
+        let url = control(
+            &hub,
+            &velo_hub::protocol::instance_probe(client.instance_id()),
+        );
+        async move { http().post(url).send().await }
+    });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(10), hub.shutdown())
+        .await
+        .expect("shutdown hung on a stuck request")
+        .unwrap();
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "shutdown took {:?}",
+        started.elapsed()
+    );
+    drop(probe);
+}
+
+/// The hub's own probe of a peer has a deadline: one heartbeat interval.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_probe_to_a_wedged_peer_times_out() {
+    let mut config = config();
+    config.server.heartbeat_interval = Duration::from_millis(300);
+    config.server.heartbeat_max_failures = 1000;
+    let hub = Hub::builder(config)
+        .velo(velo_builder())
+        .serve()
+        .await
+        .unwrap();
+    let client = new_velo().await;
+    install_wedged_heartbeat(&client, Duration::from_secs(120));
+    wire_mutual(&hub, &client).await;
+    let started = std::time::Instant::now();
+    let response = http()
+        .post(control(
+            &hub,
+            &velo_hub::protocol::instance_probe(client.instance_id()),
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 502);
+    assert!(
+        started.elapsed() < Duration::from_secs(3),
+        "probe took {:?}",
+        started.elapsed()
+    );
+}
+
+/// Dropping a `shutdown()` future part-way does not leave the hub half
+/// stopped: the shutdown finishes on its own, and a later call waits for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_shutdown_still_finishes() {
+    let store = Arc::new(FaultStore::default());
+    let hub = builder()
+        .store(store.clone())
+        .velo(velo_builder())
+        .extension(Ledger::default())
+        .serve()
+        .await
+        .unwrap();
+    let ledger = hub.extension::<Ledger>().unwrap();
+    let gate = ledger.gate_next_prepare();
+    let held = tokio::spawn({
+        let hub = hub.clone();
+        // Decodes, so it reaches prepare on a hub with velo.
+        let body = request(&unreachable_peer());
+        async move { post_register(&hub, &body, None).await.status() }
+    });
+    gate.entered().await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), hub.shutdown())
+            .await
+            .is_err()
+    );
+    gate.release();
+    let _ = held.await;
+    hub.shutdown().await.unwrap();
+    for addr in [hub.public_addr(), hub.control_addr()] {
+        std::net::TcpListener::bind(addr)
+            .unwrap_or_else(|error| panic!("{addr} still bound: {error}"));
+    }
+    assert!(
+        store.list().iter().all(|stored| !stored.record.pinned),
+        "the pinned entry is removed"
+    );
+}
+
+/// Starts slowly, and records its shutdown.
+struct SlowStart {
+    log: Log,
+}
+
+impl Extension for SlowStart {
+    const NAME: &'static str = "slow-start";
+    type Registration = ();
+    type Staged = ();
+
+    async fn start(&self, _ctx: &StartContext<'_>) -> anyhow::Result<()> {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        Ok(())
+    }
+
+    async fn shutdown(&self) {
+        self.log.lock().push("shutdown slow-start".to_string());
+    }
+
+    async fn prepare(&self, _txn: &Txn<'_>, _payload: Option<()>) -> Result<(), Rejection> {
+        Ok(())
+    }
+
+    fn commit(&self, _staged: (), _registration: &Committed<'_>) {}
+
+    fn on_removed(&self, _removal: Removal) {}
+}
+
+/// Dropping a `serve()` future part-way does not strand what startup did:
+/// the pinned entry is removed and started extensions shut down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_cancelled_serve_still_cleans_up() {
+    let store = Arc::new(FaultStore::default());
+    let log = Log::default();
+    let serving = builder()
+        .store(store.clone())
+        .velo(velo_builder())
+        .extension(SlowStart {
+            log: Arc::clone(&log),
+        })
+        .serve();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), serving)
+            .await
+            .is_err()
+    );
+    assert!(
+        eventually(Duration::from_secs(3), || store.list().is_empty()
+            && !log.lock().is_empty())
+        .await,
+        "entries: {}, log: {:?}",
+        store.list().len(),
+        log.lock()
+    );
 }

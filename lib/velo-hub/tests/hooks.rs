@@ -868,3 +868,39 @@ async fn a_dead_transaction_whose_entry_was_removed_does_not_lock_the_owner_out(
         "the owner was left reserved with no entry to clear it"
     );
 }
+
+/// A store remove that never returns cannot hold the registration lock
+/// forever: removes under the lock run under `step_timeout_ms`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_store_remove_does_not_hold_the_lock_forever() {
+    let store = Arc::new(FaultStore::default());
+    let mut config = config();
+    config.server.step_timeout = Duration::from_millis(200);
+    config.server.lock_timeout = Duration::from_secs(2);
+    let hub = Hub::builder(config)
+        .store(store.clone())
+        .serve()
+        .await
+        .unwrap();
+    let peer = make_peer();
+    let credential = register_plain(&hub, &peer, None).await.credential;
+    let _gate = store.gate_next_remove();
+    let delete = unregister_status(&hub, peer.instance_id(), Some(&credential)).await;
+    assert_eq!(delete, 503, "an unresolved remove is retryable");
+    assert_eq!(
+        heartbeat_status(&hub, peer.instance_id(), Some(&credential)).await,
+        200,
+        "the owner is restored, not left Busy"
+    );
+    assert_eq!(
+        post_register(&hub, &request(&make_peer()), None)
+            .await
+            .status(),
+        200,
+        "the lock is free"
+    );
+    tokio::time::timeout(Duration::from_secs(5), hub.shutdown())
+        .await
+        .expect("shutdown hung")
+        .unwrap();
+}
