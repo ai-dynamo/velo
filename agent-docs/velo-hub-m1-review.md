@@ -94,3 +94,18 @@ Not acted on (recorded): removals produced while extensions shut down are not de
 | S3 | is_gone, hub_task helper, one probe fn, inline resolve, fail_unresolved method, dead Stale arm | done | suite | 78ea7ae |
 
 Not acted on (recorded): a panicking store or velo call in a hub task (lifecycle, unregister) is not caught, unlike extension code; continuity Lost -> Live does not reconcile, and `State::Removed` is not reclaimed after sync (M4); `GET /v1/instances` copies payloads via `list()` (not a hot path); startup has no deadline on `attach`/`start`; `heartbeat_max_failures = 0` acts as 1; `end_at_stop` costs one waiter per request.
+
+## Mega review round 3 (Fable, read-only, range origin/main...0cc55f8): 3 defects, 5 suggestions. Last pass by the review cap.
+
+| # | Claim | Ruling | Evidence | Fix commit |
+|---|---|---|---|---|
+| 1 | A lost registration response (socket closed, transaction committed) locks the owner out while it answers the hub's velo probes | valid (major). Fixed by giving `HeartbeatAck.ok` a meaning: a registrant that holds no registration answers `false`, which counts as a failed probe; the M2 client implements it | `a_registrant_that_lost_its_response_is_freed_by_answering_not_ok` (failed: entry kept) | ab987f1 |
+| 2 | A panicking `descriptor` drops `GET /v1/hub` | valid | `a_panicking_descriptor_answers_an_error_body` (failed: IncompleteMessage) | 6574e7c |
+| 3 | The pinned startup put is unbounded and not read back on Indeterminate | valid | `the_pinned_startup_write_is_bounded_and_read_back` (failed: 1 pinned entry left) | 9f724d7 |
+| S1 | Heartbeat route re-derives `Authorized`; `HeaderMap` clones | done (`Presented` extractor) | suite | de72825 |
+| S2 | Duplicate worker index in the in-memory store | done for the worker index; folding `last_seen` skipped (eight sites, small gain) | suite | a005a15 |
+| S4, N7 | Drop repeats abort's body; erased admit hides a failed downcast | done | suite | 4dc151e |
+| S3, S5 | Startup `?` refactor; merge two cancel tokens | skipped (optional, no defect) | - | - |
+| D1-D4 | doc drift | D1, D2, D4 fixed; D3 is a V0 file, passed to the V0 thread | - | 2f4fcc4 |
+
+Recorded, not acted on: N1 (a backend whose hook lags `remove()` leaves the owner Busy until it arrives; M4 contract input), N2 (eviction removes serialize in the loop; revisit with a remote store), N3 (probe tasks are not joined at stop), N4 (CI does not build velo-hub without `server`; M2 adds that check), N8 (`UnregisterPermit` has no Drop guard; same class as a panicking store call).
