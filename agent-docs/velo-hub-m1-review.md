@@ -41,6 +41,25 @@ Refuted: none stood. The one refutation (row 1) was overturned by a test.
 | 5 | Stale rustdoc: second shutdown, `step_timeout`, `shutdown_timeout` | valid | - | fbaf263 |
 | 6 | Test gaps: on_registered deadline, the three other bounded-remove sites, DELETE lock timeout, the unwritten Drop arm order, tests that fail by hanging, semver (v) tautological, header whitespace | valid (the probe test fails by assertion after 120 s, not a hang; given a deadline anyway) | six tests and two script cases, each mutation-checked | df5d5ef |
 
-## Round 3
+## Round 3 (range c1d66c4..df5d5ef, fixes 300aa87..df5d5ef): 16 claims, 15 confirmed, 1 refuted
 
-See below (appended when it completes).
+| # | Claim | Ruling | Test | Fix commit |
+|---|---|---|---|---|
+| 1 | A reservation is cleared only by a removal of its own incarnation; after an unresolved write, a late-landing replacement that then expires strands the owner reserved until restart | valid (major). Changes one ported transition: any removal of a reserved owner clears it; safe because a credential-free claim writes with `expected: None` | `any_removal_of_a_reserved_owner_clears_the_reservation`, `a_late_landing_write_does_not_strand_a_reservation` (fails with the old arm) | d7f98e5 |
+| 2 | A panicking extension `shutdown` kills the stop task: ports bound, pinned entry kept, velo running, every later `shutdown` errors | valid (found by two finders) | `a_panicking_extension_shutdown_does_not_leave_the_hub_half_stopped` | 546194c |
+| 3 | A hung extension `shutdown` hangs the stop under the lock | valid | `a_hung_extension_shutdown_is_bounded` | 546194c |
+| 4 | A panicking `attach`/`start` skips the unwind | valid | `a_panic_in_start_unwinds_like_an_error` | 546194c |
+| 5 | Routers (extension route code) built after the irreversible hook; a route panic consumes the hook | valid | `a_panic_while_building_routes_unwinds_and_leaves_the_store_reusable` | 546194c |
+| 6 | Dropping the hub on a thread outside its runtime skips the ordered stop | valid | `dropping_the_hub_off_the_runtime_still_stops_it_in_order` | 546194c |
+| 7 | `ServerConfig` not validated; zero intervals panic the heartbeat or reaper silently | valid; verifier correction: zero `step_timeout` only expires steps that yield, so it is refused for clarity, not because every step fails | `zero_intervals_are_rejected_before_binding` | 546194c |
+| 8 | Book: drain "drops the rest" after one budget; it answers 503 and can take two | valid; the config doc's "three times" was also inexact | - | acc3c8e |
+| 9 | Book: a timed-out remove is read back only by DELETE | **refuted** by the verifier: every remove under the lock is followed by a store read that decides the next step | - | - |
+| 10 | Introduction still says two crates | valid | - | acc3c8e |
+| 11 | Code and tests cite `agent-docs/` and plan labels R1/R2/R4, which do not merge | valid (verifier found five more sites) | - | acc3c8e |
+| 12 | put and resolve deadlines untested | valid | `a_hung_store_write_is_cut_off_and_aborts`, `a_hung_read_back_is_cut_off_and_fails_closed` | ee189ed |
+| 13 | bounded core-task join untested | valid | `a_task_that_ignores_cancellation_does_not_hang_shutdown` (`FaultStore::stubborn_liveness`) | ee189ed |
+| 14 | heartbeat remove bound untested | valid | `a_hung_store_remove_does_not_stop_the_heartbeat` | ee189ed |
+| 15 | shutdown's lifecycle drain untested | valid; verifier correction: the lock is FIFO, so shutdown must queue before the lifecycle task to reach the drain | `shutdown_delivers_the_removals_still_queued` (two removals: in hand and queued; each mutant fails) | ee189ed |
+| 16 | prepare deadline test hangs on regression; semver branches untested | valid in part: of five script mutants, two are real gaps (explicit caret, dotted inheritor); two are behavior-equivalent; one strip was unreachable and is removed | cases (z), (za), (zb) | ee189ed |
+
+The loop did not run dry: round 3 still produced confirmed findings, and the skill stops after 3 rounds. The findings got narrower each round: round 1 lifecycle and protocol defects, round 2 the boundedness of the round-1 fixes, round 3 panics and hangs in extension code plus one state-machine edge under a double store fault. Every confirmed item is fixed with a test, or documented: the hook-linearization race test is probabilistic, the two admission checks back each other up, an extension's own panicking `commit` drops its `Staged` before `on_removed`, and the server-abort fallback after the second drain has no test (no request survives the per-request stop).

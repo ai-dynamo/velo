@@ -476,3 +476,14 @@ M1 is implemented on `bb/m1-velo-hub-server-core-thr_juy4b2a2x8` (stacked on V0)
 - §11 and §13.4 counts were both wrong. Actual: `tests/integration.rs` 59, `src/registry/tests.rs` 17, `src/registration/tests.rs` 6, `tests/registration_lifecycle.rs` 14, `tests/heartbeat_integration.rs` 5.
 - "Port `tests/integration.rs` with path changes only" was wrong: 13 of its tests exercise kvbm's `HubClient` (M2) and 8 exercise kvbm-owned features (K1). 33 port to M1, one of them rewritten (its DELETE came from a client drop guard); 5 handler tests merge into `protocol` unit tests. Seven CD tests are about the hub's behavior and port with a toy `Role` extension.
 - R4's step order (drop Staged before on_removed) would re-expose state; see 14.1.
+
+### 14.4 After review, 2026-10-18
+
+Three review rounds (record: `agent-docs/velo-hub-m1-review.md`) changed these behaviors from 14.1:
+
+- **Unregistration is a hub-owned task**, like registration. hyper drops a handler when its client closes the socket.
+- **Every wait under the registration lock or in shutdown is bounded**: store puts, read-backs and removes, `on_registered`, and the heartbeat's store calls run under `step_timeout`; each extension `shutdown` and hub task join, under `shutdown_timeout`. Panics in `attach`, `start`, `shutdown` and route building are caught and take the unwind path.
+- **Shutdown and startup run as their own tasks**, so a caller that stops waiting cannot leave the hub half stopped; a dropped `Hub` stops in order on the runtime that served it. Shutdown releases the lock before the HTTP drain, then ends requests still in flight with 503 (a per-request layer; axum's connection tasks outlive an aborted server).
+- **Routers are built before the removal hook.** They run extension code that can panic, and nothing after the hook may fail.
+- **A reservation is cleared by any removal of its owner** (one ported transition changed; see the review record, round 3 row 1).
+- **`ServerConfig::validate`** refuses zero intervals and timeouts.
