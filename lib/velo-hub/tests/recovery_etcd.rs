@@ -112,6 +112,15 @@ async fn a_restarted_hub_lets_its_registrant_back_in() {
     let second = client.register(&velo, Default::default()).await.unwrap();
     assert_ne!(second.epoch, first.epoch);
     assert_eq!(second.hub_id, hub_b.hub_id());
+    // The new hub runs a new velo instance, and a call to it by instance id
+    // gets through. Here the handshake of a probe from B registered B with
+    // the client before this call. `client.rs` has the test for `register`
+    // itself, before any probe.
+    let b_velo = hub_b.velo().unwrap();
+    install_echo(b_velo);
+    assert_eq!(second.hub_instance_id, Some(b_velo.instance_id()));
+    assert_ne!(second.hub_instance_id, first.hub_instance_id);
+    assert_eq!(echo_to(&velo, b_velo.instance_id(), 1).await.unwrap(), 2);
     assert!(!*client.recovered().borrow());
     assert_eq!(
         client.services().get_instances("svc").await.unwrap(),
