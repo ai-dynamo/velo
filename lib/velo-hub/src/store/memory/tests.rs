@@ -85,28 +85,6 @@ async fn reregister_mints_incarnation_and_rejects_stale_mutations() {
 }
 
 #[tokio::test]
-async fn reregister_purges_every_worker_mapping_owned_by_instance() {
-    let store = InMemoryStore::default();
-    let id = InstanceId::new_v4();
-    let peer_a = peer_with_address(id, b"address-a");
-    let peer_b = peer_with_address(id, b"address-b");
-    let stale_a = WorkerId::from_u64(peer_a.worker_id().as_u64().wrapping_add(1));
-    let stale_b = WorkerId::from_u64(peer_a.worker_id().as_u64().wrapping_add(2));
-
-    put(&store, &peer_a).await;
-    store.insert_worker_claim(stale_a, id);
-    put(&store, &peer_b).await;
-    assert!(!store.worker_claims_of(id).contains(&stale_a));
-
-    // A replacement must not keep a claim an earlier incarnation left.
-    store.insert_worker_claim(stale_b, id);
-    put(&store, &peer_a).await;
-
-    assert_eq!(store.worker_claims_of(id), vec![peer_a.worker_id()]);
-    assert_eq!(store.get(id).unwrap().record.peer, peer_a);
-}
-
-#[tokio::test]
 async fn removal_callback_identifies_removed_incarnation() {
     let store = InMemoryStore::default();
     let (hook, removals) = recording_hook();
@@ -452,4 +430,52 @@ async fn discovery_serves_the_replacement_address() {
             .unwrap(),
         second
     );
+}
+
+/// Cost of the writes that hold the store's write lock: a registration, a
+/// removal, and a reaper pass that expires every entry. Each must be O(1) in
+/// the number of other entries; while one runs, lookups on its DashMap shard
+/// wait. Not a gate: run it with
+/// `cargo test --release -p velo-hub --features server write_cost -- --ignored --nocapture`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "measurement, not a check"]
+async fn write_cost() {
+    const PEERS: usize = 10_000;
+    const OPS: usize = 1_000;
+    let store = InMemoryStore::builder()
+        .ttl(Duration::from_millis(1))
+        .build();
+    for _ in 0..PEERS {
+        put(&store, &make_peer()).await;
+    }
+    let fresh: Vec<PeerInfo> = (0..OPS).map(|_| make_peer()).collect();
+    let per_op = |elapsed: Duration| elapsed.as_nanos() as f64 / OPS as f64 / 1e3;
+    let started = std::time::Instant::now();
+    for peer in &fresh {
+        put(&store, peer).await;
+    }
+    let put_fresh = per_op(started.elapsed());
+    let started = std::time::Instant::now();
+    for peer in &fresh {
+        let expected = store.current_incarnation(peer.instance_id());
+        store
+            .put(RegistrationRecord::bare(peer.clone()), expected)
+            .await
+            .unwrap();
+    }
+    let put_replace = per_op(started.elapsed());
+    let started = std::time::Instant::now();
+    for peer in &fresh {
+        let incarnation = store.current_incarnation(peer.instance_id()).unwrap();
+        store.remove(peer.instance_id(), incarnation).await.unwrap();
+    }
+    let remove = per_op(started.elapsed());
+    println!(
+        "{PEERS} entries: put {put_fresh:.1} us, replacing put {put_replace:.1} us, remove {remove:.1} us"
+    );
+    tokio::time::sleep(Duration::from_millis(5)).await;
+    let started = std::time::Instant::now();
+    store.prune_stale();
+    println!("prune_stale expiring all {PEERS}: {:?}", started.elapsed());
+    assert!(store.list().is_empty());
 }

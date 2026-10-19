@@ -96,7 +96,7 @@ All kept. One change applies to all: kvbm's `register(peer)` was unconditional; 
 | `register_and_list` | kept |
 | `reregister_same_instance_replaces_single_entry` | kept |
 | `reregister_mints_incarnation_and_rejects_stale_mutations` | kept (`StaleIncarnation` -> `Stale`) |
-| `reregister_purges_every_worker_mapping_owned_by_instance` | kept; internals reached through two `#[cfg(test)]` helpers instead of the map |
+| `reregister_purges_every_worker_mapping_owned_by_instance` | **intentionally removed** (mega review round 1): it planted a worker claim that no public API can create (`WorkerId` is a function of `InstanceId`), and the scan it defended cost 21 µs per write at 10,000 entries. `write_cost` records the numbers. |
 | `removal_callback_identifies_removed_incarnation` | kept |
 | `hook_installation_returns_existing_registrations` | kept |
 | `removal_hook_cannot_be_replaced` | kept (`HookInstalled`) |

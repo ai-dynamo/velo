@@ -157,6 +157,8 @@ Setup: release build, 10,000 owners or peers, 2,000,000 calls spread over the ow
 
 `get` and `list` copy each record with its payloads. With a 2 KiB payload, `get` took 248 ns, and `list` took 14 to 19 ms for 10,000 entries. The heartbeat uses `peers()`, which does not copy payloads: 0.3 ms for 10,000 entries.
 
+A write holds the store's write lock and a shard of the copy, so its cost must not grow with the number of entries. With 10,000 entries (`write_cost`), a put takes 1.0 µs and a remove 0.6 µs, and a reaper pass that expires all 10,000 takes 7.2 ms. An index update that scanned every entry was measured first and rejected: 21 µs for each put and each remove, and 109 ms for that reaper pass, all of it with the write lock held.
+
 ## Versioning
 
 `velo-hub` takes the workspace version and depends on `velo` with a caret on that version. See [Versioning](../development/versioning.md#velo-hub).

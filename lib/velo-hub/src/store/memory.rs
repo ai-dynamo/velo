@@ -62,10 +62,17 @@ impl InMemoryStore {
     /// Remove `id` from every map. Call with the write lock held.
     fn remove_entry(&self, inner: &mut Inner, id: InstanceId) -> Option<StoredRegistration> {
         let stored = inner.by_instance.remove(&id)?;
-        inner.by_worker.retain(|_, owner| *owner != id);
+        // An entry holds exactly one worker key, its own: `WorkerId` is a
+        // function of `InstanceId`. A scan here would write-lock every
+        // DashMap shard on each removal and make a mass expiry O(n^2).
+        let worker = id.worker_id();
+        if inner.by_worker.get(&worker) == Some(&id) {
+            inner.by_worker.remove(&worker);
+        }
         inner.last_seen.remove(&id);
         self.peers.remove(&id);
-        self.workers.retain(|_, peer| peer.instance_id() != id);
+        self.workers
+            .remove_if(&worker, |_, peer| peer.instance_id() == id);
         Some(stored)
     }
 }
@@ -168,16 +175,12 @@ impl InMemoryStore {
             .ok_or_else(|| StoreError::Backend(anyhow!("incarnation counter exhausted")))?;
         inner.last_incarnation = next;
         let incarnation = Incarnation::from_u64(next);
-        // A replacement drops every worker claim the earlier incarnation
-        // held. WorkerId derives from InstanceId today, but clearing by owner
-        // keeps the index right if that ever changes.
-        inner.by_worker.retain(|_, owner| *owner != id);
+        // A replacement has the same worker key as the entry it replaces
+        // (`WorkerId` is a function of `InstanceId`), so overwriting in place
+        // is the whole update. Overwriting, not remove-then-insert, keeps a
+        // lock-free reader from missing a peer that never left.
         inner.by_worker.insert(worker, id);
-        // Overwrite in place, then drop stale keys: a remove-then-insert
-        // would let a lock-free reader miss a peer that never left.
         self.workers.insert(worker, record.peer.clone());
-        self.workers
-            .retain(|key, peer| *key == worker || peer.instance_id() != id);
         self.peers.insert(id, record.peer.clone());
         inner.by_instance.insert(
             id,
@@ -235,16 +238,6 @@ impl InMemoryStore {
     #[cfg(test)]
     pub(crate) fn insert_worker_claim(&self, worker: WorkerId, owner: InstanceId) {
         self.inner.write().by_worker.insert(worker, owner);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn worker_claims_of(&self, owner: InstanceId) -> Vec<WorkerId> {
-        self.inner
-            .read()
-            .by_worker
-            .iter()
-            .filter_map(|(worker, id)| (*id == owner).then_some(*worker))
-            .collect()
     }
 }
 
