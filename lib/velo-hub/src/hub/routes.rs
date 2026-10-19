@@ -144,6 +144,9 @@ fn core_routes() -> Router<Arc<Shared>> {
         .route(paths::HUB, get(describe))
         .route(paths::PEERS_BY_INSTANCE, get(peer_by_instance))
         .route(paths::PEERS_BY_WORKER, get(peer_by_worker))
+        .route(paths::SERVICES, get(list_services))
+        .route(paths::SERVICE, get(service_instances))
+        .route(paths::SERVICE_WATCH, get(watch_service))
 }
 
 /// The public listener: discovery and the extensions' public routes.
@@ -159,6 +162,10 @@ pub(crate) fn control_router(shared: &Arc<Shared>, stop: &CancellationToken) -> 
         .route(paths::INSTANCE_BY_ID, delete(unregister))
         .route(paths::INSTANCE_HEARTBEAT, post(heartbeat))
         .route(paths::INSTANCE_PROBE, post(probe))
+        .route(
+            paths::SERVICE_INSTANCE,
+            axum::routing::put(put_service_instance).delete(delete_service_instance),
+        )
         .with_state(Arc::clone(shared));
     mount(core, shared, stop, |extension| extension.control_routes())
 }
@@ -216,7 +223,13 @@ async fn health() -> &'static str {
 
 async fn describe(State(shared): HubState) -> Result<Json<HubDescriptor>, HubError> {
     let mut extensions = Vec::with_capacity(shared.extensions.len());
-    for extension in &shared.extensions {
+    // The service directory is built in; its routes are core routes, and
+    // no user extension can take its name.
+    for extension in shared
+        .extensions
+        .iter()
+        .filter(|extension| extension.name() != super::services::NAME)
+    {
         // Extension code on a public route: a panic must answer an
         // `ErrorBody`, not drop the connection.
         let descriptor =
@@ -349,4 +362,49 @@ async fn probe(
         seq: ack.seq,
         ok: ack.ok,
     }))
+}
+
+async fn list_services(State(shared): HubState) -> Json<protocol::ServiceListResponse> {
+    Json(protocol::ServiceListResponse {
+        services: shared.services.list(),
+    })
+}
+
+async fn service_instances(
+    State(shared): HubState,
+    HubPath(service): HubPath<String>,
+) -> Result<Json<protocol::ServiceInstancesResponse>, HubError> {
+    super::services::check_name(&service)?;
+    Ok(Json(protocol::ServiceInstancesResponse {
+        instances: shared.services.instances(&service),
+    }))
+}
+
+async fn watch_service(
+    State(shared): HubState,
+    HubPath(service): HubPath<String>,
+) -> Result<axum::response::Response, HubError> {
+    use axum::response::IntoResponse;
+    super::services::check_name(&service)?;
+    Ok(shared.services.watch(&service).into_response())
+}
+
+async fn put_service_instance(
+    State(shared): HubState,
+    HubPath((service, _)): HubPath<(String, InstanceId)>,
+    auth: Authorized,
+) -> Result<StatusCode, HubError> {
+    super::services::check_name(&service)?;
+    shared.services.put(&service, &auth)?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+async fn delete_service_instance(
+    State(shared): HubState,
+    HubPath((service, _)): HubPath<(String, InstanceId)>,
+    auth: Authorized,
+) -> Result<StatusCode, HubError> {
+    super::services::check_name(&service)?;
+    shared.services.delete(&service, &auth)?;
+    Ok(StatusCode::NO_CONTENT)
 }

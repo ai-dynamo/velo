@@ -40,6 +40,7 @@ mod heartbeat;
 mod lifecycle;
 mod registration;
 mod routes;
+mod services;
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -83,6 +84,10 @@ pub(crate) struct Shared {
     /// In start order.
     pub(crate) extensions: Vec<Arc<dyn DynExtension>>,
     pub(crate) by_name: HashMap<&'static str, Arc<dyn Any + Send + Sync>>,
+    /// The built-in service directory, also in `extensions`.
+    pub(crate) services: Arc<services::ServiceDirectory>,
+    /// Owners whose registration transaction runs; the heartbeat skips them.
+    pub(crate) in_flight: Arc<heartbeat::InFlight>,
     /// The hub-wide registration lock. Every extension mutation
     /// (`commit`, `on_registered`, `on_removed`) runs under it.
     pub(crate) lock: tokio::sync::Mutex<()>,
@@ -180,13 +185,25 @@ impl HubBuilder {
             store,
             velo,
             bundles,
-            direct,
+            mut direct,
         } = self;
         let server = config.server.clone();
 
-        // 1. Graph and config, before any I/O.
+        // 1. Graph and config, before any I/O. The service directory is a
+        // built-in extension, first in start order.
         server.validate()?;
-        let extensions = graph::plan(bundles, direct, &config.bundles)?;
+        let directory = Arc::new(services::ServiceDirectory::default());
+        direct.insert(0, PendingExtension::new(Arc::clone(&directory), HUB_OWNER));
+        let mut extensions = graph::plan(bundles, direct, &config.bundles)?;
+        // `plan` puts bundle extensions before direct ones. The directory
+        // requires nothing and nothing requires it, so it can go first.
+        if let Some(at) = extensions
+            .iter()
+            .position(|extension| extension.name() == services::NAME)
+        {
+            let directory = extensions.remove(at);
+            extensions.insert(0, directory);
+        }
 
         // 2. Listeners.
         let public = TcpListener::bind((server.bind_addr, server.public_port))
@@ -318,6 +335,8 @@ impl HubBuilder {
             velo: unwind.velo.clone(),
             by_name: attached,
             extensions,
+            services: directory,
+            in_flight: Arc::default(),
             lock: tokio::sync::Mutex::new(()),
             admission: AtomicBool::new(false),
             jobs: jobs.clone(),
@@ -386,6 +405,7 @@ impl HubBuilder {
                 server.heartbeat_max_failures,
                 server.step_timeout,
                 core_cancel.clone(),
+                Arc::clone(&shared.in_flight),
             )),
             None => tracing::info!(
                 "no velo instance: the hub does not probe registrants; liveness is the store's TTL alone"
