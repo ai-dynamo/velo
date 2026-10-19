@@ -420,6 +420,7 @@ struct LedgerFaults {
     hang_next_prepare: bool,
     panic_next_prepare: bool,
     panic_next_commit: bool,
+    panic_next_registered: bool,
     gate_next_registered: Option<Arc<Gate>>,
     gate_next_publish: Option<Arc<Gate>>,
 }
@@ -428,6 +429,7 @@ struct LedgerFaults {
 /// (removed, or replaced by a commit) it does nothing.
 pub struct Unhide {
     state: Arc<Mutex<LedgerState>>,
+    revealed: Arc<std::sync::atomic::AtomicUsize>,
     owner: InstanceId,
     epoch: RegistrationEpoch,
     armed: bool,
@@ -443,6 +445,7 @@ impl Drop for Unhide {
         {
             owner.visible = true;
             owner.publish_open = true;
+            self.revealed.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
@@ -458,6 +461,9 @@ pub struct Ledger {
     /// Every `on_removed`, with the incarnation the ledger held for that
     /// owner when it arrived.
     removals: Mutex<Vec<(Removal, Option<Incarnation>)>>,
+    /// How many undos of a hide took effect, that is, made an owner's
+    /// entries visible again.
+    revealed: Arc<std::sync::atomic::AtomicUsize>,
     faults: Mutex<LedgerFaults>,
     pub attached: AtomicBool,
 }
@@ -482,6 +488,15 @@ impl Ledger {
     /// The next prepare hides, then panics.
     pub fn panic_next_prepare(&self) {
         self.faults.lock().panic_next_prepare = true;
+    }
+
+    pub fn panic_next_registered(&self) {
+        self.faults.lock().panic_next_registered = true;
+    }
+
+    /// How many undos of a hide made entries visible again.
+    pub fn revealed(&self) -> usize {
+        self.revealed.load(Ordering::Acquire)
     }
 
     pub fn panic_next_commit(&self) {
@@ -646,6 +661,7 @@ impl Extension for Ledger {
                 owner.publish_open = false;
                 Unhide {
                     state: Arc::clone(&self.state),
+                    revealed: Arc::clone(&self.revealed),
                     owner: txn.owner,
                     epoch: owner.epoch,
                     armed: true,
@@ -696,9 +712,18 @@ impl Extension for Ledger {
     }
 
     async fn on_registered(&self, _registration: &Committed<'_>) {
-        let gate = self.faults.lock().gate_next_registered.take();
+        let (gate, panic) = {
+            let mut faults = self.faults.lock();
+            (
+                faults.gate_next_registered.take(),
+                std::mem::take(&mut faults.panic_next_registered),
+            )
+        };
         if let Some(gate) = gate {
             gate.pass().await;
+        }
+        if panic {
+            panic!("injected on_registered panic");
         }
     }
 

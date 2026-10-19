@@ -213,6 +213,7 @@ async fn prepare_failure_leaves_prior_untouched() {
     assert_eq!(response.status(), 409);
     assert_eq!(error_code(response).await, ErrorCode::Conflict);
     assert_prior_intact(&f, &peer, &prior, incarnation).await;
+    assert_eq!(f.ledger.revealed(), 1, "the abort undid the hide");
 }
 
 /// `prepare` hides, then never returns. The deadline drops its future,
@@ -318,6 +319,11 @@ async fn removal_during_prepare_cannot_interleave_with_commit() {
     assert!(
         !f.ledger.has_owner(owner),
         "the abort delivered the removal"
+    );
+    assert_eq!(
+        f.ledger.revealed(),
+        0,
+        "the removal was delivered before the hide was undone"
     );
     assert_eq!(
         post_register(&f.hub, &request(&peer), None).await.status(),
@@ -497,6 +503,11 @@ async fn post_write_register_peer_failure_fails_closed_and_leaves_no_velo_peer()
     assert_eq!(response.status(), 409);
     assert_eq!(error_code(response).await, ErrorCode::RegisterAgain);
     assert_failed_closed(&f, &client.peer_info(), &prior.credential).await;
+    assert_eq!(
+        f.ledger.revealed(),
+        0,
+        "on_removed ran before the hide was undone"
+    );
     assert!(
         velo.primary_transport_key(owner).is_none(),
         "no velo peer is left"
@@ -761,6 +772,11 @@ async fn a_panic_after_the_write_never_shows_the_prior_state_again() {
         "the removal was delivered before the response"
     );
     assert_eq!(query(&hub, owner, "k").await, None);
+    assert_eq!(
+        ledger.revealed(),
+        0,
+        "on_removed ran before the hide was undone"
+    );
     retire.release();
     assert!(
         eventually(Duration::from_secs(1), || !store.contains(owner)).await,
@@ -903,4 +919,165 @@ async fn a_hung_store_remove_does_not_hold_the_lock_forever() {
         .await
         .expect("shutdown hung")
         .unwrap();
+}
+
+// ---- paths the first review found untested -------------------------------
+
+/// An `on_registered` that panics after the credential committed: the
+/// entry is retired, its removal revokes the credential nobody received,
+/// and the owner registers afresh.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panicking_on_registered_retires_the_registration() {
+    let f = plain().await;
+    let peer = make_peer();
+    let owner = peer.instance_id();
+    f.ledger.panic_next_registered();
+    let response = post_register(&f.hub, &request_with(&peer, &[ledger_opt_in()]), None).await;
+    assert_eq!(response.status(), 500);
+    assert!(
+        eventually(Duration::from_secs(1), || !f.store.contains(owner)
+            && !f.ledger.has_owner(owner))
+        .await,
+        "the written entry is retired"
+    );
+    let mut fresh = post_register(&f.hub, &request(&peer), None).await;
+    for _ in 0..50 {
+        if fresh.status() != 409 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        fresh = post_register(&f.hub, &request(&peer), None).await;
+    }
+    assert_eq!(fresh.status(), 200);
+}
+
+/// Panics in `on_removed`. Started after the ledger, so removals reach it
+/// first.
+struct PanicsOnRemoved;
+
+impl Extension for PanicsOnRemoved {
+    const NAME: &'static str = "panics-on-removed";
+    type Registration = ();
+    type Staged = ();
+
+    async fn prepare(
+        &self,
+        _txn: &velo_hub::Txn<'_>,
+        _payload: Option<()>,
+    ) -> Result<(), Rejection> {
+        Ok(())
+    }
+
+    fn commit(&self, _staged: (), _registration: &velo_hub::Committed<'_>) {}
+
+    fn on_removed(&self, _removal: velo_hub::store::Removal) {
+        panic!("injected on_removed panic");
+    }
+}
+
+/// One extension's panic in `on_removed` does not stop delivery to the
+/// others, the DELETE, or the lifecycle task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panicking_on_removed_does_not_stop_delivery() {
+    let hub = builder()
+        .extension(Ledger::default())
+        .extension(PanicsOnRemoved)
+        .serve()
+        .await
+        .unwrap();
+    let ledger = hub.extension::<Ledger>().unwrap();
+    let peer = make_peer();
+    let owner = peer.instance_id();
+    let credential = register(&hub, &request_with(&peer, &[ledger_opt_in()]), None)
+        .await
+        .credential;
+    assert_eq!(unregister_status(&hub, owner, Some(&credential)).await, 204);
+    assert!(!ledger.has_owner(owner));
+    // The lifecycle task survived its copy of the removal too.
+    let second = make_peer();
+    let credential = register(&hub, &request_with(&second, &[ledger_opt_in()]), None)
+        .await
+        .credential;
+    assert_eq!(
+        unregister_status(&hub, second.instance_id(), Some(&credential)).await,
+        204
+    );
+    assert_eq!(
+        post_register(&hub, &request(&peer), None).await.status(),
+        200
+    );
+}
+
+/// A DELETE whose store remove fails leaves the registration as it was.
+#[tokio::test]
+async fn a_failed_store_remove_restores_the_registration() {
+    let f = plain().await;
+    let peer = make_peer();
+    let credential = register_plain(&f.hub, &peer, None).await.credential;
+    f.store.fail_next_remove();
+    assert_eq!(
+        unregister_status(&f.hub, peer.instance_id(), Some(&credential)).await,
+        500
+    );
+    assert_eq!(
+        heartbeat_status(&f.hub, peer.instance_id(), Some(&credential)).await,
+        200
+    );
+    assert_eq!(
+        unregister_status(&f.hub, peer.instance_id(), Some(&credential)).await,
+        204
+    );
+}
+
+/// After the write, the failed registration's entry cannot be removed: it
+/// stays reserved, so nobody claims it without a credential, until it
+/// leaves the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_entry_that_could_not_be_removed_after_a_failure_stays_reserved() {
+    let f = fixture(|_| {}, true).await;
+    let owner = InstanceId::new_v4();
+    let unreachable = PeerInfo::new(owner, unreachable_peer().worker_address().clone());
+    f.store.fail_next_remove();
+    let response = post_register(&f.hub, &request(&unreachable), None).await;
+    assert_eq!(response.status(), 409);
+    assert!(f.store.contains(owner), "the remove failed");
+    assert_eq!(
+        post_register(&f.hub, &request(&unreachable), None)
+            .await
+            .status(),
+        401,
+        "reserved"
+    );
+    f.store.expire(owner);
+    // The reservation went with the entry: the next attempt reaches velo
+    // again (and fails the same way) instead of answering 401.
+    assert_eq!(
+        post_register(&f.hub, &request(&unreachable), None)
+            .await
+            .status(),
+        409
+    );
+}
+
+/// A registration that cannot get the lock in `lock_timeout_ms` answers 503.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registration_waits_at_most_lock_timeout() {
+    let f = fixture(
+        |config| config.server.lock_timeout = Duration::from_millis(200),
+        false,
+    )
+    .await;
+    let gate = f.ledger.gate_next_prepare();
+    let held = tokio::spawn({
+        let hub = f.hub.clone();
+        let body = request(&make_peer());
+        async move { post_register(&hub, &body, None).await.status() }
+    });
+    gate.entered().await;
+    let started = std::time::Instant::now();
+    let waiting = post_register(&f.hub, &request(&make_peer()), None).await;
+    assert_eq!(waiting.status(), 503);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    gate.release();
+    assert_eq!(held.await.unwrap(), 200);
 }

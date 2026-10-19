@@ -128,3 +128,39 @@ async fn hub_does_not_probe_self() {
     assert!(ids.contains(&hub.velo().unwrap().instance_id()));
     hub.shutdown().await.unwrap();
 }
+
+/// A successful probe refreshes liveness. With a TTL far shorter than the
+/// test, a responsive peer stays only because each probe touches its
+/// entry; a peer that never answers, with failures set too high to evict
+/// it, is expired by the TTL in the same time, which shows the TTL bites.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_successful_probe_refreshes_liveness() {
+    let mut config = config();
+    config.server.heartbeat_interval = Duration::from_millis(150);
+    config.server.heartbeat_max_failures = 1000;
+    config.server.ttl = Duration::from_millis(600);
+    config.server.prune_interval = Duration::from_millis(50);
+    let hub = Hub::builder(config)
+        .velo(velo_builder())
+        .serve()
+        .await
+        .unwrap();
+    let responsive = new_velo().await;
+    install_heartbeat(&responsive);
+    wire_mutual(&hub, &responsive).await;
+    let silent = new_velo().await;
+    install_wedged_heartbeat(&silent, Duration::from_secs(60));
+    wire_mutual(&hub, &silent).await;
+
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let ids = registered_ids(&hub);
+    assert!(
+        ids.contains(&responsive.instance_id()),
+        "probes must refresh the TTL"
+    );
+    assert!(
+        !ids.contains(&silent.instance_id()),
+        "the TTL is short enough to evict an untouched entry"
+    );
+    hub.shutdown().await.unwrap();
+}

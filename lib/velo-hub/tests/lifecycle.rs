@@ -683,6 +683,12 @@ async fn shutdown_does_not_wait_out_the_lock_timeout_of_queued_requests() {
         async move { unregister_status(&hub, victim.instance_id(), Some(&victim_credential)).await }
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
+    let late_registration = tokio::spawn({
+        let hub = hub.clone();
+        let body = request(&make_peer());
+        async move { post_register(&hub, &body, None).await.status() }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
     gate.release();
     assert_eq!(held.await.unwrap(), 200);
     shutdown.await.unwrap().unwrap();
@@ -692,6 +698,11 @@ async fn shutdown_does_not_wait_out_the_lock_timeout_of_queued_requests() {
         started.elapsed()
     );
     assert_eq!(delete.await.unwrap(), 503);
+    assert_eq!(
+        late_registration.await.unwrap(),
+        503,
+        "admission closed when shutdown began"
+    );
 }
 
 /// A request that never finishes (a probe to a peer that never answers)
@@ -854,5 +865,77 @@ async fn a_cancelled_serve_still_cleans_up() {
         "entries: {}, log: {:?}",
         store.list().len(),
         log.lock()
+    );
+}
+
+struct NeedsGhost;
+
+impl Extension for NeedsGhost {
+    const NAME: &'static str = "needs-ghost";
+    type Registration = ();
+    type Staged = ();
+
+    fn registration_requires() -> &'static [&'static str] {
+        &["ghost"]
+    }
+
+    async fn prepare(&self, _txn: &Txn<'_>, _payload: Option<()>) -> Result<(), Rejection> {
+        Ok(())
+    }
+
+    fn commit(&self, _staged: (), _registration: &Committed<'_>) {}
+
+    fn on_removed(&self, _removal: Removal) {}
+}
+
+struct CycleA;
+struct CycleB;
+
+impl Bundle for CycleA {
+    const NAME: &'static str = "cycle-a";
+
+    fn requires() -> &'static [&'static str] {
+        &["cycle-b"]
+    }
+
+    fn install(self, _installer: &mut BundleInstaller<'_>) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+impl Bundle for CycleB {
+    const NAME: &'static str = "cycle-b";
+
+    fn requires() -> &'static [&'static str] {
+        &["cycle-a"]
+    }
+
+    fn install(self, _installer: &mut BundleInstaller<'_>) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn registration_requirements_and_bundle_cycles_are_checked() {
+    let missing = builder().extension(NeedsGhost).serve().await.unwrap_err();
+    assert!(
+        matches!(
+            missing.downcast_ref::<GraphError>(),
+            Some(GraphError::MissingRegistrationRequirement {
+                requires: "ghost",
+                ..
+            })
+        ),
+        "{missing}"
+    );
+    let cycle = builder()
+        .bundle(CycleA)
+        .bundle(CycleB)
+        .serve()
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(cycle.downcast_ref::<GraphError>(), Some(GraphError::BundleCycle(names)) if names == &["cycle-a", "cycle-b"]),
+        "{cycle}"
     );
 }
