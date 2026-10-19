@@ -299,7 +299,7 @@ pub async fn run_f1r_consumer_drop(ctx: &ScenarioCtx) -> Result<ScenarioReport> 
     let h = owner.register_data(payload.clone());
     oracle.inc_sent();
 
-    // Run pull on the consumer in a task; drop the consumer Velo Arc mid-way.
+    // Run pull on the consumer in a task; drop the consumer `Velo` handle mid-way.
     let consumer_velo = pair.client.velo.clone();
     let pull_task: tokio::task::JoinHandle<Result<usize>> = tokio::spawn(async move {
         let (data, lease) = consumer_velo.get(h).await?;
