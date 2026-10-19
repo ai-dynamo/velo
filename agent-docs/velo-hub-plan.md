@@ -784,3 +784,7 @@ Nothing met the bar. Five probes passed, among them an H-2 discriminator (etcd a
 
 - **D-1 ratified:** one custody lease per hub (M4's departure from R7) is accepted. M4 merged to `main` as #131 (`2cf026d`).
 - **H-8 and the `not_ready` field:** the user asked for more detail before ruling.
+
+### 18.12 `not_ready` is an error code, 2026-10-19
+
+The user chose a new `ErrorCode::NotReady` (503) over the `ErrorBody::not_ready` field. The code is the client's next action, and "another hub may serve this" is a different action from "retry later on this hub". `Unavailable` now means the request may have changed the hub's state; the four refusal sites that answered `not_ready: true` answer `NotReady`, and the field is gone. The user also said HA is P1/P2, not needed now: M7 stays on `bb/m7-velo-hub-ha` and does not land yet. The choice between this design and Raft (H-8) stays open until HA is picked up.

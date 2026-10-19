@@ -66,7 +66,7 @@ async fn ready_answers_503_while_the_store_is_not_live() {
     for url in [public(&hub, paths::READY), control(&hub, paths::READY)] {
         let response = status(url).await;
         assert_eq!(response.status(), 503);
-        assert_eq!(error_code(response).await, ErrorCode::Unavailable);
+        assert_eq!(error_code(response).await, ErrorCode::NotReady);
     }
     assert_eq!(status(public(&hub, paths::HEALTH)).await.status(), 200);
     store.set_continuity(Continuity::Live);
@@ -116,7 +116,7 @@ async fn a_stopping_hub_is_not_ready_and_refuses_registrations_as_not_ready() {
         .json()
         .await
         .unwrap();
-    assert!(body.not_ready, "{body:?}");
+    assert_eq!(body.code, ErrorCode::NotReady, "{body:?}");
     let health = http()
         .get(public(&hub, paths::HEALTH))
         .send()
@@ -126,8 +126,8 @@ async fn a_stopping_hub_is_not_ready_and_refuses_registrations_as_not_ready() {
     let refused = post_register(&hub, &request(&make_peer()), None).await;
     assert_eq!(refused.status(), 503);
     let body: ErrorBody = refused.json().await.unwrap();
-    assert_eq!(body.code, ErrorCode::Unavailable);
-    assert!(body.not_ready, "{body:?}");
+    assert_eq!(body.code, ErrorCode::NotReady);
+    assert_eq!(body.code, ErrorCode::NotReady, "{body:?}");
     gate.release();
     held.await.unwrap();
     stopping.await.unwrap().unwrap();

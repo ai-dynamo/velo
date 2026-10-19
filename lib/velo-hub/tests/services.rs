@@ -274,7 +274,7 @@ async fn a_watch_ends_when_the_store_leaves_live() {
     let code = refused
         .downcast_ref::<ClientError>()
         .and_then(ClientError::code);
-    assert_eq!(code, Some(ErrorCode::Unavailable), "{refused:#}");
+    assert_eq!(code, Some(ErrorCode::NotReady), "{refused:#}");
     store.set_continuity(Continuity::Live);
     let mut again = services.watch_instances("svc").await.unwrap();
     assert_eq!(next(&mut again).await, ServiceEvent::Initial(vec![]));

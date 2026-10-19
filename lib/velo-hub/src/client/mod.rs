@@ -168,8 +168,8 @@ impl HubClientBuilder {
     ///
     /// A call goes to the host that answered last. It moves to the next
     /// host only when no hub that could act got the request: it could not
-    /// connect, or the hub answered 503 with
-    /// [`not_ready`](ErrorBody::not_ready). Every other answer is the
+    /// connect, or the hub answered [`ErrorCode::NotReady`]. Every other
+    /// answer is the
     /// hub's, and the call returns it, so a request that may have changed
     /// one hub's state is never sent to another. After every host was
     /// tried once, the call returns the last answer.
@@ -409,7 +409,7 @@ async fn decode<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, C
 }
 
 /// The error of a hub's error answer, and whether the hub said it is not
-/// ready and did nothing ([`ErrorBody::not_ready`]).
+/// ready and did nothing ([`ErrorCode::NotReady`]).
 async fn failure(response: reqwest::Response) -> (ClientError, bool) {
     let status = response.status();
     let bytes = match response.bytes().await {
@@ -423,7 +423,7 @@ async fn failure(response: reqwest::Response) -> (ClientError, bool) {
                 code: error.code,
                 message: error.message,
             },
-            error.not_ready && status == StatusCode::SERVICE_UNAVAILABLE,
+            error.code == ErrorCode::NotReady,
         ),
         Err(_) => (
             ClientError::Unexpected {
