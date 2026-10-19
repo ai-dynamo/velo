@@ -582,13 +582,14 @@ async fn a_dropped_register_future_does_not_answer_probes_ok() {
     hub.shutdown().await.unwrap();
 }
 
-/// A re-registration whose future is dropped after the hub committed leaves
-/// the client with the old credential. `unregister` then gets 401, which
-/// means "this credential owns nothing there", so it answers Ok and drops
-/// the registration, while the hub still holds the new one. The client
-/// then answers probes not ok, and the hub frees the entry.
+/// A re-registration whose future is dropped: the hub may have committed
+/// it (here it did) and rotated the credential, so the client cannot know
+/// whether the credential it holds still works. It fails closed: it drops
+/// the registration, answers the hub's probes not ok, and the hub frees the
+/// entry on its own, with no call from the caller. Then a fresh `register`
+/// works.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_dropped_re_register_heals_through_the_probes() {
+async fn a_dropped_re_register_fails_closed_and_the_hub_frees_the_entry() {
     let mut config = config();
     config.server.heartbeat_interval = Duration::from_millis(100);
     config.server.heartbeat_max_failures = 2;
@@ -625,13 +626,103 @@ async fn a_dropped_re_register_heals_through_the_probes() {
         })
         .await
     );
-    assert!(client.unregister().await.is_ok());
     assert!(!client.is_registered());
     assert!(
         eventually(Duration::from_secs(3), || hub_ref.store().get(id).is_none()).await,
-        "the hub did not free the registration the client lost"
+        "the hub kept a registration that nobody can use"
     );
     client.register(&velo, none()).await.unwrap();
+    client.unregister().await.unwrap();
+    hub.shutdown().await.unwrap();
+}
+
+/// An `ExtClient` control call answered `unauthorized` (someone with the
+/// credential re-registered around the client) drops the registration,
+/// like every other call that presents the credential.
+#[tokio::test]
+async fn an_ext_control_call_answered_unauthorized_drops_the_registration() {
+    let hub = builder()
+        .extension(Ledger::default())
+        .serve()
+        .await
+        .unwrap();
+    let client = client_for(&hub);
+    let ledger = client.ext(Ledger::NAME);
+    let peer = make_peer();
+    let owner = peer.instance_id();
+    let (name, payload) = ledger_opt_in();
+    let mut extensions = none();
+    extensions.insert(name.to_string(), payload);
+    let first = client
+        .register_peer(peer.clone(), extensions)
+        .await
+        .unwrap();
+    let _second = register(
+        &hub,
+        &request_with(&peer, &[ledger_opt_in()]),
+        Some(&first.credential),
+    )
+    .await;
+    let error = ledger
+        .control_post::<_, ()>(
+            &format!("/instances/{owner}/publish"),
+            &Publish {
+                key: "k".into(),
+                generation: 1,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Unauthorized), "{error}");
+    assert!(!client.is_registered());
+}
+
+/// The hub holds a registration the client never got, and the caller
+/// retries `register` in a tight loop (each refused with 401). While a
+/// call is in flight the handler would answer probes ok, and the hub would
+/// never reach `heartbeat_max_failures`. A credential-free register that the
+/// hub refuses tells the client that an orphan holds its instance, so the
+/// handler stops answering ok until a registration succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tight_register_retry_loop_still_frees_the_orphan() {
+    let mut config = config();
+    config.server.heartbeat_interval = Duration::from_millis(100);
+    config.server.heartbeat_max_failures = 2;
+    let hub = Hub::builder(config)
+        .velo(velo_builder())
+        .serve()
+        .await
+        .unwrap();
+    let client = client_for(&hub);
+    let velo = client
+        .velo_builder()
+        .add_transport(tcp_transport())
+        .build()
+        .await
+        .unwrap();
+    // Installs the handler; the hub refuses the payload, so nothing is held.
+    let mut unknown = none();
+    unknown.insert("no-such-extension".to_string(), serde_json::Value::Null);
+    assert!(client.register(&velo, unknown).await.is_err());
+    let _orphan = register(&hub, &request(&velo.peer_info()), None).await;
+    assert!(!client.is_registered());
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let mut got_in = false;
+    while tokio::time::Instant::now() < deadline {
+        match client.register(&velo, none()).await {
+            Ok(_) => {
+                got_in = true;
+                break;
+            }
+            Err(ClientError::Hub {
+                code: ErrorCode::Unauthorized,
+                ..
+            }) => continue,
+            Err(error) => panic!("{error}"),
+        }
+    }
+    assert!(got_in, "retries without backoff kept the orphan alive");
     client.unregister().await.unwrap();
     hub.shutdown().await.unwrap();
 }

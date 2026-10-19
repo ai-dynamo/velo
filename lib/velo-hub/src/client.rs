@@ -293,6 +293,18 @@ struct State {
     /// A register call is running. The hub may commit before the client
     /// sees the answer, and its first probe may arrive first.
     acquiring: bool,
+    /// The hub refused a register without a credential: it holds a
+    /// registration of this instance that the client never got. Until a
+    /// register succeeds, the handler answers not ok even while a call is
+    /// in flight, so retries cannot keep that registration alive.
+    orphaned: bool,
+}
+
+impl State {
+    /// The heartbeat handler's answer.
+    fn answer_ok(&self) -> bool {
+        self.response.is_some() || (self.acquiring && !self.orphaned)
+    }
 }
 
 /// What the client's handles share: the registration and what the
@@ -328,34 +340,57 @@ impl Shared {
     }
 }
 
-/// Clears [`State::acquiring`] when a register call ends, also when its
-/// future is dropped: a flag left set would answer the hub's probes ok for
-/// a registration the client never got, and the hub would keep it.
-struct Acquiring<'a>(&'a Shared);
+/// One register call. Its `Drop` runs on every exit, also when the future
+/// is dropped: it clears [`State::acquiring`], and if the call presented a
+/// credential and got no answer, it drops the registration. The hub may
+/// have committed the re-registration and rotated the credential, so the
+/// client cannot know whether it still holds anything; holding a dead
+/// credential would answer the hub's probes ok for a registration nobody
+/// can use. Failing closed lets the hub free it.
+struct Acquiring<'a> {
+    shared: &'a Shared,
+    presented: Option<Credential>,
+    answered: bool,
+}
 
 impl<'a> Acquiring<'a> {
-    fn start(shared: &'a Shared) -> Self {
+    fn start(shared: &'a Shared, presented: Option<Credential>) -> Self {
         shared.state.lock().acquiring = true;
-        Self(shared)
+        Self {
+            shared,
+            presented,
+            answered: false,
+        }
     }
 }
 
 impl Drop for Acquiring<'_> {
     fn drop(&mut self) {
-        self.0.state.lock().acquiring = false;
+        if !self.answered
+            && let Some(credential) = &self.presented
+        {
+            self.shared.forget(credential);
+        }
+        self.shared.state.lock().acquiring = false;
     }
 }
 
-/// An answer that says this credential owns nothing on the hub (any more).
-fn owns_nothing(error: &ClientError) -> bool {
+/// An answer that says the hub does not accept this credential (any more).
+fn credential_rejected(error: &ClientError) -> bool {
     match error {
-        ClientError::Hub { code, .. } => matches!(
-            code,
-            ErrorCode::Unauthorized | ErrorCode::RegisterAgain | ErrorCode::NotFound
-        ),
+        ClientError::Hub { code, .. } => {
+            matches!(code, ErrorCode::Unauthorized | ErrorCode::RegisterAgain)
+        }
         ClientError::Unexpected { status, .. } => *status == StatusCode::UNAUTHORIZED,
         _ => false,
     }
+}
+
+/// An answer on a core route that says this credential owns nothing on the
+/// hub: rejected, or the instance is unknown (404). Not for extension
+/// routes, where a 404 can be the extension's own miss.
+fn owns_nothing(error: &ClientError) -> bool {
+    credential_rejected(error) || error.code() == Some(ErrorCode::NotFound)
 }
 
 struct Inner {
@@ -494,25 +529,32 @@ impl HubClient {
     ) -> Result<RegisterResponse, ClientError> {
         let _op = self.inner.op.lock().await;
         let presented = self.check_peer(peer.instance_id())?;
-        let shared = &self.inner.shared;
-        let _acquiring = Acquiring::start(shared);
         let endpoints = &self.inner.endpoints;
         let url = Endpoints::join(&endpoints.control, protocol::paths::INSTANCES)?;
         let request = RegisterRequest { peer, extensions };
+        // From here to the answer, no early return: a drop of `call` without
+        // an answer means "the request may have reached the hub".
+        let shared = &self.inner.shared;
+        let mut call = Acquiring::start(shared, presented.clone());
         let answer: Result<RegisterResponse, ClientError> = endpoints
             .call(Method::POST, url, presented.as_ref(), Some(&request))
             .await;
+        call.answered = true;
         match answer {
             Ok(response) => {
-                // Set before `_acquiring` clears, so probes never see neither.
-                shared.state.lock().response = Some(response.clone());
+                // Set before `call` clears `acquiring`, so a probe never
+                // finds neither.
+                let mut state = shared.state.lock();
+                state.response = Some(response.clone());
+                state.orphaned = false;
                 Ok(response)
             }
             Err(error) => {
-                if owns_nothing(&error)
-                    && let Some(credential) = &presented
-                {
-                    shared.forget(credential);
+                if credential_rejected(&error) {
+                    match &presented {
+                        Some(credential) => shared.forget(credential),
+                        None => shared.state.lock().orphaned = true,
+                    }
                 }
                 Err(error)
             }
@@ -628,10 +670,7 @@ fn heartbeat_handler(shared: Weak<Shared>) -> Handler {
                     .map_or(1, |since| since.as_millis().max(1) as u64);
                 shared.seq.store(seq, Ordering::Release);
                 shared.at_unix_ms.store(now, Ordering::Release);
-                let ok = {
-                    let state = shared.state.lock();
-                    state.response.is_some() || state.acquiring
-                };
+                let ok = shared.state.lock().answer_ok();
                 Ok(HeartbeatAck { seq, ok })
             }
         },
@@ -703,18 +742,32 @@ impl ExtClient {
         let (base, credential) = match listener {
             Listener::Public => (&self.endpoints.public, None),
             Listener::Control => {
-                let (_, credential) = self
+                let shared = self
                     .registration
                     .upgrade()
-                    .and_then(|shared| shared.credential())
                     .ok_or(ClientError::NotRegistered)?;
-                (&self.endpoints.control, Some(credential))
+                let (_, credential) = shared.credential().ok_or(ClientError::NotRegistered)?;
+                (&self.endpoints.control, Some((shared, credential)))
             }
         };
         let url = Endpoints::join(base, &format!("{}{path}", self.root))?;
-        self.endpoints
-            .call(method, url, credential.as_ref(), body)
-            .await
+        let answer = self
+            .endpoints
+            .call(
+                method,
+                url,
+                credential.as_ref().map(|(_, credential)| credential),
+                body,
+            )
+            .await;
+        // A rejected credential is dead for every call: drop it, as the
+        // core calls do. A 404 is not: it can be the extension's own miss.
+        if let (Err(error), Some((shared, credential))) = (&answer, &credential)
+            && credential_rejected(error)
+        {
+            shared.forget(credential);
+        }
+        answer
     }
 
     /// `GET` on the public listener.
