@@ -86,3 +86,8 @@ required-features = ["test-support"]
 name = "hooks"
 path = "tests/hooks.rs"
 required-features = ["test-support"]
+
+[[test]]
+name = "lifecycle"
+path = "tests/lifecycle.rs"
+required-features = ["test-support"]
