@@ -49,7 +49,7 @@ pub(crate) async fn register(
     request: RegisterRequest,
 ) -> Result<RegisterResponse, HubError> {
     if !shared.admitting() {
-        return Err(HubError::unavailable("the hub is not taking registrations"));
+        return Err(HubError::not_ready("the hub is not taking registrations"));
     }
     // Decoding runs in the task too, so a panic in an extension's `decode`
     // or `admit` meets the same boundary as one in `prepare` and answers 500
@@ -378,7 +378,7 @@ async fn transact(
         .await
         .map_err(|_| HubError::unavailable("timed out waiting for the registration lock"))?;
     if !shared.admitting() {
-        return Err(HubError::unavailable("the hub is not taking registrations"));
+        return Err(HubError::not_ready("the hub is not taking registrations"));
     }
     let locked_at = Instant::now();
 
@@ -570,7 +570,7 @@ async fn unregister_now(
         .await
         .map_err(|_| HubError::unavailable("timed out waiting for the registration lock"))?;
     if !shared.admitting() {
-        return Err(HubError::unavailable("the hub is stopping"));
+        return Err(HubError::not_ready("the hub is stopping"));
     }
     let permit = shared
         .authority

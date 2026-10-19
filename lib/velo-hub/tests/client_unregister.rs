@@ -116,6 +116,7 @@ async fn unregister(
             Json(ErrorBody {
                 code: ErrorCode::Internal,
                 message: "transient failure".to_string(),
+                not_ready: false,
             }),
         ));
     }

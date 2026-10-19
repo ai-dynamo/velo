@@ -8,13 +8,15 @@
 mod common;
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use common::*;
 use serde::{Deserialize, Serialize};
 use velo_hub::client::{ClientError, HubClient, HubClientBuilder};
 use velo_hub::protocol::{ErrorCode, peers_by_instance};
-use velo_hub::store::HubStore;
+use velo_hub::store::testing::FaultStore;
+use velo_hub::store::{Continuity, HubStore, InMemoryStore};
 use velo_hub::velo::discovery::PeerDiscovery;
 use velo_hub::velo::{Handler, Velo};
 use velo_hub::{Extension, Hub};
@@ -1115,4 +1117,105 @@ async fn an_unresolved_write_answers_recovered_and_the_credential_recovers() {
         .expect("the credential recovers the reserved entry");
     assert_ne!(again.epoch, first.epoch);
     assert!(!*client.recovered().borrow());
+}
+
+// ---- a list of hosts ------------------------------------------------------
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A hub at `host` on `ports`, on `store`.
+async fn hub_at(host: &str, ports: (u16, u16), store: Arc<dyn HubStore>) -> Hub {
+    let mut config = config();
+    config.server.bind_addr = host.parse().unwrap();
+    config.server.public_port = ports.0;
+    config.server.control_port = ports.1;
+    Hub::builder(config).store(store).serve().await.unwrap()
+}
+
+fn client_on(hosts: &[&str], ports: (u16, u16)) -> HubClient {
+    HubClient::builder()
+        .hosts(hosts.iter().copied())
+        .public_port(ports.0)
+        .control_port(ports.1)
+        .build()
+        .unwrap()
+}
+
+/// A host where nothing listens is skipped: the request never left, so
+/// the next host gets it, and later calls go to that host first.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dead_first_host_is_skipped() {
+    let ports = (free_port(), free_port());
+    let hub = hub_at("127.0.0.1", ports, Arc::new(InMemoryStore::default())).await;
+    let client = client_on(&["127.0.0.2", "127.0.0.1"], ports);
+    let answer = client.register_peer(make_peer(), none()).await.unwrap();
+    assert_eq!(answer.hub_id, hub.hub_id());
+    assert_eq!(client.control_url().host_str(), Some("127.0.0.1"));
+    assert_eq!(client.describe().await.unwrap().hub_id, hub.hub_id());
+    client.unregister().await.unwrap();
+    hub.shutdown().await.unwrap();
+}
+
+/// A hub that is not ready (its store is not live) answers 503 with
+/// `not_ready` before it does anything, so the next host gets the request.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hub_that_is_not_ready_is_skipped() {
+    let ports = (free_port(), free_port());
+    let degraded = Arc::new(FaultStore::default());
+    degraded.set_continuity(Continuity::Degraded);
+    let first = hub_at(
+        "127.0.0.1",
+        ports,
+        Arc::clone(&degraded) as Arc<dyn HubStore>,
+    )
+    .await;
+    let second = hub_at("127.0.0.2", ports, Arc::new(InMemoryStore::default())).await;
+    let client = client_on(&["127.0.0.1", "127.0.0.2"], ports);
+    let answer = client.register_peer(make_peer(), none()).await.unwrap();
+    assert_eq!(answer.hub_id, second.hub_id());
+    assert!(degraded.list().is_empty());
+    client.unregister().await.unwrap();
+    first.shutdown().await.unwrap();
+    second.shutdown().await.unwrap();
+}
+
+/// Every other answer is the hub's own, and the call returns it: a
+/// request is never sent to a second hub after one hub answered it. Here
+/// a 401 (the first hub holds the instance, and the client has no
+/// credential) and an indeterminate 503 (the write's outcome was unknown;
+/// it did not apply, but the hub had acted on the request).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hub_answer_is_not_sent_to_the_next_host() {
+    use velo_hub::store::testing::PutFault;
+    let ports = (free_port(), free_port());
+    let store = Arc::new(FaultStore::default());
+    let first = hub_at("127.0.0.1", ports, Arc::clone(&store) as Arc<dyn HubStore>).await;
+    let second_store = Arc::new(InMemoryStore::default());
+    let second = hub_at(
+        "127.0.0.2",
+        ports,
+        Arc::clone(&second_store) as Arc<dyn HubStore>,
+    )
+    .await;
+    let peer = make_peer();
+    register_plain(&first, &peer, None).await;
+    let client = client_on(&["127.0.0.1", "127.0.0.2"], ports);
+    let refused = client.register_peer(peer, none()).await.unwrap_err();
+    assert_eq!(refused.code(), Some(ErrorCode::Unauthorized), "{refused}");
+
+    store.fault_next_put(PutFault::IndeterminateNotWritten);
+    let unknown = client.register_peer(make_peer(), none()).await.unwrap_err();
+    assert_eq!(unknown.code(), Some(ErrorCode::Unavailable), "{unknown}");
+    assert!(
+        second_store.list().is_empty(),
+        "the second hub got a request"
+    );
+    first.shutdown().await.unwrap();
+    second.shutdown().await.unwrap();
 }

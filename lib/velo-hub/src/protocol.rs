@@ -423,6 +423,14 @@ pub struct ErrorBody {
     pub code: ErrorCode,
     /// Human-readable detail.
     pub message: String,
+    /// Set on a 503 that the hub answered because it is not ready (its
+    /// store is not live, or it does not take registrations), before it
+    /// did anything for the request. Another hub may serve the request,
+    /// so a client with more than one host tries the next one. Not set
+    /// on a 503 whose request may have changed the hub's state, such as
+    /// an indeterminate write. Absent means `false`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub not_ready: bool,
 }
 
 impl std::fmt::Display for ErrorBody {
@@ -463,7 +471,7 @@ pub enum ErrorCode {
     /// record and starts a new epoch.
     Recovered,
     /// 503: the hub is starting, stopping, overloaded, or its store has
-    /// lost continuity. Retry later.
+    /// lost continuity. Retry later. See [`ErrorBody::not_ready`].
     Unavailable,
     /// 502: the hub could not reach the instance over velo.
     BadGateway,

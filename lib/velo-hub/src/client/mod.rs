@@ -30,7 +30,7 @@
 //! ```
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -116,7 +116,7 @@ impl ClientError {
 /// Builder for [`HubClient`]. Only the host is required.
 #[derive(Debug, Clone)]
 pub struct HubClientBuilder {
-    host: Option<String>,
+    hosts: Vec<String>,
     scheme: String,
     public_port: u16,
     control_port: u16,
@@ -126,7 +126,7 @@ pub struct HubClientBuilder {
 impl Default for HubClientBuilder {
     fn default() -> Self {
         Self {
-            host: None,
+            hosts: Vec::new(),
             scheme: "http".to_string(),
             public_port: DEFAULT_PUBLIC_PORT,
             control_port: DEFAULT_CONTROL_PORT,
@@ -156,9 +156,25 @@ impl HubClientBuilder {
             ))
     }
 
-    /// The hub's host name or address. Required.
+    /// The hub's host name or address. Required, or [`hosts`](Self::hosts).
     pub fn host(mut self, host: impl Into<String>) -> Self {
-        self.host = Some(host.into());
+        self.hosts = vec![host.into()];
+        self
+    }
+
+    /// Hosts of hubs that share the same ports, in order: an active hub
+    /// and its standbys, where no shared address (a VIP, a Service) is in
+    /// front of them. Replaces [`host`](Self::host).
+    ///
+    /// A call goes to the host that answered last. It moves to the next
+    /// host only when no hub that could act got the request: it could not
+    /// connect, or the hub answered 503 with
+    /// [`not_ready`](ErrorBody::not_ready). Every other answer is the
+    /// hub's, and the call returns it, so a request that may have changed
+    /// one hub's state is never sent to another. After every host was
+    /// tried once, the call returns the last answer.
+    pub fn hosts<H: Into<String>>(mut self, hosts: impl IntoIterator<Item = H>) -> Self {
+        self.hosts = hosts.into_iter().map(Into::into).collect();
         self
     }
 
@@ -194,19 +210,29 @@ impl HubClientBuilder {
 
     /// Build the client. It holds no registration yet.
     pub fn build(self) -> Result<HubClient, ClientError> {
-        let host = self
-            .host
-            .ok_or_else(|| ClientError::InvalidUrl("no host".to_string()))?;
-        // An IPv6 literal needs brackets in a URL.
-        let host = if host.contains(':') && !host.starts_with('[') {
-            format!("[{host}]")
-        } else {
-            host
-        };
-        let url = |port: u16| {
+        if self.hosts.is_empty() {
+            return Err(ClientError::InvalidUrl("no host".to_string()));
+        }
+        let url = |host: &str, port: u16| {
+            // An IPv6 literal needs brackets in a URL.
+            let host = if host.contains(':') && !host.starts_with('[') {
+                format!("[{host}]")
+            } else {
+                host.to_string()
+            };
             Url::parse(&format!("{}://{host}:{port}", self.scheme))
                 .map_err(|error| ClientError::InvalidUrl(format!("{host}:{port}: {error}")))
         };
+        let hosts = self
+            .hosts
+            .iter()
+            .map(|host| {
+                Ok(Host {
+                    public: url(host, self.public_port)?,
+                    control: url(host, self.control_port)?,
+                })
+            })
+            .collect::<Result<Vec<_>, ClientError>>()?;
         // A watch is one long response, so the default watch client has no
         // total timeout, only an idle one longer than the hub's keep-alive.
         let (http, watch) = match self.http {
@@ -225,8 +251,8 @@ impl HubClientBuilder {
         let endpoints = Arc::new(Endpoints {
             http,
             watch,
-            public: url(self.public_port)?,
-            control: url(self.control_port)?,
+            hosts,
+            current: AtomicUsize::new(0),
         });
         Ok(HubClient {
             inner: Arc::new(Inner {
@@ -252,14 +278,39 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 /// `Disconnected`.
 pub const DEFAULT_WATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The HTTP clients and the two listener URLs, shared by every handle.
+/// The two listener URLs of one host.
+#[derive(Debug)]
+struct Host {
+    public: Url,
+    control: Url,
+}
+
+impl Host {
+    fn base(&self, listener: Listener) -> &Url {
+        match listener {
+            Listener::Public => &self.public,
+            Listener::Control => &self.control,
+        }
+    }
+}
+
+/// Which listener a call goes to.
+#[derive(Clone, Copy, Debug)]
+enum Listener {
+    Public,
+    Control,
+}
+
+/// The HTTP clients and the hosts, shared by every handle.
 #[derive(Debug)]
 struct Endpoints {
     http: reqwest::Client,
     /// For service watches: no total timeout.
     watch: reqwest::Client,
-    public: Url,
-    control: Url,
+    /// At least one.
+    hosts: Vec<Host>,
+    /// The host the next call goes to first: the one that answered last.
+    current: AtomicUsize,
 }
 
 impl Endpoints {
@@ -268,53 +319,119 @@ impl Endpoints {
             .map_err(|error| ClientError::InvalidUrl(format!("{base}{path}: {error}")))
     }
 
+    fn current(&self) -> &Host {
+        &self.hosts[self.current.load(Ordering::Relaxed) % self.hosts.len()]
+    }
+
+    /// Send a request to the current host, and to the next while no hub
+    /// that could act got it (see [`HubClientBuilder::hosts`]). Returns a
+    /// success response, or the error of the last answer.
+    async fn send<B: Serialize + ?Sized>(
+        &self,
+        http: &reqwest::Client,
+        method: Method,
+        listener: Listener,
+        path: &str,
+        credential: Option<&Credential>,
+        body: Option<&B>,
+    ) -> Result<reqwest::Response, ClientError> {
+        let first = self.current.load(Ordering::Relaxed);
+        let count = self.hosts.len();
+        for step in 0..count {
+            let index = (first + step) % count;
+            let url = Self::join(self.hosts[index].base(listener), path)?;
+            let mut request = http.request(method.clone(), url);
+            if let Some(credential) = credential {
+                request = request.header(CREDENTIAL_HEADER, credential.to_header_value());
+            }
+            if let Some(body) = body {
+                request = request.json(body);
+            }
+            let last = step + 1 == count;
+            let (error, untouched) = match request.send().await {
+                Ok(response) if response.status().is_success() => {
+                    self.current.store(index, Ordering::Relaxed);
+                    return Ok(response);
+                }
+                Ok(response) => failure(response).await,
+                // Could not connect: the request never left.
+                Err(error) => {
+                    let untouched = error.is_connect();
+                    (ClientError::from(error), untouched)
+                }
+            };
+            if !untouched || last {
+                if !untouched {
+                    self.current.store(index, Ordering::Relaxed);
+                }
+                return Err(error);
+            }
+        }
+        unreachable!("the client has at least one host")
+    }
+
     async fn call<B: Serialize + ?Sized, T: DeserializeOwned>(
         &self,
         method: Method,
-        url: Url,
+        listener: Listener,
+        path: &str,
         credential: Option<&Credential>,
         body: Option<&B>,
     ) -> Result<T, ClientError> {
-        let mut request = self.http.request(method, url);
-        if let Some(credential) = credential {
-            request = request.header(CREDENTIAL_HEADER, credential.to_header_value());
-        }
-        if let Some(body) = body {
-            request = request.json(body);
-        }
-        decode(request.send().await?).await
+        let response = self
+            .send(&self.http, method, listener, path, credential, body)
+            .await?;
+        decode(response).await
     }
 
     async fn lookup(&self, path: String) -> Result<PeerInfo, ClientError> {
-        let url = Self::join(&self.public, &path)?;
-        let found: PeerLookupResponse = self.call::<(), _>(Method::GET, url, None, None).await?;
+        let found: PeerLookupResponse = self
+            .call::<(), _>(Method::GET, Listener::Public, &path, None, None)
+            .await?;
         Ok(found.peer)
     }
 }
 
-/// Decode a hub answer. A success with an empty body (204) decodes as JSON
+/// Decode a hub's success answer. An empty body (204) decodes as JSON
 /// `null`, so `T = ()` reads it; use `serde::de::IgnoredAny` to ignore any
-/// body.
+/// body. An error answer decodes as [`failure`] does.
 async fn decode<T: DeserializeOwned>(response: reqwest::Response) -> Result<T, ClientError> {
     let status = response.status();
-    let bytes = response.bytes().await?;
-    if status.is_success() {
-        let body: &[u8] = if bytes.is_empty() { b"null" } else { &bytes };
-        return serde_json::from_slice(body).map_err(|error| ClientError::Unexpected {
-            status,
-            body: format!("undecodable success body: {error}"),
-        });
+    if !status.is_success() {
+        return Err(failure(response).await.0);
     }
+    let bytes = response.bytes().await?;
+    let body: &[u8] = if bytes.is_empty() { b"null" } else { &bytes };
+    serde_json::from_slice(body).map_err(|error| ClientError::Unexpected {
+        status,
+        body: format!("undecodable success body: {error}"),
+    })
+}
+
+/// The error of a hub's error answer, and whether the hub said it is not
+/// ready and did nothing ([`ErrorBody::not_ready`]).
+async fn failure(response: reqwest::Response) -> (ClientError, bool) {
+    let status = response.status();
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(error) => return (ClientError::from(error), false),
+    };
     match serde_json::from_slice::<ErrorBody>(&bytes) {
-        Ok(error) => Err(ClientError::Hub {
-            status,
-            code: error.code,
-            message: error.message,
-        }),
-        Err(_) => Err(ClientError::Unexpected {
-            status,
-            body: String::from_utf8_lossy(&bytes[..bytes.len().min(256)]).into_owned(),
-        }),
+        Ok(error) => (
+            ClientError::Hub {
+                status,
+                code: error.code,
+                message: error.message,
+            },
+            error.not_ready && status == StatusCode::SERVICE_UNAVAILABLE,
+        ),
+        Err(_) => (
+            ClientError::Unexpected {
+                status,
+                body: String::from_utf8_lossy(&bytes[..bytes.len().min(256)]).into_owned(),
+            },
+            false,
+        ),
     }
 }
 
@@ -440,12 +557,15 @@ impl Shared {
         &self,
         endpoints: &Endpoints,
         method: Method,
-        url: Url,
+        listener: Listener,
+        path: &str,
         body: Option<&B>,
         route: Route,
     ) -> Result<T, ClientError> {
         let (_, credential) = self.credential().ok_or(ClientError::NotRegistered)?;
-        let answer = endpoints.call(method, url, Some(&credential), body).await;
+        let answer = endpoints
+            .call(method, listener, path, Some(&credential), body)
+            .await;
         if let Err(error) = &answer {
             // The hub restarted and holds this registration from before:
             // not a rejection; the app registers again with the credential.
@@ -569,9 +689,15 @@ async fn delete(
     instance_id: InstanceId,
     credential: &Credential,
 ) -> Result<(), ClientError> {
-    let url = Endpoints::join(&endpoints.control, &protocol::instance_by_id(instance_id))?;
+    let path = protocol::instance_by_id(instance_id);
     match endpoints
-        .call::<(), ()>(Method::DELETE, url, Some(credential), None)
+        .call::<(), ()>(
+            Method::DELETE,
+            Listener::Control,
+            &path,
+            Some(credential),
+            None,
+        )
         .await
     {
         Err(error) if owns_nothing(&error) => Ok(()),
@@ -579,7 +705,8 @@ async fn delete(
     }
 }
 
-/// A client of one hub. Cheap to clone; every clone shares the one
+/// A client of one hub, or of an active hub and its standbys (see
+/// [`HubClientBuilder::hosts`]). Cheap to clone; every clone shares the one
 /// registration, and dropping the last clone unregisters it in the
 /// background, best effort. Prefer [`unregister`](Self::unregister) where
 /// you can await.
@@ -591,8 +718,8 @@ pub struct HubClient {
 impl std::fmt::Debug for HubClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HubClient")
-            .field("public", &self.inner.endpoints.public.as_str())
-            .field("control", &self.inner.endpoints.control.as_str())
+            .field("public", &self.public_url().as_str())
+            .field("control", &self.control_url().as_str())
             .field("registered", &self.is_registered())
             .finish()
     }
@@ -604,14 +731,14 @@ impl HubClient {
         HubClientBuilder::default()
     }
 
-    /// The public listener's base URL.
-    pub fn public_url(&self) -> &Url {
-        &self.inner.endpoints.public
+    /// The public listener's base URL, on the host the next call goes to.
+    pub fn public_url(&self) -> Url {
+        self.inner.endpoints.current().public.clone()
     }
 
-    /// The control listener's base URL.
-    pub fn control_url(&self) -> &Url {
-        &self.inner.endpoints.control
+    /// The control listener's base URL, on the host the next call goes to.
+    pub fn control_url(&self) -> Url {
+        self.inner.endpoints.current().control.clone()
     }
 
     /// Peer discovery through this hub, for [`VeloBuilder::discovery`]. It
@@ -687,13 +814,18 @@ impl HubClient {
                 serde_json::to_value(&serving).expect("names serialize"),
             );
             let endpoints = &self.inner.endpoints;
-            let url = Endpoints::join(&endpoints.control, protocol::paths::INSTANCES)?;
             let request = RegisterRequest { peer, extensions };
             // From here to the answer, no early return: a drop of `call`
             // without an answer means "the request may have reached the hub".
             let mut call = Acquiring::start(shared, presented.clone());
             let answer: Result<RegisterResponse, ClientError> = endpoints
-                .call(Method::POST, url, presented.as_ref(), Some(&request))
+                .call(
+                    Method::POST,
+                    Listener::Control,
+                    protocol::paths::INSTANCES,
+                    presented.as_ref(),
+                    Some(&request),
+                )
                 .await;
             // Answered means the hub answered (any `ErrorBody`), or the
             // request provably never left (could not connect). Anything else,
@@ -747,9 +879,16 @@ impl HubClient {
             return Ok(());
         };
         let endpoints = &self.inner.endpoints;
-        let url = Endpoints::join(&endpoints.control, &protocol::instance_by_id(instance_id))?;
+        let path = protocol::instance_by_id(instance_id);
         match shared
-            .credentialed::<(), ()>(endpoints, Method::DELETE, url, None, Route::Core)
+            .credentialed::<(), ()>(
+                endpoints,
+                Method::DELETE,
+                Listener::Control,
+                &path,
+                None,
+                Route::Core,
+            )
             .await
         {
             Ok(()) => {
@@ -781,12 +920,16 @@ impl HubClient {
         let shared = &self.inner.shared;
         let (instance_id, _) = shared.credential().ok_or(ClientError::NotRegistered)?;
         let endpoints = &self.inner.endpoints;
-        let url = Endpoints::join(
-            &endpoints.control,
-            &protocol::instance_heartbeat(instance_id),
-        )?;
+        let path = protocol::instance_heartbeat(instance_id);
         let answer: HeartbeatResponse = shared
-            .credentialed::<(), _>(endpoints, Method::POST, url, None, Route::Core)
+            .credentialed::<(), _>(
+                endpoints,
+                Method::POST,
+                Listener::Control,
+                &path,
+                None,
+                Route::Core,
+            )
             .await?;
         if !answer.acknowledged {
             return Err(ClientError::Unexpected {
@@ -828,8 +971,15 @@ impl HubClient {
     /// The hub's descriptor: its id, its velo instance, its extensions.
     pub async fn describe(&self) -> Result<HubDescriptor, ClientError> {
         let endpoints = &self.inner.endpoints;
-        let url = Endpoints::join(&endpoints.public, protocol::paths::HUB)?;
-        endpoints.call::<(), _>(Method::GET, url, None, None).await
+        endpoints
+            .call::<(), _>(
+                Method::GET,
+                Listener::Public,
+                protocol::paths::HUB,
+                None,
+                None,
+            )
+            .await
     }
 
     /// Calls to the routes of the extension named `name`. The `ExtClient`
@@ -928,14 +1078,6 @@ pub struct ExtClient {
     root: String,
 }
 
-/// Which listener an [`ExtClient`] call goes to. Control calls always carry
-/// the credential.
-#[derive(Clone, Copy)]
-enum Listener {
-    Public,
-    Control,
-}
-
 impl ExtClient {
     async fn request<B: Serialize + ?Sized, T: DeserializeOwned>(
         &self,
@@ -946,18 +1088,26 @@ impl ExtClient {
     ) -> Result<T, ClientError> {
         let path = format!("{}{path}", self.root);
         match listener {
+            // Control calls always carry the credential.
             Listener::Public => {
-                let url = Endpoints::join(&self.endpoints.public, &path)?;
-                self.endpoints.call(method, url, None, body).await
+                self.endpoints
+                    .call(method, listener, &path, None, body)
+                    .await
             }
             Listener::Control => {
                 let shared = self
                     .registration
                     .upgrade()
                     .ok_or(ClientError::NotRegistered)?;
-                let url = Endpoints::join(&self.endpoints.control, &path)?;
                 shared
-                    .credentialed(&self.endpoints, method, url, body, Route::Extension)
+                    .credentialed(
+                        &self.endpoints,
+                        method,
+                        listener,
+                        &path,
+                        body,
+                        Route::Extension,
+                    )
                     .await
             }
         }

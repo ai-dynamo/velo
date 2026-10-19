@@ -17,6 +17,8 @@ use crate::store::StoreError;
 pub struct HubError {
     code: ErrorCode,
     message: String,
+    /// See [`ErrorBody::not_ready`].
+    not_ready: bool,
 }
 
 impl HubError {
@@ -25,6 +27,17 @@ impl HubError {
         Self {
             code,
             message: message.into(),
+            not_ready: false,
+        }
+    }
+
+    /// 503 because the hub is not ready, before it did anything for the
+    /// request: a client with more than one host tries the next one. Only
+    /// for answers that changed nothing; see [`ErrorBody::not_ready`].
+    pub(crate) fn not_ready(message: impl Into<String>) -> Self {
+        Self {
+            not_ready: true,
+            ..Self::new(ErrorCode::Unavailable, message)
         }
     }
 
@@ -70,7 +83,8 @@ impl From<AuthorityError> for HubError {
             AuthorityError::NotFound { .. } => ErrorCode::NotFound,
             AuthorityError::StateChanged { .. } => ErrorCode::RegisterAgain,
             AuthorityError::Recovered { .. } => ErrorCode::Recovered,
-            AuthorityError::Unavailable => ErrorCode::Unavailable,
+            // Authority answers before any write: the store is not live.
+            AuthorityError::Unavailable => return Self::not_ready(error.to_string()),
         };
         Self::new(code, error.to_string())
     }
@@ -101,6 +115,7 @@ impl IntoResponse for HubError {
             Json(ErrorBody {
                 code: self.code,
                 message: self.message,
+                not_ready: self.not_ready,
             }),
         )
             .into_response()

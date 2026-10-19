@@ -229,12 +229,12 @@ async fn health() -> &'static str {
 async fn ready(State(shared): HubState) -> Result<&'static str, HubError> {
     let continuity = *shared.store.continuity().borrow();
     if continuity != crate::store::Continuity::Live {
-        return Err(HubError::unavailable(format!(
+        return Err(HubError::not_ready(format!(
             "the hub is not ready: its store is {continuity:?}"
         )));
     }
     if !shared.admitting() {
-        return Err(HubError::unavailable(
+        return Err(HubError::not_ready(
             "the hub is not ready: it is not taking registrations",
         ));
     }
@@ -416,7 +416,7 @@ async fn watch_service(
     let continuity = shared.store.continuity();
     let now = *continuity.borrow();
     if now != crate::store::Continuity::Live {
-        return Err(HubError::unavailable(format!(
+        return Err(HubError::not_ready(format!(
             "the hub's store is {now:?}; its services may be stale"
         )));
     }

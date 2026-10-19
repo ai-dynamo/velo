@@ -23,7 +23,7 @@ use velo::InstanceId;
 use velo::discovery::{ServiceDiscovery, ServiceEvent, ServiceRegistrationGuard};
 
 use super::sse::parse_events;
-use super::{ClientError, Endpoints, HubClient, Inner, Route, decode};
+use super::{ClientError, Endpoints, HubClient, Inner, Listener, Route};
 use crate::protocol;
 
 fn check_name(name: &str) -> Result<(), ClientError> {
@@ -113,10 +113,7 @@ impl HubClient {
             let Some((method, name)) = next else {
                 return Ok(());
             };
-            let url = Endpoints::join(
-                &endpoints.control,
-                &protocol::service_instance(&name, instance_id),
-            )?;
+            let path = protocol::service_instance(&name, instance_id);
             let put = method == Method::PUT;
             // Unsettled until the hub answers: a dropped future or an answer
             // that is not the hub's leaves it so.
@@ -124,7 +121,14 @@ impl HubClient {
             // `credentialed` drops a rejected registration, which clears
             // these sets; the loop then ends for want of a credential.
             let answer = shared
-                .credentialed::<(), ()>(endpoints, method, url, None, Route::Core)
+                .credentialed::<(), ()>(
+                    endpoints,
+                    method,
+                    Listener::Control,
+                    &path,
+                    None,
+                    Route::Core,
+                )
                 .await;
             match answer {
                 Ok(()) => {
@@ -218,10 +222,15 @@ pub struct HubServices {
 impl ServiceDiscovery for HubServices {
     fn list_services(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
         Box::pin(async move {
-            let url = Endpoints::join(&self.endpoints.public, protocol::paths::SERVICES)?;
             let list: protocol::ServiceListResponse = self
                 .endpoints
-                .call::<(), _>(Method::GET, url, None, None)
+                .call::<(), _>(
+                    Method::GET,
+                    Listener::Public,
+                    protocol::paths::SERVICES,
+                    None,
+                    None,
+                )
                 .await?;
             Ok(list.services)
         })
@@ -231,10 +240,15 @@ impl ServiceDiscovery for HubServices {
         let name = service_name.to_string();
         Box::pin(async move {
             check_name(&name)?;
-            let url = Endpoints::join(&self.endpoints.public, &protocol::service(&name))?;
             let found: protocol::ServiceInstancesResponse = self
                 .endpoints
-                .call::<(), _>(Method::GET, url, None, None)
+                .call::<(), _>(
+                    Method::GET,
+                    Listener::Public,
+                    &protocol::service(&name),
+                    None,
+                    None,
+                )
                 .await?;
             Ok(found.instances)
         })
@@ -247,17 +261,17 @@ impl ServiceDiscovery for HubServices {
         let name = service_name.to_string();
         Box::pin(async move {
             check_name(&name)?;
-            let url = Endpoints::join(&self.endpoints.public, &protocol::service_watch(&name))?;
-            let response = self
-                .endpoints
-                .watch
-                .get(url)
-                .send()
-                .await
-                .map_err(ClientError::from)?;
-            if !response.status().is_success() {
-                return Err(decode::<()>(response).await.unwrap_err().into());
-            }
+            let endpoints = &self.endpoints;
+            let response = endpoints
+                .send::<()>(
+                    &endpoints.watch,
+                    Method::GET,
+                    Listener::Public,
+                    &protocol::service_watch(&name),
+                    None,
+                    None,
+                )
+                .await?;
             let stream: Pin<Box<dyn Stream<Item = ServiceEvent> + Send>> =
                 Box::pin(parse_events(response.bytes_stream()));
             Ok(stream)
