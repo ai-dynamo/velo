@@ -9,13 +9,13 @@ Velo 0.19 makes runtime ownership explicit and removes duplicate dispatch and ca
 
 ## Runtime ownership
 
-Keep a `Velo` owner for as long as its streams are needed. `Velo` values and `Arc<Velo>` can still be cloned. Dropping one clone does not stop streams. Dropping the final Velo owner cancels its streams and stops the builder-owned streaming listener and tasks, even if an `Arc<Messenger>` remains alive.
+Keep a `Velo` owner for as long as its streams are needed. `Velo` is a handle, and clones share one instance. Dropping one clone does not stop streams. Dropping the final Velo owner cancels its streams and stops the builder-owned streaming listener and tasks, even if an `Arc<Messenger>` remains alive.
 
 `Messenger` values no longer implement `Clone`. Clone `Arc<Messenger>` to share the instance:
 
 ```rust,ignore
 let messages = Arc::clone(velo.messenger());
-let streams = Arc::clone(&velo); // Keep this owner while streams are active.
+let streams = velo.clone(); // Keep this owner while streams are active.
 ```
 
 The handlers that `AnchorManager::register_handlers` installs no longer keep their manager alive, so keep your own `Arc<AnchorManager>` for as long as you use it. The manager still keeps its Messenger alive: drop the manager too before you expect final Messenger drop to start teardown. `RendezvousManager::register_handlers` no longer keeps the Messenger alive. The public handler factories `streaming::control::create_anchor_{attach,detach,finalize,cancel}_handler` and `streaming::mpsc::create_mpsc_anchor_{attach,detach,cancel}_handler` are removed; call `AnchorManager::register_handlers` instead. A manager whose handlers owned it formed a cycle with its Messenger, so neither was ever dropped.

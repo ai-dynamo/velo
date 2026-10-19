@@ -42,7 +42,7 @@ const HANDLER_AM_SLOW: &str = "soak_slow";
 /// Wire up handlers used across messenger scenarios. Idempotent per-Velo
 /// because we register them once at pair-build time on the server side.
 fn register_handlers(
-    velo: &Arc<Velo>,
+    velo: &Velo,
     oracle: Arc<Oracle>,
     slow_dice: Arc<Dice>,
     slow_for: Duration,
@@ -147,7 +147,7 @@ pub async fn run_m1(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let oracle = Oracle::arc();
     let pair = fresh_pair(ctx, Arc::clone(&oracle)).await?;
     let target = pair.server.instance_id;
-    let velo = Arc::clone(&pair.client.velo);
+    let velo = pair.client.velo.clone();
 
     let cancel = CancellationToken::new();
     let pl = progress::spawn(
@@ -197,7 +197,7 @@ pub async fn run_m1(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
 }
 
 async fn drive_am_send(
-    velo: Arc<Velo>,
+    velo: Velo,
     target: InstanceId,
     oracle: Arc<Oracle>,
     duration: Duration,
@@ -239,7 +239,7 @@ pub async fn run_m2(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let oracle = Oracle::arc();
     let pair = fresh_pair(ctx, Arc::clone(&oracle)).await?;
     let target = pair.server.instance_id;
-    let velo = Arc::clone(&pair.client.velo);
+    let velo = pair.client.velo.clone();
 
     let cancel = CancellationToken::new();
     let pl = progress::spawn(
@@ -261,7 +261,7 @@ pub async fn run_m2(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
         {
             r??;
         }
-        let v = Arc::clone(&velo);
+        let v = velo.clone();
         let p = payload.clone();
         let oracle = Arc::clone(&oracle);
         oracle.inc_sent();
@@ -319,7 +319,7 @@ pub async fn run_m3(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let oracle = Oracle::arc();
     let pair = fresh_pair(ctx, Arc::clone(&oracle)).await?;
     let target = pair.server.instance_id;
-    let velo = Arc::clone(&pair.client.velo);
+    let velo = pair.client.velo.clone();
 
     let cancel = CancellationToken::new();
     let pl = progress::spawn(
@@ -335,7 +335,7 @@ pub async fn run_m3(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
 
     // AM driver in the background, unary driver in the foreground.
     let am_oracle = Arc::clone(&oracle);
-    let v = Arc::clone(&velo);
+    let v = velo.clone();
     let am_handle =
         tokio::spawn(
             async move { drive_am_send(v, target, am_oracle, duration, am_rate / 2).await },
@@ -351,7 +351,7 @@ pub async fn run_m3(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
         {
             r??;
         }
-        let v = Arc::clone(&velo);
+        let v = velo.clone();
         let p = payload.clone();
         let oracle = Arc::clone(&oracle);
         oracle.inc_sent();
@@ -405,7 +405,7 @@ pub async fn run_m5(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let oracle = Oracle::arc();
     let pair = fresh_pair(ctx, Arc::clone(&oracle)).await?;
     let target = pair.server.instance_id;
-    let velo = Arc::clone(&pair.client.velo);
+    let velo = pair.client.velo.clone();
 
     let started = Instant::now();
     let duration = ctx.scenario_duration().min(Duration::from_secs(10));
@@ -421,7 +421,7 @@ pub async fn run_m5(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
         {
             let _ = r?; // tolerate errors; drain may produce them
         }
-        let v = Arc::clone(&velo);
+        let v = velo.clone();
         let p = payload.clone();
         let oracle = Arc::clone(&oracle);
         oracle.inc_sent();
@@ -509,7 +509,7 @@ pub async fn run_f1_panicking_handler(ctx: &ScenarioCtx) -> Result<ScenarioRepor
         .await?;
 
     let started = Instant::now();
-    let velo = Arc::clone(&pair.client.velo);
+    let velo = pair.client.velo.clone();
     let target = pair.server.instance_id;
     let payload = Bytes::from(vec![0u8; 64]);
     let count = ctx.tier.budget().messenger_rate / 4;
@@ -561,7 +561,7 @@ pub async fn run_f2_peer_kill(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let oracle = Oracle::arc();
     let pair = fresh_pair(ctx, Arc::clone(&oracle)).await?;
     let target = pair.server.instance_id;
-    let velo = Arc::clone(&pair.client.velo);
+    let velo = pair.client.velo.clone();
 
     let started = Instant::now();
     let payload = Bytes::from(vec![0u8; 64]);
@@ -570,7 +570,7 @@ pub async fn run_f2_peer_kill(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
 
     // Spawn a wave of unaries; mid-flight, drop the server side.
     for i in 0..concurrency * 4 {
-        let v = Arc::clone(&velo);
+        let v = velo.clone();
         let p = payload.clone();
         let oracle = Arc::clone(&oracle);
         oracle.inc_sent();
@@ -647,7 +647,7 @@ pub async fn run_f3_slow_handler(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     )
     .await?;
     let target = pair.server.instance_id;
-    let velo = Arc::clone(&pair.client.velo);
+    let velo = pair.client.velo.clone();
 
     let started = Instant::now();
     let payload = Bytes::from(vec![0u8; 64]);
@@ -660,7 +660,7 @@ pub async fn run_f3_slow_handler(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
         {
             r??;
         }
-        let v = Arc::clone(&velo);
+        let v = velo.clone();
         let p = payload.clone();
         let oracle = Arc::clone(&oracle);
         oracle.inc_sent();

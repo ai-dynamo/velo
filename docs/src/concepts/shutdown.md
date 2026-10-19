@@ -24,6 +24,8 @@ sequenceDiagram
 
 `Velo` is `Clone`. If two clones call `graceful_shutdown` at the same time, the first runs the sequence and the second waits for it.
 
+Shutdown does not remove handlers. A handler that holds a `Velo` clone of its own instance keeps that instance alive, so its final drop never runs. A handler that needs its own instance holds a `WeakVelo` from `Velo::downgrade` and calls `upgrade` on each request.
+
 Work that was accepted before the drain keeps flowing through it. The messenger mux sends its records and its credit as active messages, so the gate lets through the handlers that serve accepted work:
 
 - The mux batch handlers (`_stream_batch`, and `_stream_batch.1` to `_stream_batch.15`, one for each lane), which carry the records and credit of open mux streams.
