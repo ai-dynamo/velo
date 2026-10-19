@@ -13,7 +13,7 @@ use common::*;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use velo_hub::Hub;
-use velo_hub::client::HubClient;
+use velo_hub::client::{ClientError, HubClient};
 use velo_hub::protocol::{CREDENTIAL_HEADER, ErrorCode, service_instance};
 use velo_hub::store::testing::FaultStore;
 use velo_hub::velo::discovery::{ServiceDiscovery, ServiceEvent, ServiceRegistrationGuard};
@@ -328,4 +328,56 @@ async fn a_peer_found_by_service_name_answers() {
     a.unregister().await.unwrap();
     b.unregister().await.unwrap();
     hub.shutdown().await.unwrap();
+}
+
+/// A guard outlives its registration. The client holds one guard per name
+/// and puts every name again after a registration, so after a fresh
+/// registration (which the hub starts with no services) the entry is back
+/// without a second `register_service`, and the one guard still removes it.
+#[tokio::test]
+async fn a_guard_outlives_a_fresh_registration_and_stays_the_only_one() {
+    let hub = start().await;
+    let client = client_for(&hub);
+    let peer = make_peer();
+    client
+        .register_peer(peer.clone(), Default::default())
+        .await
+        .unwrap();
+    let guard = client.register_service("r").await.unwrap();
+    client.unregister().await.unwrap();
+    assert!(hub_instances(&hub, "r").await.is_empty());
+    client
+        .register_peer(peer.clone(), Default::default())
+        .await
+        .unwrap();
+    assert_eq!(hub_instances(&hub, "r").await, [peer.instance_id()]);
+    assert!(client.register_service("r").await.is_err());
+    drop(guard);
+    let hub_ref = &hub;
+    let mut gone = false;
+    for _ in 0..100 {
+        if hub_instances(hub_ref, "r").await.is_empty() {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(gone, "the one guard did not remove its entry");
+}
+
+/// One guard per name: a second `register_service` of a name the client
+/// serves is refused, as velo's own backends refuse a duplicate, so no
+/// second guard can remove the first one's entry.
+#[tokio::test]
+async fn a_second_guard_for_one_name_is_refused() {
+    let hub = start().await;
+    let (client, id) = registered(&hub).await;
+    let first = client.register_service("r").await.unwrap();
+    let second = client.register_service("r").await;
+    assert!(
+        matches!(second, Err(ClientError::AlreadyServing(_))),
+        "{second:?}"
+    );
+    assert_eq!(hub_instances(&hub, "r").await, [id]);
+    drop(first);
 }

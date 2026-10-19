@@ -39,8 +39,9 @@ use crate::store::{Incarnation, Removal};
 pub(crate) const NAME: &str = "services";
 
 /// Changes a watcher can fall behind by before its stream ends with
-/// `disconnected`.
-const WATCH_BUFFER: usize = 1024;
+/// `disconnected`. tokio allocates the whole ring for each watched name, so
+/// it stays small; a watcher that falls behind watches again either way.
+const WATCH_BUFFER: usize = 128;
 
 /// Interval of the SSE keep-alive comment, so a client's idle read timeout
 /// tells a stalled stream from a quiet one.
@@ -147,9 +148,12 @@ impl Default for ServiceDirectory {
 }
 
 impl ServiceDirectory {
+    // Reads collect under the lock and sort after it: every registration's
+    // `commit` takes this lock under the hub's registration lock.
     pub(crate) fn list(&self) -> Vec<String> {
-        let state = self.state.lock();
-        let mut names: Vec<String> = state
+        let mut names: Vec<String> = self
+            .state
+            .lock()
             .services
             .iter()
             .filter(|(_, service)| !service.instances.is_empty())
@@ -160,12 +164,14 @@ impl ServiceDirectory {
     }
 
     pub(crate) fn instances(&self, name: &str) -> Vec<InstanceId> {
-        self.state
+        let instances: Vec<InstanceId> = self
+            .state
             .lock()
             .services
             .get(name)
-            .map(|service| sorted(&service.instances))
-            .unwrap_or_default()
+            .map(|service| service.instances.iter().copied().collect())
+            .unwrap_or_default();
+        sorted(instances)
     }
 
     pub(crate) fn put(&self, name: &str, auth: &Authorized) -> Result<(), HubError> {
@@ -195,9 +201,10 @@ impl ServiceDirectory {
                 .services
                 .entry(name.to_string())
                 .or_insert_with(Service::new);
-            let initial = sorted(&service.instances);
+            let initial: Vec<InstanceId> = service.instances.iter().copied().collect();
             (initial, service.changes.subscribe())
         };
+        let initial = sorted(initial);
         let watch = Watch {
             directory: Arc::clone(self),
             name: name.to_string(),
@@ -308,10 +315,9 @@ impl Extension for ServiceDirectory {
     }
 }
 
-fn sorted(instances: &HashSet<InstanceId>) -> Vec<InstanceId> {
-    let mut sorted: Vec<InstanceId> = instances.iter().copied().collect();
-    sorted.sort_by_key(|id| id.as_u128());
-    sorted
+fn sorted(mut instances: Vec<InstanceId>) -> Vec<InstanceId> {
+    instances.sort_by_key(|id| id.as_u128());
+    instances
 }
 
 /// Answer 400 for a name that is not one valid path segment.
@@ -320,7 +326,8 @@ pub(crate) fn check_name(name: &str) -> Result<(), HubError> {
         Ok(())
     } else {
         Err(HubError::bad_request(format!(
-            "{name:?} is not a service name: 1 to 128 of A-Z a-z 0-9 . _ -"
+            "{name:?} is not a service name: {}",
+            protocol::SERVICE_NAME_RULE
         )))
     }
 }

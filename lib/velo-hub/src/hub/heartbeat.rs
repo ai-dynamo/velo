@@ -51,6 +51,7 @@ pub(crate) fn spawn(
     max_failures: u32,
     step_timeout: Duration,
     cancel: CancellationToken,
+    in_flight: Arc<InFlight>,
 ) -> JoinHandle<()> {
     let (tx, mut rx) = mpsc::unbounded_channel::<ProbeOutcome>();
     tokio::spawn(async move {
@@ -69,8 +70,9 @@ pub(crate) fn spawn(
                 _ = tick.tick() => {
                     let Some(velo) = velo.upgrade() else { return };
                     seq = seq.wrapping_add(1);
-                    let registrations = store.peers();
+                    let mut registrations = store.peers();
                     retain_current_failures(&mut failures, &registrations);
+                    in_flight.skip(&mut registrations);
                     fan_out(&velo, &store, registrations, seq, interval, step_timeout, &tx);
                 }
                 Some(outcome) = rx.recv() => {
@@ -79,6 +81,41 @@ pub(crate) fn spawn(
             }
         }
     })
+}
+
+/// Owners whose registration transaction is running. The heartbeat does
+/// not probe them: the registrant has no answer yet, so it cannot tell its
+/// new registration from one it never got, and a slow but conforming
+/// transaction (an `on_registered` takes up to `step_timeout`) would let
+/// the probes evict the entry before the response arrives.
+#[derive(Default)]
+pub(crate) struct InFlight(parking_lot::Mutex<HashSet<InstanceId>>);
+
+impl InFlight {
+    /// Mark `owner` in flight until the guard drops.
+    pub(crate) fn enter(&self, owner: InstanceId) -> InFlightGuard<'_> {
+        self.0.lock().insert(owner);
+        InFlightGuard { set: self, owner }
+    }
+
+    fn skip(&self, registrations: &mut Vec<StoredPeer>) {
+        let set = self.0.lock();
+        if !set.is_empty() {
+            registrations.retain(|stored| !set.contains(&stored.peer.instance_id()));
+        }
+    }
+}
+
+/// See [`InFlight::enter`].
+pub(crate) struct InFlightGuard<'a> {
+    set: &'a InFlight,
+    owner: InstanceId,
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.set.0.lock().remove(&self.owner);
+    }
 }
 
 fn retain_current_failures(failures: &mut HashMap<FailureKey, u32>, registrations: &[StoredPeer]) {

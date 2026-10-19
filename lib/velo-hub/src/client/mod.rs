@@ -9,6 +9,9 @@
 //!              listeners; dropping the last clone sends DELETE
 //! HubDiscovery PeerDiscovery for velo; shares the HTTP client, holds no
 //!              registration, so velo keeping it does not keep a registration
+//! HubServices  ServiceDiscovery: list, get, watch (services.rs, sse.rs)
+//! HubServiceRegistration  one per name the client serves; the names follow
+//!              the registration
 //! ExtClient    JSON calls under /v1/ext/{name}; control calls carry the credential
 //! ```
 //!
@@ -26,7 +29,7 @@
 //! # }
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -35,11 +38,13 @@ use futures::future::BoxFuture;
 use reqwest::{Method, StatusCode, Url};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use std::pin::Pin;
-
-use futures::{Stream, StreamExt};
-use velo::discovery::{PeerDiscovery, ServiceDiscovery, ServiceEvent, ServiceRegistrationGuard};
+use velo::discovery::PeerDiscovery;
 use velo::{Handler, InstanceId, PeerInfo, Velo, VeloBuilder, WorkerId};
+
+mod services;
+mod sse;
+
+pub use services::{HubServiceRegistration, HubServices};
 
 use crate::protocol::{
     self, CREDENTIAL_HEADER, Credential, DEFAULT_CONTROL_PORT, DEFAULT_PUBLIC_PORT, ErrorBody,
@@ -86,6 +91,12 @@ pub enum ClientError {
     /// The hub URL is not valid.
     #[error("invalid hub url: {0}")]
     InvalidUrl(String),
+    /// Not a service name: see [`protocol::SERVICE_NAME_RULE`].
+    #[error("{0:?} is not a service name: {rule}", rule = protocol::SERVICE_NAME_RULE)]
+    InvalidServiceName(String),
+    /// The client already serves this service; it holds one guard per name.
+    #[error("the client already serves {0:?}")]
+    AlreadyServing(String),
     /// The local velo instance refused a step (installing the heartbeat
     /// handler).
     #[error("velo: {0:#}")]
@@ -231,8 +242,9 @@ impl HubClientBuilder {
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Request timeout of the client's default HTTP client. Longer than a
-/// registration can take on a hub with default settings and up to three
-/// extensions: 5 s for the lock, then 5 s for each of `2n + 3` steps.
+/// registration can take on a hub with default settings and up to two
+/// extensions of its own: 5 s for the lock, then 5 s for each of `2n + 3`
+/// steps, where `n` counts the built-in service directory too.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Idle timeout of a service watch on the default client: no bytes for
@@ -335,6 +347,9 @@ impl State {
 #[derive(Debug, Default)]
 struct Shared {
     state: parking_lot::Mutex<State>,
+    /// The services this client serves, one guard each. They follow the
+    /// registration: every successful register puts them again.
+    services: parking_lot::Mutex<BTreeSet<String>>,
     seq: AtomicU64,
     at_unix_ms: AtomicU64,
 }
@@ -360,6 +375,41 @@ impl Shared {
             state.response = None;
         }
     }
+
+    /// One call that presents the registration's credential. The one place
+    /// that applies the rule every such call follows: an answer that says
+    /// the hub does not accept the credential drops the registration, and
+    /// on a core route so does `not_found` (on an extension route a 404 can
+    /// be the extension's own miss).
+    async fn credentialed<B: Serialize + ?Sized, T: DeserializeOwned>(
+        &self,
+        endpoints: &Endpoints,
+        method: Method,
+        url: Url,
+        body: Option<&B>,
+        route: Route,
+    ) -> Result<T, ClientError> {
+        let (_, credential) = self.credential().ok_or(ClientError::NotRegistered)?;
+        let answer = endpoints.call(method, url, Some(&credential), body).await;
+        if let Err(error) = &answer {
+            let dead = match route {
+                Route::Core => owns_nothing(error),
+                Route::Extension => credential_rejected(error),
+            };
+            if dead {
+                self.forget(&credential);
+            }
+        }
+        answer
+    }
+}
+
+/// Which kind of route a credentialed call goes to; see
+/// [`Shared::credentialed`].
+#[derive(Clone, Copy)]
+enum Route {
+    Core,
+    Extension,
 }
 
 /// One register call. Its `Drop` runs on every exit, also when the future
@@ -388,12 +438,19 @@ impl<'a> Acquiring<'a> {
 
 impl Drop for Acquiring<'_> {
     fn drop(&mut self) {
+        // One lock for both writes, so no probe sees the flag still set on
+        // a registration already dropped.
+        let mut state = self.shared.state.lock();
         if !self.answered
             && let Some(credential) = &self.presented
+            && state
+                .response
+                .as_ref()
+                .is_some_and(|response| &response.credential == credential)
         {
-            self.shared.forget(credential);
+            state.response = None;
         }
-        self.shared.state.lock().acquiring = false;
+        state.acquiring = false;
     }
 }
 
@@ -561,14 +618,27 @@ impl HubClient {
         let answer: Result<RegisterResponse, ClientError> = endpoints
             .call(Method::POST, url, presented.as_ref(), Some(&request))
             .await;
-        call.answered = true;
+        // A transport error other than "could not connect" means the request
+        // may have reached the hub: that is no answer, so the guard fails
+        // closed, as for a dropped future.
+        call.answered = !matches!(
+            &answer,
+            Err(ClientError::Transport(error)) if !error.is_connect() && !error.is_builder()
+        );
         match answer {
             Ok(response) => {
                 // Set before `call` clears `acquiring`, so a probe never
                 // finds neither.
-                let mut state = shared.state.lock();
-                state.response = Some(response.clone());
-                state.orphaned = false;
+                {
+                    let mut state = shared.state.lock();
+                    state.response = Some(response.clone());
+                    state.orphaned = false;
+                }
+                drop(call);
+                // The services this client serves follow the registration:
+                // a fresh one starts with none on the hub, and a hub that
+                // restarted has none.
+                self.put_services().await?;
                 Ok(response)
             }
             Err(error) => {
@@ -588,12 +658,24 @@ impl HubClient {
     /// `DELETE` again.
     pub async fn unregister(&self) -> Result<(), ClientError> {
         let _op = self.inner.op.lock().await;
-        let Some((instance_id, credential)) = self.inner.shared.credential() else {
+        let shared = &self.inner.shared;
+        let Some((instance_id, credential)) = shared.credential() else {
             return Ok(());
         };
-        delete(&self.inner.endpoints, instance_id, &credential).await?;
-        self.inner.shared.forget(&credential);
-        Ok(())
+        let endpoints = &self.inner.endpoints;
+        let url = Endpoints::join(&endpoints.control, &protocol::instance_by_id(instance_id))?;
+        match shared
+            .credentialed::<(), ()>(endpoints, Method::DELETE, url, None, Route::Core)
+            .await
+        {
+            Ok(()) => {
+                shared.forget(&credential);
+                Ok(())
+            }
+            // Owns nothing there any more; `credentialed` dropped it.
+            Err(error) if owns_nothing(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Whether the client holds a registration.
@@ -612,32 +694,23 @@ impl HubClient {
     /// [`register`](Self::register); this is for a hub without velo. An
     /// answer that says the hub no longer has the registration drops it.
     pub async fn send_heartbeat(&self) -> Result<(), ClientError> {
-        let (instance_id, credential) = self
-            .inner
-            .shared
-            .credential()
-            .ok_or(ClientError::NotRegistered)?;
+        let shared = &self.inner.shared;
+        let (instance_id, _) = shared.credential().ok_or(ClientError::NotRegistered)?;
         let endpoints = &self.inner.endpoints;
         let url = Endpoints::join(
             &endpoints.control,
             &protocol::instance_heartbeat(instance_id),
         )?;
-        let answer: Result<HeartbeatResponse, ClientError> = endpoints
-            .call::<(), _>(Method::POST, url, Some(&credential), None)
-            .await;
-        match answer {
-            Ok(answer) if answer.acknowledged => Ok(()),
-            Ok(_) => Err(ClientError::Unexpected {
+        let answer: HeartbeatResponse = shared
+            .credentialed::<(), _>(endpoints, Method::POST, url, None, Route::Core)
+            .await?;
+        if !answer.acknowledged {
+            return Err(ClientError::Unexpected {
                 status: StatusCode::OK,
                 body: "heartbeat not acknowledged".to_string(),
-            }),
-            Err(error) => {
-                if owns_nothing(&error) {
-                    self.inner.shared.forget(&credential);
-                }
-                Err(error)
-            }
+            });
         }
+        Ok(())
     }
 
     /// The last hub heartbeat the handler installed by
@@ -659,49 +732,6 @@ impl HubClient {
         let endpoints = &self.inner.endpoints;
         let url = Endpoints::join(&endpoints.public, protocol::paths::HUB)?;
         endpoints.call::<(), _>(Method::GET, url, None, None).await
-    }
-
-    /// Service discovery through this hub, for code that takes a
-    /// [`ServiceDiscovery`]. It holds no registration.
-    pub fn services(&self) -> HubServices {
-        HubServices {
-            endpoints: Arc::clone(&self.inner.endpoints),
-        }
-    }
-
-    /// Add this client's instance to the service `name`. The entry lives
-    /// until the guard unregisters it or the registration ends; a
-    /// re-registration with the credential keeps it. Dropping the guard
-    /// removes it in the background, best effort.
-    pub async fn register_service(
-        &self,
-        name: &str,
-    ) -> Result<HubServiceRegistration, ClientError> {
-        if !protocol::is_valid_service_name(name) {
-            return Err(ClientError::InvalidUrl(format!(
-                "{name:?} is not a service name: 1 to 128 of A-Z a-z 0-9 . _ -"
-            )));
-        }
-        let (instance_id, credential) = self
-            .inner
-            .shared
-            .credential()
-            .ok_or(ClientError::NotRegistered)?;
-        service_call(
-            &self.inner.endpoints,
-            Method::PUT,
-            name,
-            instance_id,
-            &credential,
-        )
-        .await?;
-        Ok(HubServiceRegistration {
-            endpoints: Arc::clone(&self.inner.endpoints),
-            registration: Arc::downgrade(&self.inner.shared),
-            name: name.to_string(),
-            instance_id,
-            done: false,
-        })
     }
 
     /// Calls to the routes of the extension named `name`. The `ExtClient`
@@ -804,35 +834,23 @@ impl ExtClient {
         path: &str,
         body: Option<&B>,
     ) -> Result<T, ClientError> {
-        let (base, credential) = match listener {
-            Listener::Public => (&self.endpoints.public, None),
+        let path = format!("{}{path}", self.root);
+        match listener {
+            Listener::Public => {
+                let url = Endpoints::join(&self.endpoints.public, &path)?;
+                self.endpoints.call(method, url, None, body).await
+            }
             Listener::Control => {
                 let shared = self
                     .registration
                     .upgrade()
                     .ok_or(ClientError::NotRegistered)?;
-                let (_, credential) = shared.credential().ok_or(ClientError::NotRegistered)?;
-                (&self.endpoints.control, Some((shared, credential)))
+                let url = Endpoints::join(&self.endpoints.control, &path)?;
+                shared
+                    .credentialed(&self.endpoints, method, url, body, Route::Extension)
+                    .await
             }
-        };
-        let url = Endpoints::join(base, &format!("{}{path}", self.root))?;
-        let answer = self
-            .endpoints
-            .call(
-                method,
-                url,
-                credential.as_ref().map(|(_, credential)| credential),
-                body,
-            )
-            .await;
-        // A rejected credential is dead for every call: drop it, as the
-        // core calls do. A 404 is not: it can be the extension's own miss.
-        if let (Err(error), Some((shared, credential))) = (&answer, &credential)
-            && credential_rejected(error)
-        {
-            shared.forget(credential);
         }
-        answer
     }
 
     /// `GET` on the public listener.
@@ -872,258 +890,4 @@ impl ExtClient {
         self.request::<(), _>(Method::DELETE, Listener::Control, path, None)
             .await
     }
-}
-
-async fn service_call(
-    endpoints: &Endpoints,
-    method: Method,
-    name: &str,
-    instance_id: InstanceId,
-    credential: &Credential,
-) -> Result<(), ClientError> {
-    let url = Endpoints::join(
-        &endpoints.control,
-        &protocol::service_instance(name, instance_id),
-    )?;
-    endpoints
-        .call::<(), ()>(method, url, Some(credential), None)
-        .await
-}
-
-/// One instance's entry in one service. Holds the registration weakly:
-/// when the client is gone, its registration's end removes the entry.
-#[derive(Debug)]
-pub struct HubServiceRegistration {
-    endpoints: Arc<Endpoints>,
-    registration: Weak<Shared>,
-    name: String,
-    instance_id: InstanceId,
-    done: bool,
-}
-
-impl HubServiceRegistration {
-    /// The service's name.
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-
-    /// The current credential of the registration this entry belongs to:
-    /// a re-registration rotates it and keeps the entry.
-    fn credential(&self) -> Option<Credential> {
-        self.registration
-            .upgrade()
-            .and_then(|shared| shared.credential())
-            .filter(|(id, _)| *id == self.instance_id)
-            .map(|(_, credential)| credential)
-    }
-
-    async fn remove(&mut self) -> Result<(), ClientError> {
-        if self.done {
-            return Ok(());
-        }
-        // No registration: the hub dropped the entry with it.
-        if let Some(credential) = self.credential() {
-            match service_call(
-                &self.endpoints,
-                Method::DELETE,
-                &self.name,
-                self.instance_id,
-                &credential,
-            )
-            .await
-            {
-                Err(error) if !owns_nothing(&error) => return Err(error),
-                _ => {}
-            }
-        }
-        self.done = true;
-        Ok(())
-    }
-}
-
-impl ServiceRegistrationGuard for HubServiceRegistration {
-    fn unregister(&mut self) -> BoxFuture<'_, anyhow::Result<()>> {
-        Box::pin(async move { Ok(self.remove().await?) })
-    }
-}
-
-impl Drop for HubServiceRegistration {
-    fn drop(&mut self) {
-        if self.done {
-            return;
-        }
-        let Some(credential) = self.credential() else {
-            return;
-        };
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return;
-        };
-        let endpoints = Arc::clone(&self.endpoints);
-        let (name, instance_id) = (std::mem::take(&mut self.name), self.instance_id);
-        runtime.spawn(async move {
-            let _ = service_call(&endpoints, Method::DELETE, &name, instance_id, &credential).await;
-        });
-    }
-}
-
-/// Service discovery through a hub. Cheap to clone. Get one from
-/// [`HubClient::services`].
-#[derive(Debug, Clone)]
-pub struct HubServices {
-    endpoints: Arc<Endpoints>,
-}
-
-impl HubServices {
-    fn checked(name: &str) -> Result<(), ClientError> {
-        if protocol::is_valid_service_name(name) {
-            Ok(())
-        } else {
-            Err(ClientError::InvalidUrl(format!(
-                "{name:?} is not a service name"
-            )))
-        }
-    }
-}
-
-impl ServiceDiscovery for HubServices {
-    fn list_services(&self) -> BoxFuture<'_, anyhow::Result<Vec<String>>> {
-        Box::pin(async move {
-            let url = Endpoints::join(&self.endpoints.public, protocol::paths::SERVICES)?;
-            let list: protocol::ServiceListResponse = self
-                .endpoints
-                .call::<(), _>(Method::GET, url, None, None)
-                .await?;
-            Ok(list.services)
-        })
-    }
-
-    fn get_instances(&self, service_name: &str) -> BoxFuture<'_, anyhow::Result<Vec<InstanceId>>> {
-        let name = service_name.to_string();
-        Box::pin(async move {
-            Self::checked(&name)?;
-            let url = Endpoints::join(&self.endpoints.public, &protocol::service(&name))?;
-            let found: protocol::ServiceInstancesResponse = self
-                .endpoints
-                .call::<(), _>(Method::GET, url, None, None)
-                .await?;
-            Ok(found.instances)
-        })
-    }
-
-    fn watch_instances(
-        &self,
-        service_name: &str,
-    ) -> BoxFuture<'_, anyhow::Result<Pin<Box<dyn Stream<Item = ServiceEvent> + Send>>>> {
-        let name = service_name.to_string();
-        Box::pin(async move {
-            Self::checked(&name)?;
-            let url = Endpoints::join(&self.endpoints.public, &protocol::service_watch(&name))?;
-            let response = self
-                .endpoints
-                .watch
-                .get(url)
-                .send()
-                .await
-                .map_err(ClientError::from)?;
-            if !response.status().is_success() {
-                return Err(decode::<()>(response).await.unwrap_err().into());
-            }
-            let stream: Pin<Box<dyn Stream<Item = ServiceEvent> + Send>> =
-                Box::pin(watch_events(response));
-            Ok(stream)
-        })
-    }
-}
-
-/// Parse the hub's SSE stream into [`ServiceEvent`]s. Anything that ends
-/// the stream other than the hub closing it cleanly after a
-/// `disconnected` (a dropped connection, an idle timeout, a hub that
-/// stopped, bytes that do not parse) yields `Disconnected`, then the stream
-/// ends: the watcher's set is stale either way.
-fn watch_events(response: reqwest::Response) -> impl Stream<Item = ServiceEvent> + Send {
-    parse_events(response.bytes_stream())
-}
-
-fn parse_events<S, B>(bytes: S) -> impl Stream<Item = ServiceEvent> + Send
-where
-    S: Stream<Item = reqwest::Result<B>> + Send + 'static,
-    B: AsRef<[u8]>,
-{
-    struct State<S> {
-        bytes: Pin<Box<S>>,
-        buffer: Vec<u8>,
-        pending: std::collections::VecDeque<ServiceEvent>,
-        ended: bool,
-    }
-    let state = State {
-        bytes: Box::pin(bytes),
-        buffer: Vec::new(),
-        pending: std::collections::VecDeque::new(),
-        ended: false,
-    };
-    futures::stream::unfold(state, |mut state| async move {
-        loop {
-            if let Some(event) = state.pending.pop_front() {
-                if event == ServiceEvent::Disconnected {
-                    state.ended = true;
-                }
-                return Some((event, state));
-            }
-            if state.ended {
-                return None;
-            }
-            match state.bytes.next().await {
-                Some(Ok(chunk)) => {
-                    state.buffer.extend_from_slice(chunk.as_ref());
-                    while let Some(end) = find_event_end(&state.buffer) {
-                        let raw: Vec<u8> = state.buffer.drain(..end).collect();
-                        match parse_event(&raw) {
-                            Ok(Some(event)) => state.pending.push_back(event),
-                            Ok(None) => {}
-                            Err(()) => state.pending.push_back(ServiceEvent::Disconnected),
-                        }
-                    }
-                }
-                Some(Err(_)) | None => state.pending.push_back(ServiceEvent::Disconnected),
-            }
-        }
-    })
-}
-
-/// The end of the first complete SSE event in `buffer` (past its blank
-/// line), if there is one.
-fn find_event_end(buffer: &[u8]) -> Option<usize> {
-    buffer
-        .windows(2)
-        .position(|pair| pair == b"\n\n")
-        .map(|at| at + 2)
-}
-
-/// One SSE event: `None` for a comment (keep-alive), `Err` for one that
-/// does not parse.
-fn parse_event(raw: &[u8]) -> Result<Option<ServiceEvent>, ()> {
-    let text = std::str::from_utf8(raw).map_err(|_| ())?;
-    let (mut name, mut data) = (None, String::new());
-    for line in text.lines() {
-        if let Some(value) = line.strip_prefix("event:") {
-            name = Some(value.trim());
-        } else if let Some(value) = line.strip_prefix("data:") {
-            data.push_str(value.trim());
-        }
-    }
-    let Some(name) = name else {
-        return Ok(None);
-    };
-    let event = match name {
-        protocol::WATCH_INITIAL => {
-            ServiceEvent::Initial(serde_json::from_str(&data).map_err(|_| ())?)
-        }
-        protocol::WATCH_ADDED => ServiceEvent::Added(serde_json::from_str(&data).map_err(|_| ())?),
-        protocol::WATCH_REMOVED => {
-            ServiceEvent::Removed(serde_json::from_str(&data).map_err(|_| ())?)
-        }
-        protocol::WATCH_DISCONNECTED => ServiceEvent::Disconnected,
-        _ => return Ok(None),
-    };
-    Ok(Some(event))
 }

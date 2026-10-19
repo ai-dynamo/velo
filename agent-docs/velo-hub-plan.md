@@ -551,3 +551,11 @@ Plan §8.2 scope: service entries owned by a registered peer that die with it; `
 ### 16.2 Tests (first)
 
 watch order (initial then deltas, no gap or duplicate under concurrent puts); entries die with their owner (DELETE, expiry, heartbeat eviction); credential required (401 without, 409/401 with a stale one); a stale removal does not drop a re-registered owner's services; a re-registration keeps the services; a lagging watcher gets `disconnected`; a watch ends when the hub stops and shutdown is not delayed; client `ServiceDiscovery` round trip between two velos; the client's watch reports `Disconnected` when the hub goes away; invalid names 400.
+
+### 16.3 After review pass 1, 2026-10-19 (record: /tmp/m3r1/report.md)
+
+- **R3-6. One guard per name; the names follow the registration** (pass 1 A1). The client keeps the names it serves; `register_service` refuses a second guard for a name (`AlreadyServing`), and every successful `register` puts every name again. A stale guard can no longer exist, so it cannot delete another guard's entry; and a fresh registration or a restarted hub gets the services back without caller action (the restart half of M4 D-8, done here).
+- **R3-7. The hub does not probe an owner whose registration transaction runs** (pass 1 A2: with `orphaned` set, a slow conforming `on_registered` let the probes evict the entry before the answer). An `InFlight` set, entered by the transaction and left when it is settled, filters the heartbeat's registrations.
+- **R3-8. One credentialed-call path** (pass 1 A3): `Shared::credentialed` applies the forget rule (core routes: rejected or not_found; extension routes: rejected) for every call that presents the credential; the client module is split (`client/{mod,services,sse}.rs`).
+- **R3-9. No answer includes a timed-out or broken request** (pass 1 A4): only a connect or builder error proves the request never left.
+- Also: the directory is moved to the front of the start order after `plan`; reads sort outside the directory lock; the watch ring is 128; `Acquiring::drop` takes one lock; the 50 s bound counts the built-in.

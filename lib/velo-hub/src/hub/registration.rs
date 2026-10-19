@@ -143,6 +143,9 @@ fn decode(
 /// removals itself, before it drops the staged values: an undo in a staged
 /// value must never show state that was just removed.
 struct Transaction<'a> {
+    /// Fields drop after `Drop::drop` has settled the transaction, so the
+    /// heartbeat does not probe the owner until then.
+    _in_flight: super::heartbeat::InFlightGuard<'a>,
     shared: &'a Shared,
     owner: InstanceId,
     permit: Option<RegistrationPermit>,
@@ -318,6 +321,7 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
         .authority
         .begin_registration(owner, presented.as_ref())?;
     let mut txn = Transaction {
+        _in_flight: shared.in_flight.enter(owner),
         shared: &shared,
         owner,
         permit: Some(permit),

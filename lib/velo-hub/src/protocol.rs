@@ -76,8 +76,11 @@ pub fn service_instance(name: &str, id: InstanceId) -> String {
     format!("/v1/services/{name}/instances/{id}")
 }
 
-/// Whether `name` is a valid service name: 1 to 128 of `A-Z a-z 0-9 . _ -`,
-/// so it is always one URL path segment.
+/// The rule for service names, as error messages state it.
+pub const SERVICE_NAME_RULE: &str = "1 to 128 of A-Z a-z 0-9 . _ -";
+
+/// Whether `name` is a valid service name: see [`SERVICE_NAME_RULE`]. A
+/// valid name is always one URL path segment.
 pub fn is_valid_service_name(name: &str) -> bool {
     (1..=128).contains(&name.len())
         && name
