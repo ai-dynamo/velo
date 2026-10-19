@@ -9,7 +9,10 @@
 //! removes only that incarnation, so an outcome from an earlier
 //! registration cannot refresh or evict its replacement. Probes run
 //! detached and each times out after one interval, so a wedged peer does
-//! not delay the others.
+//! not delay the others. A probe that succeeds touches the store itself:
+//! done in the loop, one at a time, the touches of a large fleet against a
+//! remote store would take longer than the interval. The loop keeps only
+//! the failure counters and the rare remove.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -27,10 +30,10 @@ type FailureKey = (InstanceId, Incarnation);
 
 #[derive(Debug)]
 enum ProbeOutcome {
+    /// Answered, and the store was touched.
     Ok {
         id: InstanceId,
         incarnation: Incarnation,
-        ack_seq: u64,
     },
     Failed {
         id: InstanceId,
@@ -52,9 +55,9 @@ pub(crate) fn spawn(
     let (tx, mut rx) = mpsc::unbounded_channel::<ProbeOutcome>();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
-        // Outcomes are handled one at a time, each awaiting a store call, so
-        // the loop can miss ticks. Replaying them (tokio's default) would fan
-        // out a full round of probes per missed tick at once.
+        // A failure outcome can await a store remove, so the loop can miss
+        // ticks. Replaying them (tokio's default) would fan out a full round
+        // of probes per missed tick at once.
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await;
         let mut failures: HashMap<FailureKey, u32> = HashMap::new();
@@ -68,7 +71,7 @@ pub(crate) fn spawn(
                     seq = seq.wrapping_add(1);
                     let registrations = store.peers();
                     retain_current_failures(&mut failures, &registrations);
-                    fan_out(&velo, registrations, seq, interval, &tx);
+                    fan_out(&velo, &store, registrations, seq, interval, step_timeout, &tx);
                 }
                 Some(outcome) = rx.recv() => {
                     handle_outcome(outcome, store.as_ref(), &mut failures, max_failures, step_timeout).await;
@@ -93,9 +96,11 @@ fn retain_current_failures(failures: &mut HashMap<FailureKey, u32>, registration
 
 fn fan_out(
     velo: &velo::Velo,
+    store: &Arc<dyn HubStore>,
     registrations: Vec<StoredPeer>,
     seq: u64,
     interval: Duration,
+    step_timeout: Duration,
     tx: &mpsc::UnboundedSender<ProbeOutcome>,
 ) {
     for stored in registrations {
@@ -106,6 +111,7 @@ fn fan_out(
         let id = stored.peer.instance_id();
         let incarnation = stored.incarnation;
         let velo = velo.downgrade();
+        let store = Arc::clone(store);
         let tx = tx.clone();
         tokio::spawn(async move {
             let probe = async {
@@ -121,11 +127,19 @@ fn fan_out(
                 Ok::<HeartbeatAck, anyhow::Error>(ack)
             };
             let outcome = match tokio::time::timeout(interval, probe).await {
-                Ok(Ok(ack)) => ProbeOutcome::Ok {
-                    id,
-                    incarnation,
-                    ack_seq: ack.seq,
-                },
+                Ok(Ok(ack)) => {
+                    // Conditional on the incarnation probed, so a late touch
+                    // cannot refresh a replacement.
+                    match super::bounded(step_timeout, store.touch(id, incarnation)).await {
+                        Ok(()) => {
+                            tracing::trace!(instance = %id, %incarnation, ack_seq = ack.seq, "heartbeat: refreshed")
+                        }
+                        Err(error) => {
+                            tracing::trace!(instance = %id, %incarnation, %error, "heartbeat: stale touch ignored")
+                        }
+                    }
+                    ProbeOutcome::Ok { id, incarnation }
+                }
                 Ok(Err(error)) => ProbeOutcome::Failed {
                     id,
                     incarnation,
@@ -142,8 +156,8 @@ fn fan_out(
     }
 }
 
-/// The loop handles outcomes one at a time, so each store call here is
-/// bounded: one that never answered would stop every later probe and keep
+/// The loop handles outcomes one at a time, so its store call is bounded:
+/// a remove that never answered would stop every later probe and keep
 /// shutdown, which joins this task, waiting.
 async fn handle_outcome(
     outcome: ProbeOutcome,
@@ -153,20 +167,8 @@ async fn handle_outcome(
     step_timeout: Duration,
 ) {
     match outcome {
-        ProbeOutcome::Ok {
-            id,
-            incarnation,
-            ack_seq,
-        } => {
+        ProbeOutcome::Ok { id, incarnation } => {
             failures.remove(&(id, incarnation));
-            match super::bounded(step_timeout, store.touch(id, incarnation)).await {
-                Ok(()) => {
-                    tracing::trace!(instance = %id, %incarnation, ack_seq, "heartbeat: refreshed")
-                }
-                Err(error) => {
-                    tracing::trace!(instance = %id, %incarnation, %error, "heartbeat: stale touch ignored")
-                }
-            }
         }
         ProbeOutcome::Failed {
             id,

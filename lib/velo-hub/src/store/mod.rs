@@ -323,9 +323,8 @@ pub trait HubStore: PeerDiscovery + Send + Sync + 'static {
 
     /// Refresh liveness if `incarnation` is current.
     ///
-    /// The heartbeat calls this once per registration per tick, one call at
-    /// a time, so a backend's round trip times the fleet size must stay
-    /// well under the heartbeat interval.
+    /// The heartbeat calls this once per registration per tick, from that
+    /// registration's probe task, so one tick's calls run concurrently.
     fn touch(
         &self,
         id: InstanceId,

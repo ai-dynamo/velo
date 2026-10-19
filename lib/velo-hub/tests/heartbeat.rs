@@ -248,9 +248,8 @@ async fn a_hung_store_remove_does_not_stop_the_heartbeat() {
 
 /// A tick the loop could not take, because it was waiting on a store call,
 /// is skipped, not replayed. Replaying would fan out one full round of
-/// probes per missed interval the moment the call returns, and with a slow
-/// store the loop would spend its time fanning out instead of counting
-/// failures.
+/// probes per missed interval the moment the call returns. The loop's one
+/// store call is the remove after a peer fails its probes; hold that one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn missed_ticks_are_skipped_not_replayed() {
     let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::new(
@@ -261,6 +260,7 @@ async fn missed_ticks_are_skipped_not_replayed() {
     let interval = Duration::from_millis(50);
     let mut config = config();
     config.server.heartbeat_interval = interval;
+    config.server.heartbeat_max_failures = 1;
     config.server.step_timeout = Duration::from_secs(5);
     let hub = Hub::builder(config)
         .store(store.clone())
@@ -268,13 +268,16 @@ async fn missed_ticks_are_skipped_not_replayed() {
         .serve()
         .await
         .unwrap();
-    let peer = new_velo().await;
-    let probes = install_counting_heartbeat(&peer);
-    wire_mutual(&hub, &peer).await;
+    let healthy = new_velo().await;
+    let probes = install_counting_heartbeat(&healthy);
+    wire_mutual(&hub, &healthy).await;
+    let gate = store.gate_next_remove();
+    let wedged = new_velo().await;
+    install_wedged_heartbeat(&wedged, Duration::from_secs(60));
+    wire_mutual(&hub, &wedged).await;
 
-    let gate = store.gate_next_touch();
     gate.entered().await;
-    // Twelve intervals pass while the loop waits on the touch.
+    // Twelve intervals pass while the loop waits on the remove.
     tokio::time::sleep(interval * 12).await;
     let before = probes.load(std::sync::atomic::Ordering::Acquire);
     gate.release();
@@ -284,5 +287,44 @@ async fn missed_ticks_are_skipped_not_replayed() {
         burst <= 2,
         "{burst} probes within half an interval of the store call returning"
     );
+    hub.shutdown().await.unwrap();
+}
+
+/// A probe that succeeds touches the store from its own task, not from the
+/// heartbeat loop. So a touch that hangs (here, for longer than the test)
+/// delays neither other probes nor the eviction of a peer that stopped
+/// answering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_touch_does_not_delay_evicting_a_dead_peer() {
+    let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::new(
+        velo_hub::store::InMemoryStore::builder()
+            .ttl(Duration::from_secs(60))
+            .build(),
+    ));
+    let interval = Duration::from_millis(100);
+    let mut config = config();
+    config.server.heartbeat_interval = interval;
+    config.server.heartbeat_max_failures = 1;
+    config.server.step_timeout = Duration::from_secs(10);
+    let hub = Hub::builder(config)
+        .store(store.clone())
+        .velo(velo_builder())
+        .serve()
+        .await
+        .unwrap();
+    let healthy = new_velo().await;
+    install_heartbeat(&healthy);
+    wire_mutual(&hub, &healthy).await;
+    let gate = store.gate_next_touch();
+    gate.entered().await;
+    let wedged = new_velo().await;
+    install_wedged_heartbeat(&wedged, Duration::from_secs(60));
+    wire_mutual(&hub, &wedged).await;
+    let evicted = eventually(Duration::from_secs(2), || {
+        !registered_ids(&hub).contains(&wedged.instance_id())
+    })
+    .await;
+    gate.release();
+    assert!(evicted, "the dead peer waited behind a hung touch");
     hub.shutdown().await.unwrap();
 }
