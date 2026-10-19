@@ -125,24 +125,25 @@ where
 
 type HubState = State<Arc<Shared>>;
 
-/// The public listener: discovery and the extensions' public routes.
-pub(crate) fn public_router(shared: &Arc<Shared>, stop: &CancellationToken) -> Router {
-    let core = Router::new()
+/// The routes both listeners serve: health, the hub's description, and
+/// peer discovery.
+fn core_routes() -> Router<Arc<Shared>> {
+    Router::new()
         .route(paths::HEALTH, get(health))
         .route(paths::HUB, get(describe))
         .route(paths::PEERS_BY_INSTANCE, get(peer_by_instance))
         .route(paths::PEERS_BY_WORKER, get(peer_by_worker))
-        .with_state(Arc::clone(shared));
+}
+
+/// The public listener: discovery and the extensions' public routes.
+pub(crate) fn public_router(shared: &Arc<Shared>, stop: &CancellationToken) -> Router {
+    let core = core_routes().with_state(Arc::clone(shared));
     mount(core, shared, stop, |extension| extension.public_routes())
 }
 
 /// The control listener: everything public, plus registration.
 pub(crate) fn control_router(shared: &Arc<Shared>, stop: &CancellationToken) -> Router {
-    let core = Router::new()
-        .route(paths::HEALTH, get(health))
-        .route(paths::HUB, get(describe))
-        .route(paths::PEERS_BY_INSTANCE, get(peer_by_instance))
-        .route(paths::PEERS_BY_WORKER, get(peer_by_worker))
+    let core = core_routes()
         .route(paths::INSTANCES, get(list).post(register))
         .route(paths::INSTANCE_BY_ID, delete(unregister))
         .route(paths::INSTANCE_HEARTBEAT, post(heartbeat))
