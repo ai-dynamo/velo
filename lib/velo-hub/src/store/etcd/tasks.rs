@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use etcd_client::{GetOptions, Txn, TxnOp, TxnOpResponse, WatchOptions, WatchStream, Watcher};
+use tokio::sync::watch;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::shared::Shared;
@@ -261,21 +263,104 @@ fn lease_gone(shared: &Shared, lease: i64, role: LeaseRole) {
     }
 }
 
-/// Keep `lease` alive at a third of its TTL. A keep-alive answering TTL 0
-/// means the lease expired.
+/// Where the lock keep-alive reports each renewal etcd answered with a TTL
+/// above zero: the lease is held until that renewal's send time plus the
+/// lock deadline. [`lease_deadline`] reads it.
+pub(super) struct Renewals {
+    deadline: watch::Sender<Instant>,
+    length: Duration,
+}
+
+impl Renewals {
+    /// The first deadline counts from when the lease grant was sent.
+    pub(super) fn new(granted_at: Instant, length: Duration) -> (Self, watch::Receiver<Instant>) {
+        let (deadline, receiver) = watch::channel(granted_at + length);
+        (Self { deadline, length }, receiver)
+    }
+
+    /// The send time, not the receive time: etcd counts the TTL from when
+    /// it processed the renewal, which is after the send, so a deadline
+    /// from the send passes no later than the lease can expire at etcd.
+    fn answered(&self, sent: Instant) {
+        let next = sent + self.length;
+        self.deadline.send_if_modified(|deadline| {
+            let later = next > *deadline;
+            if later {
+                *deadline = next;
+            }
+            later
+        });
+    }
+}
+
+/// Mark the store `Degraded` when the lock lease's deadline passes with no
+/// renewal answered, and clear it when one moves the deadline past now.
+///
+/// A timer, apart from the keep-alive: a renewal sent into a partition may
+/// never answer, and the keep-alive may be opening a stream or pausing
+/// between attempts when the deadline passes. Not `Fenced`: a renewal
+/// answered later with a TTL above zero proves the lease never lapsed (an
+/// etcd leader change extends every lease), so no other hub can have taken
+/// the prefix. A lease that did lapse is fenced by etcd's answer on
+/// reconnect.
+pub(super) async fn lease_deadline(
+    shared: Arc<Shared>,
+    mut deadline: watch::Receiver<Instant>,
+    cancel: CancellationToken,
+) {
+    let mut stale = false;
+    loop {
+        let until = *deadline.borrow_and_update();
+        if stale && Instant::now() < until {
+            tracing::info!(prefix = %shared.keys.root, "etcd answered a lock renewal; the lease is held again");
+            shared.set_lease_stale(false);
+            stale = false;
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return,
+            changed = deadline.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+            }
+            _ = tokio::time::sleep_until(until), if !stale => {
+                tracing::warn!(
+                    prefix = %shared.keys.root,
+                    deadline = ?shared.settings.lock_deadline,
+                    "no lock renewal was answered within the lock TTL: another hub may hold the prefix; the store is degraded until etcd answers one"
+                );
+                shared.set_lease_stale(true);
+                stale = true;
+            }
+        }
+    }
+}
+
+/// Keep `lease` alive at a third of its TTL (the lock: of its deadline). A
+/// keep-alive answering TTL 0 means the lease expired. The lock's
+/// keep-alive reports each answered renewal to `renewals`.
 pub(super) async fn keep_alive(
     shared: Arc<Shared>,
     lease: i64,
     role: LeaseRole,
+    renewals: Option<Renewals>,
     cancel: CancellationToken,
 ) {
     let mut interval = match role {
-        LeaseRole::Lock => third_of(shared.settings.lock_ttl_secs),
+        LeaseRole::Lock => third(shared.settings.lock_deadline),
         LeaseRole::Custody => third_of(shared.settings.custody_ttl_secs),
         // Learned from the first answer.
         LeaseRole::Adopted => Duration::from_secs(1),
     };
     let deadline = shared.settings.request_deadline;
+    // Only the lock's renewals can be held, and only by a test.
+    let holds = &shared.holds;
+    let before_send = move || async move {
+        if role == LeaseRole::Lock {
+            holds.before_renewal().await;
+        }
+    };
     loop {
         if role == LeaseRole::Adopted && !referenced(&shared, lease) {
             tracing::debug!(
@@ -285,26 +370,36 @@ pub(super) async fn keep_alive(
             return;
         }
         let mut client = shared.client.lease_client();
+        // Opening the stream sends a renewal and reads its answer.
         let opened = tokio::select! {
             _ = cancel.cancelled() => return,
-            opened = tokio::time::timeout(deadline, client.keep_alive(lease)) => opened,
+            opened = async {
+                before_send().await;
+                let sent = Instant::now();
+                (sent, tokio::time::timeout(deadline, client.keep_alive(lease)).await)
+            } => opened,
         };
         let (mut keeper, mut answers) = match opened {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(etcd_client::Error::LeaseKeepAliveError(message)))
+            (sent, Ok(Ok(pair))) => {
+                if let Some(renewals) = &renewals {
+                    renewals.answered(sent);
+                }
+                pair
+            }
+            (_, Ok(Err(etcd_client::Error::LeaseKeepAliveError(message))))
                 if message.contains("not found") =>
             {
                 lease_gone(&shared, lease, role);
                 return;
             }
-            Ok(Err(error)) => {
+            (_, Ok(Err(error))) => {
                 tracing::warn!(lease, %error, "opening a lease keep-alive failed; retrying");
                 if !pause(&cancel, RETRY).await {
                     return;
                 }
                 continue;
             }
-            Err(_) => {
+            (_, Err(_)) => {
                 tracing::warn!(lease, "opening a lease keep-alive timed out; retrying");
                 continue;
             }
@@ -325,11 +420,19 @@ pub(super) async fn keep_alive(
                 );
                 return;
             }
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = before_send() => {}
+            }
+            let sent = Instant::now();
             if keeper.keep_alive().await.is_err() {
                 break;
             }
             match tokio::time::timeout(deadline, answers.message()).await {
                 Ok(Ok(Some(answer))) if answer.ttl() > 0 => {
+                    if let Some(renewals) = &renewals {
+                        renewals.answered(sent);
+                    }
                     if role == LeaseRole::Adopted {
                         interval = third_of(answer.ttl());
                     }
@@ -345,7 +448,11 @@ pub(super) async fn keep_alive(
 }
 
 fn third_of(ttl_secs: i64) -> Duration {
-    (Duration::from_secs(u64::try_from(ttl_secs).unwrap_or(1)) / 3).max(Duration::from_millis(100))
+    third(Duration::from_secs(u64::try_from(ttl_secs).unwrap_or(1)))
+}
+
+fn third(ttl: Duration) -> Duration {
+    (ttl / 3).max(Duration::from_millis(100))
 }
 
 /// Run a reaper pass every prune interval.

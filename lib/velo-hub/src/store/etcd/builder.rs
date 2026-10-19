@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 
 use super::EtcdStore;
 use super::shared::{KeyKind, Keys, Settings, Shared};
-use super::tasks::{self, LeaseRole};
+use super::tasks::{self, LeaseRole, Renewals};
 use crate::store::RegistrationRecord;
 
 /// Default key prefix.
@@ -28,7 +28,8 @@ pub const DEFAULT_PRUNE_INTERVAL: Duration = Duration::from_secs(10);
 /// Default TTL of the custody lease every record is written with. It is
 /// how long a dead hub's registrations wait for the next hub.
 pub const DEFAULT_CUSTODY_TTL: Duration = Duration::from_secs(300);
-/// Default TTL of the lock lease. A crashed hub holds its prefix this long.
+/// Default TTL of the lock lease. A crashed hub holds its prefix this long,
+/// and a hub that gets no renewal answered for this long is `Degraded`.
 pub const DEFAULT_LOCK_TTL: Duration = Duration::from_secs(10);
 /// Default budget for one call: its txn and the wait for the watch. Below
 /// the hub's default step timeout (5 s), so the store answers, and marks
@@ -77,6 +78,9 @@ pub struct EtcdStoreBuilder {
     lock_ttl: Duration,
     request_deadline: Duration,
     wait_for_prefix: Duration,
+    /// The local deadline of the lock lease, when a test sets one shorter
+    /// than `lock_ttl`.
+    lock_deadline: Option<Duration>,
 }
 
 /// Pause between attempts while another store holds the prefix.
@@ -112,6 +116,7 @@ impl EtcdStoreBuilder {
             lock_ttl: DEFAULT_LOCK_TTL,
             request_deadline: DEFAULT_REQUEST_DEADLINE,
             wait_for_prefix: Duration::ZERO,
+            lock_deadline: None,
         }
     }
 
@@ -173,6 +178,18 @@ impl EtcdStoreBuilder {
         self
     }
 
+    /// Tests only: give up on the lock lease this long after the last
+    /// renewal etcd answered, though the lease is granted for the longer
+    /// `lock_ttl`. The store then sees the deadline pass while etcd still
+    /// holds the lease, which on one local etcd node happens almost never.
+    /// Renewals go out every third of it, and the request deadline must be
+    /// under two thirds of it.
+    #[cfg(feature = "test-support")]
+    pub fn lock_deadline(mut self, deadline: Duration) -> Self {
+        self.lock_deadline = Some(deadline);
+        self
+    }
+
     fn settings(&self) -> Result<(String, Settings), ConnectError> {
         let invalid = |why: &str| Err(ConnectError::InvalidConfig(why.to_string()));
         let prefix = self.prefix.trim_end_matches('/');
@@ -196,10 +213,14 @@ impl EtcdStoreBuilder {
         if custody_ttl_secs < lock_ttl_secs {
             return invalid("the custody TTL must be at least the lock TTL");
         }
-        // The lock is kept alive every third of its TTL, and each answer may
-        // take the request deadline: with a deadline of two thirds of the
-        // TTL or more, one slow answer lets the lock expire.
-        if self.request_deadline * 3 >= self.lock_ttl * 2 {
+        let lock_deadline = self.lock_deadline.unwrap_or(self.lock_ttl);
+        if lock_deadline.is_zero() || lock_deadline > self.lock_ttl {
+            return invalid("the lock deadline must be non-zero and at most the lock TTL");
+        }
+        // The lock is kept alive every third of its deadline, and each
+        // answer may take the request deadline: with a request deadline of
+        // two thirds of it or more, one slow answer misses the deadline.
+        if self.request_deadline * 3 >= lock_deadline * 2 {
             return invalid("the request deadline must be under two thirds of the lock TTL");
         }
         Ok((
@@ -209,6 +230,7 @@ impl EtcdStoreBuilder {
                 prune_interval: self.prune_interval,
                 request_deadline: self.request_deadline,
                 lock_ttl_secs,
+                lock_deadline,
                 custody_ttl_secs,
                 // A put that timed out can still reach etcd; its tombstone
                 // must outlive that by a margin (D-10).
@@ -254,6 +276,8 @@ impl EtcdStoreBuilder {
                 .map_err(etcd)?;
         let keys = Keys::new(&prefix);
 
+        // The lease's first local deadline counts from here.
+        let granted_at = tokio::time::Instant::now();
         let lock_lease = grant(&client, settings.lock_ttl_secs, deadline)
             .await
             .map_err(etcd)?;
@@ -295,7 +319,7 @@ impl EtcdStoreBuilder {
             return Err(ConnectError::PrefixHeld { prefix, holder });
         }
 
-        match start(client.clone(), keys, settings, lock_lease).await {
+        match start(client.clone(), keys, settings, lock_lease, granted_at).await {
             Ok(store) => Ok(store),
             Err(error) => {
                 revoke(&client, &[lock_lease], deadline).await;
@@ -357,6 +381,7 @@ async fn start(
     keys: Keys,
     settings: Settings,
     lock_lease: i64,
+    granted_at: tokio::time::Instant,
 ) -> anyhow::Result<EtcdStore> {
     let deadline = settings.request_deadline;
 
@@ -436,18 +461,26 @@ async fn start(
     };
 
     let cancel = CancellationToken::new();
+    let (renewals, lock_deadline) = Renewals::new(granted_at, shared.settings.lock_deadline);
     let mut handles = vec![
         tokio::spawn(tasks::watch(Arc::clone(&shared), first, cancel.clone())),
         tokio::spawn(tasks::keep_alive(
             Arc::clone(&shared),
             lock_lease,
             LeaseRole::Lock,
+            Some(renewals),
+            cancel.clone(),
+        )),
+        tokio::spawn(tasks::lease_deadline(
+            Arc::clone(&shared),
+            lock_deadline,
             cancel.clone(),
         )),
         tokio::spawn(tasks::keep_alive(
             Arc::clone(&shared),
             custody_lease,
             LeaseRole::Custody,
+            None,
             cancel.clone(),
         )),
         tokio::spawn(tasks::reap(Arc::clone(&shared), cancel.clone())),
@@ -460,6 +493,7 @@ async fn start(
             Arc::clone(&shared),
             lease,
             LeaseRole::Adopted,
+            None,
             cancel.clone(),
         )));
     }

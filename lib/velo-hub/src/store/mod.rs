@@ -246,13 +246,16 @@ pub type RemovalHook = Arc<dyn Fn(Removal) + Send + Sync + 'static>;
 pub enum Continuity {
     /// The cache is current.
     Live,
-    /// The backend is behind or reconnecting; the cache may be stale.
+    /// The backend is behind or reconnecting, or cannot confirm that this
+    /// hub still holds it (for example the etcd lock lease went one TTL
+    /// without an answered renewal); the cache may be stale.
     Degraded,
     /// The backend lost history (for example a compacted watch or a lost
     /// leader). The cache is stale until the backend resynchronizes.
     Lost,
     /// Another hub took the store over, or this hub lost its hold on it
-    /// (for example its etcd lock lease expired during a partition). The
+    /// (for example its etcd lock lease expired during a partition; the
+    /// hub learns it when it reaches etcd again). The
     /// state is terminal: every later write fails, and the hub must stop,
     /// because a second hub may now answer for the same owners.
     Fenced,

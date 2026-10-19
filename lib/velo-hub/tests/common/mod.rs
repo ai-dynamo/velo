@@ -17,6 +17,8 @@
 
 #![allow(dead_code)]
 
+pub mod proxy;
+
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

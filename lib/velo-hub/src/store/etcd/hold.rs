@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Seams for tests (feature `test-support`): hold the watch, gate a put,
-//! and record every continuity change. Without the feature each is a no-op
+//! Seams for tests (feature `test-support`): hold the watch, hold the lock
+//! renewals, gate a put, and record every continuity change. Without the feature each is a no-op
 //! the compiler removes.
 
 use crate::store::Continuity;
@@ -12,7 +12,7 @@ pub(super) use disabled::Holds;
 #[cfg(feature = "test-support")]
 pub(super) use enabled::Holds;
 #[cfg(feature = "test-support")]
-pub use enabled::{WatchHold, WatchHoldGuard};
+pub use enabled::{RenewalHoldGuard, WatchHold, WatchHoldGuard};
 
 #[cfg(feature = "test-support")]
 mod enabled {
@@ -46,8 +46,22 @@ mod enabled {
         }
     }
 
+    /// Lets the lock renewals go again when dropped.
+    #[must_use = "the hold ends when the guard is dropped"]
+    pub struct RenewalHoldGuard {
+        pub(in crate::store::etcd) renewals: watch::Sender<bool>,
+    }
+
+    impl Drop for RenewalHoldGuard {
+        fn drop(&mut self) {
+            self.renewals.send_replace(false);
+        }
+    }
+
     pub(in crate::store::etcd) struct Holds {
         pub(in crate::store::etcd) watch: watch::Sender<Option<WatchHold>>,
+        /// True while the lock keep-alive must send nothing.
+        pub(in crate::store::etcd) renewals: watch::Sender<bool>,
         pub(in crate::store::etcd) put_gate: Mutex<Option<Arc<Gate>>>,
         history: Mutex<Vec<Continuity>>,
     }
@@ -56,6 +70,7 @@ mod enabled {
         fn default() -> Self {
             Self {
                 watch: watch::Sender::new(None),
+                renewals: watch::Sender::new(false),
                 put_gate: Mutex::new(None),
                 history: Mutex::new(vec![Continuity::Live]),
             }
@@ -63,6 +78,12 @@ mod enabled {
     }
 
     impl Holds {
+        /// Wait while the lock renewals are held.
+        pub(in crate::store::etcd) async fn before_renewal(&self) {
+            let mut held = self.renewals.subscribe();
+            let _ = held.wait_for(|held| !*held).await;
+        }
+
         pub(in crate::store::etcd) fn record(&self, continuity: Continuity) {
             self.history.lock().push(continuity);
         }
@@ -117,6 +138,8 @@ mod disabled {
         }
 
         pub(in crate::store::etcd) async fn before_put(&self) {}
+
+        pub(in crate::store::etcd) async fn before_renewal(&self) {}
     }
 
     pub(in crate::store::etcd) struct Watching;

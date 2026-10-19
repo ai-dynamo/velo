@@ -960,3 +960,61 @@ async fn a_store_can_wait_for_the_prefix_without_a_limit() {
         .expect("the waiting store failed to connect");
     waited.close().await;
 }
+
+/// Continuity has one writer. A store whose lock lease is past its local
+/// deadline stays `Degraded` while its watch breaks, reconnects and catches
+/// up; only an answered renewal brings `Live` back. A watch that published
+/// `Live` itself once it caught up would report a fresh cache over a lease
+/// another hub may hold by now.
+///
+/// The renewals are held (etcd stays reachable), and the local deadline
+/// (1.5 s) is shorter than the TTL the store grants (9 s), so the lease
+/// stays alive at etcd and the store can write while it is `Degraded`. A
+/// put that answers proves the watch applied its revision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_reconnected_watch_does_not_report_live_over_a_stale_lease() {
+    let _serial = SERIAL.lock().await;
+    let prefix = prefix();
+    let store = builder(&prefix)
+        .lock_ttl(Duration::from_secs(9))
+        .lock_deadline(Duration::from_millis(1500))
+        .request_deadline(Duration::from_millis(400))
+        .connect()
+        .await
+        .unwrap();
+    let renewals = store.hold_lock_renewals();
+    assert!(
+        wait_for_continuity(&store, Continuity::Degraded, Duration::from_secs(3)).await,
+        "the lease's deadline passed and the store stayed Live"
+    );
+    let disconnect = store.hold_watch(WatchHold::Disconnect);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    drop(disconnect);
+    store
+        .put(RegistrationRecord::bare(peer()), None)
+        .await
+        .expect("the watch reconnected and applied the put");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let history = store.continuity_history();
+    assert_eq!(
+        *store.continuity().borrow(),
+        Continuity::Degraded,
+        "{history:?}"
+    );
+    let first_degraded = history
+        .iter()
+        .position(|c| *c == Continuity::Degraded)
+        .unwrap();
+    assert!(
+        !history[first_degraded..].contains(&Continuity::Live),
+        "Live while the lease was stale: {history:?}"
+    );
+
+    drop(renewals);
+    assert!(
+        wait_for_continuity(&store, Continuity::Live, Duration::from_secs(3)).await,
+        "an answered renewal did not bring Live back: {:?}",
+        store.continuity_history()
+    );
+    store.close().await;
+}

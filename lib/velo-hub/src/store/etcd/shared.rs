@@ -83,6 +83,10 @@ pub(super) struct Settings {
     pub(super) prune_interval: Duration,
     pub(super) request_deadline: Duration,
     pub(super) lock_ttl_secs: i64,
+    /// How long after a lock renewal was sent, if etcd answered it, the
+    /// store still counts the lease as held. The requested lock TTL: etcd
+    /// counts from when it processed the renewal, which is later.
+    pub(super) lock_deadline: Duration,
     pub(super) custody_ttl_secs: i64,
     pub(super) tombstone_ttl_secs: i64,
 }
@@ -126,6 +130,11 @@ impl Cache {
 }
 
 /// What makes up [`Continuity`]. Fenced is terminal; the rest clear.
+///
+/// Each task sets only its own input, and [`Shared::update_health`]
+/// publishes the combination. A task that published `Live` itself, say the
+/// watch once it caught up, would hide a lease that another task knows is
+/// stale.
 #[derive(Default)]
 struct Health {
     fenced: bool,
@@ -133,6 +142,9 @@ struct Health {
     disconnected: bool,
     /// A call gave up waiting for the watch to reach this revision.
     lag_until: Option<i64>,
+    /// The lock lease's local deadline passed with no renewal answered.
+    /// Another hub may hold the prefix by now, so the cache may be stale.
+    lease_stale: bool,
 }
 
 impl Health {
@@ -141,7 +153,7 @@ impl Health {
             Continuity::Fenced
         } else if self.lost {
             Continuity::Lost
-        } else if self.disconnected || self.lag_until.is_some() {
+        } else if self.disconnected || self.lag_until.is_some() || self.lease_stale {
             Continuity::Degraded
         } else {
             Continuity::Live
@@ -311,6 +323,10 @@ impl Shared {
 
     pub(super) fn set_disconnected(&self, disconnected: bool) {
         self.update_health(|health| health.disconnected = disconnected);
+    }
+
+    pub(super) fn set_lease_stale(&self, stale: bool) {
+        self.update_health(|health| health.lease_stale = stale);
     }
 
     pub(super) fn set_lost(&self, lost: bool) {

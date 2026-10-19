@@ -44,11 +44,18 @@
 //! partition, while another hub took the prefix, cannot write: the failed
 //! compare, the watch seeing the lock key leave, or a keep-alive finding
 //! the lease gone puts the store in [`Continuity::Fenced`] for good.
-//! Each of these is an answer from etcd. A store cut off from etcd is
-//! `Live` until its watch breaks (up to the 5 s connection keep-alive plus
-//! the request deadline when packets are dropped), then `Degraded` until it
-//! reaches etcd again, and is fenced then. Its lock can expire before the
-//! watch breaks.
+//! Each of these is an answer from etcd.
+//!
+//! A store that cannot reach etcd gets no such answer, so it also keeps a
+//! local deadline: one lock TTL after it sent the last renewal etcd
+//! answered, it reports [`Continuity::Degraded`]. etcd counts the TTL from
+//! when it processed that renewal, which is later, so the store degrades
+//! no later than another hub can take the lock. A renewal answered later
+//! with a TTL above zero proves the lease never lapsed, and the store is
+//! `Live` again; if the lease did lapse, etcd's answer fences it. It is
+//! not fenced at the deadline: an etcd leader change extends every lease,
+//! so an etcd outage longer than the lock TTL need not cost the lease, and
+//! a fence would turn that outage into a hub restart.
 //!
 //! # The barrier
 //!
@@ -112,7 +119,7 @@ pub use builder::{
 /// [`ConnectOptions`]: etcd_client::ConnectOptions
 pub use etcd_client;
 #[cfg(feature = "test-support")]
-pub use hold::{WatchHold, WatchHoldGuard};
+pub use hold::{RenewalHoldGuard, WatchHold, WatchHoldGuard};
 
 /// The etcd [`HubStore`]. Built by [`EtcdStore::builder`]; owns its tasks
 /// (watch, keep-alives, reaper); its [`spawn_liveness_task`] only stops
@@ -182,6 +189,16 @@ impl EtcdStore {
         self.shared.holds.watch.send_replace(Some(hold));
         WatchHoldGuard {
             holds: self.shared.holds.watch.clone(),
+        }
+    }
+
+    /// Send no lock renewal until the guard drops: the lease's local
+    /// deadline passes as in a partition, while etcd stays reachable.
+    #[cfg(feature = "test-support")]
+    pub fn hold_lock_renewals(&self) -> RenewalHoldGuard {
+        self.shared.holds.renewals.send_replace(true);
+        RenewalHoldGuard {
+            renewals: self.shared.holds.renewals.clone(),
         }
     }
 
