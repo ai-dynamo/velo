@@ -354,6 +354,10 @@ struct Shared {
     /// then moved toward `serving` by `sync_services`, one request at a
     /// time. Empty without a registration.
     confirmed: parking_lot::Mutex<BTreeSet<String>>,
+    /// Names whose last request got no answer from the hub (a dropped
+    /// future, a timeout, a proxy's 504): the hub may or may not have
+    /// applied it. `sync_services` sends these first, as `serving` says.
+    unsettled: parking_lot::Mutex<BTreeSet<String>>,
     seq: AtomicU64,
     at_unix_ms: AtomicU64,
 }
@@ -378,6 +382,7 @@ impl Shared {
         {
             state.response = None;
             self.confirmed.lock().clear();
+            self.unsettled.lock().clear();
         }
     }
 
@@ -455,6 +460,7 @@ impl Drop for Acquiring<'_> {
         {
             state.response = None;
             self.shared.confirmed.lock().clear();
+            self.shared.unsettled.lock().clear();
         }
         state.acquiring = false;
     }
@@ -657,6 +663,7 @@ impl HubClient {
                     state.response = Some(response.clone());
                     state.orphaned = false;
                     *shared.confirmed.lock() = serving;
+                    shared.unsettled.lock().clear();
                     response
                 }
                 Err(error) => {

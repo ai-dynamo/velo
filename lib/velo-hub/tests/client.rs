@@ -14,6 +14,7 @@ use common::*;
 use serde::{Deserialize, Serialize};
 use velo_hub::client::{ClientError, HubClient, HubClientBuilder};
 use velo_hub::protocol::{ErrorCode, peers_by_instance};
+use velo_hub::store::HubStore;
 use velo_hub::velo::discovery::PeerDiscovery;
 use velo_hub::velo::{Handler, Velo};
 use velo_hub::{Extension, Hub};
@@ -1022,4 +1023,96 @@ fn slow_opt_in() -> std::collections::BTreeMap<String, serde_json::Value> {
     let mut m = std::collections::BTreeMap::new();
     m.insert("slow".to_string(), serde_json::Value::Null);
     m
+}
+
+/// A panic in an extension's `on_registered` after the credential
+/// committed: the transaction's `Drop` retires the entry and fails the
+/// credential closed, and the hub answers `register_again` (not 500), so
+/// the client drops the credential the hub rotated away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hub_panic_after_the_write_drops_the_registration() {
+    let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::default());
+    let hub = builder()
+        .store(store.clone())
+        .extension(Ledger::default())
+        .serve()
+        .await
+        .unwrap();
+    let ledger = hub.extension::<Ledger>().unwrap();
+    let client = client_for(&hub);
+    let peer = make_peer();
+    let first = client
+        .register_peer(peer.clone(), Default::default())
+        .await
+        .unwrap();
+
+    ledger.panic_next_registered();
+    let answer = client.register_peer(peer.clone(), Default::default()).await;
+    assert!(
+        matches!(
+            &answer,
+            Err(velo_hub::client::ClientError::Hub {
+                code: velo_hub::protocol::ErrorCode::RegisterAgain,
+                ..
+            })
+        ),
+        "control: {answer:?}"
+    );
+    assert!(
+        eventually(Duration::from_secs(1), || store
+            .get(peer.instance_id())
+            .is_none())
+        .await,
+        "control: the hub retired the entry"
+    );
+    assert!(
+        hub.authority()
+            .authorize(peer.instance_id(), Some(&first.credential))
+            .is_err(),
+        "control: the hub rotated the credential away"
+    );
+    assert!(
+        !client.is_registered(),
+        "the client holds a credential the hub rotated away after a 500 on a re-registration"
+    );
+}
+
+/// The same through an indeterminate store write that cannot be resolved:
+/// the hub drops both the prior registration and the attempted one and
+/// answers `register_again`, so the client drops the prior credential.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unresolved_write_drops_the_registration() {
+    use velo_hub::store::testing::PutFault;
+    let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::default());
+    let hub = builder().store(store.clone()).serve().await.unwrap();
+    let client = client_for(&hub);
+    let peer = make_peer();
+    let first = client
+        .register_peer(peer.clone(), Default::default())
+        .await
+        .unwrap();
+
+    store.fault_next_put(PutFault::IndeterminateWritten);
+    store.fail_next_resolve();
+    let answer = client.register_peer(peer.clone(), Default::default()).await;
+    assert!(
+        matches!(
+            &answer,
+            Err(velo_hub::client::ClientError::Hub {
+                code: velo_hub::protocol::ErrorCode::RegisterAgain,
+                ..
+            })
+        ),
+        "control: {answer:?}"
+    );
+    assert!(
+        hub.authority()
+            .authorize(peer.instance_id(), Some(&first.credential))
+            .is_err(),
+        "control: the hub failed the prior credential closed"
+    );
+    assert!(
+        !client.is_registered(),
+        "the client holds a credential the hub failed closed after a 503 on a re-registration"
+    );
 }

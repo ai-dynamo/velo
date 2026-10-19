@@ -82,12 +82,17 @@ pub fn service_instance(name: &str, id: InstanceId) -> String {
 pub const SERVICES_EXTENSION: &str = "services";
 
 /// The rule for service names, as error messages state it.
-pub const SERVICE_NAME_RULE: &str = "1 to 128 of A-Z a-z 0-9 . _ -";
+pub const SERVICE_NAME_RULE: &str = "1 to 128 of A-Z a-z 0-9 . _ -, not . or ..";
 
 /// Whether `name` is a valid service name: see [`SERVICE_NAME_RULE`]. A
 /// valid name is always one URL path segment.
 pub fn is_valid_service_name(name: &str) -> bool {
-    (1..=128).contains(&name.len())
+    // `.` and `..` are dot segments: a URL resolver removes them, so a
+    // request for such a name would reach another route (`..` would turn a
+    // service's DELETE into an unregister).
+    name != "."
+        && name != ".."
+        && (1..=128).contains(&name.len())
         && name
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))

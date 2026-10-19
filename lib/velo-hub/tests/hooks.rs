@@ -486,7 +486,8 @@ async fn indeterminate_put_that_cannot_be_resolved_drops_and_reserves() {
         Some(&prior.credential),
     )
     .await;
-    assert_eq!(response.status(), 503);
+    assert_eq!(response.status(), 409);
+    assert_eq!(error_code(response).await, ErrorCode::RegisterAgain);
     assert!(!f.ledger.has_owner(owner));
     assert!(f.store.contains(owner), "the written entry is still there");
     assert_eq!(
@@ -563,7 +564,9 @@ async fn panicking_commit_fails_closed() {
         Some(&prior.credential),
     )
     .await;
-    assert_eq!(response.status(), 500);
+    // The prior registration is gone, so the answer says register again.
+    assert_eq!(response.status(), 409);
+    assert_eq!(error_code(response).await, ErrorCode::RegisterAgain);
     assert!(
         eventually(Duration::from_secs(1), || !f.store.contains(owner)
             && !f.ledger.has_owner(owner))
@@ -794,7 +797,11 @@ async fn a_panic_after_the_write_never_shows_the_prior_state_again() {
         Some(&prior.credential),
     )
     .await;
-    assert_eq!(response.status(), 500);
+    assert_eq!(
+        response.status(),
+        409,
+        "the prior registration is gone: register again"
+    );
     assert!(
         !ledger.has_owner(owner),
         "the removal was delivered before the response"
@@ -1302,7 +1309,11 @@ async fn a_panic_before_the_write_delivers_a_removal_before_undoing_hides() {
     gate.entered().await;
     store.expire(owner);
     gate.release();
-    assert_eq!(attempt.await.unwrap(), 500);
+    assert_eq!(
+        attempt.await.unwrap(),
+        409,
+        "the prior registration is gone: register again"
+    );
     assert!(!ledger.has_owner(owner));
     assert_eq!(
         ledger.revealed(),
@@ -1327,7 +1338,7 @@ async fn a_late_landing_write_does_not_strand_a_reservation() {
         post_register(&f.hub, &request(&peer), Some(&credential))
             .await
             .status(),
-        503
+        409
     );
     assert_eq!(
         post_register(&f.hub, &request(&peer), None).await.status(),
@@ -1402,7 +1413,11 @@ async fn a_hung_read_back_is_cut_off_and_fails_closed() {
     )
     .await
     .expect("a hung read-back held the registration");
-    assert_eq!(response.status(), 503);
+    assert_eq!(
+        response.status(),
+        409,
+        "the outcome is unknown and the prior is dropped: register again"
+    );
     assert!(!f.ledger.has_owner(peer.instance_id()));
     assert_eq!(
         post_register(&f.hub, &request(&peer), None).await.status(),

@@ -16,7 +16,9 @@ use velo_hub::Hub;
 use velo_hub::client::{ClientError, HubClient};
 use velo_hub::protocol::{CREDENTIAL_HEADER, ErrorCode, service_instance};
 use velo_hub::store::testing::FaultStore;
-use velo_hub::velo::discovery::{ServiceDiscovery, ServiceEvent, ServiceRegistrationGuard};
+use velo_hub::velo::discovery::{
+    PeerDiscovery, ServiceDiscovery, ServiceEvent, ServiceRegistrationGuard,
+};
 use velo_hub::velo::{Handler, InstanceId};
 
 fn client_for(hub: &Hub) -> HubClient {
@@ -380,4 +382,43 @@ async fn a_second_guard_for_one_name_is_refused() {
     );
     assert_eq!(hub_instances(&hub, "r").await, [id]);
     drop(first);
+}
+
+/// `.` and `..` are not service names: a URL resolver removes dot segments,
+/// so a request for them would reach another route (a guard for `..` would
+/// have unregistered the instance; one for `.` hit no route, and the 404
+/// made the client forget a live registration).
+#[tokio::test]
+async fn dot_segments_are_not_service_names() {
+    let hub = start().await;
+    let (client, _) = registered(&hub).await;
+    for name in [".", ".."] {
+        let error = client.register_service(name).await.unwrap_err();
+        assert!(
+            matches!(error, ClientError::InvalidServiceName(_)),
+            "{error}"
+        );
+    }
+    assert!(client.is_registered());
+    let peer = client.registration().unwrap().instance_id;
+    assert!(
+        client_for(&hub)
+            .discovery()
+            .discover_by_instance_id(peer)
+            .await
+            .is_ok()
+    );
+    // The hub refuses them in a registration's payload too.
+    let mut extensions = none();
+    extensions.insert("services".to_string(), serde_json::json!([".."]));
+    let response = post_register(
+        &hub,
+        &velo_hub::protocol::RegisterRequest {
+            peer: make_peer(),
+            extensions,
+        },
+        None,
+    )
+    .await;
+    assert_eq!(response.status(), 400);
 }

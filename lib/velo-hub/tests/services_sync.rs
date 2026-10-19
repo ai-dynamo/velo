@@ -373,3 +373,186 @@ async fn register_answers_ok_once_the_registration_is_held() {
     );
     assert_eq!(hub_instances(&hub, "x").await, [peer.instance_id()]);
 }
+
+#[derive(Clone, Copy)]
+enum Mode {
+    /// Forward, discard the hub's answer, answer 504 with no body.
+    Fail504,
+    /// Forward, then hold the hub's answer for `delay`.
+    Delay(Duration),
+}
+
+/// A proxy in front of the control listener that applies `mode` to the next
+/// request of `method` while `armed` is set.
+async fn proxy(
+    upstream: String,
+    armed: Arc<AtomicBool>,
+    method: &'static str,
+    mode: Mode,
+) -> std::net::SocketAddr {
+    use velo_hub::axum::body::{Body, to_bytes};
+    use velo_hub::axum::extract::Request;
+    use velo_hub::axum::response::Response;
+    let http = reqwest::Client::new();
+    let app = velo_hub::axum::Router::new().fallback(move |req: Request| {
+        let http = http.clone();
+        let upstream = upstream.clone();
+        let armed = armed.clone();
+        async move {
+            let (parts, body) = req.into_parts();
+            let bytes = to_bytes(body, usize::MAX).await.unwrap();
+            let path = parts
+                .uri
+                .path_and_query()
+                .map(|p| p.as_str().to_string())
+                .unwrap_or_else(|| "/".to_string());
+            let m = reqwest::Method::from_bytes(parts.method.as_str().as_bytes()).unwrap();
+            let is_target = parts.method.as_str() == method;
+            let mut request = http.request(m, format!("{upstream}{path}"));
+            for (name, value) in &parts.headers {
+                if name != "host" && name != "content-length" {
+                    request = request.header(name.as_str(), value.as_bytes());
+                }
+            }
+            let answer = request.body(bytes).send().await.unwrap();
+            let status = answer.status().as_u16();
+            let body = answer.bytes().await.unwrap();
+            if is_target && armed.swap(false, Ordering::SeqCst) {
+                match mode {
+                    Mode::Fail504 => {
+                        return Response::builder().status(504).body(Body::empty()).unwrap();
+                    }
+                    Mode::Delay(delay) => tokio::time::sleep(delay).await,
+                }
+            }
+            Response::builder()
+                .status(status)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { velo_hub::axum::serve(listener, app).await.unwrap() });
+    addr
+}
+
+async fn client_behind(
+    hub: &Hub,
+    armed: &Arc<AtomicBool>,
+    method: &'static str,
+    mode: Mode,
+) -> HubClient {
+    let addr = proxy(
+        format!("http://{}", hub.control_addr()),
+        armed.clone(),
+        method,
+        mode,
+    )
+    .await;
+    HubClient::builder()
+        .host("127.0.0.1")
+        .public_port(hub.public_addr().port())
+        .control_port(addr.port())
+        .build()
+        .unwrap()
+}
+
+/// A PUT the hub applied but a gateway answered 504 for: `register_service`
+/// answers Err and drops its guard. The name stays unsettled, so the
+/// dropped guard's pass sends the DELETE, and the hub does not keep an
+/// entry nobody serves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_put_answered_504_then_a_dropped_guard_leaves_no_entry() {
+    let hub = start().await;
+    let armed = Arc::new(AtomicBool::new(false));
+    let client = client_behind(&hub, &armed, "PUT", Mode::Fail504).await;
+    let peer = make_peer();
+    client
+        .register_peer(peer.clone(), Default::default())
+        .await
+        .unwrap();
+
+    armed.store(true, Ordering::SeqCst);
+    let answer = client.register_service("x").await;
+    assert!(
+        answer.is_err(),
+        "control: the 504 reaches the caller: {answer:?}"
+    );
+    // The dropped guard's background pass, if any.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // An explicit pass changes nothing either.
+    client.sync_services().await.unwrap();
+    assert!(client.is_registered(), "control: the registration is held");
+    assert!(
+        hub_instances(&hub, "x").await.is_empty(),
+        "the hub kept an entry after register_service failed and dropped its guard"
+    );
+}
+
+/// The same through cancellation: `register_service` is dropped while its
+/// PUT is in flight past the hub.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_register_service_dropped_mid_put_leaves_no_entry() {
+    let hub = start().await;
+    let armed = Arc::new(AtomicBool::new(false));
+    let client = client_behind(&hub, &armed, "PUT", Mode::Delay(Duration::from_secs(1))).await;
+    let peer = make_peer();
+    client
+        .register_peer(peer.clone(), Default::default())
+        .await
+        .unwrap();
+
+    armed.store(true, Ordering::SeqCst);
+    let answer =
+        tokio::time::timeout(Duration::from_millis(200), client.register_service("x")).await;
+    assert!(answer.is_err(), "control: the call was cut off");
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    client.sync_services().await.unwrap();
+    assert!(client.is_registered(), "control: the registration is held");
+    assert!(
+        hub_instances(&hub, "x").await.is_empty(),
+        "the hub kept an entry after the register_service future was dropped"
+    );
+}
+
+/// A DELETE answered 504 is unsettled, so the retry sends it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_delete_answered_504_is_retried() {
+    let hub = start().await;
+    let armed = Arc::new(AtomicBool::new(false));
+    let client = client_behind(&hub, &armed, "DELETE", Mode::Fail504).await;
+    let peer = make_peer();
+    client
+        .register_peer(peer.clone(), Default::default())
+        .await
+        .unwrap();
+    let mut guard = client.register_service("x").await.unwrap();
+    armed.store(true, Ordering::SeqCst);
+    assert!(guard.unregister().await.is_err());
+    guard.unregister().await.unwrap();
+    assert!(hub_instances(&hub, "x").await.is_empty());
+}
+
+/// The next registration also settles everything: its payload replaces
+/// the set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_next_registration_settles_the_set() {
+    let hub = start().await;
+    let armed = Arc::new(AtomicBool::new(false));
+    let client = client_behind(&hub, &armed, "PUT", Mode::Fail504).await;
+    let peer = make_peer();
+    client
+        .register_peer(peer.clone(), Default::default())
+        .await
+        .unwrap();
+    armed.store(true, Ordering::SeqCst);
+    let _ = client.register_service("x").await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client
+        .register_peer(peer.clone(), Default::default())
+        .await
+        .unwrap();
+    assert!(hub_instances(&hub, "x").await.is_empty());
+}

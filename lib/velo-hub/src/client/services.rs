@@ -46,9 +46,10 @@ impl HubClient {
     /// Serve the service `name` with this client's instance. The client
     /// holds one guard per name ([`ClientError::AlreadyServing`] for a
     /// second). The name goes to the hub now if the client is registered,
-    /// and with every registration after. An error is the hub's answer to
-    /// that request; the name stays served, and the next pass retries.
-    /// Dropping the guard stops serving it, in the background.
+    /// and with every registration after. On `Err` there is no guard and
+    /// the name is not served; call again. The error can belong to another
+    /// name whose change was still waiting. Dropping the guard stops
+    /// serving it, in the background.
     pub async fn register_service(
         &self,
         name: &str,
@@ -78,13 +79,30 @@ impl HubClient {
             let Some((instance_id, _)) = shared.credential() else {
                 return Ok(());
             };
+            // Unsettled names first (their state on the hub is unknown),
+            // sent as `serving` dictates; then the plain differences. Both
+            // requests are idempotent on the hub.
             let next = {
                 let serving = shared.serving.lock();
                 let confirmed = shared.confirmed.lock();
-                serving
-                    .difference(&confirmed)
+                let unsettled = shared.unsettled.lock();
+                unsettled
+                    .iter()
                     .next()
-                    .map(|name| (Method::PUT, name.clone()))
+                    .map(|name| {
+                        let method = if serving.contains(name) {
+                            Method::PUT
+                        } else {
+                            Method::DELETE
+                        };
+                        (method, name.clone())
+                    })
+                    .or_else(|| {
+                        serving
+                            .difference(&confirmed)
+                            .next()
+                            .map(|name| (Method::PUT, name.clone()))
+                    })
                     .or_else(|| {
                         confirmed
                             .difference(&serving)
@@ -100,16 +118,31 @@ impl HubClient {
                 &protocol::service_instance(&name, instance_id),
             )?;
             let put = method == Method::PUT;
+            // Unsettled until the hub answers: a dropped future or an answer
+            // that is not the hub's leaves it so.
+            shared.unsettled.lock().insert(name.clone());
             // `credentialed` drops a rejected registration, which clears
-            // `confirmed`; the loop then ends for want of a credential.
-            shared
+            // these sets; the loop then ends for want of a credential.
+            let answer = shared
                 .credentialed::<(), ()>(endpoints, method, url, None, Route::Core)
-                .await?;
-            let mut confirmed = shared.confirmed.lock();
-            if put {
-                confirmed.insert(name);
-            } else {
-                confirmed.remove(&name);
+                .await;
+            match answer {
+                Ok(()) => {
+                    shared.unsettled.lock().remove(&name);
+                    let mut confirmed = shared.confirmed.lock();
+                    if put {
+                        confirmed.insert(name);
+                    } else {
+                        confirmed.remove(&name);
+                    }
+                }
+                Err(error) => {
+                    // The hub answered: it did not apply the request.
+                    if matches!(error, ClientError::Hub { .. }) {
+                        shared.unsettled.lock().remove(&name);
+                    }
+                    return Err(error);
+                }
             }
         }
     }

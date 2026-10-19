@@ -522,7 +522,7 @@ mod tests {
         for good in ["a", "rhino-router", "kv.index_v2", &"x".repeat(128)] {
             assert!(check_name(good).is_ok(), "{good}");
         }
-        for bad in ["", "a b", "a/b", "é", &"x".repeat(129)] {
+        for bad in ["", "a b", "a/b", "é", ".", "..", &"x".repeat(129)] {
             assert!(check_name(bad).is_err(), "{bad}");
         }
     }

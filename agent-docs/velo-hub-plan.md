@@ -564,3 +564,10 @@ watch order (initial then deltas, no gap or duplicate under concurrent puts); en
 - **R3-10. The registration carries the services; one writer between registrations** (pass 2 A1, proven four ways: a dropped guard's detached DELETE removed the next guard's entry in 34 of 40 rounds; a guard dropped or unregistered during a re-registration left its entry; a busy refusal could not be retried). The directory's payload is the owner's whole set (`Registration = BTreeSet<String>`; `commit` replaces); the client sends its `serving` set on every registration and records it as `confirmed`; between registrations `sync_services` (under the client's `op` lock) is the only code that sends service requests, one at a time, until `serving == confirmed`. This is pass 1's S6 plus the reconciler.
 - **R3-11. "Answered" is positive** (pass 2 A2): only the hub's own response or a connect/builder error; a proxy's 502/504, a timeout, a broken body are no answer and fail closed.
 - **R3-12. `register` answers Ok once the registration is held** (pass 2 A3); a later service-sync failure is left for `sync_services`.
+
+### 16.5 After review pass 3 (final), 2026-10-19 (record: /tmp/m3r3/report.md)
+
+- **R3-13. `.` and `..` are not service names** (pass 3 A0; pass 2 F1/F2): `Url::join` removes dot segments, so a guard for `..` sent its DELETE to `/v1/instances/{id}` and unregistered the instance, and `.` hit no route and the 404 made the client forget a live registration. Both refused on both sides.
+- **R3-14. An `unsettled` set** (pass 3 A1): a name enters it before its request and leaves on a hub answer; `sync_services` sends unsettled names first, as `serving` says. A PUT the hub applied but whose answer was lost, then a dropped guard, no longer leaks the entry.
+- **R3-15. The hub answers `register_again` when the prior registration is gone** (pass 3 A2): from `fail_unresolved` (was 503), and from a registration that panicked after the write when the presented credential no longer authorizes (was 500). Five hooks tests updated from 500/503 to 409.
+- The review cap (3 passes) is reached; M3 lands after these.
