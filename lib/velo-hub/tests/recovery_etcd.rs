@@ -228,3 +228,21 @@ async fn a_recovered_peer_is_forgotten_in_velo_when_its_entry_goes() {
     );
     hub_b.shutdown().await.unwrap();
 }
+
+/// A fenced hub's stop skips its pinned remove, so
+/// the stop reports Ok rather than a store refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fenced_hub_stop_reports_ok() {
+    use velo_hub::store::etcd::etcd_client::Client;
+    let prefix = format!("/velo-hub-test/{}", uuid::Uuid::new_v4());
+    let ports = (free_port(), free_port());
+    let hub = hub_on(&prefix, ports).await;
+    let mut etcd = Client::connect([etcd_url()], None).await.unwrap();
+    let lock = etcd.get(format!("{prefix}/hub"), None).await.unwrap();
+    let lease = lock.kvs().first().expect("the hub holds its lock").lease();
+    etcd.lease_revoke(lease).await.unwrap();
+    let stopped = tokio::time::timeout(Duration::from_secs(20), hub.shutdown())
+        .await
+        .expect("the fenced hub's stop hung");
+    assert!(stopped.is_ok(), "{stopped:?}");
+}

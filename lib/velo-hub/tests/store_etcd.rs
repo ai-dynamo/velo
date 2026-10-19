@@ -863,3 +863,69 @@ async fn a_prefix_at_target_scale_loads() {
     assert_eq!(reloaded.list().len(), ENTRIES);
     reloaded.close().await;
 }
+
+/// A reconnected watch stays `Degraded` until it has
+/// replayed what happened during the outage. The replay is held with a
+/// pause, so the window is observable: with the watch reopened but nothing
+/// applied, the cache is stale, and the store must not say `Live`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reconnect_stays_degraded_until_the_outage_is_replayed() {
+    let _serial = SERIAL.lock().await;
+    let prefix = prefix();
+    let store = connect(&prefix).await;
+    let (hook, removals) = recording_hook();
+    store.install_removal_hook(hook).unwrap();
+    let gone = peer();
+    let gone_inc = store
+        .put(RegistrationRecord::bare(gone.clone()), None)
+        .await
+        .unwrap();
+
+    let disconnect = store.hold_watch(WatchHold::Disconnect);
+    assert!(wait_for_continuity(&store, Continuity::Degraded, Duration::from_secs(5)).await);
+    raw()
+        .await
+        .delete(instance_key(&prefix, gone.instance_id()), None)
+        .await
+        .unwrap();
+    // Reconnect, but hold the replay: the stream reopens and nothing is
+    // applied. The disconnect guard is leaked so its drop cannot lift the
+    // pause.
+    let pause = store.hold_watch(WatchHold::Pause);
+    std::mem::forget(disconnect);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        removals.lock().unwrap().is_empty(),
+        "control: nothing is applied under the pause"
+    );
+    assert!(
+        store.contains(gone.instance_id()),
+        "control: the cache is stale under the pause"
+    );
+    let history = store.continuity_history();
+    assert_eq!(
+        *store.continuity().borrow(),
+        Continuity::Degraded,
+        "a reconnected watch that has not replayed the outage reported Live: {history:?}"
+    );
+    let first_degraded = history
+        .iter()
+        .position(|c| *c == Continuity::Degraded)
+        .unwrap();
+    assert!(
+        !history[first_degraded..].contains(&Continuity::Live),
+        "Live was reported before the replay: {history:?}"
+    );
+
+    drop(pause);
+    assert!(wait_for_continuity(&store, Continuity::Live, Duration::from_secs(10)).await);
+    assert_eq!(
+        removals.lock().unwrap().as_slice(),
+        &[Removal {
+            id: gone.instance_id(),
+            incarnation: gone_inc
+        }]
+    );
+    assert!(!store.contains(gone.instance_id()));
+    store.close().await;
+}

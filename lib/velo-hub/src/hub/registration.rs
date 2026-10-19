@@ -326,6 +326,7 @@ impl Transaction<'_> {
     async fn fail_after_write(&mut self, incarnation: Incarnation, error: HubError) -> HubError {
         let shared = self.shared;
         let owner = self.owner;
+        let prior = self.permit().previous().is_some();
         if let Err(remove_error) = shared.remove_bounded(owner, incarnation).await
             && !remove_error.is_gone()
         {
@@ -342,9 +343,18 @@ impl Transaction<'_> {
             id: owner,
             incarnation,
         };
-        self.settle_after_write(Some(removal), shared.store.current_incarnation(owner));
+        let reservation = shared.store.current_incarnation(owner);
+        self.settle_after_write(Some(removal), reservation);
+        // As in `fail_unresolved`: an entry still held, whose record names
+        // the presented credential, is recovered by it, not by a bare
+        // register.
+        let code = if prior && reservation.is_some() {
+            ErrorCode::Recovered
+        } else {
+            ErrorCode::RegisterAgain
+        };
         HubError::new(
-            ErrorCode::RegisterAgain,
+            code,
             format!("registration failed after it was recorded; register again: {error}"),
         )
     }
