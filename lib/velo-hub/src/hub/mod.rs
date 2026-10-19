@@ -596,14 +596,21 @@ impl HubInner {
 /// cannot leave the hub half stopped.
 async fn stop(shared: &Shared, running: Running) -> anyhow::Result<()> {
     let config = &shared.config;
-    // Every async holder of the lock is bounded, but a sync hook that
-    // blocks its thread (against the extension rules) holds it for as long
-    // as it blocks. Stop without the lock rather than hang.
-    let guard = match tokio::time::timeout(config.shutdown_timeout, shared.lock.lock()).await {
+    // Every async step under the lock is bounded, so a conforming
+    // transaction holds it for at most a prepare and an on_registered per
+    // extension plus a put, a read-back and a remove, each `step_timeout`.
+    // Wait at least that long, so only a sync hook that blocks its thread
+    // (against the extension rules) makes the stop go on without the lock.
+    let extensions = u32::try_from(shared.extensions.len()).unwrap_or(u32::MAX);
+    let longest_hold = config
+        .step_timeout
+        .saturating_mul(extensions.saturating_mul(2).saturating_add(3));
+    let lock_wait = config.shutdown_timeout.max(longest_hold);
+    let guard = match tokio::time::timeout(lock_wait, shared.lock.lock()).await {
         Ok(guard) => Some(guard),
         Err(_) => {
             tracing::warn!(
-                timeout = ?config.shutdown_timeout,
+                timeout = ?lock_wait,
                 "the registration lock was not released; stopping without it"
             );
             None
@@ -616,6 +623,11 @@ async fn stop(shared: &Shared, running: Running) -> anyhow::Result<()> {
     // task may not run again until the blocking hook returns.
     let mut lifecycle = running.lifecycle;
     match tokio::time::timeout(config.shutdown_timeout, &mut lifecycle).await {
+        // Removals are delivered only under the lock: without it, an
+        // `on_removed` would run while the holder is inside another hook.
+        Ok(Ok(_)) if guard.is_none() => tracing::warn!(
+            "stopping without the registration lock; queued removals are not delivered"
+        ),
         Ok(Ok((mut queue, in_flight))) => {
             if let Some(job) = in_flight {
                 shared.run_job(job).await;

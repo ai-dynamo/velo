@@ -1413,15 +1413,21 @@ async fn a_hung_read_back_is_cut_off_and_fails_closed() {
 
 /// A sync hook that blocks its thread (here `on_removed`, while DELETE
 /// holds the registration lock) breaks the extension rules, but it must not
-/// hang shutdown. The stop waits for the lock for `shutdown_timeout_ms` and
-/// then goes on without it. It bounds its join of the lifecycle task too:
+/// hang shutdown. The stop waits for the lock as long as a conforming
+/// transaction can hold it (at least `shutdown_timeout_ms`), then goes on
+/// without it. It bounds its join of the lifecycle task too:
 /// the removal DELETE queued woke that task onto the worker that then
 /// blocked, and tokio's other workers cannot steal it from that worker's
 /// LIFO slot, so it does not run until the hook returns.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_blocking_sync_hook_does_not_hang_shutdown() {
     let f = fixture(
-        |config| config.server.shutdown_timeout = Duration::from_millis(300),
+        |config| {
+            config.server.shutdown_timeout = Duration::from_millis(300);
+            // Stop waits for the lock as long as a conforming transaction
+            // can hold it, a few step timeouts; keep that short too.
+            config.server.step_timeout = Duration::from_millis(40);
+        },
         false,
     )
     .await;
@@ -1553,4 +1559,91 @@ async fn an_entry_that_expires_while_a_failed_registration_settles_is_not_reserv
     assert!(f.store.current_incarnation(owner).is_none());
     let again = post_register(&f.hub, &request(&peer), None).await;
     assert_eq!(again.status(), 200, "the owner is reserved for good");
+}
+
+/// When stop gives up waiting for the lock (a sync hook blocks its thread),
+/// it must not deliver queued removals without the lock: `on_removed`
+/// would run for one owner while another owner's `commit` still runs under
+/// the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_without_the_lock_delivers_no_removal() {
+    let f = fixture(
+        |config| {
+            config.server.shutdown_timeout = Duration::from_millis(300);
+            config.server.step_timeout = Duration::from_millis(40);
+        },
+        false,
+    )
+    .await;
+    let other = make_peer();
+    let _ = seeded(&f, &other).await;
+    let peer = make_peer();
+    let (entered, release) = f.ledger.block_next_commit();
+    let attempt = tokio::spawn({
+        let hub = f.hub.clone();
+        let body = request_with(&peer, &[ledger_opt_in()]);
+        async move { post_register(&hub, &body, None).await }
+    });
+    tokio::task::spawn_blocking(move || entered.recv())
+        .await
+        .unwrap()
+        .expect("commit was reached");
+    // The hook queues this removal; the lifecycle task waits for the lock.
+    f.store.expire(other.instance_id());
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(f.ledger.has_owner(other.instance_id()));
+    tokio::time::timeout(Duration::from_secs(5), f.hub.shutdown())
+        .await
+        .expect("shutdown hung")
+        .unwrap();
+    let delivered_without_the_lock = !f.ledger.has_owner(other.instance_id());
+    drop(release);
+    let _ = attempt.await;
+    assert!(
+        !delivered_without_the_lock,
+        "stop delivered a removal without the lock while a commit ran under it"
+    );
+}
+
+/// A conforming transaction can hold the lock for several step timeouts,
+/// more than `shutdown_timeout_ms`. Stop waits it out, takes the lock, and
+/// delivers the removals still queued, instead of giving up on the lock.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stop_waits_out_a_slow_conforming_transaction() {
+    let f = fixture(
+        |config| {
+            config.server.shutdown_timeout = Duration::from_millis(100);
+            config.server.step_timeout = Duration::from_secs(2);
+        },
+        false,
+    )
+    .await;
+    let other = make_peer();
+    let _ = seeded(&f, &other).await;
+    let peer = make_peer();
+    let gate = f.ledger.gate_next_prepare();
+    let attempt = tokio::spawn({
+        let hub = f.hub.clone();
+        let body = request_with(&peer, &[ledger_opt_in()]);
+        async move { post_register(&hub, &body, None).await }
+    });
+    gate.entered().await;
+    f.store.expire(other.instance_id());
+    let shutdown = tokio::spawn({
+        let hub = f.hub.clone();
+        async move { hub.shutdown().await }
+    });
+    // Longer than shutdown_timeout, well within the prepare's step timeout.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    gate.release();
+    tokio::time::timeout(Duration::from_secs(10), shutdown)
+        .await
+        .expect("shutdown hung")
+        .unwrap()
+        .unwrap();
+    let _ = attempt.await;
+    assert!(
+        !f.ledger.has_owner(other.instance_id()),
+        "stop gave up on the lock and left the queued removal undelivered"
+    );
 }

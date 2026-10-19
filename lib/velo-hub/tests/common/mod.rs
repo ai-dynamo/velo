@@ -444,6 +444,8 @@ struct LedgerFaults {
     panic_next_admit: bool,
     /// (entered, release): the next on_removed blocks its thread.
     block_next_removed: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
+    /// (entered, release): the next commit blocks its thread.
+    block_next_commit: Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>,
     panic_next_prepare: bool,
     panic_next_commit: bool,
     panic_next_registered: bool,
@@ -520,6 +522,16 @@ impl Ledger {
         let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         self.faults.lock().block_next_removed = Some((entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    /// The next commit blocks its thread, as `block_next_removed` does.
+    pub fn block_next_commit(
+        &self,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        self.faults.lock().block_next_commit = Some((entered_tx, release_rx));
         (entered_rx, release_tx)
     }
 
@@ -743,6 +755,11 @@ impl Extension for Ledger {
     fn commit(&self, mut staged: LedgerStaged, registration: &Committed<'_>) {
         if std::mem::take(&mut self.faults.lock().panic_next_commit) {
             panic!("injected commit panic");
+        }
+        let block = self.faults.lock().block_next_commit.take();
+        if let Some((entered, release)) = block {
+            let _ = entered.send(());
+            let _ = release.recv();
         }
         if let Some(unhide) = staged.unhide.as_mut() {
             unhide.armed = false;

@@ -64,7 +64,8 @@ pub struct ServerConfig {
     #[serde(rename = "step_timeout_ms", with = "millis")]
     pub step_timeout: Duration,
     /// Shutdown budget, applied to each wait in turn: the registration
-    /// lock; each extension `shutdown`; each hub task to stop; the HTTP requests in flight to
+    /// lock (at least as long as a registration can hold it, a few
+    /// `step_timeout`s); the lifecycle task; each extension `shutdown`; each hub task to stop; the HTTP requests in flight to
     /// finish, then, after they are ended with 503, their connections to
     /// close; and the drain of the hub's velo instance.
     #[serde(rename = "shutdown_timeout_ms", with = "millis")]
@@ -79,7 +80,7 @@ pub const DEFAULT_HEARTBEAT_MAX_FAILURES: u32 = 3;
 pub const DEFAULT_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 /// Default deadline of one registration step.
 pub const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Default velo drain budget at shutdown.
+/// Default budget of each wait at shutdown.
 pub const DEFAULT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
 impl Default for ServerConfig {

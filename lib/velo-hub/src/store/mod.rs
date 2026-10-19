@@ -389,8 +389,9 @@ pub trait HubStore: PeerDiscovery + Send + Sync + 'static {
     fn continuity(&self) -> watch::Receiver<Continuity>;
 
     /// Spawn the backend's liveness task (a TTL reaper), if it needs one.
-    /// Backends with native leases return `None`. The hub cancels `cancel`
-    /// and awaits the handle at shutdown.
+    /// Backends with native leases return `None`. At shutdown the hub
+    /// cancels `cancel`, waits up to its shutdown timeout for the task, then
+    /// aborts it.
     fn spawn_liveness_task(self: Arc<Self>, _cancel: CancellationToken) -> Option<JoinHandle<()>> {
         None
     }
