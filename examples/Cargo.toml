@@ -17,6 +17,7 @@ quic = ["velo/quic"]
 
 [dependencies]
 velo = { path = "../lib/velo", features = ["test-helpers"] }
+velo-hub = { path = "../lib/velo-hub", features = ["server", "client"] }
 
 anyhow = "1"
 bytes = { version = "1", features = ["serde"] }
@@ -66,3 +67,6 @@ path = "examples/soak/main.rs"
 required-features = ["grpc"]
 
 [workspace]
+
+[[example]]
+name = "hub"

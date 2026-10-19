@@ -11,6 +11,7 @@ Runnable examples for the `velo` facade crate. This is a standalone crate
 | `ping_pong`  | Round-trip latency for unary messages between two `Velo` instances.          |
 | `throughput` | msgs/sec + MiB/s + p50/p95/p99 across sequential, concurrent, pipeline, and stream. |
 | `mpsc_fanin` | MPSC streaming: many producers fan into one consumer via `LoopbackTransport`.|
+| `hub`        | A `velo-hub` service from two bundles (`greeter` requires `counter`), configured by `hub.json`; `--demo` runs a client against it. |
 
 ## Run
 
@@ -19,6 +20,7 @@ Runnable examples for the `velo` facade crate. This is a standalone crate
 cargo run --example ping_pong  --all-features -- --rounds 1000
 cargo run --example throughput --all-features -- --count 10000
 cargo run --example mpsc_fanin --all-features -- --producers 4 --items 40
+cargo run --example hub        --all-features -- --config hub.json --demo
 ```
 
 ### `throughput` across two hosts

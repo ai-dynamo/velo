@@ -319,6 +319,9 @@ jobs:
     - name: Run throughput
       timeout-minutes: 3
       run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example throughput -- --count 1000 --payload-sizes 0,1024 --concurrency 1,10
+    - name: Run the hub example (demo)
+      timeout-minutes: 2
+      run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example hub -- --config examples/hub.json --demo
     - name: Run mpsc_fanin
       timeout-minutes: 2
       run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example mpsc_fanin -- --producers 4 --items 40
