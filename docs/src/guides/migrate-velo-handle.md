@@ -15,6 +15,7 @@ SPDX-License-Identifier: Apache-2.0
 - Keep `.clone()` as it is. It now clones the handle.
 - Change `Arc::clone(&velo)` to `velo.clone()`.
 - Change `Arc::downgrade(&velo)` to `velo.downgrade()`. It returns a `WeakVelo`, and `WeakVelo::upgrade()` returns `Option<Velo>`. A handler that reaches its own instance must hold a `WeakVelo`. A `Velo` clone in the handler keeps the instance alive, so its final drop never runs.
+- Change `Weak::new()` to `WeakVelo::default()`. It points at no instance, and `upgrade()` returns `None`.
 - Remove `Arc::new(velo)` if you wrapped a built `Velo`. Pass `velo` or `velo.clone()` instead.
 
 ```rust,ignore
