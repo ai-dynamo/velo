@@ -9,9 +9,11 @@ use std::time::Duration;
 
 use anyhow::Context;
 use etcd_client::{
-    Client, Compare, CompareOp, ConnectOptions, GetOptions, KeyValue, PutOptions, Txn, TxnOp,
+    Client, Compare, CompareOp, ConnectOptions, EventType, GetOptions, KeyValue, PutOptions, Txn,
+    TxnOp, WatchOptions,
 };
 use parking_lot::Mutex;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use super::EtcdStore;
@@ -83,7 +85,8 @@ pub struct EtcdStoreBuilder {
     lock_deadline: Option<Duration>,
 }
 
-/// Pause between attempts while another store holds the prefix.
+/// Pause before the next connect attempt after a failure, and after a
+/// failed watch of a held prefix's lock key.
 const PREFIX_RETRY: Duration = Duration::from_millis(250);
 
 impl std::fmt::Debug for EtcdStoreBuilder {
@@ -168,11 +171,14 @@ impl EtcdStoreBuilder {
         self
     }
 
-    /// How long `connect` keeps trying while another store holds the
-    /// prefix (default zero: fail at once with
-    /// [`ConnectError::PrefixHeld`]). After a hub crashed, its lock lives
-    /// one `lock_ttl` more; a hub that restarts in its place waits that
-    /// long. A standby waits with `Duration::MAX`, which never gives up.
+    /// How long `connect` keeps trying (default zero: fail at once, with
+    /// [`ConnectError::PrefixHeld`] if another store holds the prefix).
+    /// While the prefix is held, `connect` watches its lock key and tries
+    /// again when the key goes. After any other failure (etcd cannot be
+    /// reached, for example) it tries again after 250 ms. After a hub
+    /// crashed, its lock lives one `lock_ttl` more; a hub that restarts in
+    /// its place waits that long. A standby waits with `Duration::MAX`,
+    /// which never gives up.
     pub fn wait_for_prefix(mut self, wait: Duration) -> Self {
         self.wait_for_prefix = wait;
         self
@@ -241,43 +247,136 @@ impl EtcdStoreBuilder {
 
     /// Connect, take the prefix's lock, delete the pinned entries of hubs
     /// before this one, load the prefix, and start the store's tasks.
+    ///
+    /// With [`wait_for_prefix`](Self::wait_for_prefix), a held prefix is
+    /// waited for on a watch of its lock key, and any other failure is
+    /// tried again after a short pause, until the wait ends.
     pub async fn connect(self) -> Result<EtcdStore, ConnectError> {
+        self.settings()?;
         // `None` past the clock's range: wait without a limit.
-        let until = tokio::time::Instant::now().checked_add(self.wait_for_prefix);
+        let until = Instant::now().checked_add(self.wait_for_prefix);
+        let waiting = || until.is_none_or(|until| Instant::now() < until);
+        // One client for every attempt: tonic reconnects it, and a new one
+        // per attempt is a new connection per attempt.
+        let mut client = None;
+        let mut last = None;
         loop {
-            match self.connect_once().await {
-                Err(ConnectError::PrefixHeld { .. })
-                    if until.is_none_or(|until| tokio::time::Instant::now() < until) =>
-                {
-                    tokio::time::sleep(PREFIX_RETRY).await;
+            let error = match self.connect_once(&mut client).await {
+                Ok(store) => return Ok(store),
+                Err(error) => error,
+            };
+            if !waiting() {
+                return Err(error.into());
+            }
+            // Logged when it changes, not on every attempt of a long wait.
+            let now = error.to_string();
+            if last.as_ref() != Some(&now) {
+                match &error {
+                    Attempt::Held { .. } => tracing::info!(%now, "waiting for the etcd prefix"),
+                    Attempt::Failed(_) => {
+                        tracing::warn!(%now, "connecting the etcd store failed; retrying")
+                    }
                 }
-                other => return other,
+                last = Some(now);
+            }
+            match (&error, &client) {
+                (Attempt::Held { revision, .. }, Some(client)) => {
+                    if let Err(error) = self.wait_for_release(client, *revision, until).await {
+                        tracing::debug!(%error, "watching the etcd prefix lock failed; retrying");
+                        tokio::time::sleep(PREFIX_RETRY).await;
+                    }
+                }
+                _ => tokio::time::sleep(PREFIX_RETRY).await,
             }
         }
     }
 
-    async fn connect_once(&self) -> Result<EtcdStore, ConnectError> {
+    /// Wait until the lock key changes after `revision` (the holder let it
+    /// go, or its lease expired), `until` passes, or one lock TTL passes,
+    /// after which the caller looks again. Watching costs etcd nothing per
+    /// poll, where trying to take the lock costs a lease grant, a txn and a
+    /// revoke.
+    async fn wait_for_release(
+        &self,
+        client: &Client,
+        revision: i64,
+        until: Option<Instant>,
+    ) -> anyhow::Result<()> {
+        let (prefix, settings) = self.settings()?;
+        let lock = Keys::new(&prefix).lock;
+        let options = WatchOptions::new().with_start_revision(revision + 1);
+        let (_watcher, mut events) = bounded(
+            settings.request_deadline,
+            watch(client).watch(lock.as_str(), Some(options)),
+        )
+        .await
+        .context("watching the prefix lock")?;
+        let look_again = Instant::now() + self.lock_ttl;
+        let end = until.map_or(look_again, |until| until.min(look_again));
+        loop {
+            let message = tokio::select! {
+                _ = tokio::time::sleep_until(end) => return Ok(()),
+                message = events.message() => message,
+            };
+            match message.context("watching the prefix lock")? {
+                Some(response) if response.canceled() || response.compact_revision() != 0 => {
+                    return Ok(());
+                }
+                Some(response) => {
+                    if response
+                        .events()
+                        .iter()
+                        .any(|event| event.event_type() == EventType::Delete)
+                    {
+                        return Ok(());
+                    }
+                }
+                None => anyhow::bail!("the watch of the prefix lock closed"),
+            }
+        }
+    }
+
+    async fn connect_once(&self, client: &mut Option<Client>) -> Result<EtcdStore, Attempt> {
         let (prefix, settings) = self.settings()?;
         let deadline = settings.request_deadline;
-        let options = self
-            .options
-            .clone()
-            .unwrap_or_default()
-            .with_connect_timeout(deadline)
-            .with_keep_alive(KEEP_ALIVE_INTERVAL, deadline)
-            .with_require_leader(true);
-        let etcd = |error: anyhow::Error| ConnectError::Etcd(error);
-        let client =
-            tokio::time::timeout(deadline, Client::connect(&self.endpoints, Some(options)))
-                .await
-                .context("connecting to etcd timed out")
-                .map_err(etcd)?
-                .context("connecting to etcd")
-                .map_err(etcd)?;
+        let etcd = |error: anyhow::Error| Attempt::Failed(ConnectError::Etcd(error));
+        let client = match client {
+            Some(client) => client.clone(),
+            None => {
+                let options = self
+                    .options
+                    .clone()
+                    .unwrap_or_default()
+                    .with_connect_timeout(deadline)
+                    .with_keep_alive(KEEP_ALIVE_INTERVAL, deadline)
+                    .with_require_leader(true);
+                let connected =
+                    tokio::time::timeout(deadline, Client::connect(&self.endpoints, Some(options)))
+                        .await
+                        .context("connecting to etcd timed out")
+                        .map_err(etcd)?
+                        .context("connecting to etcd")
+                        .map_err(etcd)?;
+                client.insert(connected).clone()
+            }
+        };
         let keys = Keys::new(&prefix);
 
+        // Look before taking: a held prefix costs one read, not a lease.
+        let found = bounded(deadline, kv(&client).get(keys.lock.as_str(), None))
+            .await
+            .context("reading the prefix lock")
+            .map_err(etcd)?;
+        if let Some(lock) = found.kvs().first() {
+            return Err(Attempt::Held {
+                prefix,
+                holder: String::from_utf8_lossy(lock.value()).into_owned(),
+                revision: found.header().map_or(0, |header| header.revision()),
+            });
+        }
+
         // The lease's first local deadline counts from here.
-        let granted_at = tokio::time::Instant::now();
+        let granted_at = Instant::now();
         let lock_lease = grant(&client, settings.lock_ttl_secs, deadline)
             .await
             .map_err(etcd)?;
@@ -316,7 +415,11 @@ impl EtcdStoreBuilder {
                     _ => None,
                 })
                 .unwrap_or_default();
-            return Err(ConnectError::PrefixHeld { prefix, holder });
+            return Err(Attempt::Held {
+                prefix,
+                holder,
+                revision: taken.header().map_or(0, |header| header.revision()),
+            });
         }
 
         match start(client.clone(), keys, settings, lock_lease, granted_at).await {
@@ -325,6 +428,29 @@ impl EtcdStoreBuilder {
                 revoke(&client, &[lock_lease], deadline).await;
                 Err(etcd(error))
             }
+        }
+    }
+}
+
+/// How one connect attempt failed.
+#[derive(Debug, thiserror::Error)]
+enum Attempt {
+    /// Another store holds the prefix; its lock key was read at `revision`.
+    #[error("the etcd prefix {prefix} is held by another hub ({holder})")]
+    Held {
+        prefix: String,
+        holder: String,
+        revision: i64,
+    },
+    #[error(transparent)]
+    Failed(#[from] ConnectError),
+}
+
+impl From<Attempt> for ConnectError {
+    fn from(attempt: Attempt) -> Self {
+        match attempt {
+            Attempt::Held { prefix, holder, .. } => Self::PrefixHeld { prefix, holder },
+            Attempt::Failed(error) => error,
         }
     }
 }
@@ -381,7 +507,7 @@ async fn start(
     keys: Keys,
     settings: Settings,
     lock_lease: i64,
-    granted_at: tokio::time::Instant,
+    granted_at: Instant,
 ) -> anyhow::Result<EtcdStore> {
     let deadline = settings.request_deadline;
 

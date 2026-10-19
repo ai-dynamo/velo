@@ -413,3 +413,47 @@ async fn a_cut_past_the_lock_ttl_fences_on_reconnect() {
     );
     drop(hub);
 }
+
+/// A standby that waits for the prefix without a limit outlives a short
+/// etcd outage, and takes the prefix when the holder frees it. A
+/// deployment whose standby gave up on any error but "prefix held" (a lease
+/// grant that could not connect, for example) survived an outage only as
+/// a crash loop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_waiting_standby_outlives_a_short_etcd_outage() {
+    let lock_ttl = Duration::from_secs(3);
+    let prefix = format!("/velo-hub-test/{}", uuid::Uuid::new_v4());
+    let holder = store_on(&etcd_url(), &prefix, lock_ttl)
+        .connect()
+        .await
+        .unwrap();
+    let proxy = Proxy::start(etcd_addr());
+    let standby = tokio::spawn(
+        store_on(&proxy.url(), &prefix, lock_ttl)
+            .wait_for_prefix(Duration::MAX)
+            .connect(),
+    );
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(!standby.is_finished(), "the standby took a held prefix");
+    proxy.set(Mode::Refuse);
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    proxy.set(Mode::Forward);
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(
+        !standby.is_finished(),
+        "the standby stopped waiting during the outage: {:?}",
+        standby.await.unwrap().map(|_| ())
+    );
+    let freed = Instant::now();
+    holder.close().await;
+    let store = tokio::time::timeout(Duration::from_secs(5), standby)
+        .await
+        .expect("the standby did not take the freed prefix")
+        .unwrap()
+        .expect("the standby failed to connect");
+    println!(
+        "standby took the prefix {:?} after it was freed",
+        freed.elapsed()
+    );
+    store.close().await;
+}
