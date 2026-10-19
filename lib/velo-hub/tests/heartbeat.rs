@@ -214,14 +214,17 @@ async fn a_hung_store_touch_does_not_stop_the_heartbeat_or_hang_shutdown() {
 async fn a_hung_store_remove_does_not_stop_the_heartbeat() {
     let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::new(
         velo_hub::store::InMemoryStore::builder()
-            .ttl(Duration::from_millis(800))
-            .prune_interval(Duration::from_millis(50))
+            .ttl(Duration::from_millis(2400))
+            .prune_interval(Duration::from_millis(100))
             .build(),
     ));
     let mut config = config();
-    config.server.heartbeat_interval = Duration::from_millis(100);
+    // A probe's deadline is the interval, and with `max_failures = 1` one
+    // late answer evicts the healthy peer: keep the interval long enough
+    // for a loaded CI runner.
+    config.server.heartbeat_interval = Duration::from_millis(300);
     config.server.heartbeat_max_failures = 1;
-    config.server.step_timeout = Duration::from_millis(200);
+    config.server.step_timeout = Duration::from_millis(600);
     let hub = Hub::builder(config)
         .store(store.clone())
         .velo(velo_builder())
@@ -235,7 +238,8 @@ async fn a_hung_store_remove_does_not_stop_the_heartbeat() {
     let wedged = new_velo().await;
     install_wedged_heartbeat(&wedged, Duration::from_secs(60));
     wire_mutual(&hub, &wedged).await;
-    tokio::time::sleep(Duration::from_millis(1600)).await;
+    // Two TTLs: the peer stays only if later probes still touch it.
+    tokio::time::sleep(Duration::from_millis(4800)).await;
     assert!(
         registered_ids(&hub).contains(&healthy.instance_id()),
         "the heartbeat stopped behind one hung remove"
