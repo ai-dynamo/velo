@@ -49,7 +49,7 @@ pub use services::{HubServiceRegistration, HubServices};
 use crate::protocol::{
     self, CREDENTIAL_HEADER, Credential, DEFAULT_CONTROL_PORT, DEFAULT_PUBLIC_PORT, ErrorBody,
     ErrorCode, HEARTBEAT_HANDLER, HeartbeatAck, HeartbeatRequest, HeartbeatResponse, HubDescriptor,
-    PeerLookupResponse, RegisterRequest, RegisterResponse,
+    HubId, PeerLookupResponse, RegisterRequest, RegisterResponse,
 };
 
 /// Extension payloads of a registration, keyed by extension name.
@@ -332,12 +332,39 @@ struct State {
     /// register succeeds, the handler answers not ok even while a call is
     /// in flight, so retries cannot keep that registration alive.
     orphaned: bool,
+    /// The hubs this client registered with, oldest first, at most
+    /// [`KNOWN_HUBS`]. Kept when a registration is dropped.
+    hubs: std::collections::VecDeque<HubId>,
 }
+
+/// How many hub ids [`State::hubs`] keeps. A client moves to a new hub
+/// once per takeover, so a few cover every hub that can still be probing.
+const KNOWN_HUBS: usize = 8;
 
 impl State {
     /// The heartbeat handler's answer.
     fn answer_ok(&self) -> bool {
         self.response.is_some() || (self.acquiring && !self.orphaned)
+    }
+
+    /// Record a registration's answer.
+    fn registered(&mut self, response: RegisterResponse) {
+        let hub = response.hub_id;
+        self.hubs.retain(|known| *known != hub);
+        if self.hubs.len() == KNOWN_HUBS {
+            self.hubs.pop_front();
+        }
+        self.hubs.push_back(hub);
+        self.response = Some(response);
+        self.orphaned = false;
+    }
+
+    /// Whether a probe from `hub` says that the hub holding the
+    /// registration restarted: it comes from a hub this client never
+    /// registered with. A hub it registered with and has since left, cut
+    /// off from its store and still probing, says nothing.
+    fn restarted_by(&self, hub: HubId) -> bool {
+        self.response.is_some() && !self.hubs.contains(&hub)
     }
 }
 
@@ -347,8 +374,8 @@ impl State {
 #[derive(Debug)]
 struct Shared {
     state: parking_lot::Mutex<State>,
-    /// Set when a heartbeat comes from a hub other than the one that
-    /// answered the registration: the hub restarted. Cleared by the next
+    /// Set when a heartbeat comes from a hub this client never registered
+    /// with: the hub restarted, or a standby took over. Cleared by the next
     /// successful registration.
     recovered: tokio::sync::watch::Sender<bool>,
     /// The services this client serves, one guard each.
@@ -683,8 +710,7 @@ impl HubClient {
                     // Set before `call` clears `acquiring`, so a probe never
                     // finds neither.
                     let mut state = shared.state.lock();
-                    state.response = Some(response.clone());
-                    state.orphaned = false;
+                    state.registered(response.clone());
                     *shared.confirmed.lock() = serving;
                     shared.unsettled.lock().clear();
                     shared.recovered.send_replace(false);
@@ -772,7 +798,9 @@ impl HubClient {
     }
 
     /// Whether the hub restarted since this client registered: a heartbeat
-    /// came from another hub id. The hub then holds the registration from
+    /// came from a hub id this client never registered with (a hub it left
+    /// does not count, so an old hub that still probes cannot raise it).
+    /// The hub then holds the registration from
     /// before the restart, and its routes answer `recovered`; call
     /// [`register`](Self::register) again, which presents the credential,
     /// starts a new epoch on the new hub and puts the services back. The
@@ -837,10 +865,7 @@ fn heartbeat_handler(shared: Weak<Shared>) -> Handler {
                 shared.at_unix_ms.store(now, Ordering::Release);
                 let ok = {
                     let state = shared.state.lock();
-                    let restarted = matches!(
-                        (&state.response, ctx.input.hub_id),
-                        (Some(response), Some(hub)) if response.hub_id != hub
-                    );
+                    let restarted = ctx.input.hub_id.is_some_and(|hub| state.restarted_by(hub));
                     // Under the state lock, as a registration clears it, so
                     // a late probe cannot set it on a fresh registration.
                     // Still ok: the hub holds the registration from before
@@ -974,5 +999,57 @@ impl ExtClient {
     pub async fn control_delete<T: DeserializeOwned>(&self, path: &str) -> Result<T, ClientError> {
         self.request::<(), _>(Method::DELETE, Listener::Control, path, None)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn answer(hub: HubId) -> RegisterResponse {
+        RegisterResponse {
+            instance_id: InstanceId::new_v4(),
+            hub_instance_id: None,
+            credential: Credential::from_header_str(&uuid::Uuid::new_v4().to_string()).unwrap(),
+            epoch: protocol::RegistrationEpoch::new(),
+            hub_id: hub,
+        }
+    }
+
+    /// A probe from a hub the client never registered with says the hub
+    /// restarted. One from a hub it left does not, also after the client
+    /// dropped a registration and registered afresh: that hub, cut off
+    /// from its store, can keep probing, and heeding it would make the
+    /// client register again once per probe, each time with a new epoch.
+    #[test]
+    fn a_probe_from_a_hub_the_client_left_is_not_a_restart() {
+        let (a, b, c) = (HubId::new(), HubId::new(), HubId::new());
+        let mut state = State::default();
+        assert!(!state.restarted_by(a), "no registration, nothing restarted");
+        state.registered(answer(a));
+        assert!(!state.restarted_by(a));
+        assert!(state.restarted_by(b), "a new hub holds the registration");
+        state.registered(answer(b));
+        assert!(!state.restarted_by(a), "the hub the client left");
+        assert!(state.restarted_by(c));
+        state.response = None;
+        state.registered(answer(b));
+        assert!(
+            !state.restarted_by(a),
+            "kept when the registration was dropped"
+        );
+    }
+
+    /// The list is bounded: the oldest id goes first.
+    #[test]
+    fn the_known_hubs_are_bounded() {
+        let mut state = State::default();
+        let first = HubId::new();
+        state.registered(answer(first));
+        for _ in 0..KNOWN_HUBS {
+            state.registered(answer(HubId::new()));
+        }
+        assert_eq!(state.hubs.len(), KNOWN_HUBS);
+        assert!(!state.hubs.contains(&first));
     }
 }
