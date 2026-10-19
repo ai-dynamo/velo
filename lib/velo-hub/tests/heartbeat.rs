@@ -301,7 +301,10 @@ async fn a_hung_touch_does_not_delay_evicting_a_dead_peer() {
             .ttl(Duration::from_secs(60))
             .build(),
     ));
-    let interval = Duration::from_millis(100);
+    // Long enough that a healthy probe answers within it on a slow
+    // (instrumented) build: with `max_failures = 1` one late answer evicts
+    // the healthy peer, and its touch never reaches the gate.
+    let interval = Duration::from_millis(300);
     let mut config = config();
     config.server.heartbeat_interval = interval;
     config.server.heartbeat_max_failures = 1;
@@ -316,11 +319,13 @@ async fn a_hung_touch_does_not_delay_evicting_a_dead_peer() {
     install_heartbeat(&healthy);
     wire_mutual(&hub, &healthy).await;
     let gate = store.gate_next_touch();
-    gate.entered().await;
+    tokio::time::timeout(Duration::from_secs(10), gate.entered())
+        .await
+        .expect("no probe of the healthy peer reached the store's touch");
     let wedged = new_velo().await;
     install_wedged_heartbeat(&wedged, Duration::from_secs(60));
     wire_mutual(&hub, &wedged).await;
-    let evicted = eventually(Duration::from_secs(2), || {
+    let evicted = eventually(Duration::from_secs(5), || {
         !registered_ids(&hub).contains(&wedged.instance_id())
     })
     .await;
