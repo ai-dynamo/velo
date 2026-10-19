@@ -490,8 +490,10 @@ async fn indeterminate_put_that_cannot_be_resolved_drops_and_reserves() {
         Some(&prior.credential),
     )
     .await;
+    // The presented credential recovers the reserved entry, so the answer
+    // says so and the client keeps it.
     assert_eq!(response.status(), 409);
-    assert_eq!(error_code(response).await, ErrorCode::RegisterAgain);
+    assert_eq!(error_code(response).await, ErrorCode::Recovered);
     assert!(!f.ledger.has_owner(owner));
     assert!(f.store.contains(owner), "the written entry is still there");
     assert_eq!(
@@ -1688,7 +1690,7 @@ async fn a_recovery_that_fails_before_its_write_is_not_register_again() {
         Some(&prior.credential),
     )
     .await;
-    assert_eq!(error_code(response).await, ErrorCode::RegisterAgain);
+    assert_eq!(error_code(response).await, ErrorCode::Recovered);
     assert_eq!(
         heartbeat_status(&f.hub, owner, Some(&prior.credential)).await,
         409,

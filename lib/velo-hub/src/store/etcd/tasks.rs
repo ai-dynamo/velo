@@ -69,10 +69,30 @@ async fn reconnect(shared: &Shared) -> Reconnect {
         Ok(Err(error)) => return Reconnect::Failed(error.to_string()),
         Err(_) => return Reconnect::Failed("the compaction probe timed out".to_string()),
     }
-    match open_watch(shared, start).await {
-        Ok(watch) => Reconnect::Watching(Box::new(watch)),
-        Err(error) => Reconnect::Failed(error),
+    let watch = match open_watch(shared, start).await {
+        Ok(watch) => watch,
+        Err(error) => return Reconnect::Failed(error),
+    };
+    // Stay `Degraded` until the watch has replayed the outage: write the
+    // barrier key now and wait (through `lag_until`) for the watch to apply
+    // it. The probe's header revision would not do: it is the cluster's, and
+    // a prefix watch may never see that revision.
+    let marker = Txn::new()
+        .when([shared.lock_compare()])
+        .and_then([TxnOp::put(shared.keys.barrier.as_str(), "", None)])
+        .or_else([TxnOp::get(shared.keys.lock.as_str(), None)]);
+    let mut kv = super::builder::kv(&shared.client);
+    match tokio::time::timeout(shared.settings.request_deadline, kv.txn(marker)).await {
+        Ok(Ok(response)) if response.succeeded() => {
+            if let Some(header) = response.header() {
+                shared.lagging(header.revision());
+            }
+        }
+        Ok(Ok(_)) => shared.fence("reconnect: the lock compare failed"),
+        Ok(Err(error)) => return Reconnect::Failed(error.to_string()),
+        Err(_) => return Reconnect::Failed("the reconnect barrier timed out".to_string()),
     }
+    Reconnect::Watching(Box::new(watch))
 }
 
 /// History is gone: report `Lost`, reload the prefix, report what vanished

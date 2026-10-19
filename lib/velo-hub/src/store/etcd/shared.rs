@@ -317,7 +317,7 @@ impl Shared {
         self.update_health(|health| health.lost = lost);
     }
 
-    fn lagging(&self, revision: i64) {
+    pub(super) fn lagging(&self, revision: i64) {
         self.update_health(|health| {
             health.lag_until = Some(health.lag_until.map_or(revision, |r| r.max(revision)));
         });
@@ -628,11 +628,7 @@ impl Shared {
 
     pub(super) fn touch(&self, id: InstanceId, expected: Incarnation) -> Result<(), StoreError> {
         let cache = self.cache.read();
-        let entry = cache
-            .entries
-            .get(&id)
-            .filter(|entry| !entry.reaping.load(Ordering::Acquire))
-            .ok_or(StoreError::NotFound(id))?;
+        let entry = cache.entries.get(&id).ok_or(StoreError::NotFound(id))?;
         if entry.stored.incarnation != expected {
             return Err(StoreError::Stale {
                 id,

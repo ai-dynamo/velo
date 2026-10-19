@@ -72,14 +72,15 @@ pub(crate) async fn register(
     // A panic after the write has dropped the prior registration (the
     // transaction's `Drop` failed it closed); say so, as every other
     // post-write failure does, or the client keeps a dead credential.
-    // The prior registration is gone if the write happened, or if the
-    // credential no longer authorizes for any reason but `Recovered` (a
-    // reserved owner's credential can still recover it).
+    // The prior registration is gone if the write happened, or if a removal
+    // took it while the transaction ran (the credential is now unknown to
+    // the hub). Not on `Recovered` (a reserved owner's credential can still
+    // recover it) or `Unavailable`/`Busy` (the hub cannot tell yet).
     let prior_gone = |credential: &Credential| {
         written.load(Ordering::Acquire)
             || matches!(
                 authority.authorize(owner, Some(credential)),
-                Err(error) if !matches!(error, AuthorityError::Recovered { .. })
+                Err(AuthorityError::Unauthorized { .. } | AuthorityError::NotFound { .. })
             )
     };
     match answer {
@@ -299,13 +300,22 @@ impl Transaction<'_> {
         });
         let reservation = self.shared.store.current_incarnation(self.owner);
         self.settle_after_write(removal, reservation);
-        // `register_again`, not `unavailable`: the prior registration is
-        // gone, and a client that read "unavailable" as "nothing happened"
-        // would keep its dead credential.
+        // Not `unavailable`: the prior registration is gone, and a client
+        // that read "unavailable" as "nothing happened" would keep its dead
+        // credential. When a credential was presented and an entry is
+        // reserved, that credential recovers it (the reserved record is
+        // either the attempted write, which names it as presented, or the
+        // prior registration, which minted it): say `recovered`, so the
+        // client keeps it and registers again with it.
+        let code = if prior.is_some() && reservation.is_some() {
+            ErrorCode::Recovered
+        } else {
+            ErrorCode::RegisterAgain
+        };
         HubError::new(
-            ErrorCode::RegisterAgain,
+            code,
             format!(
-                "store write outcome is unknown and could not be resolved ({error}); the registration is dropped and its entry reserved until it expires"
+                "store write outcome is unknown and could not be resolved ({error}); the registration is dropped and its entry reserved"
             ),
         )
     }

@@ -204,6 +204,8 @@ async fn resolve_tombstone_stops_a_late_put() {
 async fn a_failed_compare_returns_promptly_on_a_quiet_prefix() {
     let store = builder(&prefix())
         .request_deadline(Duration::from_secs(10))
+        .lock_ttl(Duration::from_secs(30))
+        .custody_ttl(Duration::from_secs(60))
         .connect()
         .await
         .unwrap();
@@ -617,6 +619,7 @@ async fn a_new_store_adopts_the_custody_lease_and_drops_the_old_pinned_entry() {
     let first = builder(&prefix)
         .custody_ttl(Duration::from_secs(3))
         .lock_ttl(Duration::from_secs(2))
+        .request_deadline(Duration::from_secs(1))
         .connect()
         .await
         .unwrap();

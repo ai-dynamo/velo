@@ -1077,11 +1077,13 @@ async fn a_hub_panic_after_the_write_drops_the_registration() {
     );
 }
 
-/// The same through an indeterminate store write that cannot be resolved:
-/// the hub drops both the prior registration and the attempted one and
-/// answers `register_again`, so the client drops the prior credential.
+/// An indeterminate store write that cannot be resolved: the hub drops
+/// both the prior registration and the attempted one and reserves the
+/// entry, whose record holds the presented credential. It answers
+/// `recovered`, so the client keeps that credential (and raises its
+/// `recovered` flag), and the next `register` recovers the entry.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_unresolved_write_drops_the_registration() {
+async fn an_unresolved_write_answers_recovered_and_the_credential_recovers() {
     use velo_hub::store::testing::PutFault;
     let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::default());
     let hub = builder().store(store.clone()).serve().await.unwrap();
@@ -1099,20 +1101,18 @@ async fn an_unresolved_write_drops_the_registration() {
         matches!(
             &answer,
             Err(velo_hub::client::ClientError::Hub {
-                code: velo_hub::protocol::ErrorCode::RegisterAgain,
+                code: velo_hub::protocol::ErrorCode::Recovered,
                 ..
             })
         ),
-        "control: {answer:?}"
+        "{answer:?}"
     );
-    assert!(
-        hub.authority()
-            .authorize(peer.instance_id(), Some(&first.credential))
-            .is_err(),
-        "control: the hub failed the prior credential closed"
-    );
-    assert!(
-        !client.is_registered(),
-        "the client holds a credential the hub failed closed after a 503 on a re-registration"
-    );
+    assert!(client.is_registered(), "the client keeps the credential");
+    assert!(*client.recovered().borrow());
+    let again = client
+        .register_peer(peer.clone(), Default::default())
+        .await
+        .expect("the credential recovers the reserved entry");
+    assert_ne!(again.epoch, first.epoch);
+    assert!(!*client.recovered().borrow());
 }

@@ -27,8 +27,8 @@
 //! drain removal delivery; shut extensions down in reverse order; stop the
 //! heartbeat and reaper; release the lock; drain both listeners (up to
 //! `shutdown_timeout_ms`, then the requests still in flight answer 503 and
-//! the connections get one more budget); remove the pinned entry; shut
-//! velo down.
+//! the connections get one more budget); remove the pinned entry; close
+//! the store (an etcd store frees its prefix); shut velo down.
 
 mod authority;
 mod config;
@@ -775,7 +775,10 @@ async fn stop(shared: &Shared, running: Running) -> anyhow::Result<()> {
         }
     }
     let mut result = Ok(());
-    if let Some((id, incarnation)) = running.pinned
+    // A fenced store accepts no write; the hub that fenced it owns the
+    // prefix, and the entry goes with this hub's custody lease.
+    let fenced = *shared.store.continuity().borrow() == Continuity::Fenced;
+    if let Some((id, incarnation)) = running.pinned.filter(|_| !fenced)
         && let Err(error) = shared.remove_bounded(id, incarnation).await
         && !error.is_gone()
     {

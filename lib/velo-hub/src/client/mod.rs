@@ -691,6 +691,9 @@ impl HubClient {
                     response
                 }
                 Err(error) => {
+                    if error.code() == Some(ErrorCode::Recovered) {
+                        shared.recovered.send_replace(true);
+                    }
                     if credential_rejected(&error) {
                         match &presented {
                             Some(credential) => shared.forget(credential),

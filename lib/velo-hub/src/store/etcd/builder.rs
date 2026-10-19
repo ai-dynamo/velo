@@ -196,6 +196,12 @@ impl EtcdStoreBuilder {
         if custody_ttl_secs < lock_ttl_secs {
             return invalid("the custody TTL must be at least the lock TTL");
         }
+        // The lock is kept alive every third of its TTL, and each answer may
+        // take the request deadline: with a deadline of two thirds of the
+        // TTL or more, one slow answer lets the lock expire.
+        if self.request_deadline * 3 >= self.lock_ttl * 2 {
+            return invalid("the request deadline must be under two thirds of the lock TTL");
+        }
         Ok((
             prefix.to_string(),
             Settings {
