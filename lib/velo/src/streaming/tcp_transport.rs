@@ -497,6 +497,8 @@ fn configure_socket(stream: &TcpStream) {
     ) {
         tracing::warn!("Failed to set TCP keepalive: {}", e);
     }
+    // TCP_USER_TIMEOUT is Linux-only; socket2 does not expose it elsewhere.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "fuchsia"))]
     if let Err(e) = sock.set_tcp_user_timeout(Some(Duration::from_secs(30))) {
         tracing::warn!("Failed to set TCP_USER_TIMEOUT: {}", e);
     }
