@@ -160,18 +160,7 @@ impl Drop for Transaction<'_> {
         tracing::error!(instance = %self.owner, "registration stopped before it finished; settling it");
         let shared = self.shared;
         match self.written {
-            None => {
-                let permit = self.permit.take().expect("checked above");
-                if let Ok(AbortOutcome::Revoked(prior)) =
-                    shared.authority.abort_registration(permit)
-                {
-                    shared.deliver_removal(Removal {
-                        id: self.owner,
-                        incarnation: prior,
-                    });
-                }
-                self.drop_staged();
-            }
+            None => self.settle_before_write(),
             Some(incarnation) => {
                 // Reserve only what the store still holds: a removal can have
                 // taken the entry already, and nothing would clear a
@@ -238,6 +227,12 @@ impl Transaction<'_> {
     /// before the staged hides are undone, so readers never see the prior
     /// state again.
     fn abort(&mut self, error: HubError) -> HubError {
+        self.settle_before_write();
+        error
+    }
+
+    /// The body of [`abort`](Self::abort), which `Drop` also runs.
+    fn settle_before_write(&mut self) {
         let permit = self
             .permit
             .take()
@@ -253,7 +248,6 @@ impl Transaction<'_> {
             }
         }
         self.drop_staged();
-        error
     }
 
     /// The write's outcome cannot be learned. Neither the prior registration

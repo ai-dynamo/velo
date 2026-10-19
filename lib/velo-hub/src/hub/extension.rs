@@ -371,7 +371,13 @@ impl<E: Extension> DynExtension for Erased<E> {
         view: &RegistrationView<'_>,
         payload: Option<&AnyPayload>,
     ) -> Result<(), Rejection> {
-        let typed = payload.and_then(|payload| payload.downcast_ref::<E::Registration>());
+        // `decode` built the payload for this extension; a failed downcast is
+        // a hub bug, not "not opted in", as in `prepare` and `commit`.
+        let typed = payload.map(|payload| {
+            payload
+                .downcast_ref::<E::Registration>()
+                .expect("decode produced this extension's payload type")
+        });
         self.0.admit(view, typed)
     }
 
