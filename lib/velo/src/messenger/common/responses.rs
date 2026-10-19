@@ -670,12 +670,16 @@ impl ResponseManagerInner {
             return false;
         }
 
-        // Check if slot is currently allocated (not recycled)
+        // A released slot means the caller gave up: its `.timeout` ran out or
+        // it dropped the result. A reply after that is expected, so it is
+        // dropped at debug, not warn: every late reply would warn otherwise.
+        // The free list is FIFO, so a late reply almost always lands here
+        // rather than on a reused slot's generation check below.
         if !self.arena.is_allocated(slot_index) {
-            warn!(
+            debug!(
                 response_id = %response_id,
                 slot_index,
-                "response slot has been recycled - discarding stale response"
+                "response slot has been released - discarding late response"
             );
             return false;
         }
