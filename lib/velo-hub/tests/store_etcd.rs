@@ -929,3 +929,34 @@ async fn reconnect_stays_degraded_until_the_outage_is_replayed() {
     assert!(!store.contains(gone.instance_id()));
     store.close().await;
 }
+
+/// A store that waits for the prefix with no limit waits; it does not
+/// panic on the deadline arithmetic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_store_can_wait_for_the_prefix_without_a_limit() {
+    let prefix = format!("/velo-hub-test/{}", uuid::Uuid::new_v4());
+    let holder = EtcdStore::builder([etcd_url()])
+        .prefix(&prefix)
+        .connect()
+        .await
+        .unwrap();
+    let waiting = tokio::spawn({
+        let prefix = prefix.clone();
+        async move {
+            EtcdStore::builder([etcd_url()])
+                .prefix(prefix)
+                .wait_for_prefix(Duration::MAX)
+                .connect()
+                .await
+        }
+    });
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!waiting.is_finished(), "the waiting store stopped waiting");
+    holder.close().await;
+    let waited = tokio::time::timeout(Duration::from_secs(5), waiting)
+        .await
+        .expect("the waiting store did not take the freed prefix")
+        .expect("the waiting store panicked")
+        .expect("the waiting store failed to connect");
+    waited.close().await;
+}
