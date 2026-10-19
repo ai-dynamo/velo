@@ -587,6 +587,10 @@ async fn delayed_removal_of_an_old_incarnation_does_not_unregister_the_replaceme
         f.ledger.has_owner(owner),
         "the late removal reached the replacement's ledger state"
     );
+    assert!(
+        f.ledger.late_removals(owner) >= 1,
+        "the queued copy of the first removal must arrive after the replacement, or this test proves nothing"
+    );
 }
 
 // ---- store continuity --------------------------------------------------
@@ -690,4 +694,78 @@ async fn malformed_credential_header_is_a_bad_request() {
         .await
         .unwrap();
     assert_eq!(response.status(), 400);
+}
+
+/// Commits before the ledger, and can panic there.
+#[derive(Default)]
+struct PanicsInCommit {
+    armed: std::sync::atomic::AtomicBool,
+}
+
+impl Extension for PanicsInCommit {
+    const NAME: &'static str = "panics-in-commit";
+    type Registration = ();
+    type Staged = ();
+
+    async fn prepare(
+        &self,
+        _txn: &velo_hub::Txn<'_>,
+        _payload: Option<()>,
+    ) -> Result<(), Rejection> {
+        Ok(())
+    }
+
+    fn commit(&self, _staged: (), _registration: &velo_hub::Committed<'_>) {
+        if self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            panic!("injected commit panic");
+        }
+    }
+
+    fn on_removed(&self, _removal: velo_hub::store::Removal) {}
+}
+
+/// A commit panics while the ledger's staged value (which hid the prior
+/// entries) is not yet committed. The hub delivers the removal before it
+/// drops that value, so the prior entries never become visible again, and
+/// by the time the 500 arrives the ledger has dropped the owner.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_panic_after_the_write_never_shows_the_prior_state_again() {
+    let store = Arc::new(FaultStore::default());
+    let hub = builder()
+        .store(store.clone())
+        .extension(PanicsInCommit::default())
+        .extension(Ledger::default())
+        .serve()
+        .await
+        .unwrap();
+    let ledger = hub.extension::<Ledger>().unwrap();
+    let peer = make_peer();
+    let owner = peer.instance_id();
+    let prior = register(&hub, &request_with(&peer, &[ledger_opt_in()]), None).await;
+    assert_eq!(publish(&hub, owner, &prior.credential, "k", 1).await, 204);
+
+    hub.extension::<PanicsInCommit>()
+        .unwrap()
+        .armed
+        .store(true, std::sync::atomic::Ordering::Release);
+    // Hold the queued retirement at its store remove, so only the hub's own
+    // settling can have removed the owner from the ledger.
+    let retire = store.gate_next_remove();
+    let response = post_register(
+        &hub,
+        &request_with(&peer, &[ledger_opt_in()]),
+        Some(&prior.credential),
+    )
+    .await;
+    assert_eq!(response.status(), 500);
+    assert!(
+        !ledger.has_owner(owner),
+        "the removal was delivered before the response"
+    );
+    assert_eq!(query(&hub, owner, "k").await, None);
+    retire.release();
+    assert!(
+        eventually(Duration::from_secs(1), || !store.contains(owner)).await,
+        "the written entry is retired"
+    );
 }

@@ -124,15 +124,21 @@ fn decode(
     })
 }
 
-/// Holds the permit for the life of the transaction. If the task stops
-/// before it finishes (a panicking extension), `Drop` settles the owner
-/// so it is not left Busy: before the write it aborts; after it, it fails
-/// closed and queues the entry's removal.
+/// Holds the permit and the staged values for the life of the
+/// transaction. If the task stops before it finishes (a panicking
+/// extension), `Drop` settles the owner so it is not left Busy: before the
+/// write it aborts; after it, it fails closed and queues the removal of
+/// the entry. `Drop` runs before the lock guard is released, so it delivers
+/// removals itself, before it drops the staged values: an undo in a staged
+/// value must never show state that was just removed.
 struct Transaction<'a> {
     shared: &'a Shared,
     owner: InstanceId,
     permit: Option<RegistrationPermit>,
     written: Option<Incarnation>,
+    /// One slot per extension that prepared, in start order; `commit`
+    /// takes each one.
+    staged: Vec<Option<AnyStaged>>,
 }
 
 impl Drop for Transaction<'_> {
@@ -141,28 +147,47 @@ impl Drop for Transaction<'_> {
             return;
         };
         tracing::error!(instance = %self.owner, "registration stopped before it finished; settling it");
-        let authority = &self.shared.authority;
+        let shared = self.shared;
         match self.written {
             None => {
-                if let Ok(AbortOutcome::Revoked(prior)) = authority.abort_registration(permit) {
-                    let _ = self.shared.jobs.send(Job::Removal(Removal {
+                if let Ok(AbortOutcome::Revoked(prior)) =
+                    shared.authority.abort_registration(permit)
+                {
+                    shared.deliver_removal(Removal {
                         id: self.owner,
                         incarnation: prior,
-                    }));
+                    });
                 }
+                self.drop_staged();
             }
             Some(incarnation) => {
-                let _ = authority.fail_closed_registration(permit, Some(incarnation));
-                let _ = self.shared.jobs.send(Job::Retire(Removal {
+                let _ = shared
+                    .authority
+                    .fail_closed_registration(permit, Some(incarnation));
+                let removal = Removal {
                     id: self.owner,
                     incarnation,
-                }));
+                };
+                shared.notify_removed(removal);
+                self.drop_staged();
+                if let Some(velo) = &shared.velo {
+                    velo.unregister_peer(self.owner);
+                }
+                // The store write needs an await, which Drop cannot do.
+                let _ = shared.jobs.send(Job::Retire(removal));
             }
         }
     }
 }
 
 impl Transaction<'_> {
+    /// Drop the staged values not yet committed, last first.
+    fn drop_staged(&mut self) {
+        while let Some(value) = self.staged.pop() {
+            drop(value);
+        }
+    }
+
     fn permit(&self) -> &RegistrationPermit {
         self.permit
             .as_ref()
@@ -173,7 +198,7 @@ impl Transaction<'_> {
     /// unless the store removed it meanwhile; then deliver that removal
     /// before the staged hides are undone, so readers never see the prior
     /// state again.
-    fn abort(&mut self, staged: Vec<AnyStaged>, error: HubError) -> HubError {
+    fn abort(&mut self, error: HubError) -> HubError {
         let permit = self
             .permit
             .take()
@@ -188,17 +213,12 @@ impl Transaction<'_> {
                 tracing::warn!(instance = %self.owner, %abort_error, "could not abort registration");
             }
         }
-        drop_in_reverse(staged);
+        self.drop_staged();
         error
     }
 
     /// Fail after the store write (R4). One path for every such failure.
-    async fn fail_after_write(
-        &mut self,
-        incarnation: Incarnation,
-        staged: Vec<AnyStaged>,
-        error: HubError,
-    ) -> HubError {
+    async fn fail_after_write(&mut self, incarnation: Incarnation, error: HubError) -> HubError {
         let shared = self.shared;
         let owner = self.owner;
         match shared.store.remove(owner, incarnation).await {
@@ -216,7 +236,7 @@ impl Transaction<'_> {
             id: owner,
             incarnation,
         });
-        drop_in_reverse(staged);
+        self.drop_staged();
         // The owner is Busy, so no replacement can be registered with velo.
         if let Some(velo) = &shared.velo {
             velo.unregister_peer(owner);
@@ -236,12 +256,6 @@ impl Transaction<'_> {
             ErrorCode::RegisterAgain,
             format!("registration failed after it was recorded; register again: {error}"),
         )
-    }
-}
-
-fn drop_in_reverse(mut staged: Vec<AnyStaged>) {
-    while let Some(value) = staged.pop() {
-        drop(value);
     }
 }
 
@@ -271,12 +285,12 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
         owner,
         permit: Some(permit),
         written: None,
+        staged: Vec::with_capacity(shared.extensions.len()),
     };
     let epoch = txn.permit().epoch();
     let previous = txn.permit().previous();
 
     // Prepare, in start order.
-    let mut staged: Vec<AnyStaged> = Vec::with_capacity(shared.extensions.len());
     {
         let view = Txn {
             owner,
@@ -289,15 +303,15 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
             let prepared =
                 tokio::time::timeout(config.step_timeout, extension.prepare(&view, payload)).await;
             match prepared {
-                Ok(Ok(value)) => staged.push(value),
-                Ok(Err(rejection)) => return Err(txn.abort(staged, rejection.into())),
+                Ok(Ok(value)) => txn.staged.push(Some(value)),
+                Ok(Err(rejection)) => return Err(txn.abort(rejection.into())),
                 Err(_) => {
                     let error = HubError::unavailable(format!(
                         "extension {:?} did not prepare within {:?}",
                         extension.name(),
                         config.step_timeout
                     ));
-                    return Err(txn.abort(staged, error));
+                    return Err(txn.abort(error));
                 }
             }
         }
@@ -324,17 +338,16 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
                 txn.written = Some(incarnation);
                 let error =
                     HubError::unavailable(format!("store write was indeterminate: {reason}"));
-                return Err(txn.fail_after_write(incarnation, staged, error).await);
+                return Err(txn.fail_after_write(incarnation, error).await);
             }
             Ok(None) => {
                 let error =
                     HubError::unavailable(format!("store write did not apply: {reason}; retry"));
-                return Err(txn.abort(staged, error));
+                return Err(txn.abort(error));
             }
             Err(error) => {
                 return Err(fail_unresolved(
                     &mut txn,
-                    staged,
                     previous.map(|lease| lease.incarnation),
                     error,
                 ));
@@ -345,9 +358,9 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
                 ErrorCode::RegisterAgain,
                 format!("the prior registration changed meanwhile; register again: {error}"),
             );
-            return Err(txn.abort(staged, error));
+            return Err(txn.abort(error));
         }
-        Ok(Err(error)) => return Err(txn.abort(staged, error.into())),
+        Ok(Err(error)) => return Err(txn.abort(error.into())),
         Err(_) => {
             // The put future is gone, but a remote write may still land:
             // treat it as indeterminate.
@@ -355,19 +368,18 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
                 Ok(Some(incarnation)) => {
                     txn.written = Some(incarnation);
                     let error = HubError::unavailable("store write timed out after it applied");
-                    return Err(txn.fail_after_write(incarnation, staged, error).await);
+                    return Err(txn.fail_after_write(incarnation, error).await);
                 }
                 Ok(None) => {
                     let error = HubError::unavailable(format!(
                         "store write did not complete within {:?}; retry",
                         config.step_timeout
                     ));
-                    return Err(txn.abort(staged, error));
+                    return Err(txn.abort(error));
                 }
                 Err(error) => {
                     return Err(fail_unresolved(
                         &mut txn,
-                        staged,
                         previous.map(|lease| lease.incarnation),
                         error,
                     ));
@@ -379,15 +391,13 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
 
     // Everything below fails through R4.
     if let Err(error) = shared.authority.record_write(txn.permit(), incarnation) {
-        return Err(txn
-            .fail_after_write(incarnation, staged, error.into())
-            .await);
+        return Err(txn.fail_after_write(incarnation, error.into()).await);
     }
     if let Some(velo) = &shared.velo
         && let Err(error) = velo.register_peer(peer.clone())
     {
         let error = HubError::bad_request(format!("velo cannot reach the peer: {error}"));
-        return Err(txn.fail_after_write(incarnation, staged, error).await);
+        return Err(txn.fail_after_write(incarnation, error).await);
     }
     let committed = Committed {
         owner,
@@ -397,7 +407,13 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
         previous,
         extensions: &raw,
     };
-    for (extension, value) in shared.extensions.iter().zip(staged) {
+    // Each slot is taken just before its commit, so if a commit panics the
+    // values not yet committed are still in the transaction, and its Drop
+    // delivers the removal before it drops them.
+    for (index, extension) in shared.extensions.iter().enumerate() {
+        let value = txn.staged[index]
+            .take()
+            .expect("every extension prepared before the write");
         extension.commit(value, &committed);
     }
     let lease = match shared
@@ -406,9 +422,7 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
     {
         Ok(lease) => lease,
         Err(error) => {
-            return Err(txn
-                .fail_after_write(incarnation, Vec::new(), error.into())
-                .await);
+            return Err(txn.fail_after_write(incarnation, error.into()).await);
         }
     };
     let credential = txn.permit().credential().clone();
@@ -452,7 +466,6 @@ async fn resolve(
 /// until it expires.
 fn fail_unresolved(
     txn: &mut Transaction<'_>,
-    staged: Vec<AnyStaged>,
     prior: Option<Incarnation>,
     error: StoreError,
 ) -> HubError {
@@ -464,7 +477,7 @@ fn fail_unresolved(
             incarnation: prior,
         });
     }
-    drop_in_reverse(staged);
+    txn.drop_staged();
     if let Some(velo) = &shared.velo {
         velo.unregister_peer(owner);
     }

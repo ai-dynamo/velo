@@ -455,6 +455,9 @@ pub struct LedgerStaged {
 #[derive(Default)]
 pub struct Ledger {
     state: Arc<Mutex<LedgerState>>,
+    /// Every `on_removed`, with the incarnation the ledger held for that
+    /// owner when it arrived.
+    removals: Mutex<Vec<(Removal, Option<Incarnation>)>>,
     faults: Mutex<LedgerFaults>,
     pub attached: AtomicBool,
 }
@@ -514,6 +517,18 @@ impl Ledger {
             }),
             _ => None,
         }
+    }
+
+    /// Removals that arrived for `owner` while the ledger already held a
+    /// later incarnation of it: late copies, which must change nothing.
+    pub fn late_removals(&self, owner: InstanceId) -> usize {
+        self.removals
+            .lock()
+            .iter()
+            .filter(|(removal, held)| {
+                removal.id == owner && held.is_some_and(|held| held > removal.incarnation)
+            })
+            .count()
     }
 
     pub fn has_owner(&self, owner: InstanceId) -> bool {
@@ -689,6 +704,8 @@ impl Extension for Ledger {
 
     fn on_removed(&self, removal: Removal) {
         let mut state = self.state.lock();
+        let held = state.owners.get(&removal.id).map(|owner| owner.incarnation);
+        self.removals.lock().push((removal, held));
         if state
             .owners
             .get(&removal.id)
