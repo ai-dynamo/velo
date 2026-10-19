@@ -63,3 +63,21 @@ Refuted: none stood. The one refutation (row 1) was overturned by a test.
 | 16 | prepare deadline test hangs on regression; semver branches untested | valid in part: of five script mutants, two are real gaps (explicit caret, dotted inheritor); two are behavior-equivalent; one strip was unreachable and is removed | cases (z), (za), (zb) | ee189ed |
 
 The loop did not run dry: round 3 still produced confirmed findings, and the skill stops after 3 rounds. The findings got narrower each round: round 1 lifecycle and protocol defects, round 2 the boundedness of the round-1 fixes, round 3 panics and hangs in extension code plus one state-machine edge under a double store fault. Every confirmed item is fixed with a test, or documented: the hook-linearization race test is probabilistic, the two admission checks back each other up, an extension's own panicking `commit` drops its `Staged` before `on_removed`, and the server-abort fallback after the second drain has no test (no request survives the per-request stop).
+
+## Mega review round 1 (Fable, read-only, range origin/main...76b2381, V0 + M1): 6 findings, 4 suggestions
+
+Reviewer: Fable, running `thermo-nuclear-code-quality-review`, with two independent read-only second-opinion sessions. Each claim was adjudicated with a test that failed before the fix.
+
+| # | Claim | Ruling | Evidence | Fix commit |
+|---|---|---|---|---|
+| 1 | In-memory put/remove scan every entry under the write lock and every DashMap shard; a mass expiry is O(n^2) | valid | `write_cost`, 10,000 entries: put 21.4 -> 1.0 us, remove 20.0 -> 0.6 us, expiring all: 109 -> 7.2 ms. The ported `reregister_purges_*` test planted a state no API can create; removed (ledger updated) | 108ee60 |
+| 2 | Heartbeat replays missed ticks (tokio `Burst`); O(F x N) failure retain | valid | `missed_ticks_are_skipped_not_replayed`: 12 probes in half an interval before, <= 2 after | bec3df0 |
+| 3 | A panicking `admit`/`decode` drops the connection | valid | `panicking_admit_answers_an_error_body` failed with `IncompleteMessage` | c3d3650 |
+| 4 | `shutdown()` spawns the stop on the caller's runtime; it dies with it and the hub never stops | valid | `a_shutdown_from_another_runtime_runs_on_the_serving_one` failed: "stop task ended without a result" | 6b7d232 |
+| 5 | stop's lock wait unbounded against a blocking sync hook; HTTP heartbeat touch unbounded | valid, and the mechanism was incomplete: bounding the lock alone still hung, because the lifecycle task was woken into the blocked worker's LIFO slot, which tokio cannot steal. The lifecycle join is bounded too | `a_blocking_sync_hook_does_not_hang_shutdown` (mutation: lock bound removed -> fails), `a_hung_store_touch_answers_the_heartbeat_with_503` | e79414d |
+| 6 | Docs: pending digest describes a takeover not built; startup doc promises an unwind for any panic; `Staged::drop` panic; CONTRIBUTING.md one exception | valid | - | d4ffdbb |
+| S1/S3 | One bounded store-call helper; collapse the put's timeout and Indeterminate branches | done | suite | e79414d |
+| S2 | One settle path for the three after-write ends | done | order mutation fails 2 tests | (refactor commit) |
+| S4 | Core routes listed twice | done | suite | (refactor commit) |
+
+Not acted on (recorded): removals produced while extensions shut down are not delivered (a second drain would deliver to extensions already shut down); the removal hook is never uninstalled after a clean shutdown and a dead-runtime drop leaves the pinned entry (M4 design input); an indeterminate put that resolves as applied is failed closed (R6, settled); recovery (M4) must accept a stored digest for a `Reserved` owner and must not evict preloaded entries it has no velo peer for.
