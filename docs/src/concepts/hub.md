@@ -121,7 +121,7 @@ The lifecycle task forgets the velo peer only if no later incarnation replaced i
 
 ## Heartbeat
 
-When the hub runs velo, it sends a heartbeat to each registration every `heartbeat_interval_ms` (10 s by default). The registrant answers on the `velo_hub_heartbeat` handler. Each probe times out after one interval. After `heartbeat_max_failures` (3 by default) failures in a row, the hub removes that incarnation. A success touches that incarnation. Probes run in parallel, so a stopped peer does not delay the others. The hub does not probe its own pinned entry. Without velo, liveness is the store's TTL.
+When the hub runs velo, it sends a heartbeat to each registration every `heartbeat_interval_ms` (10 s by default). The registrant answers on the `velo_hub_heartbeat` handler. Each probe times out after one interval. After `heartbeat_max_failures` (3 by default) failures in a row, the hub removes that incarnation. A success touches that incarnation. An answer with `ok: false` counts as a failure: a registrant answers that while it holds no registration with this hub, for example after the response to its registration was lost. The hub committed that registration, but nobody holds its credential, so the registrant could never register again while its probes kept the entry alive. Probes run in parallel, so a stopped peer does not delay the others. The hub does not probe its own pinned entry. Without velo, liveness is the store's TTL.
 
 The heartbeat task holds a `WeakVelo`. Extension handlers and tasks that use the hub's `Velo` must also hold a `WeakVelo`, and upgrade it on each call. A handler that holds a `Velo` is in that instance's own handler registry, so the instance holds itself and is never dropped.
 

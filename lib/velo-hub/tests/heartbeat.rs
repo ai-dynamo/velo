@@ -328,3 +328,75 @@ async fn a_hung_touch_does_not_delay_evicting_a_dead_peer() {
     assert!(evicted, "the dead peer waited behind a hung touch");
     hub.shutdown().await.unwrap();
 }
+
+/// The registration's response is lost: the client closed its socket while
+/// the transaction ran, and the hub committed anyway (a hub task, on
+/// purpose). The hub then holds a registration whose credential nobody has,
+/// and the registrant's retry without a credential answers 401. With velo
+/// the hub's probes would keep that entry alive for as long as the
+/// registrant lives. A registrant that holds no registration answers its
+/// probes `ok: false`, the hub counts that as a failed probe, and after
+/// `heartbeat_max_failures` the entry goes and the retry succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_registrant_that_lost_its_response_is_freed_by_answering_not_ok() {
+    use velo_hub::AuthorityError;
+    use velo_hub::protocol::paths;
+    use velo_hub::store::HubStore;
+    use velo_hub::store::testing::FaultStore;
+
+    let store = std::sync::Arc::new(FaultStore::new(
+        velo_hub::store::InMemoryStore::builder()
+            .ttl(Duration::from_secs(60))
+            .build(),
+    ));
+    let mut config = config();
+    config.server.heartbeat_interval = Duration::from_millis(100);
+    config.server.heartbeat_max_failures = 2;
+    let hub = Hub::builder(config)
+        .store(store.clone())
+        .velo(velo_builder())
+        .serve()
+        .await
+        .unwrap();
+    let client = new_velo().await;
+    install_unregistered_heartbeat(&client);
+    client
+        .register_peer(hub.velo().unwrap().peer_info())
+        .unwrap();
+    let owner = client.instance_id();
+
+    let gate = store.gate_next_put();
+    let body = serde_json::to_value(request(&client.peer_info())).unwrap();
+    let socket = send_and_abandon(&hub, "POST", paths::INSTANCES, None, Some(&body)).await;
+    gate.entered().await;
+    drop(socket);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    gate.release();
+    // Committed: the hub holds a credential the registrant never got.
+    assert!(
+        eventually(Duration::from_secs(1), || matches!(
+            hub.authority().authorize(owner, None),
+            Err(AuthorityError::Unauthorized { .. })
+        ))
+        .await
+    );
+    assert_eq!(
+        post_register(&hub, &request(&client.peer_info()), None)
+            .await
+            .status(),
+        401
+    );
+
+    let store_ref = &store;
+    assert!(
+        eventually(Duration::from_secs(3), || store_ref.get(owner).is_none()).await,
+        "probes answered not ok kept the orphaned registration"
+    );
+    assert_eq!(
+        post_register(&hub, &request(&client.peer_info()), None)
+            .await
+            .status(),
+        200
+    );
+    hub.shutdown().await.unwrap();
+}

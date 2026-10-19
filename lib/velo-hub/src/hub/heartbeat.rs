@@ -121,6 +121,15 @@ fn fan_out(
                 probe(&velo, id, seq, interval).await
             };
             let outcome = match probe.await {
+                // The registrant holds no registration with this hub (its
+                // registration's response was lost, or it dropped its
+                // client). Count it as a failure, so the entry goes and the
+                // owner can register again.
+                Ok(ack) if !ack.ok => ProbeOutcome::Failed {
+                    id,
+                    incarnation,
+                    reason: "the registrant answered not ok: it holds no registration".to_string(),
+                },
                 Ok(ack) => {
                     // Conditional on the incarnation probed, so a late touch
                     // cannot refresh a replacement.

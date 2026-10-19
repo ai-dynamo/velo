@@ -322,7 +322,11 @@ pub struct HeartbeatRequest {
 pub struct HeartbeatAck {
     /// The request's sequence number.
     pub seq: u64,
-    /// Whether the registrant considers itself healthy.
+    /// `true` while the registrant holds a registration with this hub.
+    /// `false` (it lost the registration's response, or dropped its client)
+    /// counts as a failed probe: after `heartbeat_max_failures` the hub
+    /// removes the entry, and the registrant can register again without a
+    /// credential.
     pub ok: bool,
 }
 

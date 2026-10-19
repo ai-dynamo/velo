@@ -128,6 +128,24 @@ pub fn install_heartbeat(velo: &Velo) {
     .unwrap();
 }
 
+/// Answer the hub's heartbeat probes with `ok: false`: what a registrant
+/// answers while it holds no registration with this hub.
+pub fn install_unregistered_heartbeat(velo: &Velo) {
+    velo.register_handler(
+        Handler::typed_unary_async::<HeartbeatRequest, HeartbeatAck, _, _>(
+            HEARTBEAT_HANDLER,
+            |ctx| async move {
+                Ok(HeartbeatAck {
+                    seq: ctx.input.seq,
+                    ok: false,
+                })
+            },
+        )
+        .build(),
+    )
+    .unwrap();
+}
+
 /// Answer the hub's heartbeat probes and count them.
 pub fn install_counting_heartbeat(velo: &Velo) -> Arc<std::sync::atomic::AtomicUsize> {
     let probes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
