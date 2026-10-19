@@ -18,6 +18,7 @@ use velo_hub::protocol::{
 };
 use velo_hub::store::InMemoryStore;
 use velo_hub::velo::{InstanceId, Transport};
+use velo_hub::{Bundle, BundleInstaller, Hub};
 
 // ---- HTTP-direct server tests ------------------------------------------
 
@@ -483,19 +484,9 @@ async fn start_with_role() -> (velo_hub::Hub, Arc<Role>) {
     (hub, role)
 }
 
-/// `HubBuilder::extension` takes `impl Into<Arc<E>>`, as
-/// `BundleInstaller::extension` does, so the program can keep an `Arc` to
-/// its extension: the hub runs that same instance, not a copy. An `Arc`
-/// argument needs the type: `Arc<Role>` converts into `Arc<Role>` and
-/// into `Arc<Arc<Role>>`, and inference does not choose between them.
-#[tokio::test]
-async fn the_builder_takes_an_extension_the_caller_keeps() {
-    let role = Arc::new(Role::default());
-    let hub = builder()
-        .extension::<Role>(Arc::clone(&role))
-        .serve()
-        .await
-        .unwrap();
+/// Register a peer as a decode, and check that `role`, the `Arc` that the
+/// caller kept, is the instance that the hub runs.
+async fn the_hub_runs(hub: Hub, role: &Arc<Role>) {
     let peer = make_peer();
     register(
         &hub,
@@ -504,8 +495,45 @@ async fn the_builder_takes_an_extension_the_caller_keeps() {
     )
     .await;
     assert_eq!(role.snapshot().decode, [peer.instance_id()]);
-    assert!(Arc::ptr_eq(&role, &hub.extension::<Role>().unwrap()));
+    assert!(Arc::ptr_eq(role, &hub.extension::<Role>().unwrap()));
     hub.shutdown().await.unwrap();
+}
+
+/// `HubBuilder::extension` takes an extension or an `Arc` of one
+/// (`IntoExtension`), so the program can keep an `Arc` to its extension:
+/// the hub runs that same instance, not a copy. The call names no type.
+/// With `impl Into<Arc<E>>` it had to: `Arc<Role>` converts into
+/// `Arc<Role>` and into `Arc<Arc<Role>>`, and inference does not choose.
+#[tokio::test]
+async fn the_builder_takes_an_extension_the_caller_keeps() {
+    let role = Arc::new(Role::default());
+    let hub = builder()
+        .extension(Arc::clone(&role))
+        .serve()
+        .await
+        .unwrap();
+    the_hub_runs(hub, &role).await;
+}
+
+/// A bundle that installs an `Arc` it keeps, through
+/// `BundleInstaller::extension`, as the builder test above does.
+#[tokio::test]
+async fn a_bundle_installs_an_extension_it_keeps() {
+    struct KeepsRole(Arc<Role>);
+    impl Bundle for KeepsRole {
+        const NAME: &'static str = "keeps-role";
+        fn install(self, installer: &mut BundleInstaller<'_>) -> anyhow::Result<()> {
+            installer.extension(self.0);
+            Ok(())
+        }
+    }
+    let role = Arc::new(Role::default());
+    let hub = builder()
+        .bundle(KeepsRole(Arc::clone(&role)))
+        .serve()
+        .await
+        .unwrap();
+    the_hub_runs(hub, &role).await;
 }
 
 /// kvbm: "feature_register_without_manager_rejects". A payload for an
