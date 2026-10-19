@@ -59,7 +59,10 @@ use crate::store::{Incarnation, Removal};
 /// - `commit` cannot fail; check everything in `prepare`. Nothing else
 ///   changes extension state between them, because `commit`,
 ///   `on_registered` and `on_removed` all run under the hub-wide
-///   registration lock.
+///   registration lock. A `commit` that panics anyway drops its own
+///   `Staged` during the unwind, before the hub delivers `on_removed`, so
+///   that one undo can briefly show the state it hid. (The hub delivers the
+///   removal before it drops every other extension's `Staged`.)
 /// - `on_removed` may be delivered twice for one removal, and may name an
 ///   incarnation older than the one committed; ignore those.
 /// - An owner-scoped mutation outside the hooks (a route, a velo handler)
@@ -147,7 +150,9 @@ pub trait Extension: Send + Sync + 'static {
     fn commit(&self, staged: Self::Staged, registration: &Committed<'_>);
 
     /// After every extension committed and the credential is live. Runs
-    /// under the lock: spawn anything slow.
+    /// under the lock and under `step_timeout_ms`: at the deadline the hub
+    /// drops this future at whatever await it is on, logs it, and the
+    /// registration still succeeds. Spawn anything that awaits.
     fn on_registered(&self, _registration: &Committed<'_>) -> impl Future<Output = ()> + Send {
         async {}
     }

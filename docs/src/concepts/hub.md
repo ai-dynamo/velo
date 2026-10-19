@@ -73,7 +73,7 @@ An extension implements `Extension`. It has a wire name, a payload type, a stage
 | `admit` | before the registration lock | reject a payload that does not fit the hub's config |
 | `prepare` | under the lock, before the store write | can fail; can only hide or revoke, and the staged value undoes that when it drops |
 | `commit` | after the write | cannot fail |
-| `on_registered` | after the credential is live | must not block; spawn slow work |
+| `on_registered` | after the credential is live | runs under `step_timeout_ms` and is dropped at the deadline; spawn work that awaits |
 | `on_removed` | when an incarnation leaves the store | drop the owner's state if it belongs to that incarnation or an older one |
 
 Each extension sees each registration. The payload is `None` when the registrant did not opt in. Then `commit` drops what the owner had before. `commit`, `on_registered`, and `on_removed` all run under one hub-wide registration lock, so nothing changes extension state between `prepare` and `commit`.

@@ -416,7 +416,9 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
     };
     // Each slot is taken just before its commit, so if a commit panics the
     // values not yet committed are still in the transaction, and its Drop
-    // delivers the removal before it drops them.
+    // delivers the removal before it drops them. The panicking extension's
+    // own value is in its commit frame and drops during the unwind, first;
+    // the Extension rules say so.
     for (index, extension) in shared.extensions.iter().enumerate() {
         let value = txn.staged[index]
             .take()

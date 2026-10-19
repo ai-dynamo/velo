@@ -55,12 +55,17 @@ pub struct ServerConfig {
     /// registration lock before answering 503.
     #[serde(rename = "lock_timeout_ms", with = "millis")]
     pub lock_timeout: Duration,
-    /// Deadline of each extension `prepare` and of the store write in a
-    /// registration. Expiry aborts the registration like any failure, so a
+    /// Deadline of each step that runs under the registration lock: each
+    /// extension `prepare` and `on_registered`, and each store write,
+    /// read-back, and remove; also each store call of the heartbeat. A
+    /// `prepare` or write that expires aborts the registration like any
+    /// failure; an `on_registered` that expires is dropped and logged. So a
     /// hung extension or backend cannot hold the lock forever.
     #[serde(rename = "step_timeout_ms", with = "millis")]
     pub step_timeout: Duration,
-    /// Budget for draining the hub's velo instance at shutdown.
+    /// Shutdown budget, used three times: for the HTTP requests in flight
+    /// to finish (then they are ended with 503), for each hub task to stop,
+    /// and for draining the hub's velo instance.
     #[serde(rename = "shutdown_timeout_ms", with = "millis")]
     pub shutdown_timeout: Duration,
 }

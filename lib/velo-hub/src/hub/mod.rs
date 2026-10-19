@@ -655,7 +655,8 @@ impl Hub {
         Arc::clone(any).downcast::<T>().ok()
     }
 
-    /// Stop in order (see the module docs). A second call returns at once.
+    /// Stop in order (see the module docs). A second call, also one made
+    /// while the first runs, waits for the same stop and returns its result.
     pub async fn shutdown(&self) -> anyhow::Result<()> {
         let mut result = {
             let mut stage = self.inner.stage.lock().await;
