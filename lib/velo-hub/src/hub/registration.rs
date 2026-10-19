@@ -147,13 +147,14 @@ struct Transaction<'a> {
 
 impl Drop for Transaction<'_> {
     fn drop(&mut self) {
-        let Some(permit) = self.permit.take() else {
+        if self.permit.is_none() {
             return;
-        };
+        }
         tracing::error!(instance = %self.owner, "registration stopped before it finished; settling it");
         let shared = self.shared;
         match self.written {
             None => {
+                let permit = self.permit.take().expect("checked above");
                 if let Ok(AbortOutcome::Revoked(prior)) =
                     shared.authority.abort_registration(permit)
                 {
@@ -172,18 +173,11 @@ impl Drop for Transaction<'_> {
                     .store
                     .current_incarnation(self.owner)
                     .filter(|current| *current == incarnation);
-                let _ = shared
-                    .authority
-                    .fail_closed_registration(permit, reservation);
                 let removal = Removal {
                     id: self.owner,
                     incarnation,
                 };
-                shared.notify_removed(removal);
-                self.drop_staged();
-                if let Some(velo) = &shared.velo {
-                    velo.unregister_peer(self.owner);
-                }
+                self.settle_after_write(Some(removal), reservation);
                 // The store write needs an await, which Drop cannot do.
                 let _ = shared.jobs.send(Job::Retire(removal));
             }
@@ -196,6 +190,33 @@ impl Transaction<'_> {
     fn drop_staged(&mut self) {
         while let Some(value) = self.staged.pop() {
             drop(value);
+        }
+    }
+
+    /// End a registration that may have written and will not finish. The
+    /// one order for every such end: deliver `removal` before the staged
+    /// undos run, so readers never see the prior state again; forget the
+    /// velo peer (the owner is Busy, so no replacement is registered with
+    /// velo); fail the credential closed, reserving `reservation`. Sync, so
+    /// `Drop` can call it.
+    fn settle_after_write(&mut self, removal: Option<Removal>, reservation: Option<Incarnation>) {
+        let shared = self.shared;
+        if let Some(removal) = removal {
+            shared.notify_removed(removal);
+        }
+        self.drop_staged();
+        if let Some(velo) = &shared.velo {
+            velo.unregister_peer(self.owner);
+        }
+        let permit = self
+            .permit
+            .take()
+            .expect("the permit is held until the end");
+        if let Err(close_error) = shared
+            .authority
+            .fail_closed_registration(permit, reservation)
+        {
+            tracing::warn!(instance = %self.owner, %close_error, "could not fail the registration closed");
         }
     }
 
@@ -245,26 +266,11 @@ impl Transaction<'_> {
         }
         // The new incarnation replaced the prior one in the store, so this
         // removal covers both: the extensions drop whatever the owner had.
-        shared.notify_removed(Removal {
+        let removal = Removal {
             id: owner,
             incarnation,
-        });
-        self.drop_staged();
-        // The owner is Busy, so no replacement can be registered with velo.
-        if let Some(velo) = &shared.velo {
-            velo.unregister_peer(owner);
-        }
-        let reservation = shared.store.current_incarnation(owner);
-        let permit = self
-            .permit
-            .take()
-            .expect("the permit is held until the end");
-        if let Err(close_error) = shared
-            .authority
-            .fail_closed_registration(permit, reservation)
-        {
-            tracing::warn!(instance = %owner, %close_error, "could not fail the registration closed");
-        }
+        };
+        self.settle_after_write(Some(removal), shared.store.current_incarnation(owner));
         HubError::new(
             ErrorCode::RegisterAgain,
             format!("registration failed after it was recorded; register again: {error}"),
@@ -467,23 +473,12 @@ fn fail_unresolved(
     prior: Option<Incarnation>,
     error: StoreError,
 ) -> HubError {
-    let shared = txn.shared;
-    let owner = txn.owner;
-    if let Some(prior) = prior {
-        shared.notify_removed(Removal {
-            id: owner,
-            incarnation: prior,
-        });
-    }
-    txn.drop_staged();
-    if let Some(velo) = &shared.velo {
-        velo.unregister_peer(owner);
-    }
-    let reservation = shared.store.current_incarnation(owner);
-    let permit = txn.permit.take().expect("the permit is held until the end");
-    let _ = shared
-        .authority
-        .fail_closed_registration(permit, reservation);
+    let removal = prior.map(|incarnation| Removal {
+        id: txn.owner,
+        incarnation,
+    });
+    let reservation = txn.shared.store.current_incarnation(txn.owner);
+    txn.settle_after_write(removal, reservation);
     HubError::unavailable(format!(
         "store write outcome is unknown and could not be resolved ({error}); the registration is dropped and its entry reserved until it expires"
     ))
