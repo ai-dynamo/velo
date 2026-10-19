@@ -437,3 +437,42 @@ Finding 8 applies to kvbm today: `register_instance` awaits inline in the axum h
 The V0 review (Codex gpt-6-astra, bb thread) found three minor issues: a stale `examples/Cargo.lock`, guide wording that claimed `shutdown` runs once (only `graceful_shutdown` does; `shutdown` repeats its streaming step), and a missing README note. Fixing the lockfile exposed a design gap the review could not see, because the examples did not build: `examples/throughput.rs` took `Arc::downgrade(&velo)` so its handler would not keep `velo` alive. The handle removed that option. V0 now adds `Velo::downgrade() -> WeakVelo` and `WeakVelo::upgrade() -> Option<Velo>`, with a test that a handler holding a `WeakVelo` does not keep the instance alive.
 
 Rule for velo-hub: extension handlers and spawned tasks that reach the hub's `Velo` hold a `WeakVelo` and upgrade per call. Contexts hand out `Velo`; registering a handler that captures a strong clone is the cycle to avoid.
+
+---
+
+## 14. M1 implementation addendum, 2026-10-18
+
+M1 is implemented on `bb/m1-velo-hub-server-core-thr_juy4b2a2x8` (stacked on V0). The plan held; these are the places the code departs from it or settles what it left open. Evidence is the test named, all in `lib/velo-hub`. The assertion ledger is `agent-docs/velo-hub-m1-ledger.md`.
+
+### 14.1 Departures
+
+| Plan | Code | Why |
+|---|---|---|
+| §6.1: decode the peer address after `begin`, always | Decoded before the lock, and only when the hub runs velo (`registration::decode`) | Pure validation needs no lock. Without velo the address is opaque; kvbm's own tests register `b"test-addr"` on velo-less hubs. |
+| §6.1: `commit` then `register_peer` | `register_peer` before extension `commit` | A failure there then only drops `Staged`; the R4 path covers both orders anyway. |
+| §5.1: `admit(&self, view)` | `admit(&self, view, payload: Option<&Self::Registration>)` | The payload is decoded once, before admit; admit needs it for config checks (kvbm's PrimaryConfig). |
+| §5.1: `attach` required | `attach` has a default | Most toy and real extensions need none. |
+| R6: `put(record, op_id, expected)` | `put(record, expected)`, op id is `record.op` | The record stores it for read-back anyway. `resolve(id, op)` is async. |
+| R3: removals only enqueue; lifecycle delivers | Also: `DELETE` takes the lock and delivers its own removal | kvbm's observable behavior is that extension lists are empty when DELETE returns (`unregister_removes_from_extension_lists`). The queued copy is a no-op. |
+| R4: "drop or reverse Staged, conditional remove, on_removed" | Order is remove, `on_removed`, then drop `Staged`; `Staged::drop` must be epoch-fenced | Dropping first un-hides prior state that is about to be removed. Documented on `Extension`. |
+| (not in plan) panicking extension | The transaction owns permit and staged values; its `Drop` aborts before the write, and after it fails closed, delivers `on_removed` synchronously (lock still held), then queues `Job::Retire` for the store remove | Otherwise a panic leaves the owner Busy forever (`panicking_prepare_*`, `panicking_commit_fails_closed`, `a_panic_after_the_write_never_shows_the_prior_state_again`). |
+| (not in plan) an indeterminate write whose read-back also fails | Drop the prior registration's extension state, forget the velo peer, reserve whatever the store holds, answer 503 (`indeterminate_put_that_cannot_be_resolved_drops_and_reserves`) | Neither outcome is knowable; fail closed. |
+| §4 crate layout `routes.rs` errors | Every core-route failure is an `ErrorBody`, including axum's body/path rejections and unknown routes/methods (`HubJson`, `HubPath`, JSON fallbacks, new code `method_not_allowed`) | Clients act on the code. Found in review. |
+| Authority storage: kvbm's `Mutex<HashMap>` | Same map under one mutex for transitions, plus a sharded read view (`DashMap`) written under that mutex | Measured: with readers on one `RwLock`, 8 threads made 9.4 M authorize calls/s in total, fewer than one thread (20.7 M/s). With the view: 52 M/s. Cross-owner atomicity of `synchronize_reservations` against the removal hook is kept because every transition still holds the one mutex. Same pattern for the in-memory store's discovery lookups. |
+| `HubStore` | Added `peers() -> Vec<StoredPeer>` (no payloads) | The heartbeat lists every tick; `list()` deep-copies payloads under the read lock (19 ms vs 0.3 ms for 10,000 entries with 2 KiB payloads). |
+| §3.2 rule 1 | `velo-hub` has `publish = false` | R9 gates publishing on the K1 spike; CLAUDE.md rule 1 says new crates start unpublishable. |
+| §10 | `RegisterResponse { instance_id, hub_instance_id, credential, epoch }`; `GET /v1/instances` returns `{ peer, extensions, pinned }`; error codes add `busy`, `register_again`, `unavailable`, `bad_gateway`, `method_not_allowed` | Clean protocol; a client must tell "retry" from "register again". |
+
+### 14.2 Open
+
+- **R5 is half done.** The record carries `accepted` and `pending` credential digests, but the ported state machine still answers 401 for a `Reserved` owner whatever it presents. M4 must let `begin_registration` accept a `Reserved` owner presenting a credential whose digest matches either stored digest, and must add the test.
+- **§12 lock-hold metric** is not implemented; the transaction logs the hold time at `debug`.
+- **`client` feature** is an empty placeholder so `protocol` is proven to build without `server`.
+- **Shutdown order (R8)** drains HTTP after extensions shut down, so an extension route can run after its extension's `shutdown`. Kept as specified; revisit if an extension needs routes closed first.
+- **`Velo` peer-registration check** is decode-only before the write. A peer whose address decodes but no hub transport accepts fails after the write and fails closed (`post_write_register_peer_failure_*`). A pre-write dry run would need a velo API that does not exist.
+
+### 14.3 Plan errors found
+
+- §11 and §13.4 counts were both wrong. Actual: `tests/integration.rs` 59, `src/registry/tests.rs` 17, `src/registration/tests.rs` 6, `tests/registration_lifecycle.rs` 14, `tests/heartbeat_integration.rs` 5.
+- "Port `tests/integration.rs` with path changes only" was wrong: 13 of its tests exercise kvbm's `HubClient` (M2) and 8 exercise kvbm-owned features (K1). 33 port to M1, one of them rewritten (its DELETE came from a client drop guard); 5 handler tests merge into `protocol` unit tests. Seven CD tests are about the hub's behavior and port with a toy `Role` extension.
+- R4's step order (drop Staged before on_removed) would re-expose state; see 14.1.
