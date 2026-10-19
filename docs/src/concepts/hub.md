@@ -2,7 +2,7 @@
 
 The `velo-hub` crate builds a hub: one service that is the peer discovery for a velo application and also hosts extensions. A program builds the hub in `main`, adds extensions or bundles of extensions, picks a store, and serves it. `velo` does not depend on `velo-hub`. An application that does not use a hub picks any velo discovery backend, as before.
 
-The crate has three cargo features. `server` builds the hub. `client` is reserved for the hub client, which is not in the crate yet. `test-support` adds the store conformance suite and `FaultStore`, a store that fails on request. The `protocol` module (paths, request and response types, ids) builds under either feature, and with no feature.
+The crate has three cargo features. `server` builds the hub. `client` builds the hub client, `velo_hub::client`, without the server. `test-support` adds the store conformance suite and `FaultStore`, a store that fails on request. The `protocol` module (paths, request and response types, ids) builds under either feature, and with no feature.
 
 ```rust,ignore
 use velo_hub::{Hub, HubConfig};
@@ -124,6 +124,32 @@ The lifecycle task forgets the velo peer only if no later incarnation replaced i
 When the hub runs velo, it sends a heartbeat to each registration every `heartbeat_interval_ms` (10 s by default). The registrant answers on the `velo_hub_heartbeat` handler. Each probe times out after one interval. After `heartbeat_max_failures` (3 by default) failures in a row, the hub removes that incarnation. A success touches that incarnation. An answer with `ok: false` counts as a failure: a registrant answers that while it holds no registration with this hub, for example after the response to its registration was lost. The hub committed that registration, but nobody holds its credential, so the registrant could never register again while its probes kept the entry alive. Probes run in parallel, so a stopped peer does not delay the others. The hub does not probe its own pinned entry. Without velo, liveness is the store's TTL.
 
 The heartbeat task holds a `WeakVelo`. Extension handlers and tasks that use the hub's `Velo` must also hold a `WeakVelo`, and upgrade it on each call. A handler that holds a `Velo` is in that instance's own handler registry, so the instance holds itself and is never dropped.
+
+## Client
+
+A program that uses a hub builds a `HubClient` (feature `client`), builds its `Velo` from the client, and registers:
+
+```rust,ignore
+use velo_hub::client::HubClient;
+
+let hub = HubClient::builder().host("hub.example").build()?;
+let velo = hub.velo_builder().add_transport(tcp).build().await?;
+hub.register(&velo, Default::default()).await?;
+// velo now finds every other registered peer through the hub.
+hub.unregister().await?;
+```
+
+`velo_builder()` sets the hub as the velo discovery. velo resolves a worker target through it, and `Velo::discover_and_register_peer` resolves an instance id through it.
+
+`register(&velo, extensions)` installs the heartbeat handler on `velo` first, so the hub's probes get an answer as soon as the hub answers the registration. `register_peer(peer, extensions)` registers a `PeerInfo` without a handler, for a hub without velo. A client holds one registration. A second `register` of the same peer presents the credential, and the hub replaces the registration: a new credential, a new epoch, and the old credential stops working. If the hub answers `unauthorized` or `register_again`, the client drops the registration it holds, and the next `register` starts again without a credential.
+
+The client's heartbeat handler answers `ok: true` only while the client holds a registration or is getting one. So when the response to a registration is lost, the hub removes the registration that nobody can use after `heartbeat_max_failures` probes, and the client can register again.
+
+The client is a cheap handle; its clones share the one registration. Dropping the last clone sends `DELETE` in the background on the current runtime. A program that can await calls `unregister`. If `DELETE` fails, the client keeps the registration, so a retry or the drop sends it again.
+
+velo keeps its discovery for as long as it lives, so the discovery that `velo_builder()` installs is a separate handle, `HubDiscovery`, that holds no registration. If velo held the client itself, the registration would live as long as velo does, and dropping the client would not unregister.
+
+`client.ext(name)` makes JSON calls under `/v1/ext/{name}`. `get` and `post` use the public listener. `control_get`, `control_post`, and `control_delete` use the control listener and send the registration's credential. A bundle crate builds its typed client on it. Every error that the hub answers is a `ClientError::Hub` with the hub's `ErrorCode`, so a caller acts on the code.
 
 ## Startup and shutdown
 

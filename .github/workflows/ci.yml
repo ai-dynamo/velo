@@ -201,6 +201,13 @@ jobs:
         for backend in services etcd nats-discovery nats-queue queue-messenger; do
           cargo check --locked -p velo --lib --no-default-features --features "$backend"
         done
+    - name: Check velo-hub feature sets
+      if: matrix.features == 'test-helpers'
+      run: |
+        # protocol builds alone; the client builds without the server.
+        for features in "" client server "client,server"; do
+          cargo check --locked -p velo-hub --lib --no-default-features --features "$features"
+        done
 
   soak-smoke:
     name: Soak smoke

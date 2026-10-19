@@ -487,3 +487,35 @@ Three review rounds (record: `agent-docs/velo-hub-m1-review.md`) changed these b
 - **Routers are built before the removal hook.** They run extension code that can panic, and nothing after the hook may fail.
 - **A reservation is cleared by any removal of its owner** (one ported transition changed; see the review record, round 3 row 1).
 - **`ServerConfig::validate`** refuses zero intervals and timeouts.
+## 15. M2 plan: the `client` feature, 2026-10-19
+
+M2 adds the client half, on top of M1. It ports kvbm-hub's `src/client.rs`, `src/handlers.rs` (heartbeat only) and `tests/client_unregister.rs`, plus the 13 `integration.rs` tests the M1 ledger deferred to M2 (rows 6, 26-37) and the drop half of row 38.
+
+### 15.1 Shape
+
+| Type | Role |
+|---|---|
+| `HubClient` | Cheap-clone handle (`Arc<Inner>`). HTTP to both listeners. Owns at most one registration: instance id, credential, epoch, `hub_instance_id`. `register`, `unregister`, `send_heartbeat`, `registration()`, `ext(name)`, `discovery()`, `velo_builder()`. Dropping the last clone sends `DELETE` best-effort on the current runtime. |
+| `HubDiscovery` | Discovery-only cheap-clone handle (no registration). Implements `PeerDiscovery`. `velo_builder()` installs this one. |
+| `ExtClient` | JSON helpers scoped to `/v1/ext/{name}` on either listener; `*_authorized` variants add the registration's credential. Bundle crates build typed clients on it. |
+| `ClientError` | Typed: `Hub { status, code: ErrorCode, message }`, `Transport`, `Decode`, `NotRegistered`, `InvalidUrl`. `code()` lets a caller act on `busy` / `register_again`. |
+| `HubClientBuilder` | `host`, `scheme`, `public_port`, `control_port`, `from_url`, `http_client`. |
+
+### 15.2 Rulings (settled; do not re-litigate during implementation)
+
+- **R2-1. Discovery is a separate handle.** kvbm passed `Arc<HubClient>` to velo as discovery, so velo kept the registration alive and dropping the user's client never unregistered. `HubDiscovery` shares only the HTTP client and URLs. Test: dropping the user's `HubClient` while a velo built from `velo_builder()` lives still sends `DELETE`.
+- **R2-2. `register` re-registers.** With a registration held, `register` presents its credential and the hub mints a new credential and epoch (the M1 protocol). kvbm's `client_register_twice_errors` becomes **intentionally changed**: the second call re-registers. If the hub answers `register_again`, the client drops its registration and returns the error; the caller registers again.
+- **R2-3. Two entry points.** `register_peer(peer, extensions)` is the primitive (kvbm's tests register bare `PeerInfo`s on velo-less hubs). `register(&velo, extensions)` installs the heartbeat handler on that velo first (velo replaces a handler of the same name, so this is safe to repeat), so the hub can probe the moment it answers. The handler holds a `Weak` of what it records (last `seq`, arrival time) and of the client's "holding" flag.
+- **R2-4. Unregister keeps state on failure.** Success, 404 or 401 (the credential is no longer this registration's) clears the registration; any other answer keeps it, so an explicit retry or the drop retries (`client_unregister.rs`, both tests ported).
+- **R2-5. No background loops in M2.** No client-side HTTP heartbeat loop and no automatic re-registration; the hub's velo heartbeat is the liveness path. Revisit if K1 needs it.
+- **R2-6. Dependencies.** `client = ["dep:reqwest", "dep:url", ...]` with reqwest `default-features = false, features = ["json"]`. TLS is the caller's choice through `http_client`.
+
+### 15.3 Tests (written first)
+
+Ported: rows 6, 26-37 of the M1 ledger; the drop half of 38; `client_unregister.rs` (2). New: two Velos built from `velo_builder()` discover each other through a hub and exchange a message; the hub's velo heartbeat reaches the client's handler and keeps it registered; R2-1 drop test; R2-2 re-registration rotates credential and epoch and the old credential stops working; a typed `ClientError::Hub` carries `ErrorCode` (bad payload -> `bad_request`, stale credential -> `unauthorized`); `ExtClient` reaches an extension's public and control routes, with and without the credential.
+
+### 15.4 Added during implementation, 2026-10-19
+
+- **R2-7. The handler answers `ok` only while the client holds or is getting a registration.** Mega review round 3 of M1 found that a lost registration response locked the owner out while it answered the hub's probes. The hub now counts `ok: false` as a failed probe (M1 fix ab987f1); the client sets a `holding` flag when `register_peer` starts and stores `registration.is_some()` when it ends, so a probe that arrives before the response is still answered ok. A dropped client (the handler's `Weak` fails) answers not ok. Test: `a_client_without_the_registration_answers_not_ok_and_is_freed`.
+- **Velo sends to `.instance(id)` do not consult discovery**; `.worker(id)` targets and `Velo::discover_and_register_peer` do. The two-velo test addresses the peer by worker id.
+- Mutation checks: velo's discovery holding the client (R2-1) fails `dropping_the_client_unregisters_while_its_velo_lives`; `register` not installing the handler fails `the_hub_heartbeat_reaches_the_client_and_keeps_it_registered`.

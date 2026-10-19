@@ -8,6 +8,8 @@
 
 #![deny(missing_docs)]
 
+#[cfg(feature = "client")]
+pub mod client;
 #[cfg(feature = "server")]
 mod hub;
 pub mod protocol;

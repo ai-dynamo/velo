@@ -206,3 +206,25 @@ All kept. kvbm registered with `HubClient` and had to hold it so its drop guard 
 | shutdown waits for an in-flight registration | `lifecycle::shutdown_waits_for_an_in_flight_registration` |
 | (R2) a lease cannot write across a re-registration | `hooks::a_lease_taken_before_a_reregistration_cannot_write_after_it` |
 | store contract | `store::conformance::run_all` against `InMemoryStore` and `FaultStore` |
+
+## M2: the rows deferred to the client, 2026-10-19
+
+All in `lib/velo-hub/tests/client.rs` unless named. kvbm's `register_instance(peer)` is `register_peer(peer, extensions)`; discovery calls go through `client.discovery()`.
+
+| kvbm test | velo-hub test | ruling |
+|---|---|---|
+| 6 `create_heartbeat_handler_builds` | `the_hub_heartbeat_reaches_the_client_and_keeps_it_registered` | **changed**: kvbm only built the handler; the port proves it answers the hub's probes and keeps the client registered |
+| 26 `client_builder_requires_host` | same | kept |
+| 27 `client_starts_unregistered` | same | kept |
+| 28 `client_register_sets_is_registered` | same | kept |
+| 29 `client_register_twice_errors` | `a_second_register_re_registers_and_rotates_the_credential`, `registering_a_second_peer_is_refused` | **changed**: the M1 hub supports re-registration with the credential, so a second register of the same peer re-registers; a different peer is refused (`AlreadyRegistered`) |
+| 30 `client_heartbeat_while_registered` | same | kept |
+| 31 `client_heartbeat_before_register_errors` | same | kept; the error is `NotRegistered` |
+| 32 `client_discover_by_instance_id` | same | kept |
+| 33 `client_discover_by_worker_id` | same | kept |
+| 34 `client_unregister_removes_from_server` | same | kept |
+| 35 `client_unregister_noop_when_not_registered` | same | kept |
+| 36 `client_discover_after_unregister_errors` | same | kept |
+| 37 `registration_guard_drop_fires_delete` | same | kept; also asserts a live clone keeps the registration |
+| 38 (drop half) | `a_dropped_client_leaves_the_list` | kept |
+| `client_unregister.rs` (2) | `tests/client_unregister.rs` (2) | kept; the fake hub answers the M1 `RegisterResponse` |
