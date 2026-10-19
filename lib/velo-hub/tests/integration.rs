@@ -13,8 +13,8 @@ use std::time::Duration;
 
 use common::*;
 use velo_hub::protocol::{
-    ErrorCode, HeartbeatResponse, ListInstancesResponse, PeerLookupResponse, ProbeResponse,
-    instance_probe, paths, peers_by_instance, peers_by_worker,
+    ErrorBody, ErrorCode, HeartbeatResponse, ListInstancesResponse, PeerLookupResponse,
+    ProbeResponse, instance_probe, paths, peers_by_instance, peers_by_worker,
 };
 use velo_hub::store::testing::FaultStore;
 use velo_hub::store::{Continuity, InMemoryStore};
@@ -72,6 +72,65 @@ async fn ready_answers_503_while_the_store_is_not_live() {
     store.set_continuity(Continuity::Live);
     assert_eq!(status(public(&hub, paths::READY)).await.status(), 200);
     hub.shutdown().await.unwrap();
+}
+
+/// A hub that is stopping does not take registrations, so it is not
+/// ready while its listeners are still open: `/v1/ready` answers 503 and
+/// `/v1/health` 200, and a registration answers 503 with `not_ready`, so a
+/// client with more than one host tries the next. The stop is held while
+/// it waits for the registration lock, which a gated registration holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stopping_hub_is_not_ready_and_refuses_registrations_as_not_ready() {
+    let store = Arc::new(FaultStore::default());
+    let hub = builder()
+        .store(Arc::clone(&store) as Arc<dyn velo_hub::store::HubStore>)
+        .serve()
+        .await
+        .unwrap();
+    let gate = store.gate_next_put();
+    let held = tokio::spawn({
+        let hub = hub.clone();
+        let body = request(&make_peer());
+        async move { post_register(&hub, &body, None).await.status() }
+    });
+    gate.entered().await;
+    let stopping = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.shutdown().await }
+    });
+    let ready = public(&hub, paths::READY);
+    let mut status = 200;
+    for _ in 0..200 {
+        status = http().get(&ready).send().await.unwrap().status().as_u16();
+        if status != 200 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert_eq!(status, 503, "a stopping hub stayed ready");
+    let body: ErrorBody = http()
+        .get(&ready)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(body.not_ready, "{body:?}");
+    let health = http()
+        .get(public(&hub, paths::HEALTH))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(health.status(), 200);
+    let refused = post_register(&hub, &request(&make_peer()), None).await;
+    assert_eq!(refused.status(), 503);
+    let body: ErrorBody = refused.json().await.unwrap();
+    assert_eq!(body.code, ErrorCode::Unavailable);
+    assert!(body.not_ready, "{body:?}");
+    gate.release();
+    held.await.unwrap();
+    stopping.await.unwrap().unwrap();
 }
 
 #[tokio::test]
