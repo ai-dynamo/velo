@@ -44,6 +44,8 @@
 //! partition, while another hub took the prefix, cannot write: the failed
 //! compare, the watch seeing the lock key leave, or a keep-alive finding
 //! the lease gone puts the store in [`Continuity::Fenced`] for good.
+//! Each of these is an answer from etcd: a store that cannot reach etcd
+//! at all stays `Degraded` until it can, and is fenced then.
 //!
 //! # The barrier
 //!
