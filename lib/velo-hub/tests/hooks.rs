@@ -289,6 +289,30 @@ async fn panicking_prepare_does_not_leave_the_owner_busy() {
     assert_prior_intact(&f, &peer, &prior, incarnation).await;
 }
 
+/// `admit` runs in the request handler, before the transaction task, so
+/// the task's panic boundary does not cover it. A panic there must still
+/// answer an `ErrorBody` (not drop the connection) and leave the prior
+/// registration as it was.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panicking_admit_answers_an_error_body() {
+    let f = plain().await;
+    let peer = make_peer();
+    let prior = seeded(&f, &peer).await;
+    let incarnation = f.store.current_incarnation(peer.instance_id()).unwrap();
+
+    f.ledger.panic_next_admit();
+    let response = http()
+        .post(control(&f.hub, paths::INSTANCES))
+        .header(CREDENTIAL_HEADER, prior.credential.to_header_value())
+        .json(&request_with(&peer, &[ledger_opt_in()]))
+        .send()
+        .await
+        .expect("a panicking admit must not drop the connection");
+    assert_eq!(response.status(), 500);
+    assert_eq!(error_code(response).await, ErrorCode::Internal);
+    assert_prior_intact(&f, &peer, &prior, incarnation).await;
+}
+
 /// The store expires the prior incarnation while `prepare` is gated. The
 /// removal is recorded against the transaction, not delivered into the
 /// middle of it: the ledger still holds the (hidden) owner until the

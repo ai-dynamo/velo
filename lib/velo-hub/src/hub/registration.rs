@@ -50,11 +50,15 @@ pub(crate) async fn register(
     if !shared.admitting() {
         return Err(HubError::unavailable("the hub is not taking registrations"));
     }
-    let request = decode(&shared, presented, request)?;
     // The task owns the transaction: hyper drops this handler's future when
     // the client disconnects, and an abandoned transaction would leave the
-    // owner Busy forever.
-    let task = tokio::spawn(transact(Arc::clone(&shared), request));
+    // owner Busy forever. Decoding runs in the task too, so a panic in an
+    // extension's `decode` or `admit` meets the same boundary as one in
+    // `prepare` and answers 500 instead of dropping the connection.
+    let task = tokio::spawn(async move {
+        let request = decode(&shared, presented, request)?;
+        transact(shared, request).await
+    });
     match task.await {
         Ok(result) => result,
         Err(error) => Err(HubError::internal(format!(

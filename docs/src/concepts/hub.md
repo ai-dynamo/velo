@@ -87,9 +87,9 @@ The hub checks the graph before it binds a socket. These are errors: two bundles
 ## Registration
 
 ```text
-handler   decode payloads; check registration_requires; admit           400
-          spawn the transaction task, and wait for it
-task      take the lock (503 after lock_timeout_ms); begin               401, 409 busy
+handler   spawn the transaction task, and wait for it
+task      decode payloads; check registration_requires; admit           400
+          take the lock (503 after lock_timeout_ms); begin               401, 409 busy
           prepare each extension, each under step_timeout_ms
             failure: abort; the prior registration is not changed
           write to the store, under step_timeout_ms
@@ -101,7 +101,7 @@ task      take the lock (503 after lock_timeout_ms); begin               401, 40
             refuse the credential                                        409 register_again
 ```
 
-The transaction is a task of the hub. hyper drops a request handler when its client closes the connection. If the handler ran the transaction, a disconnect could leave the owner `busy` for ever.
+The transaction is a task of the hub. hyper drops a request handler when its client closes the connection. If the handler ran the transaction, a disconnect could leave the owner `busy` for ever. Decoding and `admit` run in the task as well, so a panic in any extension hook answers 500.
 
 Each store write and remove under the lock, and each `on_registered`, runs under `step_timeout_ms`. A store or an extension that never answers cannot hold the lock. A remove that times out counts as indeterminate: the hub reads the store to learn whether it applied.
 

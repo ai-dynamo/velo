@@ -418,6 +418,7 @@ struct LedgerFaults {
     reject_next_prepare: Option<Rejection>,
     gate_next_prepare: Option<Arc<Gate>>,
     hang_next_prepare: bool,
+    panic_next_admit: bool,
     panic_next_prepare: bool,
     panic_next_commit: bool,
     panic_next_registered: bool,
@@ -483,6 +484,11 @@ impl Ledger {
     /// The next prepare hides, then never finishes.
     pub fn hang_next_prepare(&self) {
         self.faults.lock().hang_next_prepare = true;
+    }
+
+    /// The next admit panics.
+    pub fn panic_next_admit(&self) {
+        self.faults.lock().panic_next_admit = true;
     }
 
     /// The next prepare hides, then panics.
@@ -638,6 +644,17 @@ impl Extension for Ledger {
 
     async fn attach(&self, _ctx: &velo_hub::AttachContext<'_>) -> anyhow::Result<()> {
         self.attached.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    fn admit(
+        &self,
+        _view: &velo_hub::RegistrationView<'_>,
+        _payload: Option<&()>,
+    ) -> Result<(), Rejection> {
+        if std::mem::take(&mut self.faults.lock().panic_next_admit) {
+            panic!("ledger admit panicked on request");
+        }
         Ok(())
     }
 
