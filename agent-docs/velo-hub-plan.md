@@ -775,3 +775,7 @@ Not done or open:
 - The `not_ready` field on `ErrorBody` is a wire addition in place of a new error code (old clients ignore it; the code stays `unavailable` as H-6 says). Open for the user to accept.
 - H-8 still stands: none of this lands until the user rules on option A against decision 7.
 - `scripts/build-book.sh` not run here: `mdbook` is not installed in this environment.
+
+### 18.10 Review pass 1, 2026-10-19 (record: /tmp/m7p1/report.md)
+
+Nothing met the bar. Five probes passed, among them an H-2 discriminator (etcd answers delayed 600 ms: `Degraded` at release + 3.002 s, so the deadline runs from the send) and standby contention (one winner per release). The four §18.9 departures were judged sound. Fixed: the book said the hub degrades "before" a standby can take the lock; the guarantee is "no later than". Left as is: peer lookups on a `Degraded` hub do not rotate hosts (by design), no test that the standby grants no lease per poll, a few no-write 503s (lock and prepare timeouts) stay unmarked, which is conservative.
