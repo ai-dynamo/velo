@@ -16,7 +16,7 @@ let hub = Hub::builder(config)
 hub.run_until_signal().await?;
 ```
 
-The library reads no files and parses no flags. The program builds the `HubConfig`. Without `.store(...)`, the hub uses an `InMemoryStore`. Without `.velo(...)`, the hub only does discovery: it does not probe registrants, and liveness is the store's TTL.
+The library reads no files and parses no flags. The program builds the `HubConfig`. `examples/examples/hub.rs` is a complete hub program: two bundles, one requiring the other, configured by `examples/hub.json`; `--demo` serves on free ports, runs a client against it, and stops. Without `.store(...)`, the hub uses an `InMemoryStore`. Without `.velo(...)`, the hub only does discovery: it does not probe registrants, and liveness is the store's TTL.
 
 ## Listeners
 
