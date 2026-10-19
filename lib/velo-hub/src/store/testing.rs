@@ -77,6 +77,8 @@ pub struct FaultStore {
     put_gate: Mutex<Option<Arc<Gate>>>,
     touch_gate: Mutex<Option<Arc<Gate>>>,
     remove_gate: Mutex<Option<Arc<Gate>>>,
+    resolve_gate: Mutex<Option<Arc<Gate>>>,
+    stubborn_liveness: AtomicBool,
     fail_next_remove: AtomicBool,
     fail_next_resolve: AtomicBool,
     continuity: watch::Sender<Continuity>,
@@ -97,6 +99,8 @@ impl FaultStore {
             put_gate: Mutex::new(None),
             touch_gate: Mutex::new(None),
             remove_gate: Mutex::new(None),
+            resolve_gate: Mutex::new(None),
+            stubborn_liveness: AtomicBool::new(false),
             fail_next_remove: AtomicBool::new(false),
             fail_next_resolve: AtomicBool::new(false),
             continuity: watch::Sender::new(Continuity::Live),
@@ -132,6 +136,19 @@ impl FaultStore {
         let gate = Arc::new(Gate::default());
         *self.remove_gate.lock() = Some(Arc::clone(&gate));
         gate
+    }
+
+    /// The next resolve stops at the returned gate.
+    pub fn gate_next_resolve(&self) -> Arc<Gate> {
+        let gate = Arc::new(Gate::default());
+        *self.resolve_gate.lock() = Some(Arc::clone(&gate));
+        gate
+    }
+
+    /// The liveness task this store spawns ignores its cancellation, as a
+    /// broken backend's would. Set before the hub starts.
+    pub fn stubborn_liveness(&self) {
+        self.stubborn_liveness.store(true, Ordering::Release);
     }
 
     /// The next remove fails with [`StoreError::Backend`], removing nothing.
@@ -248,7 +265,13 @@ impl HubStore for FaultStore {
                 )))
             });
         }
-        self.inner.resolve(id, op)
+        let gate = self.resolve_gate.lock().take();
+        Box::pin(async move {
+            if let Some(gate) = gate {
+                gate.pass().await;
+            }
+            self.inner.resolve(id, op).await
+        })
     }
 
     fn get(&self, id: InstanceId) -> Option<StoredRegistration> {
@@ -279,6 +302,9 @@ impl HubStore for FaultStore {
     }
 
     fn spawn_liveness_task(self: Arc<Self>, cancel: CancellationToken) -> Option<JoinHandle<()>> {
+        if self.stubborn_liveness.load(Ordering::Acquire) {
+            return Some(tokio::spawn(std::future::pending()));
+        }
         Arc::clone(&self.inner).spawn_liveness_task(cancel)
     }
 }

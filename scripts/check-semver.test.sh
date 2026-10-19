@@ -172,7 +172,11 @@ EOF
     fi
     if [[ "${VELO_HUB:-0}" == "1" ]]; then
         mkdir -p lib/velo-hub/src
-        printf '[package]\nname = "velo-hub"\nversion.workspace = true\nedition.workspace = true\n\n[dependencies]\nvelo = { workspace = true }\n' > lib/velo-hub/Cargo.toml
+        if [[ "${VELO_HUB_DOTTED:-0}" == "1" ]]; then
+            printf '[package]\nname = "velo-hub"\nversion.workspace = true\nedition.workspace = true\n\n[dependencies]\nvelo.workspace = true\n' > lib/velo-hub/Cargo.toml
+        else
+            printf '[package]\nname = "velo-hub"\nversion.workspace = true\nedition.workspace = true\n\n[dependencies]\nvelo = { workspace = true }\n' > lib/velo-hub/Cargo.toml
+        fi
         echo "pub fn touch() {} // ${marker}" > lib/velo-hub/src/lib.rs
     fi
     # VELO_REQ adds the workspace velo requirement velo-hub inherits.
@@ -566,6 +570,24 @@ stale_case w '[workspace.dependencies]\n"velo" = { path = "lib/velo", version = 
 # would read 0.11.0 there and pass a requirement that has no version.
 stale_case x '[workspace.dependencies]\nvelo = { path = "lib/velo" } # version = "0.11.0"' 'could not find the velo requirement' 1 'a version only in a comment'
 stale_case y '[ workspace.dependencies ]\nvelo = { path = "lib/velo", version = "0.10.0" }' 'does not match the workspace version 0.11.0' 0 'a table header with spaces'
+
+# A requirement line commented out above the real one must not be read.
+stale_case z '[workspace.dependencies]\n# velo = { path = "lib/velo", version = "0.11.0" }\nvelo = { path = "lib/velo", version = "0.10.0" }' 'does not match the workspace version 0.11.0' 0 'a line under a commented-out one'
+# An inheritor in dotted form also makes an unreadable requirement fail.
+VELO_HUB_DOTTED=1 stale_case za '[workspace.dependencies]\n"velo" = { path = "lib/velo", version = "0.10.0" }' 'could not find the velo requirement' 1 'a form the check cannot read, with a dotted inheritor'
+
+# ── (zb) an explicit caret and a pre-release workspace version pass ──────────
+reset_index
+publish velo 0.10.0
+publish velo-ext 0.5.0
+VELO_DEP_BLOCK='[workspace.dependencies]\nvelo = { path = "lib/velo", version = "^0.11.0" }' SEMVER_SKIP=true run_case zb 0.10.0 0.5.0 0.11.0-rc.1 0.5.0
+out=$(cat "$TMP_ROOT/zb.out")
+ok=1
+if [[ "$(cat "$TMP_ROOT/zb.exit")" == "0" ]] \
+    && echo "$out" | grep -qF 'velo requirement 0.11.0 tracks workspace version 0.11.0-rc.1'; then
+    ok=0
+fi
+report "(zb) an explicit caret against a pre-release workspace version passes" "$ok" "$out"
 
 echo ""
 

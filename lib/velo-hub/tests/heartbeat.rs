@@ -207,3 +207,41 @@ async fn a_hung_store_touch_does_not_stop_the_heartbeat_or_hang_shutdown() {
         started.elapsed()
     );
 }
+
+/// The heartbeat's conditional remove, after a peer failed its probes,
+/// is bounded too: a hung one does not stop the probes of other peers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_store_remove_does_not_stop_the_heartbeat() {
+    let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::new(
+        velo_hub::store::InMemoryStore::builder()
+            .ttl(Duration::from_millis(800))
+            .prune_interval(Duration::from_millis(50))
+            .build(),
+    ));
+    let mut config = config();
+    config.server.heartbeat_interval = Duration::from_millis(100);
+    config.server.heartbeat_max_failures = 1;
+    config.server.step_timeout = Duration::from_millis(200);
+    let hub = Hub::builder(config)
+        .store(store.clone())
+        .velo(velo_builder())
+        .serve()
+        .await
+        .unwrap();
+    let healthy = new_velo().await;
+    install_heartbeat(&healthy);
+    wire_mutual(&hub, &healthy).await;
+    let _gate = store.gate_next_remove();
+    let wedged = new_velo().await;
+    install_wedged_heartbeat(&wedged, Duration::from_secs(60));
+    wire_mutual(&hub, &wedged).await;
+    tokio::time::sleep(Duration::from_millis(1600)).await;
+    assert!(
+        registered_ids(&hub).contains(&healthy.instance_id()),
+        "the heartbeat stopped behind one hung remove"
+    );
+    tokio::time::timeout(Duration::from_secs(5), hub.shutdown())
+        .await
+        .expect("shutdown hung")
+        .unwrap();
+}

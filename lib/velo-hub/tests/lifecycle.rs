@@ -1182,3 +1182,68 @@ async fn zero_intervals_are_rejected_before_binding() {
         assert!(format!("{error:#}").contains(field), "{field}: {error:#}");
     }
 }
+
+/// A hub task that ignores its cancellation (a broken backend's liveness
+/// task) is aborted after `shutdown_timeout_ms`, not waited on forever.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_task_that_ignores_cancellation_does_not_hang_shutdown() {
+    let store = Arc::new(FaultStore::default());
+    store.stubborn_liveness();
+    let mut config = config();
+    config.server.shutdown_timeout = Duration::from_millis(300);
+    let hub = Hub::builder(config)
+        .store(store.clone())
+        .serve()
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(3), hub.shutdown())
+        .await
+        .expect("shutdown waited on a task that ignores cancellation")
+        .unwrap();
+}
+
+/// A removal queued while shutdown waits for the lock is still delivered:
+/// shutdown drains the lifecycle queue before the extensions shut down.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_delivers_the_removals_still_queued() {
+    let store = Arc::new(FaultStore::default());
+    let hub = builder()
+        .store(store.clone())
+        .extension(Ledger::default())
+        .serve()
+        .await
+        .unwrap();
+    let ledger = hub.extension::<Ledger>().unwrap();
+    // Two: the lifecycle task holds one while it waits for the lock, and
+    // the other stays in its queue.
+    let victims = [make_peer(), make_peer()];
+    for victim in &victims {
+        register(&hub, &request_with(victim, &[ledger_opt_in()]), None).await;
+    }
+    let gate = ledger.gate_next_prepare();
+    let held = tokio::spawn({
+        let hub = hub.clone();
+        let body = request(&make_peer());
+        async move { post_register(&hub, &body, None).await.status() }
+    });
+    gate.entered().await;
+    // Shutdown queues on the lock first, then the lifecycle task behind it.
+    let shutdown = tokio::spawn({
+        let hub = hub.clone();
+        async move { hub.shutdown().await }
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for victim in &victims {
+        store.expire(victim.instance_id());
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    gate.release();
+    let _ = held.await;
+    shutdown.await.unwrap().unwrap();
+    for victim in &victims {
+        assert!(
+            !ledger.has_owner(victim.instance_id()),
+            "a queued removal was dropped"
+        );
+    }
+}

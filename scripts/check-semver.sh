@@ -28,7 +28,7 @@ SEMVER_INDEX_URL="${SEMVER_INDEX_URL:-https://index.crates.io}"
 # and a [workspace.dependencies.velo] table.
 toml_value() {
     awk -v section="[$1]" -v key="$2" -v subtable="${3:+[$1.$3]}" '
-        { line = $0; sub(/^[[:space:]]*#.*$/, "", line); sub(/[[:space:]]+#.*$/, "", line) }
+        { line = $0; sub(/[[:space:]]+#.*$/, "", line) }
         line ~ /^[[:space:]]*\[/ {
             header = line; gsub(/[[:space:]]/, "", header)
             in_section = (header == section); in_subtable = (subtable != "" && header == subtable)

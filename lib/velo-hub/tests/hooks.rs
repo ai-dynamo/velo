@@ -231,12 +231,16 @@ async fn prepare_deadline_aborts_and_releases_the_lock() {
     let incarnation = f.store.current_incarnation(peer.instance_id()).unwrap();
 
     f.ledger.hang_next_prepare();
-    let response = post_register(
-        &f.hub,
-        &request_with(&peer, &[ledger_opt_in()]),
-        Some(&prior.credential),
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        post_register(
+            &f.hub,
+            &request_with(&peer, &[ledger_opt_in()]),
+            Some(&prior.credential),
+        ),
     )
-    .await;
+    .await
+    .expect("the deadline did not cut prepare off");
     assert_eq!(response.status(), 503);
     assert_eq!(error_code(response).await, ErrorCode::Unavailable);
     assert_prior_intact(&f, &peer, &prior, incarnation).await;
@@ -1318,5 +1322,67 @@ async fn a_late_landing_write_does_not_strand_a_reservation() {
     assert_eq!(
         post_register(&f.hub, &request(&peer), None).await.status(),
         200
+    );
+}
+
+// ---- bounds the third review found untested --------------------------------
+
+/// A store write that never answers is cut off at `step_timeout_ms`; the
+/// read-back finds it did not apply, so the prior registration stands and
+/// the lock is free.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_store_write_is_cut_off_and_aborts() {
+    let f = fixture(
+        |config| config.server.step_timeout = Duration::from_millis(200),
+        false,
+    )
+    .await;
+    let peer = make_peer();
+    let prior = seeded(&f, &peer).await;
+    let incarnation = f.store.current_incarnation(peer.instance_id()).unwrap();
+    let _gate = f.store.gate_next_put();
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        post_register(
+            &f.hub,
+            &request_with(&peer, &[ledger_opt_in()]),
+            Some(&prior.credential),
+        ),
+    )
+    .await
+    .expect("a hung write held the registration");
+    assert_eq!(response.status(), 503);
+    assert_prior_intact(&f, &peer, &prior, incarnation).await;
+}
+
+/// A read-back that never answers is cut off too, and takes the
+/// unresolved path: the registration is dropped and its entry reserved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hung_read_back_is_cut_off_and_fails_closed() {
+    let f = fixture(
+        |config| config.server.step_timeout = Duration::from_millis(200),
+        false,
+    )
+    .await;
+    let peer = make_peer();
+    let prior = seeded(&f, &peer).await;
+    f.store.fault_next_put(PutFault::IndeterminateWritten);
+    let _gate = f.store.gate_next_resolve();
+    let response = tokio::time::timeout(
+        Duration::from_secs(3),
+        post_register(
+            &f.hub,
+            &request_with(&peer, &[ledger_opt_in()]),
+            Some(&prior.credential),
+        ),
+    )
+    .await
+    .expect("a hung read-back held the registration");
+    assert_eq!(response.status(), 503);
+    assert!(!f.ledger.has_owner(peer.instance_id()));
+    assert_eq!(
+        post_register(&f.hub, &request(&peer), None).await.status(),
+        401,
+        "reserved"
     );
 }
