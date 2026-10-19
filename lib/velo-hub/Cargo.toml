@@ -138,3 +138,8 @@ required-features = ["test-support", "etcd"]
 name = "recovery_etcd"
 path = "tests/recovery_etcd.rs"
 required-features = ["test-support", "client", "etcd"]
+
+[[test]]
+name = "ha_etcd"
+path = "tests/ha_etcd.rs"
+required-features = ["test-support", "client", "etcd"]
