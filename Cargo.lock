@@ -3629,7 +3629,6 @@ dependencies = [
  "dashmap",
  "etcd-client",
  "futures",
- "http",
  "parking_lot",
  "reqwest",
  "rmp-serde",
@@ -3643,6 +3642,18 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "velo",
+ "velo-hub-ext",
+]
+
+[[package]]
+name = "velo-hub-ext"
+version = "0.21.0"
+dependencies = [
+ "http",
+ "serde",
+ "serde_json",
+ "uuid",
+ "velo-ext",
 ]
 
 [[package]]
