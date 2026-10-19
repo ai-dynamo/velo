@@ -5,10 +5,9 @@
 //! reaper task.
 //!
 //! Writes take the write lock. Registrations and removals are rare; a touch
-//! (one per registrant per heartbeat) is frequent but O(1), so
-//! the lock is held briefly. The removal
-//! hook is always called after the lock is released, so a hook may read
-//! the store. Discovery lookups, which are on the request path, read two
+//! (one per registrant per heartbeat) is frequent but O(1), so the lock is
+//! held briefly. The removal hook is always called after the lock is
+//! released, so a hook may read the store. Discovery lookups, which are on the request path, read two
 //! sharded maps of peers that each write updates while it holds the lock:
 //! one shard read lock and a clone of the `PeerInfo`. Measured by
 //! `store::memory::tests::lookup_cost` (release, 10,000 peers, 20-core

@@ -65,9 +65,10 @@ pub struct ServerConfig {
     pub step_timeout: Duration,
     /// Shutdown budget, applied to each wait in turn: the registration
     /// lock (at least as long as a registration can hold it, a few
-    /// `step_timeout`s); the lifecycle task; each extension `shutdown`; each hub task to stop; the HTTP requests in flight to
-    /// finish, then, after they are ended with 503, their connections to
-    /// close; and the drain of the hub's velo instance.
+    /// `step_timeout`s); the lifecycle task; each extension `shutdown`;
+    /// each hub task to stop; the HTTP requests in flight to finish, then,
+    /// after they are ended with 503, their connections to close; and the
+    /// drain of the hub's velo instance.
     #[serde(rename = "shutdown_timeout_ms", with = "millis")]
     pub shutdown_timeout: Duration,
 }

@@ -25,8 +25,10 @@
 //! leave the hub half stopped: close admission; take the registration lock
 //! (waits for the registration in flight); stop extension background work;
 //! drain removal delivery; shut extensions down in reverse order; stop the
-//! heartbeat and reaper; release the lock; drain both listeners, for at
-//! most `shutdown_timeout_ms`; remove the pinned entry; shut velo down.
+//! heartbeat and reaper; release the lock; drain both listeners (up to
+//! `shutdown_timeout_ms`, then the requests still in flight answer 503 and
+//! the connections get one more budget); remove the pinned entry; shut
+//! velo down.
 
 mod authority;
 mod config;
