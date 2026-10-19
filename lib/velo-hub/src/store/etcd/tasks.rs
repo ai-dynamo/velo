@@ -43,7 +43,8 @@ pub(super) async fn open_watch(
 }
 
 enum Reconnect {
-    Watching(Watcher, WatchStream),
+    /// Boxed: the stream is large, and this is built once per reconnect.
+    Watching(Box<(Watcher, WatchStream)>),
     /// History after the last applied revision is gone.
     Compacted,
     Failed(String),
@@ -69,7 +70,7 @@ async fn reconnect(shared: &Shared) -> Reconnect {
         Err(_) => return Reconnect::Failed("the compaction probe timed out".to_string()),
     }
     match open_watch(shared, start).await {
-        Ok((watcher, stream)) => Reconnect::Watching(watcher, stream),
+        Ok(watch) => Reconnect::Watching(Box::new(watch)),
         Err(error) => Reconnect::Failed(error),
     }
 }
@@ -142,7 +143,7 @@ pub(super) async fn watch(
                     }
                 }
                 match reconnect(&shared).await {
-                    Reconnect::Watching(watcher, stream) => (watcher, stream),
+                    Reconnect::Watching(watch) => *watch,
                     Reconnect::Compacted => {
                         if !recover(&shared, &cancel).await {
                             return;
