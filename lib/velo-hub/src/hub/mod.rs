@@ -405,6 +405,7 @@ impl HubBuilder {
                 // The first value was read before this task ran; a store
                 // already fenced by then never changes again.
                 if *continuity.borrow() == Continuity::Fenced {
+                    authority.set_continuity(Continuity::Fenced);
                     fenced.cancel();
                     return;
                 }

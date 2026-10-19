@@ -1667,3 +1667,47 @@ async fn stop_waits_out_a_slow_conforming_transaction() {
         "stop gave up on the lock and left the queued removal undelivered"
     );
 }
+
+/// A recovery registration (a reserved owner presenting its credential)
+/// that fails before its write changed nothing: the answer must not be
+/// `register_again`, which would make the client drop the one credential
+/// that can recover the entry.
+#[tokio::test]
+async fn a_recovery_that_fails_before_its_write_is_not_register_again() {
+    let f = plain().await;
+    let peer = make_peer();
+    let owner = peer.instance_id();
+    let prior = seeded(&f, &peer).await;
+    // Reserve the owner: an unresolved write drops the registration and
+    // reserves the entry, whose record holds the presented credential.
+    f.store.fault_next_put(PutFault::IndeterminateWritten);
+    f.store.fail_next_resolve();
+    let response = post_register(
+        &f.hub,
+        &request_with(&peer, &[ledger_opt_in()]),
+        Some(&prior.credential),
+    )
+    .await;
+    assert_eq!(error_code(response).await, ErrorCode::RegisterAgain);
+    assert_eq!(
+        heartbeat_status(&f.hub, owner, Some(&prior.credential)).await,
+        409,
+        "reserved"
+    );
+    // The recovery's put fails before anything is written.
+    f.store.fault_next_put(PutFault::Fail);
+    let response = post_register(&f.hub, &request(&peer), Some(&prior.credential)).await;
+    let (status, code) = (response.status(), error_code(response).await);
+    assert_ne!(
+        code,
+        ErrorCode::RegisterAgain,
+        "nothing was written; got {status} {code:?}"
+    );
+    assert_eq!(
+        post_register(&f.hub, &request(&peer), Some(&prior.credential))
+            .await
+            .status(),
+        200,
+        "the credential still recovers"
+    );
+}

@@ -28,7 +28,7 @@ pub(super) async fn open_watch(
     shared: &Shared,
     start: i64,
 ) -> Result<(Watcher, WatchStream), String> {
-    let mut client = shared.client.watch_client();
+    let mut client = super::builder::watch(&shared.client);
     let options = WatchOptions::new().with_prefix().with_start_revision(start);
     match tokio::time::timeout(
         shared.settings.request_deadline,
@@ -56,7 +56,7 @@ enum Reconnect {
 /// briefly report `Live` over a stale cache.
 async fn reconnect(shared: &Shared) -> Reconnect {
     let start = *shared.applied.borrow() + 1;
-    let mut kv = shared.client.kv_client();
+    let mut kv = super::builder::kv(&shared.client);
     let probe = kv.get(
         shared.keys.barrier.as_str(),
         Some(GetOptions::new().with_revision(start)),

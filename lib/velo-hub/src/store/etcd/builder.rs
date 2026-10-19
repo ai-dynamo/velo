@@ -251,7 +251,7 @@ impl EtcdStoreBuilder {
         let holder = format!("velo-hub store {}", uuid::Uuid::new_v4());
         let taken = bounded(
             deadline,
-            client.kv_client().txn(
+            kv(&client).txn(
                 Txn::new()
                     .when([Compare::version(keys.lock.as_str(), CompareOp::Equal, 0)])
                     .and_then([TxnOp::put(
@@ -328,7 +328,7 @@ async fn load(
 ) -> anyhow::Result<(Vec<KeyValue>, i64)> {
     let mut response = bounded(
         deadline,
-        client.kv_client().get(
+        kv(client).get(
             keys.instances.as_str(),
             Some(GetOptions::new().with_prefix()),
         ),
@@ -379,7 +379,7 @@ async fn start(
         let count = pinned.len();
         let deleted = bounded(
             deadline,
-            client.kv_client().txn(
+            kv(&client).txn(
                 Txn::new()
                     .when([Compare::lease(
                         keys.lock.as_str(),
@@ -459,4 +459,17 @@ async fn start(
         cancel,
         tasks: Mutex::new(handles),
     })
+}
+
+/// A KV client for this store. tonic's default decode limit (4 MiB) is
+/// below one load of the prefix at the hub's target scale (about 590 bytes
+/// an entry on the wire: the limit falls near 7,000 registrants), and etcd
+/// itself puts no cap on a response, so the store lifts it.
+pub(super) fn kv(client: &Client) -> etcd_client::KvClient {
+    client.kv_client().max_decoding_message_size(usize::MAX)
+}
+
+/// A watch client for this store, without tonic's decode limit (see [`kv`]).
+pub(super) fn watch(client: &Client) -> etcd_client::WatchClient {
+    client.watch_client().max_decoding_message_size(usize::MAX)
 }

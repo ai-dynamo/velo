@@ -377,7 +377,7 @@ impl Shared {
         deadline: Instant,
         what: &str,
     ) -> Result<TxnResponse, StoreError> {
-        let mut kv = self.client.kv_client();
+        let mut kv = super::builder::kv(&self.client);
         match tokio::time::timeout_at(deadline, kv.txn(txn)).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(error)) => Err(classify(error, what)),

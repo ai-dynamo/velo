@@ -809,3 +809,54 @@ async fn etcd_store_cost() {
     );
     assert!(store.list().is_empty());
 }
+
+/// A prefix at the hub's target scale loads: 10,000 records of a realistic
+/// size (an epoch, two credential digests, a 48-byte address, a services
+/// payload) make one load response larger than tonic's default 4 MiB
+/// decode limit, which the store lifts. Without that, a hub restarted on
+/// such a prefix could not connect, and a store that lost history could
+/// never reload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prefix_at_target_scale_loads() {
+    use velo_hub::protocol::RegistrationEpoch;
+    use velo_hub::store::CredentialDigest;
+    const ENTRIES: usize = 10_000;
+    let prefix = prefix();
+    let store = Arc::new(builder(&prefix).connect().await.expect("connect"));
+    let digest = CredentialDigest::of(
+        &velo_hub::protocol::Credential::from_header_str("00000000-0000-4000-8000-000000000001")
+            .unwrap(),
+    );
+    let mut writers = Vec::new();
+    for chunk in 0..32 {
+        let store = Arc::clone(&store);
+        writers.push(tokio::spawn(async move {
+            for _ in (chunk..ENTRIES).step_by(32) {
+                let peer = PeerInfo::new(
+                    InstanceId::new_v4(),
+                    WorkerAddress::from_encoded(vec![7u8; 48]),
+                );
+                let mut record = RegistrationRecord::bare(peer);
+                record.epoch = Some(RegistrationEpoch::new());
+                record.accepted = Some(digest);
+                record.pending = Some(digest);
+                record
+                    .extensions
+                    .insert("services".into(), serde_json::json!(["svc-a", "svc-b"]));
+                store.put(record, None).await.unwrap();
+            }
+        }));
+    }
+    for writer in writers {
+        writer.await.unwrap();
+    }
+    store.close().await;
+    drop(store);
+    let reloaded = builder(&prefix)
+        .wait_for_prefix(Duration::from_secs(15))
+        .connect()
+        .await
+        .unwrap_or_else(|error| panic!("a prefix of {ENTRIES} records does not load: {error}"));
+    assert_eq!(reloaded.list().len(), ENTRIES);
+    reloaded.close().await;
+}
