@@ -49,7 +49,9 @@ impl Gate {
         self.release.add_permits(1);
     }
 
-    async fn pass(&self) {
+    /// Called by the gated operation: announce arrival, then wait for
+    /// [`release`](Self::release).
+    pub async fn pass(&self) {
         self.entered.notify_one();
         if let Ok(permit) = self.release.acquire().await {
             permit.forget();

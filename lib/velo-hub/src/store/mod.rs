@@ -33,7 +33,7 @@ pub mod conformance;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
 
-pub use memory::{InMemoryStore, InMemoryStoreBuilder};
+pub use memory::{DEFAULT_PRUNE_INTERVAL, DEFAULT_TTL, InMemoryStore, InMemoryStoreBuilder};
 
 /// Identity of one successful [`HubStore::put`].
 ///
