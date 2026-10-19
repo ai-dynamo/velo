@@ -318,6 +318,10 @@ pub trait HubStore: PeerDiscovery + Send + Sync + 'static {
     ) -> BoxFuture<'_, Result<(), StoreError>>;
 
     /// Refresh liveness if `incarnation` is current.
+    ///
+    /// The heartbeat calls this once per registration per tick, one call at
+    /// a time, so a backend's round trip times the fleet size must stay
+    /// well under the heartbeat interval.
     fn touch(
         &self,
         id: InstanceId,

@@ -11,7 +11,7 @@
 //! detached and each times out after one interval, so a wedged peer does
 //! not delay the others.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -52,6 +52,10 @@ pub(crate) fn spawn(
     let (tx, mut rx) = mpsc::unbounded_channel::<ProbeOutcome>();
     tokio::spawn(async move {
         let mut tick = tokio::time::interval(interval);
+        // Outcomes are handled one at a time, each awaiting a store call, so
+        // the loop can miss ticks. Replaying them (tokio's default) would fan
+        // out a full round of probes per missed tick at once.
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         tick.tick().await;
         let mut failures: HashMap<FailureKey, u32> = HashMap::new();
         let mut seq: u64 = 0;
@@ -75,11 +79,16 @@ pub(crate) fn spawn(
 }
 
 fn retain_current_failures(failures: &mut HashMap<FailureKey, u32>, registrations: &[StoredPeer]) {
-    failures.retain(|(id, incarnation), _| {
-        registrations
-            .iter()
-            .any(|stored| stored.peer.instance_id() == *id && stored.incarnation == *incarnation)
-    });
+    if failures.is_empty() {
+        return;
+    }
+    // A set, not a scan per counter: in a partition every registration
+    // fails, and a scan would cost failures x registrations each tick.
+    let current: HashSet<FailureKey> = registrations
+        .iter()
+        .map(|stored| (stored.peer.instance_id(), stored.incarnation))
+        .collect();
+    failures.retain(|key, _| current.contains(key));
 }
 
 fn fan_out(

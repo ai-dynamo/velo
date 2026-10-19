@@ -245,3 +245,44 @@ async fn a_hung_store_remove_does_not_stop_the_heartbeat() {
         .expect("shutdown hung")
         .unwrap();
 }
+
+/// A tick the loop could not take, because it was waiting on a store call,
+/// is skipped, not replayed. Replaying would fan out one full round of
+/// probes per missed interval the moment the call returns, and with a slow
+/// store the loop would spend its time fanning out instead of counting
+/// failures.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn missed_ticks_are_skipped_not_replayed() {
+    let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::new(
+        velo_hub::store::InMemoryStore::builder()
+            .ttl(Duration::from_secs(60))
+            .build(),
+    ));
+    let interval = Duration::from_millis(50);
+    let mut config = config();
+    config.server.heartbeat_interval = interval;
+    config.server.step_timeout = Duration::from_secs(5);
+    let hub = Hub::builder(config)
+        .store(store.clone())
+        .velo(velo_builder())
+        .serve()
+        .await
+        .unwrap();
+    let peer = new_velo().await;
+    let probes = install_counting_heartbeat(&peer);
+    wire_mutual(&hub, &peer).await;
+
+    let gate = store.gate_next_touch();
+    gate.entered().await;
+    // Twelve intervals pass while the loop waits on the touch.
+    tokio::time::sleep(interval * 12).await;
+    let before = probes.load(std::sync::atomic::Ordering::Acquire);
+    gate.release();
+    tokio::time::sleep(interval / 2).await;
+    let burst = probes.load(std::sync::atomic::Ordering::Acquire) - before;
+    assert!(
+        burst <= 2,
+        "{burst} probes within half an interval of the store call returning"
+    );
+    hub.shutdown().await.unwrap();
+}
