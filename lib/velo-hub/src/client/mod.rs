@@ -9,6 +9,9 @@
 //!              listeners; dropping the last clone sends DELETE
 //! HubDiscovery PeerDiscovery for velo; shares the HTTP client, holds no
 //!              registration, so velo keeping it does not keep a registration
+//! HubServices  ServiceDiscovery: list, get, watch (services.rs, sse.rs)
+//! HubServiceRegistration  one per name the client serves; the names follow
+//!              the registration
 //! ExtClient    JSON calls under /v1/ext/{name}; control calls carry the credential
 //! ```
 //!
@@ -26,7 +29,7 @@
 //! # }
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -37,6 +40,11 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use velo::discovery::PeerDiscovery;
 use velo::{Handler, InstanceId, PeerInfo, Velo, VeloBuilder, WorkerId};
+
+mod services;
+mod sse;
+
+pub use services::{HubServiceRegistration, HubServices};
 
 use crate::protocol::{
     self, CREDENTIAL_HEADER, Credential, DEFAULT_CONTROL_PORT, DEFAULT_PUBLIC_PORT, ErrorBody,
@@ -83,6 +91,12 @@ pub enum ClientError {
     /// The hub URL is not valid.
     #[error("invalid hub url: {0}")]
     InvalidUrl(String),
+    /// Not a service name: see [`protocol::SERVICE_NAME_RULE`].
+    #[error("{0:?} is not a service name: {rule}", rule = protocol::SERVICE_NAME_RULE)]
+    InvalidServiceName(String),
+    /// The client already serves this service; it holds one guard per name.
+    #[error("the client already serves {0:?}")]
+    AlreadyServing(String),
     /// The local velo instance refused a step (installing the heartbeat
     /// handler).
     #[error("velo: {0:#}")]
@@ -168,8 +182,11 @@ impl HubClientBuilder {
 
     /// A configured `reqwest::Client` (TLS, proxies, timeouts). It keeps its
     /// own timeouts: without one, a call to a hub that is gone waits for
-    /// ever. Without this, the client uses [`DEFAULT_CONNECT_TIMEOUT`] and
-    /// [`DEFAULT_REQUEST_TIMEOUT`].
+    /// ever. It also serves service watches, where a total request timeout
+    /// ends every watch after that long; prefer a read timeout. Without
+    /// this, the client uses [`DEFAULT_CONNECT_TIMEOUT`] and
+    /// [`DEFAULT_REQUEST_TIMEOUT`], and [`DEFAULT_WATCH_IDLE_TIMEOUT`] for
+    /// watches.
     pub fn http_client(mut self, http: reqwest::Client) -> Self {
         self.http = Some(http);
         self
@@ -190,15 +207,24 @@ impl HubClientBuilder {
             Url::parse(&format!("{}://{host}:{port}", self.scheme))
                 .map_err(|error| ClientError::InvalidUrl(format!("{host}:{port}: {error}")))
         };
-        let http = match self.http {
-            Some(http) => http,
-            None => reqwest::Client::builder()
-                .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
-                .timeout(DEFAULT_REQUEST_TIMEOUT)
-                .build()?,
+        // A watch is one long response, so the default watch client has no
+        // total timeout, only an idle one longer than the hub's keep-alive.
+        let (http, watch) = match self.http {
+            Some(http) => (http.clone(), http),
+            None => (
+                reqwest::Client::builder()
+                    .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+                    .timeout(DEFAULT_REQUEST_TIMEOUT)
+                    .build()?,
+                reqwest::Client::builder()
+                    .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
+                    .read_timeout(DEFAULT_WATCH_IDLE_TIMEOUT)
+                    .build()?,
+            ),
         };
         let endpoints = Arc::new(Endpoints {
             http,
+            watch,
             public: url(self.public_port)?,
             control: url(self.control_port)?,
         });
@@ -216,14 +242,22 @@ impl HubClientBuilder {
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Request timeout of the client's default HTTP client. Longer than a
-/// registration can take on a hub with default settings and up to three
-/// extensions: 5 s for the lock, then 5 s for each of `2n + 3` steps.
+/// registration can take on a hub with default settings and up to two
+/// extensions of its own: 5 s for the lock, then 5 s for each of `2n + 3`
+/// steps, where `n` counts the built-in service directory too.
 pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The HTTP client and the two listener URLs, shared by every handle.
+/// Idle timeout of a service watch on the default client: no bytes for
+/// this long (the hub sends a keep-alive every 10 s) ends the watch with
+/// `Disconnected`.
+pub const DEFAULT_WATCH_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The HTTP clients and the two listener URLs, shared by every handle.
 #[derive(Debug)]
 struct Endpoints {
     http: reqwest::Client,
+    /// For service watches: no total timeout.
+    watch: reqwest::Client,
     public: Url,
     control: Url,
 }
@@ -313,6 +347,17 @@ impl State {
 #[derive(Debug, Default)]
 struct Shared {
     state: parking_lot::Mutex<State>,
+    /// The services this client serves, one guard each.
+    serving: parking_lot::Mutex<BTreeSet<String>>,
+    /// The services the hub holds for the registration, as far as the
+    /// client knows: set by each registration (which carries `serving`),
+    /// then moved toward `serving` by `sync_services`, one request at a
+    /// time. Empty without a registration.
+    confirmed: parking_lot::Mutex<BTreeSet<String>>,
+    /// Names whose last request got no answer from the hub (a dropped
+    /// future, a timeout, a proxy's 504): the hub may or may not have
+    /// applied it. `sync_services` sends these first, as `serving` says.
+    unsettled: parking_lot::Mutex<BTreeSet<String>>,
     seq: AtomicU64,
     at_unix_ms: AtomicU64,
 }
@@ -336,8 +381,45 @@ impl Shared {
             .is_some_and(|response| &response.credential == credential)
         {
             state.response = None;
+            self.confirmed.lock().clear();
+            self.unsettled.lock().clear();
         }
     }
+
+    /// One call that presents the registration's credential. The one place
+    /// that applies the rule every such call follows: an answer that says
+    /// the hub does not accept the credential drops the registration, and
+    /// on a core route so does `not_found` (on an extension route a 404 can
+    /// be the extension's own miss).
+    async fn credentialed<B: Serialize + ?Sized, T: DeserializeOwned>(
+        &self,
+        endpoints: &Endpoints,
+        method: Method,
+        url: Url,
+        body: Option<&B>,
+        route: Route,
+    ) -> Result<T, ClientError> {
+        let (_, credential) = self.credential().ok_or(ClientError::NotRegistered)?;
+        let answer = endpoints.call(method, url, Some(&credential), body).await;
+        if let Err(error) = &answer {
+            let dead = match route {
+                Route::Core => owns_nothing(error),
+                Route::Extension => credential_rejected(error),
+            };
+            if dead {
+                self.forget(&credential);
+            }
+        }
+        answer
+    }
+}
+
+/// Which kind of route a credentialed call goes to; see
+/// [`Shared::credentialed`].
+#[derive(Clone, Copy)]
+enum Route {
+    Core,
+    Extension,
 }
 
 /// One register call. Its `Drop` runs on every exit, also when the future
@@ -366,12 +448,21 @@ impl<'a> Acquiring<'a> {
 
 impl Drop for Acquiring<'_> {
     fn drop(&mut self) {
+        // One lock for both writes, so no probe sees the flag still set on
+        // a registration already dropped.
+        let mut state = self.shared.state.lock();
         if !self.answered
             && let Some(credential) = &self.presented
+            && state
+                .response
+                .as_ref()
+                .is_some_and(|response| &response.credential == credential)
         {
-            self.shared.forget(credential);
+            state.response = None;
+            self.shared.confirmed.lock().clear();
+            self.shared.unsettled.lock().clear();
         }
-        self.shared.state.lock().acquiring = false;
+        state.acquiring = false;
     }
 }
 
@@ -518,6 +609,11 @@ impl HubClient {
     /// nothing (`unauthorized`, `register_again`) drops the registration
     /// the client held, so the next call registers afresh.
     ///
+    /// The registration carries the services the client serves (the
+    /// `services` payload; one the caller sets is replaced). It answers
+    /// `Ok` once the registration is held: a failure to sync services
+    /// changed during the call is left for [`sync_services`](Self::sync_services).
+    ///
     /// Cancellation: if this future is dropped, the hub may still commit
     /// the registration. The client then holds nothing, answers the hub's
     /// probes not ok, and the hub removes that registration after
@@ -525,40 +621,67 @@ impl HubClient {
     pub async fn register_peer(
         &self,
         peer: PeerInfo,
-        extensions: Extensions,
+        mut extensions: Extensions,
     ) -> Result<RegisterResponse, ClientError> {
-        let _op = self.inner.op.lock().await;
-        let presented = self.check_peer(peer.instance_id())?;
-        let endpoints = &self.inner.endpoints;
-        let url = Endpoints::join(&endpoints.control, protocol::paths::INSTANCES)?;
-        let request = RegisterRequest { peer, extensions };
-        // From here to the answer, no early return: a drop of `call` without
-        // an answer means "the request may have reached the hub".
-        let shared = &self.inner.shared;
-        let mut call = Acquiring::start(shared, presented.clone());
-        let answer: Result<RegisterResponse, ClientError> = endpoints
-            .call(Method::POST, url, presented.as_ref(), Some(&request))
-            .await;
-        call.answered = true;
-        match answer {
-            Ok(response) => {
-                // Set before `call` clears `acquiring`, so a probe never
-                // finds neither.
-                let mut state = shared.state.lock();
-                state.response = Some(response.clone());
-                state.orphaned = false;
-                Ok(response)
-            }
-            Err(error) => {
-                if credential_rejected(&error) {
-                    match &presented {
-                        Some(credential) => shared.forget(credential),
-                        None => shared.state.lock().orphaned = true,
-                    }
+        let response = {
+            let _op = self.inner.op.lock().await;
+            let presented = self.check_peer(peer.instance_id())?;
+            let shared = &self.inner.shared;
+            // The registration carries the names this client serves, and
+            // the hub sets the owner's services to exactly these: after any
+            // registration (fresh, re-registered, or on a restarted hub) the
+            // hub's set is the client's.
+            let serving: BTreeSet<String> = shared.serving.lock().clone();
+            extensions.insert(
+                protocol::SERVICES_EXTENSION.to_string(),
+                serde_json::to_value(&serving).expect("names serialize"),
+            );
+            let endpoints = &self.inner.endpoints;
+            let url = Endpoints::join(&endpoints.control, protocol::paths::INSTANCES)?;
+            let request = RegisterRequest { peer, extensions };
+            // From here to the answer, no early return: a drop of `call`
+            // without an answer means "the request may have reached the hub".
+            let mut call = Acquiring::start(shared, presented.clone());
+            let answer: Result<RegisterResponse, ClientError> = endpoints
+                .call(Method::POST, url, presented.as_ref(), Some(&request))
+                .await;
+            // Answered means the hub answered (any `ErrorBody`), or the
+            // request provably never left (could not connect). Anything else,
+            // a timeout, a broken connection, a proxy's 502 or 504, a body
+            // that does not decode, may hide a commit the client cannot read:
+            // that is no answer, and the guard fails closed.
+            call.answered = match &answer {
+                Ok(_) | Err(ClientError::Hub { .. }) => true,
+                Err(ClientError::Transport(error)) => error.is_connect() || error.is_builder(),
+                Err(_) => false,
+            };
+            match answer {
+                Ok(response) => {
+                    // Set before `call` clears `acquiring`, so a probe never
+                    // finds neither.
+                    let mut state = shared.state.lock();
+                    state.response = Some(response.clone());
+                    state.orphaned = false;
+                    *shared.confirmed.lock() = serving;
+                    shared.unsettled.lock().clear();
+                    response
                 }
-                Err(error)
+                Err(error) => {
+                    if credential_rejected(&error) {
+                        match &presented {
+                            Some(credential) => shared.forget(credential),
+                            None => shared.state.lock().orphaned = true,
+                        }
+                    }
+                    return Err(error);
+                }
             }
-        }
+        };
+        // Names added or dropped while the request ran. The registration is
+        // held either way; a failure here stays in the diff for the next
+        // pass (`sync_services`).
+        let _ = self.sync_services().await;
+        Ok(response)
     }
 
     /// Unregister. Without a registration this does nothing. On failure the
@@ -566,12 +689,24 @@ impl HubClient {
     /// `DELETE` again.
     pub async fn unregister(&self) -> Result<(), ClientError> {
         let _op = self.inner.op.lock().await;
-        let Some((instance_id, credential)) = self.inner.shared.credential() else {
+        let shared = &self.inner.shared;
+        let Some((instance_id, credential)) = shared.credential() else {
             return Ok(());
         };
-        delete(&self.inner.endpoints, instance_id, &credential).await?;
-        self.inner.shared.forget(&credential);
-        Ok(())
+        let endpoints = &self.inner.endpoints;
+        let url = Endpoints::join(&endpoints.control, &protocol::instance_by_id(instance_id))?;
+        match shared
+            .credentialed::<(), ()>(endpoints, Method::DELETE, url, None, Route::Core)
+            .await
+        {
+            Ok(()) => {
+                shared.forget(&credential);
+                Ok(())
+            }
+            // Owns nothing there any more; `credentialed` dropped it.
+            Err(error) if owns_nothing(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// Whether the client holds a registration.
@@ -590,32 +725,23 @@ impl HubClient {
     /// [`register`](Self::register); this is for a hub without velo. An
     /// answer that says the hub no longer has the registration drops it.
     pub async fn send_heartbeat(&self) -> Result<(), ClientError> {
-        let (instance_id, credential) = self
-            .inner
-            .shared
-            .credential()
-            .ok_or(ClientError::NotRegistered)?;
+        let shared = &self.inner.shared;
+        let (instance_id, _) = shared.credential().ok_or(ClientError::NotRegistered)?;
         let endpoints = &self.inner.endpoints;
         let url = Endpoints::join(
             &endpoints.control,
             &protocol::instance_heartbeat(instance_id),
         )?;
-        let answer: Result<HeartbeatResponse, ClientError> = endpoints
-            .call::<(), _>(Method::POST, url, Some(&credential), None)
-            .await;
-        match answer {
-            Ok(answer) if answer.acknowledged => Ok(()),
-            Ok(_) => Err(ClientError::Unexpected {
+        let answer: HeartbeatResponse = shared
+            .credentialed::<(), _>(endpoints, Method::POST, url, None, Route::Core)
+            .await?;
+        if !answer.acknowledged {
+            return Err(ClientError::Unexpected {
                 status: StatusCode::OK,
                 body: "heartbeat not acknowledged".to_string(),
-            }),
-            Err(error) => {
-                if owns_nothing(&error) {
-                    self.inner.shared.forget(&credential);
-                }
-                Err(error)
-            }
+            });
         }
+        Ok(())
     }
 
     /// The last hub heartbeat the handler installed by
@@ -739,35 +865,23 @@ impl ExtClient {
         path: &str,
         body: Option<&B>,
     ) -> Result<T, ClientError> {
-        let (base, credential) = match listener {
-            Listener::Public => (&self.endpoints.public, None),
+        let path = format!("{}{path}", self.root);
+        match listener {
+            Listener::Public => {
+                let url = Endpoints::join(&self.endpoints.public, &path)?;
+                self.endpoints.call(method, url, None, body).await
+            }
             Listener::Control => {
                 let shared = self
                     .registration
                     .upgrade()
                     .ok_or(ClientError::NotRegistered)?;
-                let (_, credential) = shared.credential().ok_or(ClientError::NotRegistered)?;
-                (&self.endpoints.control, Some((shared, credential)))
+                let url = Endpoints::join(&self.endpoints.control, &path)?;
+                shared
+                    .credentialed(&self.endpoints, method, url, body, Route::Extension)
+                    .await
             }
-        };
-        let url = Endpoints::join(base, &format!("{}{path}", self.root))?;
-        let answer = self
-            .endpoints
-            .call(
-                method,
-                url,
-                credential.as_ref().map(|(_, credential)| credential),
-                body,
-            )
-            .await;
-        // A rejected credential is dead for every call: drop it, as the
-        // core calls do. A 404 is not: it can be the extension's own miss.
-        if let (Err(error), Some((shared, credential))) = (&answer, &credential)
-            && credential_rejected(error)
-        {
-            shared.forget(credential);
         }
-        answer
     }
 
     /// `GET` on the public listener.

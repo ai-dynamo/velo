@@ -14,6 +14,7 @@ use common::*;
 use serde::{Deserialize, Serialize};
 use velo_hub::client::{ClientError, HubClient, HubClientBuilder};
 use velo_hub::protocol::{ErrorCode, peers_by_instance};
+use velo_hub::store::HubStore;
 use velo_hub::velo::discovery::PeerDiscovery;
 use velo_hub::velo::{Handler, Velo};
 use velo_hub::{Extension, Hub};
@@ -715,8 +716,10 @@ async fn a_tight_register_retry_loop_still_frees_the_orphan() {
                 got_in = true;
                 break;
             }
+            // `busy` while the hub evicts the orphan: retry, as the
+            // protocol says.
             Err(ClientError::Hub {
-                code: ErrorCode::Unauthorized,
+                code: ErrorCode::Unauthorized | ErrorCode::Busy,
                 ..
             }) => continue,
             Err(error) => panic!("{error}"),
@@ -803,5 +806,313 @@ fn an_ipv6_literal_host_builds() {
             "http://[2001:db8::1]:{}/",
             velo_hub::protocol::DEFAULT_PUBLIC_PORT
         )
+    );
+}
+
+// ---- M3 review pass 1 -------------------------------------------------------
+
+fn client_with_http(hub: &Hub, http: reqwest::Client) -> HubClient {
+    HubClient::builder()
+        .host("127.0.0.1")
+        .public_port(hub.public_addr().port())
+        .control_port(hub.control_addr().port())
+        .http_client(http)
+        .build()
+        .unwrap()
+}
+
+/// A `register_service` answered `unauthorized` (the credential was rotated
+/// around the client) drops the registration, like every other call that
+/// presents the credential.
+#[tokio::test]
+async fn register_service_answered_unauthorized_drops_the_registration() {
+    let hub = start().await;
+    let client = client_for(&hub);
+    let peer = make_peer();
+    let first = client
+        .register_peer(peer.clone(), Default::default())
+        .await
+        .unwrap();
+    // Someone with the credential re-registers around the client.
+    let _second = register(&hub, &request(&peer), Some(&first.credential)).await;
+    let error = client.register_service("svc").await.unwrap_err();
+    assert_eq!(error.code(), Some(ErrorCode::Unauthorized), "{error}");
+    assert!(
+        !client.is_registered(),
+        "the client kept a credential the hub rejected"
+    );
+}
+
+/// The same, checked before any further call: a re-registration that got
+/// no answer fails closed (the client holds nothing), so the handler
+/// answers not ok and the hub frees the registration nobody can use.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timed_out_re_registration_leaves_nothing_held() {
+    let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::default());
+    let hub = builder().store(store.clone()).serve().await.unwrap();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_millis(300))
+        .build()
+        .unwrap();
+    let client = client_with_http(&hub, http);
+    let peer = make_peer();
+    client
+        .register_peer(peer.clone(), Default::default())
+        .await
+        .unwrap();
+    let gate = store.gate_next_put();
+    let again = client.register_peer(peer.clone(), Default::default());
+    let (answer, _) = tokio::join!(again, async {
+        gate.entered().await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        gate.release();
+    });
+    assert!(answer.is_err());
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !client.is_registered(),
+        "the client holds a credential that may be dead; it must fail closed"
+    );
+    hub.shutdown().await.unwrap();
+}
+
+/// A re-registration whose request times out on the client while the hub
+/// commits it is the same "no answer" as a dropped future: the hub rotated
+/// the credential, so the one the client held is dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timed_out_re_registration_fails_closed() {
+    let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::default());
+    let hub = builder().store(store.clone()).serve().await.unwrap();
+    let http = reqwest::Client::builder()
+        .timeout(Duration::from_millis(300))
+        .build()
+        .unwrap();
+    let client = client_with_http(&hub, http);
+    let peer = make_peer();
+    let first = client
+        .register_peer(peer.clone(), Default::default())
+        .await
+        .unwrap();
+    let gate = store.gate_next_put();
+    let again = client.register_peer(peer.clone(), Default::default());
+    let (answer, _) = tokio::join!(again, async {
+        gate.entered().await;
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        gate.release();
+    });
+    assert!(
+        matches!(answer, Err(ClientError::Transport(ref e)) if e.is_timeout()),
+        "{answer:?}"
+    );
+    // Give the hub's transaction time to commit.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    // The hub rotated the credential, so the one the client held is dead,
+    // and the client no longer holds it.
+    let id = peer.instance_id();
+    assert!(
+        hub.authority()
+            .authorize(id, Some(&first.credential))
+            .is_err()
+    );
+    assert!(!client.is_registered());
+    hub.shutdown().await.unwrap();
+}
+
+/// An extension whose `on_registered` takes 700 ms when the registrant opts
+/// in: a conforming slow registration, longer than two heartbeat intervals.
+#[derive(Default)]
+struct Slow;
+
+impl velo_hub::Extension for Slow {
+    const NAME: &'static str = "slow";
+    type Registration = ();
+    type Staged = ();
+    async fn prepare(
+        &self,
+        _: &velo_hub::Txn<'_>,
+        _: Option<()>,
+    ) -> Result<(), velo_hub::Rejection> {
+        Ok(())
+    }
+    fn commit(&self, _: (), _: &velo_hub::Committed<'_>) {}
+    async fn on_registered(&self, reg: &velo_hub::Committed<'_>) {
+        if reg.extensions.contains_key("slow") {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+        }
+    }
+    fn on_removed(&self, _: velo_hub::store::Removal) {}
+}
+
+async fn slow_hub() -> Hub {
+    let mut config = config();
+    config.server.heartbeat_interval = Duration::from_millis(100);
+    config.server.heartbeat_max_failures = 2;
+    Hub::builder(config)
+        .velo(velo_builder())
+        .extension(Slow)
+        .serve()
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_registration_keeps_its_entry() {
+    let hub = slow_hub().await;
+    let client = client_for(&hub);
+    let velo = client
+        .velo_builder()
+        .add_transport(tcp_transport())
+        .build()
+        .await
+        .unwrap();
+    client.register(&velo, slow_opt_in()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(client.is_registered());
+    assert!(
+        hub.store().get(velo.instance_id()).is_some(),
+        "control: the entry was evicted even without orphaned"
+    );
+    client.unregister().await.unwrap();
+    hub.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+/// After an orphan was freed, the registration that succeeds must not be
+/// evicted while its transaction runs: the hub does not probe an owner whose
+/// registration is in flight, so a slow `on_registered` cannot let the probes
+/// remove the entry before the client has its answer.
+async fn a_slow_registration_after_an_orphan_keeps_its_entry() {
+    let hub = slow_hub().await;
+    let client = client_for(&hub);
+    let velo = client
+        .velo_builder()
+        .add_transport(tcp_transport())
+        .build()
+        .await
+        .unwrap();
+    // Install the handler; refuse the payload so nothing is held.
+    let mut unknown: std::collections::BTreeMap<String, serde_json::Value> = Default::default();
+    unknown.insert("no-such-extension".into(), serde_json::Value::Null);
+    assert!(client.register(&velo, unknown).await.is_err());
+    // An orphan: a registration the client never got.
+    let _orphan = register(&hub, &request(&velo.peer_info()), None).await;
+    let refused = client.register(&velo, Default::default()).await;
+    assert_eq!(refused.unwrap_err().code(), Some(ErrorCode::Unauthorized));
+    // The hub frees the orphan (handler answers not ok).
+    assert!(
+        eventually(Duration::from_secs(5), || hub
+            .store()
+            .get(velo.instance_id())
+            .is_none())
+        .await
+    );
+    // Now the register that should succeed.
+    let answer = client.register(&velo, slow_opt_in()).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let held = hub.store().get(velo.instance_id()).is_some();
+    assert!(
+        answer.is_ok() && held,
+        "the registration was evicted while it ran: answer ok = {}, hub holds = {held}",
+        answer.is_ok()
+    );
+    let _ = client.unregister().await;
+    hub.shutdown().await.unwrap();
+}
+
+fn slow_opt_in() -> std::collections::BTreeMap<String, serde_json::Value> {
+    let mut m = std::collections::BTreeMap::new();
+    m.insert("slow".to_string(), serde_json::Value::Null);
+    m
+}
+
+/// A panic in an extension's `on_registered` after the credential
+/// committed: the transaction's `Drop` retires the entry and fails the
+/// credential closed, and the hub answers `register_again` (not 500), so
+/// the client drops the credential the hub rotated away.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hub_panic_after_the_write_drops_the_registration() {
+    let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::default());
+    let hub = builder()
+        .store(store.clone())
+        .extension(Ledger::default())
+        .serve()
+        .await
+        .unwrap();
+    let ledger = hub.extension::<Ledger>().unwrap();
+    let client = client_for(&hub);
+    let peer = make_peer();
+    let first = client
+        .register_peer(peer.clone(), Default::default())
+        .await
+        .unwrap();
+
+    ledger.panic_next_registered();
+    let answer = client.register_peer(peer.clone(), Default::default()).await;
+    assert!(
+        matches!(
+            &answer,
+            Err(velo_hub::client::ClientError::Hub {
+                code: velo_hub::protocol::ErrorCode::RegisterAgain,
+                ..
+            })
+        ),
+        "control: {answer:?}"
+    );
+    assert!(
+        eventually(Duration::from_secs(1), || store
+            .get(peer.instance_id())
+            .is_none())
+        .await,
+        "control: the hub retired the entry"
+    );
+    assert!(
+        hub.authority()
+            .authorize(peer.instance_id(), Some(&first.credential))
+            .is_err(),
+        "control: the hub rotated the credential away"
+    );
+    assert!(
+        !client.is_registered(),
+        "the client holds a credential the hub rotated away after a 500 on a re-registration"
+    );
+}
+
+/// The same through an indeterminate store write that cannot be resolved:
+/// the hub drops both the prior registration and the attempted one and
+/// answers `register_again`, so the client drops the prior credential.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unresolved_write_drops_the_registration() {
+    use velo_hub::store::testing::PutFault;
+    let store = std::sync::Arc::new(velo_hub::store::testing::FaultStore::default());
+    let hub = builder().store(store.clone()).serve().await.unwrap();
+    let client = client_for(&hub);
+    let peer = make_peer();
+    let first = client
+        .register_peer(peer.clone(), Default::default())
+        .await
+        .unwrap();
+
+    store.fault_next_put(PutFault::IndeterminateWritten);
+    store.fail_next_resolve();
+    let answer = client.register_peer(peer.clone(), Default::default()).await;
+    assert!(
+        matches!(
+            &answer,
+            Err(velo_hub::client::ClientError::Hub {
+                code: velo_hub::protocol::ErrorCode::RegisterAgain,
+                ..
+            })
+        ),
+        "control: {answer:?}"
+    );
+    assert!(
+        hub.authority()
+            .authorize(peer.instance_id(), Some(&first.credential))
+            .is_err(),
+        "control: the hub failed the prior credential closed"
+    );
+    assert!(
+        !client.is_registered(),
+        "the client holds a credential the hub failed closed after a 503 on a re-registration"
     );
 }

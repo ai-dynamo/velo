@@ -49,7 +49,67 @@ pub mod paths {
     pub const INSTANCE_PROBE: &str = "/v1/instances/{instance_id}/probe";
     /// Prefix of every extension's routes: `/v1/ext/{name}/...`.
     pub const EXT: &str = "/v1/ext";
+    /// `GET`: names of the services with at least one instance. Both
+    /// listeners.
+    pub const SERVICES: &str = "/v1/services";
+    /// `GET`: the instances of one service. Both listeners.
+    pub const SERVICE: &str = "/v1/services/{service}";
+    /// `GET`: watch one service as server-sent events. Both listeners.
+    pub const SERVICE_WATCH: &str = "/v1/services/{service}/watch";
+    /// `PUT` / `DELETE`: add or remove an instance of a service, with the
+    /// instance's credential. Control listener.
+    pub const SERVICE_INSTANCE: &str = "/v1/services/{service}/instances/{instance_id}";
 }
+
+/// `/v1/services/{name}`.
+pub fn service(name: &str) -> String {
+    format!("/v1/services/{name}")
+}
+
+/// `/v1/services/{name}/watch`.
+pub fn service_watch(name: &str) -> String {
+    format!("/v1/services/{name}/watch")
+}
+
+/// `/v1/services/{name}/instances/{id}`.
+pub fn service_instance(name: &str, id: InstanceId) -> String {
+    format!("/v1/services/{name}/instances/{id}")
+}
+
+/// The name of the hub's built-in service directory. A registration's
+/// payload under this name is the set of service names the registrant
+/// serves; the hub sets the owner's services to exactly that set.
+pub const SERVICES_EXTENSION: &str = "services";
+
+/// The rule for service names, as error messages state it.
+pub const SERVICE_NAME_RULE: &str = "1 to 128 of A-Z a-z 0-9 . _ -, not . or ..";
+
+/// Whether `name` is a valid service name: see [`SERVICE_NAME_RULE`]. A
+/// valid name is always one URL path segment.
+pub fn is_valid_service_name(name: &str) -> bool {
+    // `.` and `..` are dot segments: a URL resolver removes them, so a
+    // request for such a name would reach another route (`..` would turn a
+    // service's DELETE into an unregister).
+    name != "."
+        && name != ".."
+        && (1..=128).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+/// Names of the events of a service watch. Each event's data is JSON:
+/// [`WATCH_INITIAL`] carries `[instance_id, ...]`, [`WATCH_ADDED`] and
+/// [`WATCH_REMOVED`] one `instance_id`, [`WATCH_DISCONNECTED`] `null`.
+pub const WATCH_INITIAL: &str = "initial";
+/// See [`WATCH_INITIAL`].
+pub const WATCH_ADDED: &str = "added";
+/// See [`WATCH_INITIAL`].
+pub const WATCH_REMOVED: &str = "removed";
+/// See [`WATCH_INITIAL`]. The last event of a stream the hub ends early (the
+/// watcher fell behind); the watcher treats its set as stale and watches
+/// again.
+pub const WATCH_DISCONNECTED: &str = "disconnected";
 
 /// `/v1/peers/instance/{id}`.
 pub fn peers_by_instance(id: InstanceId) -> String {
@@ -328,6 +388,20 @@ pub struct HeartbeatAck {
     /// removes the entry, and the registrant can register again without a
     /// credential.
     pub ok: bool,
+}
+
+/// `GET /v1/services`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServiceListResponse {
+    /// Names with at least one instance, sorted.
+    pub services: Vec<String>,
+}
+
+/// `GET /v1/services/{name}`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServiceInstancesResponse {
+    /// The instances, sorted. Empty for a name nobody serves.
+    pub instances: Vec<InstanceId>,
 }
 
 /// Body of every non-2xx response.

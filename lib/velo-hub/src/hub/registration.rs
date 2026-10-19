@@ -53,11 +53,31 @@ pub(crate) async fn register(
     // Decoding runs in the task too, so a panic in an extension's `decode`
     // or `admit` meets the same boundary as one in `prepare` and answers 500
     // instead of dropping the connection.
-    hub_task("registration", async move {
+    let owner = request.peer.instance_id();
+    let checked = presented.clone();
+    let authority = shared.authority.clone();
+    let answer = hub_task("registration", async move {
         let request = decode(&shared, presented, request)?;
         transact(shared, request).await
     })
-    .await
+    .await;
+    // A panic after the write has dropped the prior registration (the
+    // transaction's `Drop` failed it closed); say so, as every other
+    // post-write failure does, or the client keeps a dead credential.
+    match answer {
+        Err(error)
+            if error.code() == ErrorCode::Internal
+                && checked.as_ref().is_some_and(|credential| {
+                    authority.authorize(owner, Some(credential)).is_err()
+                }) =>
+        {
+            Err(HubError::new(
+                ErrorCode::RegisterAgain,
+                format!("the registration failed after it was recorded; register again: {error}"),
+            ))
+        }
+        other => other,
+    }
 }
 
 /// Run `work` as a task of the hub and wait for it. hyper drops a handler's
@@ -143,6 +163,9 @@ fn decode(
 /// removals itself, before it drops the staged values: an undo in a staged
 /// value must never show state that was just removed.
 struct Transaction<'a> {
+    /// Fields drop after `Drop::drop` has settled the transaction, so the
+    /// heartbeat does not probe the owner until then.
+    _in_flight: super::heartbeat::InFlightGuard<'a>,
     shared: &'a Shared,
     owner: InstanceId,
     permit: Option<RegistrationPermit>,
@@ -261,9 +284,15 @@ impl Transaction<'_> {
         });
         let reservation = self.shared.store.current_incarnation(self.owner);
         self.settle_after_write(removal, reservation);
-        HubError::unavailable(format!(
-            "store write outcome is unknown and could not be resolved ({error}); the registration is dropped and its entry reserved until it expires"
-        ))
+        // `register_again`, not `unavailable`: the prior registration is
+        // gone, and a client that read "unavailable" as "nothing happened"
+        // would keep its dead credential.
+        HubError::new(
+            ErrorCode::RegisterAgain,
+            format!(
+                "store write outcome is unknown and could not be resolved ({error}); the registration is dropped and its entry reserved until it expires"
+            ),
+        )
     }
 
     /// Fail after the store write. One path for every such failure: remove
@@ -318,6 +347,7 @@ async fn transact(shared: Arc<Shared>, request: Request) -> Result<RegisterRespo
         .authority
         .begin_registration(owner, presented.as_ref())?;
     let mut txn = Transaction {
+        _in_flight: shared.in_flight.enter(owner),
         shared: &shared,
         owner,
         permit: Some(permit),
