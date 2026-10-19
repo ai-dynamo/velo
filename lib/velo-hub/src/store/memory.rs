@@ -54,7 +54,6 @@ pub struct InMemoryStore {
 #[derive(Default)]
 struct Inner {
     by_instance: HashMap<InstanceId, StoredRegistration>,
-    by_worker: HashMap<WorkerId, InstanceId>,
     last_seen: HashMap<InstanceId, Instant>,
     last_incarnation: u64,
     hook: Option<RemovalHook>,
@@ -68,9 +67,6 @@ impl InMemoryStore {
         // function of `InstanceId`. A scan here would write-lock every
         // DashMap shard on each removal and make a mass expiry O(n^2).
         let worker = id.worker_id();
-        if inner.by_worker.get(&worker) == Some(&id) {
-            inner.by_worker.remove(&worker);
-        }
         inner.last_seen.remove(&id);
         self.peers.remove(&id);
         self.workers
@@ -163,7 +159,9 @@ impl InMemoryStore {
                 current,
             });
         }
-        if let Some(existing) = inner.by_worker.get(&worker).copied()
+        // The worker view is the worker index; it is written only under the
+        // write lock held here, so this read is current.
+        if let Some(existing) = self.workers.get(&worker).map(|peer| peer.instance_id())
             && existing != id
         {
             return Err(StoreError::Conflict {
@@ -181,7 +179,6 @@ impl InMemoryStore {
         // (`WorkerId` is a function of `InstanceId`), so overwriting in place
         // is the whole update. Overwriting, not remove-then-insert, keeps a
         // lock-free reader from missing a peer that never left.
-        inner.by_worker.insert(worker, id);
         self.workers.insert(worker, record.peer.clone());
         self.peers.insert(id, record.peer.clone());
         inner.by_instance.insert(
@@ -239,7 +236,9 @@ impl InMemoryStore {
 
     #[cfg(test)]
     pub(crate) fn insert_worker_claim(&self, worker: WorkerId, owner: InstanceId) {
-        self.inner.write().by_worker.insert(worker, owner);
+        let _write = self.inner.write();
+        let claim = PeerInfo::new(owner, velo::WorkerAddress::from_encoded(b"claim".to_vec()));
+        self.workers.insert(worker, claim);
     }
 }
 
