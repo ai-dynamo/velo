@@ -81,3 +81,16 @@ Reviewer: Fable, running `thermo-nuclear-code-quality-review`, with two independ
 | S4 | Core routes listed twice | done | suite | (refactor commit) |
 
 Not acted on (recorded): removals produced while extensions shut down are not delivered (a second drain would deliver to extensions already shut down); the removal hook is never uninstalled after a clean shutdown and a dead-runtime drop leaves the pinned entry (M4 design input); an indeterminate put that resolves as applied is failed closed (R6, settled); recovery (M4) must accept a stored digest for a `Reserved` owner and must not evict preloaded entries it has no velo peer for.
+
+## Mega review round 2 (Fable, read-only, range origin/main...3b1b9c5): 3 defects, 3 suggestions
+
+| # | Claim | Ruling | Evidence | Fix commit |
+|---|---|---|---|---|
+| D1 | A write that applied (Indeterminate) and left the store before the read-back restores the prior as Active over an empty store; owner locked out | valid | `a_write_that_applied_then_left_before_the_read_back_does_not_lock_the_owner_out` (failed: prior removal not delivered) | 4dec0bb |
+| D2 | `fail_closed_registration` reserves an incarnation the hook already recorded removed; owner reserved for the hub's life | valid | `an_entry_that_expires_while_a_failed_registration_settles_is_not_reserved` (failed: 401) | 4dec0bb |
+| D3 | A stop without the lock still drains removals; a conforming transaction (several step timeouts) can outlast `shutdown_timeout` | valid, both parts | `a_stop_without_the_lock_delivers_no_removal`, `stop_waits_out_a_slow_conforming_transaction` (fails with the old wait) | 11d8842 |
+| S1 | Touch from each probe task, not serially in the loop | done | `a_hung_touch_does_not_delay_evicting_a_dead_peer` (fails on the old loop); `missed_ticks_are_skipped_not_replayed` now stalls on a remove, still fails without `Skip` | 4661511 |
+| S2 | Incarnations must increase per instance (removals are ordered by them) | done; D1's rule relies on it | conformance `incarnations_increase` | 7221eac |
+| S3 | is_gone, hub_task helper, one probe fn, inline resolve, fail_unresolved method, dead Stale arm | done | suite | 78ea7ae |
+
+Not acted on (recorded): a panicking store or velo call in a hub task (lifecycle, unregister) is not caught, unlike extension code; continuity Lost -> Live does not reconcile, and `State::Removed` is not reclaimed after sync (M4); `GET /v1/instances` copies payloads via `list()` (not a hot path); startup has no deadline on `attach`/`start`; `heartbeat_max_failures = 0` acts as 1; `end_at_stop` costs one waiter per request.
