@@ -779,3 +779,8 @@ Not done or open:
 ### 18.10 Review pass 1, 2026-10-19 (record: /tmp/m7p1/report.md)
 
 Nothing met the bar. Five probes passed, among them an H-2 discriminator (etcd answers delayed 600 ms: `Degraded` at release + 3.002 s, so the deadline runs from the send) and standby contention (one winner per release). The four §18.9 departures were judged sound. Fixed: the book said the hub degrades "before" a standby can take the lock; the guarantee is "no later than". Left as is: peer lookups on a `Degraded` hub do not rotate hosts (by design), no test that the standby grants no lease per poll, a few no-write 503s (lock and prepare timeouts) stay unmarked, which is conservative.
+
+### 18.11 Rulings from the user, 2026-10-19
+
+- **D-1 ratified:** one custody lease per hub (M4's departure from R7) is accepted. M4 merged to `main` as #131 (`2cf026d`).
+- **H-8 and the `not_ready` field:** the user asked for more detail before ruling.
