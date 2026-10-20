@@ -482,9 +482,9 @@ pub trait Transport: Send + Sync {
     /// The runtime's graceful shutdown awaits this on every transport after
     /// calling `shutdown()`. The default returns at once, which is right for a
     /// transport whose close hands unsent bytes to the kernel: the kernel
-    /// delivers them after the process exits. (In-tree TCP and UDS override it
-    /// only to wait for their writers to write what was queued at teardown.)
-    /// A transport that keeps
+    /// delivers them after the process exits. (In-tree TCP and UDS override
+    /// it to wait for their writers to write what was queued at teardown, and
+    /// for their accept loop to close its socket.) A transport that keeps
     /// written data in user space until the peer acknowledges it (QUIC)
     /// overrides this, so that a process which exits right after graceful
     /// shutdown does not discard that data. An override must bound its wait:

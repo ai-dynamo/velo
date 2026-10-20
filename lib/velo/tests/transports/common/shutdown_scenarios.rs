@@ -538,3 +538,43 @@ where
     }
     handle_b.streams.shutdown_state.teardown_token().cancel();
 }
+
+/// A frame admitted to a connection that is still dialing reaches the peer
+/// when teardown lands before the socket exists. The first send to a peer
+/// creates the connection, and the writer dials; a sender may act on the
+/// admission at once (the messenger mux reports a stream sent when its batch
+/// is admitted, which on a new lane is before any socket). A writer that gave
+/// the dial up at teardown failed the frame instead.
+pub async fn a_frame_admitted_while_dialing_survives_teardown<C: ShutdownTestClient>()
+where
+    C::Transport: 'static,
+{
+    let handle_a = C::new_handle().await.unwrap();
+    let handle_b = C::new_handle().await.unwrap();
+    handle_a.register_peer(&handle_b).unwrap();
+
+    // No earlier traffic: this send creates the connection.
+    handle_a.send(
+        handle_b.instance_id,
+        b"cold".to_vec(),
+        vec![0u8; 64],
+        MessageType::Response,
+    );
+    handle_a.streams.shutdown_state.teardown_token().cancel();
+    handle_a.transport.shutdown();
+    timeout(Duration::from_secs(5), handle_a.transport.closed())
+        .await
+        .expect("closed() bounds its wait");
+
+    let (header, _) = timeout(
+        Duration::from_secs(3),
+        handle_b.streams.response_stream.recv_async(),
+    )
+    .await
+    .expect("the frame admitted while dialing arrives")
+    .expect("recv");
+    assert_eq!(&header[..], b"cold");
+    let failed = handle_a.error_handler.get_errors();
+    assert!(failed.is_empty(), "{:?}", failed.first().map(|(_, _, e)| e));
+    handle_b.streams.shutdown_state.teardown_token().cancel();
+}

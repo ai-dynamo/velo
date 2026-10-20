@@ -42,3 +42,13 @@ fn test_shutting_down_frame_roundtrip() {
     assert_eq!(&decoded_header[..], header);
     assert_eq!(decoded_payload.len(), 0);
 }
+
+#[tokio::test]
+async fn test_tcp_a_frame_admitted_while_dialing_survives_teardown() {
+    tokio::time::timeout(
+        OUTER_TEST_TIMEOUT,
+        shutdown_scenarios::a_frame_admitted_while_dialing_survives_teardown::<TcpShutdownClient>(),
+    )
+    .await
+    .expect("a_frame_admitted_while_dialing_survives_teardown timed out");
+}

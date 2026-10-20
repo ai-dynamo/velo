@@ -117,6 +117,80 @@ const FLUSH_FAILED: &str = "batch flush failed";
 /// so that a peer that does not read cannot hold teardown open.
 pub(crate) const TEARDOWN_FLUSH_GRACE: Duration = Duration::from_secs(1);
 
+/// How much longer than the teardown deadline `closed()` waits for the
+/// connection writers. Each one stops by that deadline on its own, so the
+/// margin only matters when the runtime that runs them is not being driven.
+const WRITERS_CLOSE_MARGIN: Duration = Duration::from_millis(500);
+
+/// The teardown a TCP or UDS connection writer may be stopped by, and the one
+/// deadline for everything it still does after: a dial in progress, the write
+/// in progress, and the frames already in its channel. The transport's
+/// `shutdown` fixes the deadline; a writer that asks first fixes it the same
+/// way, so no writer gets a grace of its own. It also counts the writers that
+/// can still write, so that `closed()` can wait for what teardown keeps.
+pub(crate) struct TeardownStop {
+    /// The transport's token: only shutdown cancels it. A connection's own
+    /// token is a child of it, so a writer that sees a stop asks here whether
+    /// that stop is teardown.
+    token: CancellationToken,
+    deadline: std::sync::OnceLock<tokio::time::Instant>,
+    /// One token per connection writer while it can still write.
+    writers: tokio_util::task::TaskTracker,
+}
+
+impl TeardownStop {
+    pub(crate) fn new(token: CancellationToken) -> Self {
+        Self {
+            token,
+            deadline: std::sync::OnceLock::new(),
+            writers: tokio_util::task::TaskTracker::new(),
+        }
+    }
+
+    /// `Some(deadline)` once the transport tears down: what the writer still
+    /// holds runs until then. `None` while a stop could only be the
+    /// connection's own (an unregister, or the peer closed the socket), where
+    /// nothing could deliver the frames.
+    pub(crate) fn deadline(&self) -> Option<tokio::time::Instant> {
+        self.token.is_cancelled().then(|| {
+            *self
+                .deadline
+                .get_or_init(|| tokio::time::Instant::now() + TEARDOWN_FLUSH_GRACE)
+        })
+    }
+
+    /// The token a connection writer holds while it can still write.
+    pub(crate) fn writer(&self) -> tokio_util::task::task_tracker::TaskTrackerToken {
+        self.writers.token()
+    }
+
+    /// For the transport's `shutdown`, after it cancelled the token: fix the
+    /// deadline, so every writer's teardown ends at the same time.
+    pub(crate) fn begin(&self) {
+        self.deadline();
+        self.writers.close();
+    }
+
+    /// For the transport's `closed`: wait for the writers to write what
+    /// teardown kept, until the teardown deadline plus a margin. `what` names
+    /// the transport in the warning when they do not finish.
+    pub(crate) async fn wait_for_writers(&self, what: &str) {
+        let Some(deadline) = self.deadline() else {
+            return;
+        };
+        self.writers.close();
+        if tokio::time::timeout_at(deadline + WRITERS_CLOSE_MARGIN, self.writers.wait())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                "{what}: connection writers did not finish within {:?} of teardown",
+                TEARDOWN_FLUSH_GRACE + WRITERS_CLOSE_MARGIN
+            );
+        }
+    }
+}
+
 /// How many frames of each [`MessageType`] one write carried.
 ///
 /// A fixed array rather than a `Vec<MessageType>` kept beside the failure
@@ -324,15 +398,16 @@ pub(crate) trait WriterObserver {
         true
     }
 
-    /// Asked once, when the stop token fires. `Some(grace)` keeps what is
+    /// Asked once, when the stop token fires. `Some(deadline)` keeps what is
     /// queued: the writer finishes the write in progress and writes the frames
-    /// already in its channel, for at most `grace`, and then stops. `None`, the
+    /// already in its channel, until `deadline`, and then stops. `None`, the
     /// default, stops at once, and the caller fails what is still queued.
     ///
-    /// TCP and UDS answer `Some` when the whole transport tears down, and
-    /// `None` when only the connection closes (an unregister, or the peer
-    /// closed the socket), where nothing could deliver the frames.
-    fn keep_queued_on_stop(&self) -> Option<Duration> {
+    /// TCP and UDS answer `Some` when the whole transport tears down, with
+    /// the one deadline of [`TeardownStop`], and `None` when only the
+    /// connection closes (an unregister, or the peer closed the socket),
+    /// where nothing could deliver the frames.
+    fn keep_queued_on_stop(&self) -> Option<tokio::time::Instant> {
         None
     }
 
@@ -566,9 +641,9 @@ impl FrameBatchBuffer {
 /// written, or the socket fails.
 ///
 /// When `cancel` fires and [`WriterObserver::keep_queued_on_stop`] gives a
-/// grace, the loop first writes what is already queued, and finishes the
-/// write in progress, until that grace runs out. It takes nothing that
-/// arrives after the channel is empty.
+/// deadline, the loop first writes what is already queued, and finishes the
+/// write in progress, until that deadline. It takes nothing that arrives
+/// after the channel is empty.
 ///
 /// The caller keeps ownership of `writer` and is responsible for any teardown
 /// (flush / shutdown) it wants afterwards.
@@ -619,8 +694,8 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
             None => tokio::select! {
                 biased;
                 _ = wait_cancelled(cancel) => match observer.keep_queued_on_stop() {
-                    Some(grace) => {
-                        bound.deadline = Some(tokio::time::Instant::now() + grace);
+                    Some(deadline) => {
+                        bound.deadline = Some(deadline);
                         continue 'writer;
                     }
                     None => break 'writer,
@@ -908,8 +983,7 @@ async fn write_all_bounded<W: AsyncWrite + Unpin, O: WriterObserver>(
         () = cancel.cancelled() => {}
     }
     match observer.keep_queued_on_stop() {
-        Some(grace) => {
-            let deadline = tokio::time::Instant::now() + grace;
+        Some(deadline) => {
             bound.deadline = Some(deadline);
             write_by(write, deadline).await
         }
