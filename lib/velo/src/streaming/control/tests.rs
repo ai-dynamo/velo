@@ -2202,3 +2202,62 @@ async fn reader_pump_cancel_ends_a_send_waiting_on_a_full_channel() {
         .expect("a cancelled pump kept waiting on a full channel")
         .unwrap();
 }
+
+// -----------------------------------------------------------------------
+// Retirement
+// -----------------------------------------------------------------------
+
+/// Several `Retired` futures of one stream, each polled from its own task.
+/// Retirement wakes every one of them, and a waiter that gave up (its future
+/// dropped after it registered) strands none of the others. One stored waker
+/// would keep only the last registration, and wake only that task.
+#[test]
+fn retirement_wakes_every_waiting_future() {
+    use futures::task::{ArcWake, waker};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    struct Counter(AtomicUsize);
+    impl ArcWake for Counter {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let counters: Vec<Arc<Counter>> = (0..3)
+        .map(|_| Arc::new(Counter(AtomicUsize::new(0))))
+        .collect();
+    let wakers: Vec<_> = counters.iter().map(|c| waker(c.clone())).collect();
+
+    let closed = SenderClosed::default();
+    for w in &wakers {
+        let mut cx = Context::from_waker(w);
+        assert_eq!(closed.poll_retired(&mut cx), Poll::Pending);
+        // The same task polling again registers once.
+        assert_eq!(closed.poll_retired(&mut cx), Poll::Pending);
+    }
+    // The last waiter gives up: its future goes, its waker stays registered.
+    drop(wakers);
+
+    closed.retire(crate::streaming::Retirement::Sent);
+    for (i, counter) in counters.iter().enumerate().take(2) {
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "waiter {i} was not woken"
+        );
+    }
+
+    let again = waker(counters[0].clone());
+    let mut cx = Context::from_waker(&again);
+    assert_eq!(
+        closed.poll_retired(&mut cx),
+        Poll::Ready(crate::streaming::Retirement::Sent)
+    );
+    // A later report changes nothing, and wakes nobody.
+    closed.retire(crate::streaming::Retirement::Discarded);
+    assert_eq!(
+        closed.poll_retired(&mut cx),
+        Poll::Ready(crate::streaming::Retirement::Sent)
+    );
+    assert_eq!(counters[0].0.load(Ordering::SeqCst), 1);
+}

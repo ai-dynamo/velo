@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 
-use futures::task::AtomicWaker;
+use parking_lot::Mutex;
 
 use super::{StreamCancelHandle, StreamCancelRequest};
 use crate::streaming::sender::Retirement;
@@ -42,7 +42,14 @@ struct SenderState {
     ///
     /// [`Retired`]: crate::streaming::Retired
     retirement: AtomicU8,
-    waker: AtomicWaker,
+    /// One waker per task that waits on a [`Retired`] future of this stream.
+    /// A sender can hand out any number of them, so one stored waker is not
+    /// enough: the last registration would replace the others, and a waiter
+    /// that gave up would strand the rest. Touched only by a poll and by the
+    /// retirement of a watched stream, never on the item path.
+    ///
+    /// [`Retired`]: crate::streaming::Retired
+    wakers: Mutex<Vec<Waker>>,
 }
 
 const SENT: u8 = 1;
@@ -94,7 +101,13 @@ impl SenderClosed {
             ) {
                 Ok(_) => {
                     if current & WATCHED != 0 {
-                        self.0.waker.wake();
+                        // Taken under the lock a poll registers under, so a
+                        // waker registered before the mark is in the list by
+                        // the time the mark is seen. Woken outside it.
+                        let wakers = std::mem::take(&mut *self.0.wakers.lock());
+                        for waker in wakers {
+                            waker.wake();
+                        }
                     }
                     return;
                 }
@@ -110,9 +123,13 @@ impl SenderClosed {
         if let Some(outcome) = outcome(state.load(Ordering::Acquire)) {
             return Poll::Ready(outcome);
         }
-        // Register before marking: a `retire` that sees the mark then finds
-        // the waker, and one that came first shows in what `fetch_or` returns.
-        self.0.waker.register(cx.waker());
+        // Register before marking, under the lock: a `retire` that sees the
+        // mark takes the lock after this and finds the waker, and one that
+        // came first shows in what `fetch_or` returns.
+        let mut wakers = self.0.wakers.lock();
+        if !wakers.iter().any(|waker| waker.will_wake(cx.waker())) {
+            wakers.push(cx.waker().clone());
+        }
         match outcome(state.fetch_or(WATCHED, Ordering::AcqRel)) {
             Some(outcome) => Poll::Ready(outcome),
             None => Poll::Pending,
