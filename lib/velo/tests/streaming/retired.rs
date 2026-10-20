@@ -9,7 +9,8 @@
 //! slow consumer can hold them there for as long as it does not read. A
 //! producer that shuts its node down in that window cuts the stream short, and
 //! nothing told it so. These tests pin what `retired()` reports in each case,
-//! and the last one shows the cut it exists to prevent.
+//! and `shutting_down_after_sent_keeps_the_tail` shows the cut it exists to
+//! prevent.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -482,29 +483,32 @@ async fn sent_resolves_while_a_staged_item_is_still_held() {
 /// Over gRPC, the per-stream pump reports `Sent` once the server has taken the
 /// whole request stream, terminal included: the call's response ends only
 /// then.
+/// A node whose streams ride per-stream gRPC.
 #[cfg(feature = "grpc")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_per_stream_grpc_transport_retires_once_its_terminal_is_taken() {
-    async fn grpc_node() -> Node {
-        let registry = Registry::new();
-        let metrics = Arc::new(VeloMetrics::register(&registry).expect("metrics"));
-        let velo = Velo::builder()
-            .add_transport(tcp())
-            .stream_config(velo::StreamConfig::Grpc(Some(velo::GrpcConfig {
-                bind_addr: "127.0.0.1:0".parse().expect("loopback"),
-            })))
-            .expect("stream config")
-            .metrics(metrics)
-            .messenger_mux(MuxConfig {
-                enabled: false,
-                ..MuxConfig::default()
-            })
-            .expect("mux config")
-            .build()
-            .await
-            .expect("build velo");
-        Node { velo, registry }
-    }
+async fn grpc_node() -> Node {
+    let registry = Registry::new();
+    let metrics = Arc::new(VeloMetrics::register(&registry).expect("metrics"));
+    let velo = Velo::builder()
+        .add_transport(tcp())
+        .stream_config(velo::StreamConfig::Grpc(Some(velo::GrpcConfig {
+            bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+        })))
+        .expect("stream config")
+        .metrics(metrics)
+        .messenger_mux(MuxConfig {
+            enabled: false,
+            ..MuxConfig::default()
+        })
+        .expect("mux config")
+        .build()
+        .await
+        .expect("build velo");
+    Node { velo, registry }
+}
+
+/// A (producer, consumer) pair over per-stream gRPC that know each other.
+#[cfg(feature = "grpc")]
+async fn grpc_pair() -> (Node, Node) {
     let producer = grpc_node().await;
     let consumer = grpc_node().await;
     producer
@@ -525,6 +529,13 @@ async fn a_per_stream_grpc_transport_retires_once_its_terminal_is_taken() {
         .expect("handshake timed out")
         .expect("handshake");
     }
+    (producer, consumer)
+}
+
+#[cfg(feature = "grpc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_per_stream_grpc_transport_retires_once_its_terminal_is_taken() {
+    let (producer, consumer) = grpc_pair().await;
     let mut anchor = consumer.velo.create_anchor::<u32>();
     let sender = producer
         .velo
@@ -546,4 +557,51 @@ async fn a_per_stream_grpc_transport_retires_once_its_terminal_is_taken() {
         Ok(Retirement::Sent)
     );
     read_to_the_end(&mut anchor).await;
+}
+
+/// Over per-stream gRPC an item larger than the transport carries in one
+/// frame fails at `send`, before anything leaves the producer, and the
+/// stream stays open; one just under the limit crosses. The limit is the
+/// one the server decodes with, so a frame the producer lets through is
+/// never one the server refuses.
+#[cfg(feature = "grpc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_item_over_the_grpc_limit_fails_at_send() {
+    use velo::streaming::SendError;
+    const LIMIT: usize = velo::streaming::grpc_transport::MAX_ITEM_BYTES;
+    // The msgpack wrapper around an item adds a few bytes: a payload of the
+    // limit's size encodes over it, one 64 bytes shorter encodes under it.
+    const OVER: usize = LIMIT;
+    const UNDER: usize = LIMIT - 64;
+
+    let (producer, consumer) = grpc_pair().await;
+    let mut anchor = consumer.velo.create_anchor::<Vec<u8>>();
+    let sender = producer
+        .velo
+        .attach_anchor::<Vec<u8>>(anchor.handle())
+        .await
+        .expect("attach");
+    let refused = sender.send(vec![0u8; OVER]).await;
+    assert!(
+        matches!(refused, Err(SendError::ItemTooLarge { limit, .. }) if limit == LIMIT),
+        "{refused:?}"
+    );
+    sender
+        .send(vec![1u8; UNDER])
+        .await
+        .expect("an item under the limit");
+    let retired = sender.retired();
+    sender.finalize().expect("finalize");
+    assert_eq!(
+        tokio::time::timeout(PATIENCE, retired).await,
+        Ok(Retirement::Sent)
+    );
+    match tokio::time::timeout(PATIENCE, anchor.next()).await {
+        Ok(Some(Ok(StreamFrame::Item(item)))) if item.len() == UNDER => {}
+        other => panic!("the item under the limit: {other:?}"),
+    }
+    match tokio::time::timeout(PATIENCE, anchor.next()).await {
+        Ok(Some(Ok(StreamFrame::Finalized))) => {}
+        other => panic!("expected Finalized: {other:?}"),
+    }
 }

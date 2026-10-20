@@ -22,4 +22,11 @@ pub(crate) trait RetiringFrameTransport: FrameTransport {
         session_id: u64,
         closed: crate::streaming::control::SenderClosed,
     ) -> futures::future::BoxFuture<'_, anyhow::Result<flume::Sender<Vec<u8>>>>;
+
+    /// The largest encoded item this transport carries in one frame, when
+    /// the producer should refuse a larger one at `send` rather than let the
+    /// transport fail the stream.
+    fn item_limit(&self) -> Option<usize> {
+        None
+    }
 }

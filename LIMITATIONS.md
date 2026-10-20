@@ -13,8 +13,9 @@ right after `Sent` can cut that item, and the consumer reads a broken stream
 instead of it.
 
 **When.** Over the messenger mux, for an item larger than the eager budget:
-the stager's threshold, `RendezvousStager::with_threshold`, 256 KiB by
-default.
+the smaller of the transport's frame limit and the stager's threshold
+(`RendezvousStager::with_threshold`, 256 KiB by default), less the message
+envelope.
 
 **Why.** Such an item leaves the producer as a handle. Its bytes stay staged
 in the producer's rendezvous store until the consumer pulls them. `Sent` is
@@ -79,8 +80,8 @@ before the producer's last write still leaves the producer with
 `Retirement::Sent`. Over the mux and on the same worker the same case gives
 `Discarded`.
 
-**When.** The mux turned off, and a consumer that leaves while the producer
-still writes.
+**When.** A stream that rides per-stream TCP (the mux off, or a peer without
+it), and a consumer that leaves while the producer still writes.
 
 **Why.** The consumer's pump learns of the drop only from the next frame it
 tries to forward, so the producer's write succeeds, and a successful write
@@ -110,27 +111,6 @@ terminal, or when the server pump was dropped with the transport.
 
 **Lifted by.** Upgrading the consumer's node.
 
-## The two sides of a gRPC stream do not share an item-size limit
-
-**What happens.** An item that the producer's side accepts but the server's
-side cannot receive (over tonic's default decode limit of 4 MiB) ends the
-request stream with an error. The consumer reads `Dropped`, and the producer
-reads `Discarded`.
-
-**When.** Over per-stream gRPC, for an item larger than the server's decode
-limit.
-
-**Why.** The client encodes any item the application sends; the server's
-decode limit is tonic's default, and nothing tells the client what it is.
-
-**Workaround.** Keep items under 4 MiB over gRPC, or use the mux, which
-stages a large item for the consumer to pull.
-
-**Lifted by.** Not scheduled. The options are a matching encode limit on the
-client, so the producer's send fails instead of the stream, or a raised and
-documented decode limit on the server; both change behaviour, and the owner
-decides.
-
 ## `MpscStreamSender` has no `retired()`
 
 **What happens.** A producer on an MPSC stream cannot wait until its output
@@ -139,7 +119,7 @@ has left the node.
 **When.** Any `MpscStreamSender`.
 
 **Why.** The retirement is recorded for an MPSC stream too, over the mux and
-over per-stream TCP, but the sender exposes no future for it.
+the per-stream transports, but the sender exposes no future for it.
 
 **Workaround.** None inside velo; an acknowledgement in the application's
 protocol.

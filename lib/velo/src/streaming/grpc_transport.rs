@@ -67,6 +67,17 @@ const SESSION_ID_META: &str = "x-session-id";
 /// so the heartbeat watchdog is what reports a wedged consumer, not this.
 const TERMINAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
+/// The largest encoded item a per-stream gRPC transport carries: the same
+/// 16 MiB as the TCP streaming codec's frame limit. The producer refuses a
+/// larger item at `send` (`SendError::ItemTooLarge`), and the server's decode
+/// limit is set from this value plus the message envelope, so the two sides
+/// cannot disagree.
+pub const MAX_ITEM_BYTES: usize = crate::transports::tcp::framing::DEFAULT_MAX_FRAME_SIZE as usize;
+
+/// Room for the protobuf envelope around an item at the limit: field tags and
+/// lengths, and the empty preamble and header fields.
+const MESSAGE_ENVELOPE: usize = 64 * 1024;
+
 /// How long `shutdown` lets open HTTP/2 connections finish GOAWAY before it
 /// cancels connection I/O. A clean close takes one round trip; this bounds the case
 /// where a peer never answers.
@@ -306,8 +317,10 @@ impl GrpcFrameTransport {
                     connection::Connection::new(socket, force_close.clone(), accepted.token())
                 })
             });
-            let server =
-                tonic::transport::Server::builder().add_service(VeloStreamingServer::new(service));
+            let server = tonic::transport::Server::builder().add_service(
+                VeloStreamingServer::new(service)
+                    .max_decoding_message_size(MAX_ITEM_BYTES + MESSAGE_ENVELOPE),
+            );
             let serve = server.serve_with_incoming_shutdown(incoming, cancel.cancelled());
             tokio::pin!(serve);
             let grace_expired = async {
@@ -418,7 +431,8 @@ impl GrpcFrameTransport {
                 .connect()
                 .await?;
 
-            let mut client = VeloStreamingClient::new(channel);
+            let mut client = VeloStreamingClient::new(channel)
+                .max_encoding_message_size(MAX_ITEM_BYTES + MESSAGE_ENVELOPE);
 
             let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel::<FramedData>(256);
             let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(4096);
@@ -548,6 +562,10 @@ impl RetiringFrameTransport for GrpcFrameTransport {
         closed: crate::streaming::control::SenderClosed,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
         self.connect_with(peer, anchor_id, session_id, Some(RetireGuard::new(closed)))
+    }
+
+    fn item_limit(&self) -> Option<usize> {
+        Some(MAX_ITEM_BYTES)
     }
 }
 
@@ -1060,15 +1078,17 @@ mod tests {
             .unwrap();
     }
 
-    /// A frame the server cannot receive, here one over tonic's default
-    /// decode limit of 4 MiB, ends the request stream with an error. The
-    /// terminal behind it never reaches the consumer, which reads `Dropped`.
-    /// The call must end with an error too, so the producer reads
-    /// `Discarded`; a call that ended cleanly said `Sent` for a stream the
-    /// consumer never got. The control item, under the limit, is `Sent`.
+    /// A frame the server cannot receive, here one past the decode limit the
+    /// server sets from `MAX_ITEM_BYTES` (a `StreamSender` refuses it at
+    /// `send`; this writes to the channel directly), ends the request stream
+    /// with an error. The terminal behind it never reaches the consumer,
+    /// which reads `Dropped`. The call must end with an error too, so the
+    /// producer reads `Discarded`; a call that ended cleanly said `Sent` for
+    /// a stream the consumer never got. The control item, well under the
+    /// limit, is `Sent`.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_frame_the_server_cannot_receive_retires_the_stream_as_discarded() {
-        const OVER_THE_DECODE_LIMIT: usize = 5 << 20;
+        const OVER_THE_DECODE_LIMIT: usize = MAX_ITEM_BYTES + (1 << 20);
         const UNDER_IT: usize = 1 << 20;
         let server = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
             .await

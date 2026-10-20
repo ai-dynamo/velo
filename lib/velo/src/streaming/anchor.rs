@@ -1117,6 +1117,14 @@ impl AnchorManagerBuilder {
     }
 }
 
+/// What `AnchorManager::connect_streaming` hands back: the stream's egress
+/// channel, who reports its retirement, and the transport's item limit.
+struct Connected {
+    tx: flume::Sender<Vec<u8>>,
+    retires_on: crate::streaming::sender::RetiresOn,
+    item_limit: Option<usize>,
+}
+
 impl AnchorManager {
     /// Stop and join mux sends while their messenger transports still exist.
     /// Readers stay attached until full shutdown withdraws their feeds.
@@ -1904,7 +1912,7 @@ impl AnchorManager {
         peer: velo_ext::WorkerId,
         anchor_id: u64,
         lifecycle: crate::streaming::control::SenderEntry,
-    ) -> Result<(flume::Sender<Vec<u8>>, crate::streaming::sender::RetiresOn), AttachError> {
+    ) -> Result<Connected, AttachError> {
         use crate::streaming::sender::RetiresOn;
         let key = &ticket.streaming_transport_key;
         let session_id = ticket.routing_session_id;
@@ -1924,7 +1932,11 @@ impl AnchorManager {
                 let tx = mux
                     .connect_controlled(key, anchor_id, session_id, limits, Some(lifecycle))
                     .await?;
-                Ok((tx, RetiresOn::Transport))
+                Ok(Connected {
+                    tx,
+                    retires_on: RetiresOn::Transport,
+                    item_limit: None,
+                })
             }
             Ok(crate::streaming::negotiation::Connect::Legacy) => {
                 let retiring = self
@@ -1935,11 +1947,19 @@ impl AnchorManager {
                     let tx = transport
                         .connect_retiring(peer, anchor_id, session_id, lifecycle.closed)
                         .await?;
-                    return Ok((tx, RetiresOn::Transport));
+                    return Ok(Connected {
+                        tx,
+                        retires_on: RetiresOn::Transport,
+                        item_limit: transport.item_limit(),
+                    });
                 }
                 let transport = self.resolve_transport(key)?;
                 let tx = transport.connect(peer, anchor_id, session_id).await?;
-                Ok((tx, RetiresOn::Queue))
+                Ok(Connected {
+                    tx,
+                    retires_on: RetiresOn::Queue,
+                    item_limit: None,
+                })
             }
             Err(error) => Err(AttachError::TransportError(anyhow::anyhow!(
                 "peer answered with {key} but {error}"
@@ -2418,7 +2438,11 @@ impl AnchorManager {
 
         // Resolve the local FrameTransport that matches the remote worker's
         // bound streaming transport, then connect by WorkerId.
-        let (frame_tx, retires_on) = match self
+        let Connected {
+            tx: frame_tx,
+            retires_on,
+            item_limit,
+        } = match self
             .connect_streaming(ticket, handle_worker_id, local_id, identity.entry.clone())
             .await
         {
@@ -2450,6 +2474,7 @@ impl AnchorManager {
                 sender_registry: self.sender_registry.clone(),
                 closed: identity.entry.closed.clone(),
                 retires_on,
+                item_limit,
             },
             Duration::from_millis(ticket.heartbeat_interval_ms),
             self.metrics.clone(),
@@ -2661,6 +2686,7 @@ impl AnchorManager {
                             sender_registry: self.sender_registry.clone(),
                             closed,
                             retires_on: crate::streaming::sender::RetiresOn::Queue,
+                            item_limit: None,
                         },
                         heartbeat_interval,
                         self.metrics.clone(),
@@ -2845,6 +2871,7 @@ impl AnchorManager {
                 sender_registry: self.sender_registry.clone(),
                 closed: identity.entry.closed.clone(),
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
+                item_limit: None,
             },
             heartbeat_interval,
             self.metrics.clone(),
@@ -2922,7 +2949,11 @@ impl AnchorManager {
                 } else {
                     sender_stream_id
                 };
-                let (frame_tx, retires_on) = match self
+                let Connected {
+                    tx: frame_tx,
+                    retires_on,
+                    item_limit,
+                } = match self
                     .connect_streaming(
                         &crate::streaming::control::StreamOpenTicket {
                             streaming_transport_key: streaming_transport_key.clone(),
@@ -2965,6 +2996,7 @@ impl AnchorManager {
                         sender_registry: self.sender_registry.clone(),
                         closed: identity.entry.closed.clone(),
                         retires_on,
+                        item_limit,
                     },
                     Duration::from_millis(heartbeat_interval_ms),
                     self.metrics.clone(),

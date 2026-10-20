@@ -56,6 +56,9 @@ pub(crate) struct StreamSenderCancelInfo {
     pub closed: crate::streaming::control::SenderClosed,
     /// Who reports the stream's retirement once the terminal is in `tx`.
     pub retires_on: RetiresOn,
+    /// The largest encoded item the stream's transport carries, when it has
+    /// a limit the producer should meet before the frame leaves.
+    pub item_limit: Option<usize>,
 }
 
 /// Who reports a stream's retirement when its terminal is handed to the
@@ -161,7 +164,8 @@ pub enum Retirement {
     /// behind every record before it. Over the messenger mux, the batch that
     /// carries the terminal was admitted by the transport. One exception: an
     /// item larger than the eager budget (the stager's threshold,
-    /// `RendezvousStager::with_threshold`, 256 KiB by default) is staged on
+    /// `RendezvousStager::with_threshold`, 256 KiB by default, or less on a
+    /// transport with a smaller frame limit) is staged on
     /// this node until the consumer pulls it, so `Sent` can resolve while
     /// this node still holds it; `LIMITATIONS.md` in the repository says
     /// what that means for a shutdown. On the same worker, the terminal is in
@@ -248,6 +252,9 @@ pub struct StreamSender<T> {
     negotiated_transport: Option<velo_ext::TransportKey>,
     /// Who reports the stream's retirement once the terminal is in `tx`.
     retires_on: RetiresOn,
+    /// The largest encoded item the transport carries in one frame, if it
+    /// has such a limit: refused at `send`, so it never reaches the wire.
+    item_limit: Option<usize>,
     /// The runtime the sender was made on. A terminal that meets a full
     /// channel on a thread with no runtime waits in a task here.
     runtime: tokio::runtime::Handle,
@@ -294,6 +301,7 @@ impl<T: Serialize> StreamSender<T> {
             sender_registry,
             closed,
             retires_on,
+            item_limit,
         } = cancel;
         let stop_token = sender_registry
             .senders
@@ -340,6 +348,7 @@ impl<T: Serialize> StreamSender<T> {
             cancel_token,
             closed,
             retires_on,
+            item_limit,
             sender_stream_id,
             sender_registry,
             metrics,
@@ -402,6 +411,9 @@ impl<T: Serialize> StreamSender<T> {
     /// # Errors
     ///
     /// - [`SendError::SerializationError`] if `rmp_serde::to_vec` fails.
+    /// - [`SendError::ItemTooLarge`] if the encoded item is larger than the
+    ///   stream's transport carries in one frame (per-stream gRPC: 16 MiB);
+    ///   nothing is sent, and the stream stays open.
     /// - [`SendError::ChannelClosed`] if the receiver has been dropped or the
     ///   stream has been cancelled. A cancel through `SenderEntry::cancel` is
     ///   seen at once; a direct cancel of [`Self::cancellation_token`] once
@@ -561,6 +573,17 @@ impl<T> StreamSender<T> {
     /// [`send_bytes`](StreamSender::send_bytes) share it, so they agree on
     /// backpressure, cancel, and a closed channel.
     async fn send_item_frame(&self, bytes: Vec<u8>) -> Result<(), SendError> {
+        // Refused here rather than by the transport's encoder, so the
+        // producer learns at once and the stream stays open. One branch per
+        // item; `None` on the mux and on the same worker.
+        if let Some(limit) = self.item_limit
+            && bytes.len() > limit
+        {
+            return Err(SendError::ItemTooLarge {
+                len: bytes.len(),
+                limit,
+            });
+        }
         // Try non-blocking first so we can record producer-side backpressure
         // before falling through to the awaited send. The connect-side channel
         // is 4096 deep on the per-stream path and C+1 deep under the mux.
@@ -813,6 +836,7 @@ mod tests {
                 sender_registry,
                 closed: Default::default(),
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
+                item_limit: None,
             },
             Duration::from_secs(5),
             None,
@@ -853,6 +877,7 @@ mod tests {
                 sender_registry: sender_registry.clone(),
                 closed,
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
+                item_limit: None,
             },
             Duration::from_secs(5),
             None,
@@ -1103,6 +1128,7 @@ mod tests {
                 sender_registry,
                 closed: Default::default(),
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
+                item_limit: None,
             },
             Duration::from_secs(5),
             None,
@@ -1147,6 +1173,7 @@ mod tests {
                 sender_registry,
                 closed: Default::default(),
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
+                item_limit: None,
             },
             Duration::from_secs(5),
             None,
