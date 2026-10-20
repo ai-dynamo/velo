@@ -172,8 +172,11 @@ pub enum Retirement {
     /// velo, or under an `AnchorManager` built by hand, the terminal is in
     /// the stream's egress channel.
     ///
-    /// It says nothing about the consumer: not that the bytes were written to
-    /// a socket, and not that they were received.
+    /// It says nothing about the consumer: not that it received anything.
+    /// Over gRPC, a server from before velo 0.21 ends the call cleanly even
+    /// when its consumer left, so a producer reads `Sent` for frames nobody
+    /// took; and a server that never ends the call gives `Discarded` after
+    /// 20 seconds.
     Sent,
     /// The stream's output was thrown away before it was handed on. Over the
     /// messenger mux and on the same worker: the consumer cancelled or dropped

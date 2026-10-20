@@ -902,3 +902,47 @@ async fn a_send_after_teardown_fails_at_once_without_a_dial() {
         "no connection, so no dial"
     );
 }
+
+/// `closed()` returns only once the connection writers are done with what
+/// teardown kept: the UDS twin of the TCP test of the same name. A peer that
+/// accepts nothing and reads nothing blocks the writer once the socket
+/// buffers are full, and `closed()` waits until the writer's deadline.
+#[tokio::test(start_paused = true)]
+async fn closed_waits_for_a_writer_blocked_on_its_peer() {
+    const FRAMES: usize = 128;
+    const PAYLOAD: usize = 256 * 1024;
+    let (transport, _path) = make_transport();
+    let dir = std::env::temp_dir().join(format!("uds-peer-{}", crate::InstanceId::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let peer_socket = dir.join("peer.sock");
+    let _peer_listener = tokio::net::UnixListener::bind(&peer_socket).unwrap();
+    let peer = make_uds_peer(&peer_socket);
+    let peer_id = peer.instance_id();
+    transport.register(peer).unwrap();
+
+    let errors = Arc::new(TrackingErrorHandler::new());
+    for _ in 0..FRAMES {
+        let _ = transport.send_message(
+            peer_id,
+            Bytes::from_static(b"hdr"),
+            Bytes::from(vec![0u8; PAYLOAD]),
+            MessageType::Response,
+            errors.clone(),
+        );
+    }
+
+    transport.shutdown();
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), transport.closed())
+        .await
+        .expect("closed() bounds its wait");
+    assert!(
+        started.elapsed() >= TEARDOWN_FLUSH_GRACE,
+        "closed() returned after {:?}, before the writer's deadline",
+        started.elapsed()
+    );
+    assert!(
+        errors.error_count() > 0,
+        "the frames the peer never read fail at the deadline"
+    );
+}

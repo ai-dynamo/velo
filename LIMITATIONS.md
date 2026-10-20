@@ -92,6 +92,45 @@ consumer's drop fires, when the difference matters.
 
 **Lifted by.** Not scheduled.
 
+## A gRPC server from before velo 0.21 answers `Sent` for frames nobody took
+
+**What happens.** Over per-stream gRPC, a producer on this velo reads
+`Retirement::Sent` although the consumer never got the stream.
+
+**When.** The consumer's node runs a velo from before 0.21, and its consumer
+left before the stream ended, or the server could not receive a frame.
+
+**Why.** `Sent` over gRPC means that the server ended the call cleanly, which
+it does only once it has taken the whole request stream. A server from
+before 0.21 ended the call cleanly in every case. A server on this velo ends
+it with an error when its consumer left, when the stream ended without its
+terminal, or when the server pump was dropped with the transport.
+
+**Workaround.** Run the same velo on both nodes.
+
+**Lifted by.** Upgrading the consumer's node.
+
+## The two sides of a gRPC stream do not share an item-size limit
+
+**What happens.** An item that the producer's side accepts but the server's
+side cannot receive (over tonic's default decode limit of 4 MiB) ends the
+request stream with an error. The consumer reads `Dropped`, and the producer
+reads `Discarded`.
+
+**When.** Over per-stream gRPC, for an item larger than the server's decode
+limit.
+
+**Why.** The client encodes any item the application sends; the server's
+decode limit is tonic's default, and nothing tells the client what it is.
+
+**Workaround.** Keep items under 4 MiB over gRPC, or use the mux, which
+stages a large item for the consumer to pull.
+
+**Lifted by.** Not scheduled. The options are a matching encode limit on the
+client, so the producer's send fails instead of the stream, or a raised and
+documented decode limit on the server; both change behaviour, and the owner
+decides.
+
 ## `MpscStreamSender` has no `retired()`
 
 **What happens.** A producer on an MPSC stream cannot wait until its output

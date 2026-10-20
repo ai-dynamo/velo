@@ -185,8 +185,11 @@ impl VeloStreaming for GrpcStreamingService {
             // Release the client's post-terminal drain (see `connect`). This
             // fires only after every request frame has been handed to the
             // consumer's channel, so the client observing end-of-response is a
-            // genuine delivery acknowledgement.
-            let _ = done_tx.send(true);
+            // genuine delivery acknowledgement. A stream that ended without
+            // its terminal (a receive error, such as a frame over the decode
+            // limit) was not taken: the client's pump must not report it
+            // sent, so the call ends with an error instead.
+            let _ = done_tx.send(last_was_terminal);
         }) {
             return Err(Status::unavailable("streaming transport shut down"));
         }
@@ -196,14 +199,15 @@ impl VeloStreaming for GrpcStreamingService {
         // consumed". Returning an already-empty stream here would let tonic
         // send the trailers before the request body was read, which is what
         // made the client's teardown race the delivery of its last frames.
-        // A consumer that left, or a pump dropped with the transport, ends
-        // the call with an error instead: the client's pump then reports the
-        // stream discarded, not sent for frames nobody took.
+        // A consumer that left, a stream that ended without its terminal, or
+        // a pump dropped with the transport, ends the call with an error
+        // instead: the client's pump then reports the stream discarded, not
+        // sent for frames nobody took.
         let response_stream = futures::stream::once(done_rx).filter_map(|taken| {
             std::future::ready(match taken {
                 Ok(true) => None::<Result<FramedData, Status>>,
                 _ => Some(Err(Status::aborted(
-                    "the consumer left before it took the stream",
+                    "the server did not take the whole stream",
                 ))),
             })
         });
@@ -1048,6 +1052,62 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), retired).await,
             Ok(crate::streaming::Retirement::Discarded)
         );
+        tokio::time::timeout(Duration::from_secs(2), server.shutdown())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), client.shutdown())
+            .await
+            .unwrap();
+    }
+
+    /// A frame the server cannot receive, here one over tonic's default
+    /// decode limit of 4 MiB, ends the request stream with an error. The
+    /// terminal behind it never reaches the consumer, which reads `Dropped`.
+    /// The call must end with an error too, so the producer reads
+    /// `Discarded`; a call that ended cleanly said `Sent` for a stream the
+    /// consumer never got. The control item, under the limit, is `Sent`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frame_the_server_cannot_receive_retires_the_stream_as_discarded() {
+        const OVER_THE_DECODE_LIMIT: usize = 5 << 20;
+        const UNDER_IT: usize = 1 << 20;
+        let server = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let client = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (peer, info) = fresh_peer(server.address());
+        client.register(&info).unwrap();
+
+        for (session, len, expected) in [
+            (4, UNDER_IT, crate::streaming::Retirement::Sent),
+            (
+                5,
+                OVER_THE_DECODE_LIMIT,
+                crate::streaming::Retirement::Discarded,
+            ),
+        ] {
+            let consumer = server.bind(session, session).await.unwrap();
+            let closed = crate::streaming::control::SenderClosed::default();
+            let tx = client
+                .connect_retiring(peer, session, session, closed.clone())
+                .await
+                .unwrap();
+            let item =
+                rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(vec![7u8; len]))
+                    .unwrap();
+            tx.send_async(item).await.unwrap();
+            tx.send_async(crate::streaming::sender::cached_finalized().clone())
+                .await
+                .unwrap();
+            let retired = std::future::poll_fn(|cx| closed.poll_retired(cx));
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(10), retired).await,
+                Ok(expected),
+                "an item of {len} bytes"
+            );
+            drop(consumer);
+        }
         tokio::time::timeout(Duration::from_secs(2), server.shutdown())
             .await
             .unwrap();
