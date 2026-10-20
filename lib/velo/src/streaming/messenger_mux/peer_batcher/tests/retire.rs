@@ -63,6 +63,11 @@ async fn a_slot_closed_with_withheld_output_retires_as_discarded() {
 
 /// A batch the transport refuses never reached the wire: the epoch dies with
 /// it, and the stream whose terminal it carried retires as discarded.
+///
+/// The terminal goes alone, so the batch parked on admission is the one that
+/// carries it, and the guard in that batch is what reports. An item queued
+/// before it could ride a batch of its own, and leave the terminal in the
+/// inlet, where the slot's close would report instead.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_batch_retires_its_terminals_as_discarded() {
     let mut harness = stalled_harness(MuxConfig::default()).await;
@@ -74,7 +79,6 @@ async fn a_refused_batch_retires_its_terminals_as_discarded() {
         .expect("slot allocated");
     // The `OpenSlot` holds the gate's one place, so the batch with the
     // terminal parks on admission.
-    inlet.send(item(0)).expect("queue item");
     inlet
         .send(cached_finalized().clone())
         .expect("queue terminal");
@@ -93,7 +97,8 @@ async fn a_refused_batch_retires_its_terminals_as_discarded() {
 /// guard in the dropped batch reports it, so `retired()` never hangs.
 ///
 /// The runtime shutdown is what drops the task without running its exit path,
-/// the same as an abort or a panic would.
+/// the same as an abort or a panic would. The terminal goes alone, so the
+/// parked batch is the one that carries it, as in the refused-batch test.
 #[test]
 fn an_aborted_batcher_retires_its_parked_terminal_as_discarded() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -109,7 +114,6 @@ fn an_aborted_batcher_retires_its_parked_terminal_as_discarded() {
             .expect("ack")
             .expect("ack delivered")
             .expect("slot allocated");
-        inlet.send(item(0)).expect("queue item");
         inlet
             .send(cached_finalized().clone())
             .expect("queue terminal");

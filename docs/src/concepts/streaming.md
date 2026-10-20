@@ -46,28 +46,28 @@ The consumer can cancel the stream with `anchor.cancel()` or a cloned `StreamCon
 
 `finalize` returns before the stream's output leaves the producer's node. Under the messenger mux, records wait on the producer for the consumer's credit, and a slow consumer can hold them there for as long as it does not read. A producer that shuts its node down in that time cuts the stream short.
 
-`sender.retired()` returns a future. The future resolves once velo on the producer's node holds none of the stream's output. It resolves after `finalize`, `detach`, or drop. Get the future before `finalize` or `detach`, because they consume the sender.
+`sender.retired()` returns a future. The future resolves once velo on the producer's node has handed on all of the stream's output; the table below says what that means on each path. It resolves after `finalize`, `detach`, or drop. Get the future before `finalize` or `detach`, because they consume the sender.
 
 ```rust,ignore
 let retired = sender.retired();
 sender.finalize()?;
 match retired.await {
-    Retirement::Sent => {}      // The node can shut down; the stream is complete.
-    Retirement::Discarded => {} // The consumer did not get the whole stream.
+    Retirement::Sent => {}      // Velo on this node holds nothing of the stream.
+    Retirement::Discarded => {} // Output was thrown away before it left this node.
 }
 ```
 
-`Retirement::Sent` means that velo handed the terminal (`Finalized`, `Detached`, or `Dropped`) on behind every record before it. What "handed on" means depends on the path of the stream:
+`Retirement::Sent` means that velo handed the terminal (`Finalized`, `Detached`, or `Dropped`) on behind every record before it. It is a statement about the producer's node, not about the consumer: it does not say that the bytes were written to a socket, and it does not say that the consumer received them. What "handed on" means depends on the path of the stream:
 
 | Path | `Sent` means |
 |---|---|
-| Messenger mux | The transport admitted the batch that carries the terminal. TCP and UDS write admitted frames before they close at graceful shutdown. |
+| Messenger mux | The transport admitted the batch that carries the terminal: it is in the connection writer's queue, or on its way there. At graceful shutdown, TCP and UDS write the frames that they admitted, until a deadline 1 second after the teardown; QUIC fails the frames that are still queued. An item over the eager budget stays staged on the producer until the consumer pulls it. Neither `Sent` nor `graceful_shutdown` waits for that pull: a shutdown right after `Sent` can drop such an item. |
 | Same worker | The terminal is in the anchor's channel. |
 | Per-stream transport (TCP, gRPC) | The terminal is in the stream's egress channel. The stream's pump still has to write it, and `graceful_shutdown` does not stop that transport. |
 
 `Retirement::Discarded` means that the output was thrown away before velo handed it on. The consumer cancelled or dropped its anchor, the consumer's process went away, the transport refused the batch, or the producer's node shut down while it held the output. A task or batch that dies with the terminal also gives `Discarded`, so the future does not wait forever.
 
-The future allocates nothing: it shares the state that the sender already keeps for the stream. A stream that nobody asks about pays one compare-exchange when it retires. [Batched streaming](batched-streaming.md#retirement) shows how the mux reports it, and what it costs.
+The future shares the state that the sender already keeps for the stream. A sender can hand out any number of them, and each one wakes. A stream that nobody asks about pays one compare-exchange when it retires. [Batched streaming](batched-streaming.md#retirement) shows how the mux reports it, and what it costs.
 
 ## Byte items
 

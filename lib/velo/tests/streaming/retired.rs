@@ -415,3 +415,63 @@ async fn a_per_stream_transport_retires_when_its_terminal_is_queued() {
     );
     read_to_the_end(&mut anchor).await;
 }
+
+/// An item over the eager budget rides the mux as a handle, and its bytes stay
+/// staged on the producer until the consumer pulls them. `Sent` does not wait
+/// for that pull: the batch that carries the handle was admitted. Nor does
+/// graceful shutdown: its drain counts requests in flight, not staged
+/// payloads, so the teardown drops the staged bytes and the consumer reads a
+/// broken stream instead of the item. This test states the contract the
+/// owner has to choose a fix for (the drain waits for staged payloads, or
+/// `Sent` waits for the pull); it is ignored until then.
+///
+/// Several trials, because the pull races the shutdown: each one builds its
+/// own two nodes, since the shutdown ends one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a staged item is lost by a shutdown right after Sent: the drain does not wait for the consumer's pull"]
+async fn shutting_down_after_sent_keeps_a_staged_item() {
+    const TRIALS: usize = 5;
+    /// Well over the default eager budget (256 KiB), so the item is staged.
+    const STAGED: usize = 1 << 20;
+
+    for trial in 0..TRIALS {
+        let (producer, consumer) = pair(window(256)).await;
+        let mut anchor = consumer.velo.create_anchor::<Vec<u8>>();
+        let ticket = consumer
+            .velo
+            .prebind_anchor(anchor.handle())
+            .expect("ticket");
+        let sender = producer
+            .velo
+            .open_anchor_stream::<Vec<u8>>(anchor.handle(), ticket)
+            .await
+            .expect("open stream");
+        let reader = tokio::spawn(async move {
+            match tokio::time::timeout(PATIENCE, anchor.next()).await {
+                Ok(Some(Ok(StreamFrame::Item(item)))) if item.len() == STAGED => {}
+                other => panic!("the staged item: {other:?}"),
+            }
+            match tokio::time::timeout(PATIENCE, anchor.next()).await {
+                Ok(Some(Ok(StreamFrame::Finalized))) => {}
+                other => panic!("expected Finalized: {other:?}"),
+            }
+        });
+        sender.send(vec![7u8; STAGED]).await.expect("send");
+        let retired = sender.retired();
+        sender.finalize().expect("finalize");
+        assert_eq!(
+            tokio::time::timeout(PATIENCE, retired).await,
+            Ok(Retirement::Sent),
+            "trial {trial}"
+        );
+        producer
+            .velo
+            .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_secs(2)))
+            .await;
+        drop(producer);
+        tokio::time::timeout(PATIENCE, reader)
+            .await
+            .unwrap_or_else(|_| panic!("trial {trial}: the reader hung"))
+            .unwrap_or_else(|error| panic!("trial {trial}: {error}"));
+    }
+}

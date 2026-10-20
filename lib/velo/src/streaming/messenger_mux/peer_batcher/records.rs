@@ -200,37 +200,35 @@ impl Batcher {
         let seq = slot.take_seq();
         let close_seq = terminal.then(|| slot.take_seq());
 
-        let written = match self.writer.encoder() {
-            Some(encoder) => {
-                if let Err(error) = encoder.push_data(id, seq, &bytes) {
-                    tracing::error!(slot = ?id, %error, "messenger mux: dropping unencodable record");
-                    return;
-                }
-                match close_seq {
-                    Some(close_seq) => {
-                        let _ = encoder.push_close_slot(id, close_seq, CloseReason::TerminalSent);
-                        // The terminal ends a stream, so it and its close travel
-                        // like the other liveness records rather than waiting for a
-                        // flush the finalizing producer may never make.
-                        self.gate.stage_urgent(2);
-                    }
-                    None => self.gate.stage(1),
-                }
-                true
+        // `emit_data` opened the batch, and nothing between that and here can
+        // have flushed it.
+        let encoder = self
+            .writer
+            .encoder()
+            .expect("the batch this record goes into is open");
+        if let Err(error) = encoder.push_data(id, seq, &bytes) {
+            tracing::error!(slot = ?id, %error, "messenger mux: dropping unencodable record");
+            return;
+        }
+        match close_seq {
+            Some(close_seq) => {
+                let _ = encoder.push_close_slot(id, close_seq, CloseReason::TerminalSent);
+                // The terminal ends a stream, so it and its close travel
+                // like the other liveness records rather than waiting for a
+                // flush the finalizing producer may never make.
+                self.gate.stage_urgent(2);
             }
-            None => false,
-        };
+            None => self.gate.stage(1),
+        }
 
         if terminal {
             // A terminal in the batch retires its stream with the batch: sent
             // once it is admitted, discarded if it is thrown away. Taken out of
-            // the slot first, or the close below would report it discarded now,
-            // as it does for a terminal that was never written.
-            if written
-                && let Some(entry) = self
-                    .slots
-                    .get_mut(index)
-                    .and_then(|slot| slot.lifecycle.take())
+            // the slot first, or the close below would report it discarded now.
+            if let Some(entry) = self
+                .slots
+                .get_mut(index)
+                .and_then(|slot| slot.lifecycle.take())
             {
                 self.retire_on_flush.push(RetireGuard::new(entry.closed));
             }

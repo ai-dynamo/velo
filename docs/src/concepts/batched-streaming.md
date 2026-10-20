@@ -323,15 +323,17 @@ On the per-stream path, the egress pump writes a terminal, discards anything que
 
 `finalize`, `detach` and `Drop` hand the terminal to the inlet without blocking a runtime worker. They call `try_send` first. On a full channel, they hand the record to a task that awaits space. The task holds a clone of the sender, so the channel stays open until the sentinel is in it. The task runs on the caller's runtime, or on the sender's own runtime when the caller has none, so no caller thread blocks. `detach` clears the attachment flag only after the sentinel is in the channel, so a re-attach cannot put records ahead of the `Detached` frame.
 
+`velo_streaming_mux_live_slots` must return to zero at teardown. A leaked slot holds credit and byte budget for the rest of the epoch, and unlike a leaked socket it does not show in `lsof`.
+
 ### Retirement
 
-`StreamSender::retired()` resolves when the producer's node holds none of the stream's output (see [Streaming](streaming.md#know-when-the-output-has-left)). Under the mux, the batcher reports it:
+`StreamSender::retired()` resolves when the producer's node has handed on all of the stream's output (see [Streaming](streaming.md#know-when-the-output-has-left)). Under the mux, the batcher reports it:
 
 - When egress writes a terminal into the open batch, it moves a guard for the stream into the batch. When the batch is admitted, each guard reports `Sent`. A terminal that goes alone through rendezvous gives its guard to the task that waits for its admission.
 - A guard that is dropped reports `Discarded`. A refused batch, an epoch death, a teardown, and a batcher task that is aborted all drop the guards that they hold.
 - A slot that closes while it still holds its producer's lifecycle reports `Discarded`. The terminal path takes the lifecycle out of the slot first. So every other close reports the loss: the `CloseSlot{UnknownSlot}` that a consumer sends when it cancels or drops its anchor, an epoch death when the consumer's process goes away, and the teardown of the producer's node.
 
-The state is two bits and a waker in the per-stream allocation that the sender and its slot already share. No message crosses the wire for it. The first outcome stands. A stream that nobody watches pays one compare-exchange when it retires, and no wake.
+The state is two bits in the per-stream allocation that the sender and its slot already share, and a list of wakers that stays empty until a `Retired` future waits. No message crosses the wire for it. The first outcome stands. A stream that nobody watches pays one compare-exchange when it retires, and no wake.
 
 The alternative is an acknowledgement from the consumer in the application's own protocol. It costs one more active message for each stream, a table of waiters on the producer, and a round trip before the producer knows.
 
@@ -345,8 +347,6 @@ Measured with the `stream_lifecycle` example ([Benchmarking](../operations/bench
 | Consumer acknowledgement (`ack`) | 162,295 | 389 µs / 734 µs |
 
 The two `plain` builds differ by less than the spread of the runs (121,897 to 122,684 before, 121,934 to 122,354 after).
-
-`velo_streaming_mux_live_slots` must return to zero at teardown. A leaked slot holds credit and byte budget for the rest of the epoch, and unlike a leaked socket it does not show in `lsof`.
 
 ## Heartbeats
 

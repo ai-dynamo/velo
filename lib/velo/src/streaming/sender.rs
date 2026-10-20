@@ -139,11 +139,16 @@ pub(crate) fn is_terminal_sentinel(bytes: &[u8]) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Retirement {
     /// The terminal (`Finalized`, `Detached` or `Dropped`) was handed on
-    /// behind every record before it, and velo on this node holds nothing of
-    /// the stream. Over the messenger mux, the batch that carries the terminal
-    /// was admitted by the transport. On the same worker, the terminal is in
-    /// the anchor's channel. On a per-stream transport, the terminal is in the
-    /// stream's egress channel, which the stream's own pump still has to write.
+    /// behind every record before it. Over the messenger mux, the batch that
+    /// carries the terminal was admitted by the transport; an item over the
+    /// eager budget stays staged on this node until the consumer pulls it,
+    /// and neither this nor graceful shutdown waits for that pull. On the same worker, the
+    /// terminal is in the anchor's channel. On a per-stream transport, the
+    /// terminal is in the stream's egress channel, which the stream's own
+    /// pump still has to write.
+    ///
+    /// It says nothing about the consumer: not that the bytes were written to
+    /// a socket, and not that they were received.
     Sent,
     /// The stream's output was thrown away before it was handed on: the
     /// consumer cancelled or dropped its anchor, the consumer's process went
@@ -151,11 +156,12 @@ pub enum Retirement {
     Discarded,
 }
 
-/// A future that resolves once velo on this node holds none of a stream's
-/// output. Made by [`StreamSender::retired`].
+/// A future that resolves once velo on this node has handed on all of a
+/// stream's output. Made by [`StreamSender::retired`].
 ///
 /// It holds no part of the stream, so it can outlive the sender, and polling
-/// it after it resolved gives the same answer again.
+/// it after it resolved gives the same answer again. A sender can hand out
+/// any number of them, and each one wakes.
 #[must_use = "a future does nothing unless polled"]
 #[derive(Debug)]
 pub struct Retired(crate::streaming::control::SenderClosed);
@@ -477,9 +483,9 @@ impl<T: Serialize> StreamSender<T> {
 }
 
 impl<T> StreamSender<T> {
-    /// A future that resolves once velo on this node holds none of this
-    /// stream's output, however the sender ends: [`finalize`](Self::finalize),
-    /// [`detach`](Self::detach), or drop.
+    /// A future that resolves once velo on this node has handed on all of
+    /// this stream's output, however the sender ends:
+    /// [`finalize`](Self::finalize), [`detach`](Self::detach), or drop.
     ///
     /// [`Retirement::Sent`] means the terminal was handed on behind every
     /// record before it; [`Retirement::Discarded`] means the output was thrown
@@ -492,10 +498,10 @@ impl<T> StreamSender<T> {
     /// consumer's credit, and a slow consumer can hold them for as long as it
     /// does not read.
     ///
-    /// It allocates nothing: it shares the state the sender already keeps per
-    /// stream, and a stream nobody asks about pays one compare-exchange when
-    /// it retires. Ask for it before `finalize` or `detach`, which consume the
-    /// sender.
+    /// It shares the state the sender already keeps per stream; the first
+    /// poll stores the waiter's waker, and a stream nobody asks about pays one
+    /// compare-exchange when it retires. Ask for it before `finalize` or
+    /// `detach`, which consume the sender.
     pub fn retired(&self) -> Retired {
         Retired(self.closed.clone())
     }

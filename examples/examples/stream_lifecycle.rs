@@ -258,13 +258,15 @@ impl Lane {
         sender.finalize()?;
         match mode {
             Mode::Plain => {}
+            // No timer around these: the measured difference between the
+            // modes is what the wait costs, not a timer's insert and remove.
+            // The reader's join below bounds a stream that never ends.
             Mode::Retired => {
-                let retired = retired.expect("retired mode asked for it");
-                let outcome = tokio::time::timeout(PATIENCE, retired).await?;
+                let outcome = retired.expect("retired mode asked for it").await;
                 anyhow::ensure!(outcome == Retirement::Sent, "stream {id}: {outcome:?}");
             }
             Mode::Ack => {
-                tokio::time::timeout(PATIENCE, ack.expect("ack mode has a waiter")).await??;
+                ack.expect("ack mode has a waiter").await?;
             }
         }
         let held = finalized.elapsed().as_micros();
