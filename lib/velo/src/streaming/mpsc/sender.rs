@@ -102,6 +102,9 @@ impl<T: Serialize> MpscStreamSender<T> {
             sender_stream_id,
             sender_registry,
             closed,
+            // An MPSC sender has no `retired()`; the report goes to a flag
+            // nobody polls.
+            retires_on: _,
         } = cancel;
         let heartbeat_cancel = cancel_token.child_token();
 
@@ -424,6 +427,7 @@ mod tests {
                 sender_stream_id: 1,
                 sender_registry: Arc::new(crate::streaming::control::SenderRegistry::default()),
                 closed: Default::default(),
+                retires_on: crate::streaming::sender::RetiresOn::Queue,
             },
             heartbeat,
             None,

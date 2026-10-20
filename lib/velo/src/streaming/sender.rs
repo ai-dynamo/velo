@@ -54,6 +54,21 @@ pub(crate) struct StreamSenderCancelInfo {
     /// The flag the registry entry's cancel sets. Passed in, not looked up:
     /// a cancel that arrives before the sender is built removes the entry.
     pub closed: crate::streaming::control::SenderClosed,
+    /// Who reports the stream's retirement once the terminal is in `tx`.
+    pub retires_on: RetiresOn,
+}
+
+/// Who reports a stream's retirement when its terminal is handed to the
+/// sender's channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetiresOn {
+    /// The channel is the last thing velo on this node hands the terminal to
+    /// (the anchor on the same worker, or a frame transport that cannot say
+    /// when a frame leaves): `send_terminal` reports `Sent` as it queues it.
+    Queue,
+    /// What is behind the channel reports: the mux slot once the terminal's
+    /// batch is admitted, a per-stream pump once it wrote the terminal.
+    Transport,
 }
 
 // ---------------------------------------------------------------------------
@@ -142,17 +157,20 @@ pub enum Retirement {
     /// behind every record before it. Over the messenger mux, the batch that
     /// carries the terminal was admitted by the transport; an item over the
     /// eager budget stays staged on this node until the consumer pulls it,
-    /// and neither this nor graceful shutdown waits for that pull. On the same worker, the
-    /// terminal is in the anchor's channel. On a per-stream transport, the
-    /// terminal is in the stream's egress channel, which the stream's own
-    /// pump still has to write.
+    /// and neither this nor graceful shutdown waits for that pull. On the
+    /// same worker, the terminal is in the anchor's channel. On a per-stream
+    /// transport of this crate, the stream's own pump wrote the terminal to
+    /// the socket (TCP), or the server took the whole stream (gRPC); on a
+    /// frame transport from outside velo, the terminal is in the stream's
+    /// egress channel.
     ///
     /// It says nothing about the consumer: not that the bytes were written to
     /// a socket, and not that they were received.
     Sent,
     /// The stream's output was thrown away before it was handed on: the
     /// consumer cancelled or dropped its anchor, the consumer's process went
-    /// away, the transport refused the batch, or this node shut down.
+    /// away, the transport refused the batch, a per-stream pump's write
+    /// failed or its connection ended first, or this node shut down.
     Discarded,
 }
 
@@ -213,6 +231,8 @@ pub struct StreamSender<T> {
     /// attach never negotiated one. See
     /// [`negotiated_transport`](StreamSender::negotiated_transport).
     negotiated_transport: Option<velo_ext::TransportKey>,
+    /// Who reports the stream's retirement once the terminal is in `tx`.
+    retires_on: RetiresOn,
     /// The runtime the sender was made on. A terminal that meets a full
     /// channel on a thread with no runtime waits in a task here.
     runtime: tokio::runtime::Handle,
@@ -258,6 +278,7 @@ impl<T: Serialize> StreamSender<T> {
             sender_stream_id,
             sender_registry,
             closed,
+            retires_on,
         } = cancel;
         let stop_token = sender_registry
             .senders
@@ -303,6 +324,7 @@ impl<T: Serialize> StreamSender<T> {
             local_registry: negotiated_transport.is_none().then_some(registry),
             cancel_token,
             closed,
+            retires_on,
             sender_stream_id,
             sender_registry,
             metrics,
@@ -506,17 +528,12 @@ impl<T> StreamSender<T> {
         Retired(self.closed.clone())
     }
 
-    /// Who reports this stream's retirement when the terminal is handed to
-    /// the channel. Under the mux, nobody here: the slot reports it once the
-    /// terminal's batch is admitted, or Discarded when the slot dies holding
-    /// it. Elsewhere the channel is the last thing velo on this node hands the
-    /// terminal to, so `send_terminal` reports it.
+    /// The flag `send_terminal` reports this stream's retirement through, when
+    /// the channel is the last thing velo on this node hands the terminal to.
+    /// `None` when what is behind the channel reports instead (see
+    /// [`RetiresOn`]).
     fn retires_on_channel(&self) -> Option<&crate::streaming::control::SenderClosed> {
-        let mux = self
-            .negotiated_transport
-            .as_ref()
-            .is_some_and(|key| key.as_str() == crate::streaming::MESSENGER_MUX_KEY);
-        (!mux).then_some(&self.closed)
+        (self.retires_on == RetiresOn::Queue).then_some(&self.closed)
     }
 
     /// Queue one encoded `Item` frame. [`send`](Self::send) and
@@ -774,6 +791,7 @@ mod tests {
                 sender_stream_id: 1,
                 sender_registry,
                 closed: Default::default(),
+                retires_on: crate::streaming::sender::RetiresOn::Queue,
             },
             Duration::from_secs(5),
             None,
@@ -813,6 +831,7 @@ mod tests {
                 sender_stream_id,
                 sender_registry: sender_registry.clone(),
                 closed,
+                retires_on: crate::streaming::sender::RetiresOn::Queue,
             },
             Duration::from_secs(5),
             None,
@@ -1062,6 +1081,7 @@ mod tests {
                 sender_stream_id: 1,
                 sender_registry,
                 closed: Default::default(),
+                retires_on: crate::streaming::sender::RetiresOn::Queue,
             },
             Duration::from_secs(5),
             None,
@@ -1105,6 +1125,7 @@ mod tests {
                 sender_stream_id: 1,
                 sender_registry,
                 closed: Default::default(),
+                retires_on: crate::streaming::sender::RetiresOn::Queue,
             },
             Duration::from_secs(5),
             None,

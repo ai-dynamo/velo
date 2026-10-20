@@ -1010,6 +1010,16 @@ pub struct AnchorManager {
     pub transport_registry:
         Arc<HashMap<String, Arc<dyn crate::streaming::transport::FrameTransport>>>,
 
+    /// The transports of the registry that report a stream's retirement
+    /// themselves, by the same key. Installed once, after the build, by
+    /// [`install_retiring_transports`](Self::install_retiring_transports);
+    /// a key that is not here connects through the registry, and its sender
+    /// reports `Sent` as the terminal enters the channel.
+    #[builder(setter(skip), default)]
+    pub(crate) retiring_transports: std::sync::OnceLock<
+        HashMap<String, Arc<dyn crate::streaming::transport::RetiringFrameTransport>>,
+    >,
+
     /// Default inactivity timeout for newly created anchors.
     /// When set, `create_anchor` spawns a timeout task that auto-removes the
     /// anchor if no sender attaches within this duration. Per-anchor overrides
@@ -1884,13 +1894,18 @@ impl AnchorManager {
     /// a negotiated slot opens already holding the window the receiver
     /// advertised, which is what removes the round trip an `OpenSlot`-time
     /// `CreditUpdate` used to cost.
+    ///
+    /// Also answers who reports the stream's retirement: the mux slot, a
+    /// per-stream transport of this crate once it wrote the terminal, or the
+    /// sender itself as the terminal enters the channel.
     async fn connect_streaming(
         &self,
         ticket: &crate::streaming::control::StreamOpenTicket,
         peer: velo_ext::WorkerId,
         anchor_id: u64,
         lifecycle: Option<crate::streaming::control::SenderEntry>,
-    ) -> Result<flume::Sender<Vec<u8>>, AttachError> {
+    ) -> Result<(flume::Sender<Vec<u8>>, crate::streaming::sender::RetiresOn), AttachError> {
+        use crate::streaming::sender::RetiresOn;
         let key = &ticket.streaming_transport_key;
         let session_id = ticket.routing_session_id;
         let initial_credit = ticket.initial_credit;
@@ -1906,18 +1921,41 @@ impl AnchorManager {
                 // The lane the receiver named, clamped to the lanes this node
                 // keeps to it. A receiver from before lanes names none: lane 0.
                 let key = mux.sender_lane(peer, ticket.lane);
-                Ok(mux
+                let tx = mux
                     .connect_controlled(key, anchor_id, session_id, limits, lifecycle)
-                    .await?)
+                    .await?;
+                Ok((tx, RetiresOn::Transport))
             }
             Ok(crate::streaming::negotiation::Connect::Legacy) => {
+                let retiring = self
+                    .retiring_transports
+                    .get()
+                    .and_then(|transports| transports.get(key.as_str()))
+                    .zip(lifecycle);
+                if let Some((transport, lifecycle)) = retiring {
+                    let tx = transport
+                        .connect_retiring(peer, anchor_id, session_id, lifecycle.closed)
+                        .await?;
+                    return Ok((tx, RetiresOn::Transport));
+                }
                 let transport = self.resolve_transport(key)?;
-                Ok(transport.connect(peer, anchor_id, session_id).await?)
+                let tx = transport.connect(peer, anchor_id, session_id).await?;
+                Ok((tx, RetiresOn::Queue))
             }
             Err(error) => Err(AttachError::TransportError(anyhow::anyhow!(
                 "peer answered with {key} but {error}"
             ))),
         }
+    }
+
+    /// Name the transports of the registry that report a stream's retirement
+    /// themselves. Once, after the build: the registry's type is public and
+    /// cannot carry them.
+    pub(crate) fn install_retiring_transports(
+        &self,
+        transports: HashMap<String, Arc<dyn crate::streaming::transport::RetiringFrameTransport>>,
+    ) {
+        let _ = self.retiring_transports.set(transports);
     }
 
     /// Resolve a FrameTransport by streaming-transport key.
@@ -2381,7 +2419,7 @@ impl AnchorManager {
 
         // Resolve the local FrameTransport that matches the remote worker's
         // bound streaming transport, then connect by WorkerId.
-        let frame_tx = match self
+        let (frame_tx, retires_on) = match self
             .connect_streaming(
                 ticket,
                 handle_worker_id,
@@ -2390,7 +2428,7 @@ impl AnchorManager {
             )
             .await
         {
-            Ok(frame_tx) => frame_tx,
+            Ok(connected) => connected,
             Err(err) => {
                 self.record_streaming_operation(
                     StreamingOp::Open,
@@ -2417,6 +2455,7 @@ impl AnchorManager {
                 sender_stream_id,
                 sender_registry: self.sender_registry.clone(),
                 closed: identity.entry.closed.clone(),
+                retires_on,
             },
             Duration::from_millis(ticket.heartbeat_interval_ms),
             self.metrics.clone(),
@@ -2627,6 +2666,7 @@ impl AnchorManager {
                             sender_stream_id,
                             sender_registry: self.sender_registry.clone(),
                             closed,
+                            retires_on: crate::streaming::sender::RetiresOn::Queue,
                         },
                         heartbeat_interval,
                         self.metrics.clone(),
@@ -2810,6 +2850,7 @@ impl AnchorManager {
                 sender_stream_id: identity.sender_stream_id,
                 sender_registry: self.sender_registry.clone(),
                 closed: identity.entry.closed.clone(),
+                retires_on: crate::streaming::sender::RetiresOn::Queue,
             },
             heartbeat_interval,
             self.metrics.clone(),
@@ -2887,7 +2928,7 @@ impl AnchorManager {
                 } else {
                     sender_stream_id
                 };
-                let frame_tx = match self
+                let (frame_tx, retires_on) = match self
                     .connect_streaming(
                         &crate::streaming::control::StreamOpenTicket {
                             streaming_transport_key: streaming_transport_key.clone(),
@@ -2903,7 +2944,7 @@ impl AnchorManager {
                     )
                     .await
                 {
-                    Ok(frame_tx) => frame_tx,
+                    Ok(connected) => connected,
                     Err(error) => {
                         self.rollback_remote_attach(
                             handle,
@@ -2929,6 +2970,7 @@ impl AnchorManager {
                         sender_stream_id,
                         sender_registry: self.sender_registry.clone(),
                         closed: identity.entry.closed.clone(),
+                        retires_on,
                     },
                     Duration::from_millis(heartbeat_interval_ms),
                     self.metrics.clone(),

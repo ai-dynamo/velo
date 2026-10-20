@@ -110,11 +110,14 @@ const DEFAULT_MAX_BATCH_FRAMES: usize = 1024;
 /// flush that had to precede it failed.
 const FLUSH_FAILED: &str = "batch flush failed";
 
-/// How long a TCP or UDS writer keeps writing at teardown: the frames already
-/// in its channel, and the write in progress. Those frames were admitted, and
-/// a sender may act on that at once (the messenger mux reports a stream sent
-/// once the batch that ends it is admitted). A writer stops at this deadline
-/// so that a peer that does not read cannot hold teardown open.
+/// The default for how long a TCP or UDS writer keeps writing at teardown:
+/// the frames already in its channel, the write in progress, and a dial in
+/// progress. Those frames were admitted, and a sender may act on that at once
+/// (the messenger mux reports a stream sent once the batch that ends it is
+/// admitted). A writer stops at this deadline so that a peer that does not
+/// read cannot hold teardown open. The transport builders set it
+/// (`teardown_flush_grace`): an engine whose requests take a minute to drain
+/// needs longer than a second.
 pub(crate) const TEARDOWN_FLUSH_GRACE: Duration = Duration::from_secs(1);
 
 /// How much longer than the teardown deadline `closed()` waits for the
@@ -133,15 +136,18 @@ pub(crate) struct TeardownStop {
     /// token is a child of it, so a writer that sees a stop asks here whether
     /// that stop is teardown.
     token: CancellationToken,
+    /// How long after the teardown the writers keep writing.
+    grace: Duration,
     deadline: std::sync::OnceLock<tokio::time::Instant>,
     /// One token per connection writer while it can still write.
     writers: tokio_util::task::TaskTracker,
 }
 
 impl TeardownStop {
-    pub(crate) fn new(token: CancellationToken) -> Self {
+    pub(crate) fn new(token: CancellationToken, grace: Duration) -> Self {
         Self {
             token,
+            grace,
             deadline: std::sync::OnceLock::new(),
             writers: tokio_util::task::TaskTracker::new(),
         }
@@ -155,7 +161,7 @@ impl TeardownStop {
         self.token.is_cancelled().then(|| {
             *self
                 .deadline
-                .get_or_init(|| tokio::time::Instant::now() + TEARDOWN_FLUSH_GRACE)
+                .get_or_init(|| tokio::time::Instant::now() + self.grace)
         })
     }
 
@@ -185,7 +191,7 @@ impl TeardownStop {
         {
             tracing::warn!(
                 "{what}: connection writers did not finish within {:?} of teardown",
-                TEARDOWN_FLUSH_GRACE + WRITERS_CLOSE_MARGIN
+                self.grace + WRITERS_CLOSE_MARGIN
             );
         }
     }
@@ -661,7 +667,8 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
     wrap: impl Fn(I) -> T,
     cancel: Option<&CancellationToken>,
     observer: &O,
-) where
+) -> WriterExit
+where
     W: AsyncWrite + Unpin,
     T: Coalescable,
     O: WriterObserver,
@@ -677,7 +684,7 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
     let mut staged: Vec<T::FailureToken> = Vec::new();
     let mut egress = EgressLog::new(observer);
 
-    'writer: loop {
+    let exit = 'writer: loop {
         let first = match bound.deadline {
             // Stopping, but keeping what is queued: take only what is already
             // there, and nothing after the deadline. The caller fails the rest.
@@ -685,9 +692,9 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
                 Ok(item) if tokio::time::Instant::now() < deadline => wrap(item),
                 Ok(item) => {
                     T::fail(wrap(item).into_failure_token(), TEARDOWN_DEADLINE);
-                    break 'writer;
+                    break 'writer WriterExit::Stopped;
                 }
-                Err(_) => break 'writer,
+                Err(_) => break 'writer WriterExit::Stopped,
             },
             // Block for the first item. Cancellation is polled first so a hot
             // send queue cannot starve shutdown.
@@ -698,13 +705,13 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
                         bound.deadline = Some(deadline);
                         continue 'writer;
                     }
-                    None => break 'writer,
+                    None => break 'writer WriterExit::Stopped,
                 },
                 recv = rx.recv_async() => match recv {
                     Ok(item) => wrap(item),
                     // `recv_async` errors only once the channel is both
                     // disconnected *and* drained, so queued items are never lost.
-                    Err(_) => break 'writer,
+                    Err(_) => break 'writer WriterExit::ChannelClosed,
                 },
             },
         };
@@ -729,7 +736,7 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
             {
                 // `item` never entered the batch, so `flush` did not report it.
                 T::fail(item.into_failure_token(), FLUSH_FAILED);
-                break 'writer;
+                break 'writer WriterExit::Failed;
             }
 
             if staging == Staging::WriteDirect {
@@ -749,7 +756,7 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
                     egress.failed();
                     observer.on_failure(kind, &e, 1);
                     T::fail(item.into_failure_token(), &e.to_string());
-                    break 'writer;
+                    break 'writer WriterExit::Failed;
                 }
                 observer.on_flush(1);
                 egress.written(observer, started);
@@ -776,7 +783,7 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
                         &mut bound,
                     )
                     .await;
-                    break 'writer;
+                    break 'writer WriterExit::Failed;
                 }
                 // Read before the move. `is_terminal` is consulted *after*
                 // staging so the terminal frame itself still reaches the wire.
@@ -819,16 +826,34 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
             &mut bound,
         )
         .await
-            || terminal
         {
-            break 'writer;
+            break 'writer WriterExit::Failed;
         }
-    }
+        if terminal {
+            break 'writer WriterExit::Terminal;
+        }
+    };
 
     debug_assert!(
         staged.is_empty(),
         "every exit path flushes or reports the staged batch"
     );
+    exit
+}
+
+/// Why [`run_coalescing_writer`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WriterExit {
+    /// A terminal item was written, and the loop ended at it. Anything queued
+    /// after it stays in the channel.
+    Terminal,
+    /// The channel closed with nothing left in it.
+    ChannelClosed,
+    /// The stop token fired and the observer kept nothing, or the teardown
+    /// deadline passed. What is still queued is the caller's to fail.
+    Stopped,
+    /// A write or an encode failed. Every frame it carried was reported.
+    Failed,
 }
 
 /// Write the staged batch. Returns `false` if the writer should stop.

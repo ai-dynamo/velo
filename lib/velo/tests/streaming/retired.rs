@@ -381,12 +381,12 @@ async fn a_same_worker_stream_retires_when_its_terminal_is_queued() {
     );
 }
 
-/// A per-stream transport (the mux turned off): the stream retires once its
-/// terminal is in the stream's egress channel. That is a weaker promise than
-/// the mux makes, because the stream's own pump still has to write it; the
-/// docs say so.
+/// A per-stream TCP transport (the mux turned off): the stream retires once
+/// its own pump has written the terminal to the socket. The pump reports it;
+/// the sender does not, because the terminal is still on this node while it
+/// waits in the egress channel.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_per_stream_transport_retires_when_its_terminal_is_queued() {
+async fn a_per_stream_transport_retires_once_its_terminal_is_written() {
     let (producer, consumer) = pair(MuxConfig {
         enabled: false,
         ..MuxConfig::default()
@@ -474,4 +474,73 @@ async fn shutting_down_after_sent_keeps_a_staged_item() {
             .unwrap_or_else(|_| panic!("trial {trial}: the reader hung"))
             .unwrap_or_else(|error| panic!("trial {trial}: {error}"));
     }
+}
+
+/// Over gRPC, the per-stream pump reports `Sent` once the server has taken the
+/// whole request stream, terminal included: the call's response ends only
+/// then.
+#[cfg(feature = "grpc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_per_stream_grpc_transport_retires_once_its_terminal_is_taken() {
+    async fn grpc_node() -> Node {
+        let registry = Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).expect("metrics"));
+        let velo = Velo::builder()
+            .add_transport(tcp())
+            .stream_config(velo::StreamConfig::Grpc(Some(velo::GrpcConfig {
+                bind_addr: "127.0.0.1:0".parse().expect("loopback"),
+            })))
+            .expect("stream config")
+            .metrics(metrics)
+            .messenger_mux(MuxConfig {
+                enabled: false,
+                ..MuxConfig::default()
+            })
+            .expect("mux config")
+            .build()
+            .await
+            .expect("build velo");
+        Node { velo, registry }
+    }
+    let producer = grpc_node().await;
+    let consumer = grpc_node().await;
+    producer
+        .velo
+        .register_peer(consumer.velo.peer_info())
+        .expect("register consumer");
+    consumer
+        .velo
+        .register_peer(producer.velo.peer_info())
+        .expect("register producer");
+    for (a, b) in [(&producer, &consumer), (&consumer, &producer)] {
+        tokio::time::timeout(
+            PATIENCE,
+            a.velo
+                .wait_for_handler(b.velo.instance_id(), "_anchor_attach"),
+        )
+        .await
+        .expect("handshake timed out")
+        .expect("handshake");
+    }
+    let mut anchor = consumer.velo.create_anchor::<u32>();
+    let sender = producer
+        .velo
+        .attach_anchor::<u32>(anchor.handle())
+        .await
+        .expect("attach");
+    assert_eq!(
+        sender.negotiated_transport().map(|key| key.as_str()),
+        Some("grpc-stream"),
+        "the stream must ride gRPC"
+    );
+    for i in 0..ITEMS {
+        sender.send(i).await.expect("send");
+    }
+    let retired = sender.retired();
+    sender.finalize().expect("finalize");
+    assert_eq!(
+        tokio::time::timeout(PATIENCE, retired).await,
+        Ok(Retirement::Sent)
+    );
+    read_to_the_end(&mut anchor).await;
 }

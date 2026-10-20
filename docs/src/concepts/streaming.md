@@ -57,13 +57,13 @@ match retired.await {
 }
 ```
 
-`Retirement::Sent` means that velo handed the terminal (`Finalized`, `Detached`, or `Dropped`) on behind every record before it. It is a statement about the producer's node, not about the consumer: it does not say that the bytes were written to a socket, and it does not say that the consumer received them. What "handed on" means depends on the path of the stream:
+`Retirement::Sent` means that velo handed the terminal (`Finalized`, `Detached`, or `Dropped`) on behind every record before it. It is a statement about the producer's node, not about the consumer: it does not say that the consumer received anything, and what "handed on" means depends on the path of the stream:
 
 | Path | `Sent` means |
 |---|---|
-| Messenger mux | The transport admitted the batch that carries the terminal: it is in the connection writer's queue, or on its way there. At graceful shutdown, TCP and UDS write the frames that they admitted, until a deadline 1 second after the teardown; QUIC fails the frames that are still queued. An item over the eager budget stays staged on the producer until the consumer pulls it. Neither `Sent` nor `graceful_shutdown` waits for that pull: a shutdown right after `Sent` can drop such an item. |
+| Messenger mux | The transport admitted the batch that carries the terminal: it is in the connection writer's queue, or on its way there. At graceful shutdown, TCP and UDS write the frames that they admitted, until their teardown grace has passed (1 second unless the builder set it); QUIC fails the frames that are still queued. An item over the eager budget stays staged on the producer until the consumer pulls it. Neither `Sent` nor `graceful_shutdown` waits for that pull: a shutdown right after `Sent` can drop such an item. |
 | Same worker | The terminal is in the anchor's channel. |
-| Per-stream transport (TCP, gRPC) | The terminal is in the stream's egress channel. The stream's pump still has to write it, and `graceful_shutdown` does not stop that transport. |
+| Per-stream transport (TCP, gRPC) | The stream's own pump wrote the terminal to the socket (TCP), or the server took the whole request stream (gRPC). `Discarded` if the write failed, or the connection ended first. A frame transport from outside velo cannot say when a frame left, so there the terminal's arrival in the egress channel counts. |
 
 `Retirement::Discarded` means that the output was thrown away before velo handed it on. The consumer cancelled or dropped its anchor, the consumer's process went away, the transport refused the batch, or the producer's node shut down while it held the output. A task or batch that dies with the terminal also gives `Discarded`, so the future does not wait forever.
 

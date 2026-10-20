@@ -559,6 +559,20 @@ impl VeloBuilder {
                 .build()
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
         );
+        // The per-stream transport of this crate reports a stream's
+        // retirement from its pump; the registry's public type cannot say so.
+        if let Some(owned) = &owned_stream_transport {
+            let retiring: Arc<dyn crate::streaming::transport::RetiringFrameTransport> = match owned
+            {
+                OwnedStreamTransport::Tcp(tcp) => Arc::clone(tcp) as _,
+                #[cfg(feature = "grpc")]
+                OwnedStreamTransport::Grpc(grpc) => Arc::clone(grpc) as _,
+            };
+            anchor_manager.install_retiring_transports(std::collections::HashMap::from([(
+                stream_transport.key().as_str().to_string(),
+                retiring,
+            )]));
+        }
 
         if let Some(mux) = mux {
             anchor_manager.install_mux(mux)?;
@@ -814,7 +828,8 @@ impl Velo {
     /// together, rather than giving each phase the full duration. Joining mux
     /// tasks comes after the drain and needs the owning runtime to make
     /// progress. The transports' close step also comes on top: it is bounded by each
-    /// transport's own [`Transport::closed`] (QUIC, TCP, UDS: 2.5 s), not by the policy,
+    /// transport's own [`Transport::closed`] (QUIC: 2.5 s; TCP and UDS: their
+    /// teardown grace, 1 s unless the builder set it, plus 1.5 s), not by the policy,
     /// because cutting it short would discard frames already written.
     /// Under [`ShutdownPolicy::WaitForever`] the sweep still takes
     /// [`RdmaConfig::shutdown_timeout`], because a peer that crashed
