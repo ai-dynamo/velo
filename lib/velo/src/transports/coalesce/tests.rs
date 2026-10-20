@@ -1547,7 +1547,7 @@ async fn a_stop_that_keeps_the_queue_ends_at_its_deadline() {
 #[tokio::test(start_paused = true)]
 async fn a_stop_is_teardown_only_once_the_transport_tears_down() {
     let token = CancellationToken::new();
-    let stop = TeardownStop::new(token.clone());
+    let stop = TeardownStop::new(token.clone(), TEARDOWN_FLUSH_GRACE);
     assert_eq!(
         stop.deadline(),
         None,
@@ -1562,5 +1562,14 @@ async fn a_stop_is_teardown_only_once_the_transport_tears_down() {
         stop.deadline(),
         Some(deadline),
         "one deadline for every writer"
+    );
+
+    // The grace is the transport's to set.
+    let token = CancellationToken::new();
+    let stop = TeardownStop::new(token.clone(), Duration::from_secs(90));
+    token.cancel();
+    assert_eq!(
+        stop.deadline(),
+        Some(tokio::time::Instant::now() + Duration::from_secs(90))
     );
 }

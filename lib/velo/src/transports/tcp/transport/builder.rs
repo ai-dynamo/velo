@@ -14,6 +14,8 @@ use velo_ext::TransportKey;
 use crate::transports::utils::interfaces::{InterfaceFilter, resolve_advertise_endpoints};
 
 use super::TcpTransport;
+use crate::transports::coalesce::{TEARDOWN_FLUSH_GRACE, TeardownStop};
+use std::sync::Arc;
 
 /// Builder for TcpTransport
 pub struct TcpTransportBuilder {
@@ -27,6 +29,7 @@ pub struct TcpTransportBuilder {
     shrink_threshold: Option<usize>,
     socket_buffers: Option<usize>,
     lanes: NonZeroU16,
+    teardown_flush_grace: Duration,
 }
 
 impl TcpTransportBuilder {
@@ -43,7 +46,27 @@ impl TcpTransportBuilder {
             shrink_threshold: None,
             socket_buffers: Some(super::super::listener::DEFAULT_SOCKET_BUFFERS),
             lanes: NonZeroU16::MIN,
+            teardown_flush_grace: TEARDOWN_FLUSH_GRACE,
         }
+    }
+
+    /// How long the connection writers keep writing after the transport
+    /// tears down at graceful shutdown (default: 1 s).
+    ///
+    /// The frames in a writer's channel were admitted, and a sender may have
+    /// acted on that: the messenger mux reports a stream sent once the batch
+    /// that ends it is admitted. At teardown each writer finishes the write
+    /// in progress, or the dial in progress, and writes what is already in
+    /// its channel, until this much time has passed; then it fails the rest.
+    /// `closed()` waits this long plus 0.5 s. A peer that does not read
+    /// cannot hold the shutdown open for longer.
+    ///
+    /// Set it to what the work behind the frames takes to finish: an LLM
+    /// engine that drains for a minute before its last responses go out
+    /// needs more than a second.
+    pub fn teardown_flush_grace(mut self, grace: Duration) -> Self {
+        self.teardown_flush_grace = grace;
+        self
     }
 
     /// Set the bind address
@@ -242,6 +265,10 @@ impl TcpTransportBuilder {
         }
         transport.socket_buffers = self.socket_buffers;
         transport.lanes = self.lanes;
+        transport.teardown = Arc::new(TeardownStop::new(
+            transport.cancel_token.clone(),
+            self.teardown_flush_grace,
+        ));
         Ok(transport)
     }
 }

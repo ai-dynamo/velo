@@ -152,7 +152,10 @@ async fn writer_observer_publishes_egress_into_the_bound_handle() {
             lane: 0,
             addr: "127.0.0.1:1".parse().unwrap(),
             egress: Some(EgressMetrics::new(handle)),
-            teardown: Arc::new(TeardownStop::new(CancellationToken::new())),
+            teardown: Arc::new(TeardownStop::new(
+                CancellationToken::new(),
+                TEARDOWN_FLUSH_GRACE,
+            )),
         },
     )
     .await;
@@ -259,7 +262,10 @@ async fn the_egress_queue_wait_spans_the_admission_gate() {
                     lane: 0,
                     addr: "127.0.0.1:1".parse().unwrap(),
                     egress: Some(EgressMetrics::new(handle)),
-                    teardown: Arc::new(TeardownStop::new(CancellationToken::new())),
+                    teardown: Arc::new(TeardownStop::new(
+                        CancellationToken::new(),
+                        TEARDOWN_FLUSH_GRACE,
+                    )),
                 },
             )
             .await;
@@ -487,7 +493,10 @@ async fn test_writer_task_cleans_up_on_write_error() {
         WriterTaskContext {
             connections: conns,
             cancel_token: cancel,
-            teardown: Arc::new(TeardownStop::new(CancellationToken::new())),
+            teardown: Arc::new(TeardownStop::new(
+                CancellationToken::new(),
+                TEARDOWN_FLUSH_GRACE,
+            )),
             writing: tokio_util::task::TaskTracker::new().token(),
             connect_timeout: Duration::from_secs(5),
             reader_ctx: None,
@@ -639,7 +648,10 @@ async fn test_writer_task_drains_on_connect_failure() {
         WriterTaskContext {
             connections: conns,
             cancel_token: cancel,
-            teardown: Arc::new(TeardownStop::new(CancellationToken::new())),
+            teardown: Arc::new(TeardownStop::new(
+                CancellationToken::new(),
+                TEARDOWN_FLUSH_GRACE,
+            )),
             writing: tokio_util::task::TaskTracker::new().token(),
             connect_timeout: Duration::from_secs(5),
             reader_ctx: None,
@@ -1526,7 +1538,7 @@ async fn teardown_keeps_a_pending_dial_until_its_deadline() {
         WriterTaskContext {
             connections: Arc::clone(&connections),
             cancel_token: teardown.child_token(),
-            teardown: Arc::new(TeardownStop::new(teardown.clone())),
+            teardown: Arc::new(TeardownStop::new(teardown.clone(), TEARDOWN_FLUSH_GRACE)),
             writing: tokio_util::task::TaskTracker::new().token(),
             connect_timeout: Duration::from_secs(5),
             reader_ctx: None,
@@ -1565,11 +1577,47 @@ async fn teardown_keeps_a_pending_dial_until_its_deadline() {
 /// writer blocks, and the test takes no real second.
 #[tokio::test(start_paused = true)]
 async fn closed_waits_for_a_writer_blocked_on_its_peer() {
+    let (transport, errors, _peer_listener) = blocked_on_its_peer(TEARDOWN_FLUSH_GRACE);
+    transport.shutdown();
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), transport.closed())
+        .await
+        .expect("closed() bounds its wait");
+    assert!(
+        started.elapsed() >= TEARDOWN_FLUSH_GRACE,
+        "closed() returned after {:?}, before the writer's deadline",
+        started.elapsed()
+    );
+    assert!(
+        errors.error_count() > 0,
+        "the frames the peer never read fail at the deadline"
+    );
+}
+
+/// A transport whose one connection writer is blocked on a peer that never
+/// reads, with `grace` as its teardown grace. The listener is returned so it
+/// stays open: the kernel completes the handshake and buffers what it can,
+/// then the writer blocks.
+fn blocked_on_its_peer(
+    grace: Duration,
+) -> (
+    TcpTransport,
+    Arc<TrackingErrorHandler>,
+    std::net::TcpListener,
+) {
     const FRAMES: usize = 128;
     const PAYLOAD: usize = 256 * 1024;
-    let (transport, _) = make_transport();
-    // Never accepted: the kernel completes the handshake and buffers what it
-    // can, then the writer blocks.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let transport = TcpTransportBuilder::new()
+        .from_listener(listener)
+        .unwrap()
+        .teardown_flush_grace(grace)
+        .build()
+        .unwrap();
+    transport
+        .runtime
+        .set(tokio::runtime::Handle::current())
+        .ok();
     let peer_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let peer = make_tcp_peer(peer_listener.local_addr().unwrap());
     let peer_id = peer.instance_id();
@@ -1585,19 +1633,48 @@ async fn closed_waits_for_a_writer_blocked_on_its_peer() {
             errors.clone(),
         );
     }
+    (transport, errors, peer_listener)
+}
 
+/// The builder's teardown grace is what the writers get. A longer one keeps a
+/// blocked writer trying past the default second, failing nothing until the
+/// grace has passed; a shorter one ends the wait sooner. An engine that drains
+/// for a minute sets a grace to match.
+#[tokio::test(start_paused = true)]
+async fn the_teardown_grace_is_the_builders() {
+    let (transport, errors, _peer_listener) = blocked_on_its_peer(Duration::from_secs(3));
+    transport.shutdown();
+    let started = tokio::time::Instant::now();
+    let closed = transport.closed();
+    tokio::pin!(closed);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), &mut closed)
+            .await
+            .is_err(),
+        "a 3 s grace keeps writing past the default second"
+    );
+    assert_eq!(
+        errors.error_count(),
+        0,
+        "nothing fails before the grace passes"
+    );
+    tokio::time::timeout(Duration::from_secs(5), closed)
+        .await
+        .expect("closed() bounds its wait");
+    assert!(started.elapsed() >= Duration::from_secs(3));
+    assert!(errors.error_count() > 0);
+
+    let (transport, errors, _peer_listener) = blocked_on_its_peer(Duration::from_millis(200));
     transport.shutdown();
     let started = tokio::time::Instant::now();
     tokio::time::timeout(Duration::from_secs(5), transport.closed())
         .await
         .expect("closed() bounds its wait");
+    assert!(started.elapsed() >= Duration::from_millis(200));
     assert!(
-        started.elapsed() >= TEARDOWN_FLUSH_GRACE,
-        "closed() returned after {:?}, before the writer's deadline",
+        started.elapsed() < Duration::from_secs(1),
+        "a 200 ms grace stops before the default second: {:?}",
         started.elapsed()
     );
-    assert!(
-        errors.error_count() > 0,
-        "the frames the peer never read fail at the deadline"
-    );
+    assert!(errors.error_count() > 0);
 }

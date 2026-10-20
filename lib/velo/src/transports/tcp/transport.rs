@@ -30,7 +30,9 @@ use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey,
 use super::framing::DEFAULT_MAX_FRAME_SIZE;
 use super::listener::TcpListener;
 use super::writer::TcpWriterObserver;
-use crate::transports::coalesce::{EgressMetrics, TeardownStop, run_coalescing_writer};
+use crate::transports::coalesce::{
+    EgressMetrics, TEARDOWN_FLUSH_GRACE, TeardownStop, run_coalescing_writer,
+};
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
 
 mod builder;
@@ -201,7 +203,7 @@ impl TcpTransport {
             connect_timeout,
             listener: Mutex::new(listener),
             listener_tasks: tokio_util::task::TaskTracker::new(),
-            teardown: Arc::new(TeardownStop::new(cancel_token)),
+            teardown: Arc::new(TeardownStop::new(cancel_token, TEARDOWN_FLUSH_GRACE)),
             local_interfaces: OnceLock::new(),
             numa_hint,
             metrics: OnceLock::new(),
@@ -611,9 +613,9 @@ impl Transport for TcpTransport {
         self.update_connection_gauge();
     }
 
-    /// Wait for the connection writers to write what teardown kept (until the
-    /// teardown deadline, plus a margin: 1.5 s), then for the accept loop to
-    /// close its socket (LISTENER_CLOSE_WAIT: 1 s).
+    /// Wait for the connection writers to write what teardown kept (the
+    /// teardown grace, 1 s unless the builder set it, plus 0.5 s), then for
+    /// the accept loop to close its socket (LISTENER_CLOSE_WAIT: 1 s).
     fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
         Box::pin(async move {
             if !self.cancel_token.is_cancelled() {

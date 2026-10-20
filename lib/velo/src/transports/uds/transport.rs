@@ -28,7 +28,9 @@ use crate::transports::tcp::framing::DEFAULT_MAX_FRAME_SIZE;
 
 use super::listener::{UdsListener, default_shrink_threshold};
 use super::writer::UdsWriterObserver;
-use crate::transports::coalesce::{EgressMetrics, TeardownStop, run_coalescing_writer};
+use crate::transports::coalesce::{
+    EgressMetrics, TEARDOWN_FLUSH_GRACE, TeardownStop, run_coalescing_writer,
+};
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
 
 /// How long `closed()` waits for the accept loop to drop its socket. The loop
@@ -156,7 +158,7 @@ impl UdsTransport {
             connect_timeout,
             metrics: OnceLock::new(),
             listener_tasks: tokio_util::task::TaskTracker::new(),
-            teardown: Arc::new(TeardownStop::new(cancel_token)),
+            teardown: Arc::new(TeardownStop::new(cancel_token, TEARDOWN_FLUSH_GRACE)),
             shrink_threshold: default_shrink_threshold(),
             dialed_ctx: OnceLock::new(),
         }
@@ -562,9 +564,9 @@ impl Transport for UdsTransport {
         self.update_connection_gauge();
     }
 
-    /// Wait for the connection writers to write what teardown kept (until the
-    /// teardown deadline, plus a margin: 1.5 s), then for the accept loop to
-    /// close its socket (LISTENER_CLOSE_WAIT: 1 s).
+    /// Wait for the connection writers to write what teardown kept (the
+    /// teardown grace, 1 s unless the builder set it, plus 0.5 s), then for
+    /// the accept loop to close its socket (LISTENER_CLOSE_WAIT: 1 s).
     fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
         Box::pin(async move {
             if !self.cancel_token.is_cancelled() {
@@ -823,6 +825,7 @@ pub struct UdsTransportBuilder {
     channel_capacity: usize,
     connect_timeout: Duration,
     shrink_threshold: Option<usize>,
+    teardown_flush_grace: Duration,
 }
 
 impl UdsTransportBuilder {
@@ -834,7 +837,16 @@ impl UdsTransportBuilder {
             channel_capacity: 256,
             connect_timeout: Duration::from_secs(5),
             shrink_threshold: None,
+            teardown_flush_grace: TEARDOWN_FLUSH_GRACE,
         }
+    }
+
+    /// How long the connection writers keep writing after the transport
+    /// tears down at graceful shutdown (default: 1 s). See
+    /// [`TcpTransportBuilder::teardown_flush_grace`](crate::transports::tcp::TcpTransportBuilder::teardown_flush_grace).
+    pub fn teardown_flush_grace(mut self, grace: Duration) -> Self {
+        self.teardown_flush_grace = grace;
+        self
     }
 
     /// Set the socket path
@@ -894,6 +906,10 @@ impl UdsTransportBuilder {
         if let Some(t) = self.shrink_threshold {
             transport.shrink_threshold = t;
         }
+        transport.teardown = Arc::new(TeardownStop::new(
+            transport.cancel_token.clone(),
+            self.teardown_flush_grace,
+        ));
         Ok(transport)
     }
 }

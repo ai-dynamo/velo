@@ -6,6 +6,7 @@
 use super::*;
 use crate::transports::AdmissionState;
 use crate::transports::address::WorkerAddressBuilder;
+use crate::transports::coalesce::TEARDOWN_FLUSH_GRACE;
 use crate::transports::tcp::TcpFrameCodec;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use velo_ext::PeerInfo;
@@ -240,7 +241,10 @@ async fn test_writer_task_cleans_up_on_write_error() {
         WriterTaskContext {
             connections: conns,
             cancel_token: cancel,
-            teardown: Arc::new(TeardownStop::new(CancellationToken::new())),
+            teardown: Arc::new(TeardownStop::new(
+                CancellationToken::new(),
+                TEARDOWN_FLUSH_GRACE,
+            )),
             writing: tokio_util::task::TaskTracker::new().token(),
             connect_timeout: Duration::from_secs(5),
             reader_ctx: None,
@@ -462,7 +466,10 @@ async fn test_writer_task_drains_on_connect_failure() {
         WriterTaskContext {
             connections: conns,
             cancel_token: cancel,
-            teardown: Arc::new(TeardownStop::new(CancellationToken::new())),
+            teardown: Arc::new(TeardownStop::new(
+                CancellationToken::new(),
+                TEARDOWN_FLUSH_GRACE,
+            )),
             writing: tokio_util::task::TaskTracker::new().token(),
             connect_timeout: Duration::from_secs(5),
             reader_ctx: None,
@@ -682,7 +689,10 @@ async fn the_egress_queue_wait_spans_the_admission_gate() {
                     instance_id,
                     path: &socket_path,
                     egress: Some(EgressMetrics::new(handle)),
-                    teardown: Arc::new(TeardownStop::new(CancellationToken::new())),
+                    teardown: Arc::new(TeardownStop::new(
+                        CancellationToken::new(),
+                        TEARDOWN_FLUSH_GRACE,
+                    )),
                 },
             )
             .await;
