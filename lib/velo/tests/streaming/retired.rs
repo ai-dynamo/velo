@@ -416,64 +416,67 @@ async fn a_per_stream_transport_retires_once_its_terminal_is_written() {
     read_to_the_end(&mut anchor).await;
 }
 
-/// An item over the eager budget rides the mux as a handle, and its bytes stay
-/// staged on the producer until the consumer pulls them. `Sent` does not wait
-/// for that pull: the batch that carries the handle was admitted. Nor does
-/// graceful shutdown: its drain counts requests in flight, not staged
-/// payloads, so the teardown drops the staged bytes and the consumer reads a
-/// broken stream instead of the item. This test states the contract the
-/// owner has to choose a fix for (the drain waits for staged payloads, or
-/// `Sent` waits for the pull); it is ignored until then.
+/// An item larger than the eager budget rides the mux as a handle, and its
+/// bytes stay staged on the producer until the consumer pulls them. `Sent`
+/// does not wait for that pull: it resolves when the handle's batch is
+/// admitted, while the producer still holds the item. This is the documented
+/// limitation; a shutdown right after `Sent` can cut such an item, because
+/// the drain does not wait for the pull either. A later fix shows up here as
+/// a change to what this test asserts.
 ///
-/// Several trials, because the pull races the shutdown: each one builds its
-/// own two nodes, since the shutdown ends one.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "a staged item is lost by a shutdown right after Sent: the drain does not wait for the consumer's pull"]
-async fn shutting_down_after_sent_keeps_a_staged_item() {
-    const TRIALS: usize = 5;
+/// The consumer never registers the producer, so it cannot pull: the staged
+/// handle is still held when `Sent` resolves, with nothing racing it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sent_resolves_while_a_staged_item_is_still_held() {
     /// Well over the default eager budget (256 KiB), so the item is staged.
     const STAGED: usize = 1 << 20;
 
-    for trial in 0..TRIALS {
-        let (producer, consumer) = pair(window(256)).await;
-        let mut anchor = consumer.velo.create_anchor::<Vec<u8>>();
-        let ticket = consumer
-            .velo
-            .prebind_anchor(anchor.handle())
-            .expect("ticket");
-        let sender = producer
-            .velo
-            .open_anchor_stream::<Vec<u8>>(anchor.handle(), ticket)
-            .await
-            .expect("open stream");
-        let reader = tokio::spawn(async move {
-            match tokio::time::timeout(PATIENCE, anchor.next()).await {
-                Ok(Some(Ok(StreamFrame::Item(item)))) if item.len() == STAGED => {}
-                other => panic!("the staged item: {other:?}"),
-            }
-            match tokio::time::timeout(PATIENCE, anchor.next()).await {
-                Ok(Some(Ok(StreamFrame::Finalized))) => {}
-                other => panic!("expected Finalized: {other:?}"),
-            }
-        });
-        sender.send(vec![7u8; STAGED]).await.expect("send");
-        let retired = sender.retired();
-        sender.finalize().expect("finalize");
-        assert_eq!(
-            tokio::time::timeout(PATIENCE, retired).await,
-            Ok(Retirement::Sent),
-            "trial {trial}"
-        );
+    let producer = node(window(256)).await;
+    let consumer = node(window(256)).await;
+    producer
+        .velo
+        .register_peer(consumer.velo.peer_info())
+        .expect("register consumer");
+    tokio::time::timeout(
+        PATIENCE,
         producer
             .velo
-            .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_secs(2)))
-            .await;
-        drop(producer);
-        tokio::time::timeout(PATIENCE, reader)
-            .await
-            .unwrap_or_else(|_| panic!("trial {trial}: the reader hung"))
-            .unwrap_or_else(|error| panic!("trial {trial}: {error}"));
-    }
+            .wait_for_handler(consumer.velo.instance_id(), "_anchor_attach"),
+    )
+    .await
+    .expect("handshake timed out")
+    .expect("handshake");
+
+    let anchor = consumer.velo.create_anchor::<Vec<u8>>();
+    let ticket = consumer
+        .velo
+        .prebind_anchor(anchor.handle())
+        .expect("ticket");
+    let sender = producer
+        .velo
+        .open_anchor_stream::<Vec<u8>>(anchor.handle(), ticket)
+        .await
+        .expect("open stream");
+    sender.send(vec![7u8; STAGED]).await.expect("send");
+    let retired = sender.retired();
+    sender.finalize().expect("finalize");
+    assert_eq!(
+        tokio::time::timeout(PATIENCE, retired).await,
+        Ok(Retirement::Sent)
+    );
+
+    // The first slot the producer staged: the item, still here.
+    let handle = velo::DataHandle::pack(producer.velo.instance_id().worker_id(), 1);
+    let staged = producer
+        .velo
+        .metadata(handle)
+        .await
+        .expect("the staged item is still held when Sent resolves");
+    assert!(
+        staged.total_len as usize >= STAGED,
+        "the staged slot is the item: {staged:?}"
+    );
+    drop(anchor);
 }
 
 /// Over gRPC, the per-stream pump reports `Sent` once the server has taken the

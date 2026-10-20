@@ -151,14 +151,21 @@ pub(crate) fn is_terminal_sentinel(bytes: &[u8]) -> bool {
 }
 
 /// How a stream's output left this node. See [`StreamSender::retired`].
+///
+/// Not exhaustive: a later velo may add an outcome, for instance for the
+/// staged item that `Sent` does not cover today (see [`Sent`](Self::Sent)).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Retirement {
     /// The terminal (`Finalized`, `Detached` or `Dropped`) was handed on
     /// behind every record before it. Over the messenger mux, the batch that
-    /// carries the terminal was admitted by the transport; an item over the
-    /// eager budget stays staged on this node until the consumer pulls it,
-    /// and neither this nor graceful shutdown waits for that pull. On the
-    /// same worker, the terminal is in the anchor's channel. On a per-stream
+    /// carries the terminal was admitted by the transport. One exception, a
+    /// known limitation: an item larger than the eager budget (the stager's
+    /// threshold, `RendezvousStager::with_threshold`, 256 KiB by default) is
+    /// staged on this node and pulled by the consumer, so `Sent` can resolve
+    /// while this node still holds that item, and a shutdown right after
+    /// `Sent` can cut it; neither `Sent` nor graceful shutdown waits for the
+    /// pull. On the same worker, the terminal is in the anchor's channel. On a per-stream
     /// transport of this crate that the `Velo` builder installed, the
     /// stream's own pump wrote the terminal to the socket (TCP), or the
     /// server took the whole stream (gRPC); on a frame transport from outside

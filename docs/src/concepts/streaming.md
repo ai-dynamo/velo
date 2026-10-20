@@ -52,8 +52,9 @@ The consumer can cancel the stream with `anchor.cancel()` or a cloned `StreamCon
 let retired = sender.retired();
 sender.finalize()?;
 match retired.await {
-    Retirement::Sent => {}      // Velo on this node holds nothing of the stream.
+    Retirement::Sent => {}      // Handed on; see the table and the staged-item exception below.
     Retirement::Discarded => {} // Output was thrown away before it left this node.
+    _ => {}                     // `Retirement` is not exhaustive.
 }
 ```
 
@@ -61,7 +62,7 @@ match retired.await {
 
 | Path | `Sent` means |
 |---|---|
-| Messenger mux | The transport admitted the batch that carries the terminal: it is in the connection writer's queue, or on its way there. At graceful shutdown, TCP and UDS write the frames that they admitted, until their teardown grace has passed (1 second unless the builder set it); QUIC fails the frames that are still queued; what another messenger transport does with them at teardown is its own (see [Shutdown](shutdown.md)). An item over the eager budget stays staged on the producer until the consumer pulls it. Neither `Sent` nor `graceful_shutdown` waits for that pull: a shutdown right after `Sent` can drop such an item. |
+| Messenger mux | The transport admitted the batch that carries the terminal: it is in the connection writer's queue, or on its way there. At graceful shutdown, TCP and UDS write the frames that they admitted, until their teardown grace has passed (1 second unless the builder set it); QUIC fails the frames that are still queued; what another messenger transport does with them at teardown is its own (see [Shutdown](shutdown.md)). One exception, a known limitation: an item larger than the eager budget (the stager's threshold, `RendezvousStager::with_threshold`, 256 KiB by default) is staged on the producer and pulled by the consumer, so `Sent` can resolve while the producer still holds that item, and a shutdown right after `Sent` can cut it. Neither `Sent` nor `graceful_shutdown` waits for the pull. |
 | Same worker | The terminal is in the anchor's channel. |
 | Per-stream transport (TCP, gRPC) | The stream's own pump wrote the terminal to the socket (TCP), or the server took the whole request stream (gRPC). `Discarded` if the write failed, or the connection ended first. This holds when the `Velo` builder installed the transport. A frame transport from outside velo cannot say when a frame left, and an `AnchorManager` built by hand names no such transport, so there the terminal's arrival in the egress channel counts. |
 
