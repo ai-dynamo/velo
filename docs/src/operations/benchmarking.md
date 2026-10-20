@@ -87,7 +87,7 @@ The harness agrees with `batched_streaming`. At `--anchor-hosts 3 --engines 2 --
 
 ## Run stream_lifecycle
 
-Run all commands from the `examples/` directory. The harness runs two nodes in one process over loopback TCP, on the messenger mux. The producer opens short streams, finalizes each one, and then does what `--mode` says:
+Run all commands from the `examples/` directory. The harness runs two nodes in one process over loopback TCP, on the messenger mux, or on one TCP connection per stream with `--path per-stream`. The producer opens short streams, finalizes each one, and then does what `--mode` says:
 
 | `--mode` | After `finalize`, the producer |
 |---|---|
@@ -110,7 +110,9 @@ cargo build --release --example stream_lifecycle
 /usr/bin/time -l target/release/examples/stream_lifecycle --mode plain
 ```
 
-On Linux, use `perf stat -e instructions` instead of `/usr/bin/time -l`. [Batched streaming](../concepts/batched-streaming.md#retirement) has the results.
+On Linux, use `perf stat -e instructions` instead of `/usr/bin/time -l`. [Batched streaming](../concepts/batched-streaming.md#retirement) has the results for the mux.
+
+On the per-stream path, keep `--streams` to a few thousand and leave time between runs: each stream opens a connection, and the ephemeral ports run out. With `--streams 4000 --warmup 400` on the same machine, median of 5: 528,056 instructions per stream with `retired()` not used and 527,616 awaited, against 529,158 and 525,836 before the pump reported retirement, so the report is within the spread of the runs. The producer holds a stream for 123 µs p50 and about 520 µs p99 after `finalize` while it waits for the write; before, `Sent` came as the terminal was queued.
 
 ## The external serving rig
 
