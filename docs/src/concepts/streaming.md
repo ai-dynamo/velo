@@ -133,9 +133,9 @@ Ticket senders support `stop_token()` and `cancellation_token()` through messeng
 
 ## Reservation renewal
 
-`VeloBuilder::reservation_config` sets the default unattached lifetime (120 seconds), prepared-slot lifetime (180 seconds), and renewal cadence (30 seconds). The renewal cadence must be positive and shorter than both lifetimes. Per-anchor `AnchorConfig::unattached_timeout` overrides the ordinary lifetime.
+`VeloBuilder::reservation_config` sets the default unattached lifetime (120 seconds) and prepared-slot lifetime (180 seconds). Per-anchor `AnchorConfig::unattached_timeout` overrides the ordinary lifetime.
 
-Capture `AnchorReservation::new(handle, ticket.as_ref())` when a request takes responsibility for a reply. Keep the reservation while that request waits or executes before attachment. Periodically pass held reservations to `AnchorManager::renew_reservations`. The call groups them by owner and sends at most 256 entries per remote batch. It does not attach a producer. Velo exposes the cadence; the application owns the collection and its renewal task.
+Capture `AnchorReservation::new(handle, ticket.as_ref())` when a request takes responsibility for a reply. Keep the reservation while that request waits or executes before attachment. Periodically pass held reservations to `AnchorManager::renew_reservations`. The call groups them by owner and sends at most 256 entries per remote batch. It does not attach a producer. The application owns the collection, renewal cadence, and call deadline. Velo does not schedule renewal. Choose a cadence shorter than the reservation lifetime.
 
 Renewal extends only a live, unattached reservation. Attached, expired, cancelled, and replaced reservations are successful no-ops, including attachment races. Renewal cannot revive an expired stream. A transport failure returns an error. Successful delivery does not prove that a reservation still exists.
 

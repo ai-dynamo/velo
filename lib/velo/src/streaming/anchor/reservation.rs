@@ -3,7 +3,7 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
-/// Receiver lifetimes and the cadence callers use for batched renewal.
+/// Receiver lifetimes before a producer attaches.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ReservationConfig {
@@ -11,25 +11,20 @@ pub struct ReservationConfig {
     pub unattached_timeout: Duration,
     /// Prepared slots wait this long for opening or renewal. Defaults to 180 seconds.
     pub prebind_timeout: Duration,
-    /// Holders batch their renewals at this cadence. Defaults to 30 seconds.
-    pub renew_interval: Duration,
 }
 impl Default for ReservationConfig {
     fn default() -> Self {
         Self {
             unattached_timeout: Duration::from_secs(120),
             prebind_timeout: Duration::from_secs(180),
-            renew_interval: Duration::from_secs(30),
         }
     }
 }
 impl ReservationConfig {
     pub(crate) fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(
-            !self.renew_interval.is_zero()
-                && self.renew_interval < self.unattached_timeout
-                && self.renew_interval < self.prebind_timeout,
-            "reservation renewal interval must be positive and shorter than both lifetimes"
+            !self.unattached_timeout.is_zero(),
+            "unattached timeout must be positive"
         );
         anyhow::ensure!(
             self.prebind_timeout.as_millis() > 0,
@@ -61,6 +56,7 @@ impl AnchorReservation {
 impl AnchorManager {
     /// Renew held reservations, grouped by owner in batches of at most 256.
     /// Attached, cancelled, expired, or replaced reservations are no-ops.
+    /// The caller schedules renewal and bounds the call with its own deadline.
     /// Only transport failures return an error; successful delivery does not
     /// prove that a reservation still exists.
     pub async fn renew_reservations(
@@ -85,15 +81,12 @@ impl AnchorManager {
             let messenger = Arc::clone(messenger);
             calls.push(async move {
                 for batch in reservations.chunks(256) {
-                    tokio::time::timeout(
-                        self.reservation_renew_interval,
-                        messenger
-                            .typed_unary_streaming::<()>("_anchor_renew")
-                            .payload(batch)?
-                            .worker(worker)
-                            .send(),
-                    )
-                    .await??;
+                    messenger
+                        .typed_unary_streaming::<()>("_anchor_renew")
+                        .payload(batch)?
+                        .worker(worker)
+                        .send()
+                        .await?;
                 }
                 Ok::<_, anyhow::Error>(())
             });
@@ -168,19 +161,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_and_invalid_cadences() {
+    fn defaults_and_invalid_lifetimes() {
         let mut config = ReservationConfig::default();
         assert_eq!(config.unattached_timeout, Duration::from_secs(120));
         assert_eq!(config.prebind_timeout, Duration::from_secs(180));
-        assert_eq!(config.renew_interval, Duration::from_secs(30));
         assert!(config.validate().is_ok());
-        for interval in [
-            Duration::ZERO,
-            Duration::from_secs(120),
-            Duration::from_secs(180),
-        ] {
-            config.renew_interval = interval;
-            assert!(config.validate().is_err());
-        }
+        config.unattached_timeout = Duration::ZERO;
+        assert!(config.validate().is_err());
+        config.unattached_timeout = Duration::from_millis(1);
+        config.prebind_timeout = Duration::ZERO;
+        assert!(config.validate().is_err());
+        config.prebind_timeout = Duration::from_millis(1);
+        assert!(config.validate().is_ok());
     }
 }

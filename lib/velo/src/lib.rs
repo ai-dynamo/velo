@@ -327,7 +327,7 @@ pub struct VeloBuilder {
 }
 
 impl VeloBuilder {
-    /// Configure anchor waiting lifetimes and the suggested batch renewal cadence.
+    /// Configure anchor waiting lifetimes.
     pub fn reservation_config(mut self, config: crate::streaming::ReservationConfig) -> Self {
         self.reservation_config = config;
         self
@@ -551,7 +551,6 @@ impl VeloBuilder {
         let anchor_manager = Arc::new(
             crate::streaming::AnchorManagerBuilder::default()
                 .default_unattached_timeout(self.reservation_config.unattached_timeout)
-                .reservation_renew_interval(self.reservation_config.renew_interval)
                 .worker_id(worker_id)
                 .transport(Arc::clone(&stream_transport))
                 .transport_registry(Arc::new(registry))

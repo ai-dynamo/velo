@@ -97,7 +97,7 @@ async fn main() -> anyhow::Result<()> {
 
 See [Getting started](docs/src/guides/getting-started.md) for the feature flags.
 
-Stream reservations default to 120 seconds before ordinary attachment and 180 seconds for a prepared slot. `VeloBuilder::reservation_config` configures these lifetimes and the 30-second renewal cadence. Applications can batch held reservations through `AnchorManager::renew_reservations`; see [reservation renewal](docs/src/concepts/streaming.md#reservation-renewal).
+Stream reservations default to 120 seconds before ordinary attachment and 180 seconds for a prepared slot. `VeloBuilder::reservation_config` configures these lifetimes. Applications can batch held reservations through `AnchorManager::renew_reservations`; see [reservation renewal](docs/src/concepts/streaming.md#reservation-renewal).
 
 ## Build and test
 

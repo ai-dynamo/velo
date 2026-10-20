@@ -1018,10 +1018,6 @@ pub struct AnchorManager {
     #[builder(default = "Some(Duration::from_secs(120))", setter(into, strip_option))]
     pub default_unattached_timeout: Option<Duration>,
 
-    /// Suggested cadence for holders to batch reservation renewals.
-    #[builder(default = "Duration::from_secs(30)")]
-    pub reservation_renew_interval: Duration,
-
     /// Default heartbeat cadence negotiated with senders attached to anchors
     /// created by this manager. Per-anchor overrides are supported via
     /// [`AnchorConfig::heartbeat_interval`] +
@@ -1090,9 +1086,6 @@ impl AnchorManagerBuilder {
     /// Build the [`AnchorManager`].
     pub fn build(self) -> Result<AnchorManager, AnchorManagerBuilderError> {
         let manager = self.build_inner()?;
-        if manager.reservation_renew_interval.is_zero() {
-            return Err(String::from("reservation renewal interval must be positive").into());
-        }
         if let Some(metrics) = manager.metrics.as_ref() {
             // Weak, so the metrics registry does not keep a dropped manager's
             // anchors alive; a dropped manager counts zero.
@@ -3814,18 +3807,6 @@ mod tests {
             !mgr.registry.contains_key(&local_id),
             "anchor must be removed after timeout expires"
         );
-    }
-
-    #[test]
-    fn manager_rejects_zero_renewal_interval() {
-        let result = AnchorManagerBuilder::default()
-            .worker_id(velo_ext::WorkerId::from_u64(42))
-            .transport(
-                Arc::new(MockTransport) as Arc<dyn crate::streaming::transport::FrameTransport>
-            )
-            .reservation_renew_interval(Duration::ZERO)
-            .build();
-        assert!(result.is_err());
     }
 
     #[tokio::test(start_paused = true)]

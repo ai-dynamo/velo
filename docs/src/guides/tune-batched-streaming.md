@@ -198,4 +198,4 @@ These changes were measured and did not help. Do not try them again without a ne
 
 [Response plane performance](../operations/response-plane-performance.md) has the measurements.
 
-For work that exceeds the initial window, renew held tickets with `AnchorManager::renew_reservations`. Configure lifetimes and cadence through `VeloBuilder::reservation_config`; see [reservation renewal](../concepts/streaming.md#reservation-renewal).
+For work that exceeds the initial window, renew held tickets with `AnchorManager::renew_reservations`. Configure lifetimes through `VeloBuilder::reservation_config`; see [reservation renewal](../concepts/streaming.md#reservation-renewal).
