@@ -338,6 +338,31 @@ The state is three bits in the per-stream allocation that the sender and its slo
 
 The alternative is an acknowledgement from the consumer in the application's own protocol. It costs one more active message for each stream, a table of waiters on the producer, and a round trip before the producer knows.
 
+Measured with the `stream_lifecycle` example ([Benchmarking](../operations/benchmarking.md#run-stream_lifecycle)): two nodes in one process over loopback TCP, 200,000 streams of four 16-byte items, 64 at once, on the example's 4 worker threads. Provisional: an Apple M5 laptop (10 cores, macOS), shared with other builds and test runs (load average 2.3 to 3.3), release build, `/usr/bin/time -l target/release/examples/stream_lifecycle --mode <mode>`. The modes ran interleaved, so contention hit each alike, and the figure is the process's instructions divided by the streams, median of nine runs (three for `ack`), with the spread of the runs. These costs are to be confirmed on dedicated hardware, and only instruction counts are compared, not wall time or tail latency.
+
+| Mode | Instructions per stream | Spread | Producer holds the stream after `finalize`, p50 / p99 |
+|---|---|---|---|
+| `plain`: `retired()` not used | 123,874 | 123,638 to 124,229 | — |
+| `retired`: `retired()` awaited | 124,470 | 124,443 to 124,702 | 76 µs / 195 µs |
+| `ack`: consumer acknowledgement | 161,890 | 161,753 to 161,928 | 276 µs / 500 µs |
+
+Awaiting `retired()` costs about 600 instructions per stream here, under 0.5 percent; the acknowledgement costs about 38,000, 30 percent, and a round trip. A stream that nobody watches pays one compare-exchange when it retires, which is below what this run can resolve.
+
+`velo_streaming_mux_live_slots` must return to zero at teardown. A leaked slot holds credit and byte budget for the rest of the epoch, and unlike a leaked socket it does not show in `lsof`.
+
+### Retirement
+
+`StreamSender::retired()` resolves when the producer's node has handed on all of the stream's output (see [Streaming](streaming.md#know-when-the-output-has-left)). Under the mux, the batcher reports it:
+
+- When egress writes a terminal into the open batch, it moves a guard for the stream into the batch. When the batch is admitted, each guard reports `Sent`. A terminal that goes alone through rendezvous gives its guard to the task that waits for its admission.
+- A guard that is dropped reports `Discarded`. A refused batch, an epoch death, a teardown, and a batcher task that is aborted all drop the guards that they hold.
+- An item larger than the eager budget goes alone, as a handle the consumer pulls. Its guard reports `Sent` when that handle's batch is admitted, while the item is still staged on the producer ([known limitation](https://github.com/ai-dynamo/velo/blob/main/LIMITATIONS.md#sent-while-a-staged-item-is-still-held)).
+- A slot that closes while it still holds its producer's lifecycle reports `Discarded`. The terminal path takes the lifecycle out of the slot first. So every other close reports the loss: the `CloseSlot{UnknownSlot}` that a consumer sends when it cancels or drops its anchor, an epoch death when the consumer's process goes away, and the teardown of the producer's node.
+
+The state is three bits in the per-stream allocation that the sender and its slot already share (the outcome, and whether anyone waits), and a list of wakers that stays empty until a `Retired` future waits. No message crosses the wire for it. The first outcome stands. A stream that nobody watches pays one compare-exchange when it retires, and no wake.
+
+The alternative is an acknowledgement from the consumer in the application's own protocol. It costs one more active message for each stream, a table of waiters on the producer, and a round trip before the producer knows.
+
 Measured with the `stream_lifecycle` example ([Benchmarking](../operations/benchmarking.md#run-stream_lifecycle)): two nodes in one process over loopback TCP, 200,000 streams of four 16-byte items, 64 at once, on an Apple M5 with 10 cores. Instructions are for the whole process, divided by the streams, median of nine runs (three for `ack`):
 
 | Build and mode | Instructions per stream | Producer holds the stream after `finalize`, p50 / p99 |
