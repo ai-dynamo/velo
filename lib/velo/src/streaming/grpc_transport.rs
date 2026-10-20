@@ -118,7 +118,9 @@ impl VeloStreaming for GrpcStreamingService {
         // if it lived inside the response body it would simply be dropped
         // mid-poll and the consumer would be left waiting on the 15s heartbeat
         // watchdog instead.
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        // `true` once every request frame reached the consumer's channel;
+        // `false`, or dropped, when the consumer left first.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<bool>();
         if !self.tasks.spawn(async move {
             let mut last_was_terminal = false;
             let mut frames_seen = 0u64;
@@ -141,10 +143,13 @@ impl VeloStreaming for GrpcStreamingService {
                                     m.record_server_pump_backpressure();
                                 }
                                 if frame_tx.send_async(b).await.is_err() {
-                                    return; // consumer dropped, no Dropped injection
+                                    // Consumer dropped: no Dropped injection.
+                                    let _ = done_tx.send(false);
+                                    return;
                                 }
                             }
                             Err(flume::TrySendError::Disconnected(_)) => {
+                                let _ = done_tx.send(false);
                                 return;
                             }
                         }
@@ -181,7 +186,7 @@ impl VeloStreaming for GrpcStreamingService {
             // fires only after every request frame has been handed to the
             // consumer's channel, so the client observing end-of-response is a
             // genuine delivery acknowledgement.
-            let _ = done_tx.send(());
+            let _ = done_tx.send(true);
         }) {
             return Err(Status::unavailable("streaming transport shut down"));
         }
@@ -191,10 +196,17 @@ impl VeloStreaming for GrpcStreamingService {
         // consumed". Returning an already-empty stream here would let tonic
         // send the trailers before the request body was read, which is what
         // made the client's teardown race the delivery of its last frames.
-        let response_stream = futures::stream::once(async move {
-            let _ = done_rx.await;
-        })
-        .filter_map(|()| std::future::ready(None::<Result<FramedData, Status>>));
+        // A consumer that left, or a pump dropped with the transport, ends
+        // the call with an error instead: the client's pump then reports the
+        // stream discarded, not sent for frames nobody took.
+        let response_stream = futures::stream::once(done_rx).filter_map(|taken| {
+            std::future::ready(match taken {
+                Ok(true) => None::<Result<FramedData, Status>>,
+                _ => Some(Err(Status::aborted(
+                    "the consumer left before it took the stream",
+                ))),
+            })
+        });
 
         Ok(Response::new(Box::pin(response_stream)))
     }
@@ -1004,5 +1016,43 @@ mod tests {
             );
         }
         // Ok(Err(_)) (channel closed) and Err(_) (timeout) are both fine.
+    }
+
+    /// The pump reports `Sent` only once the server has taken the whole
+    /// stream. A server whose consumer left answers the call with an error,
+    /// and the stream retires as discarded; a call that ended cleanly here
+    /// would have said `Sent` for frames nobody took.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_the_server_does_not_take_retires_as_discarded() {
+        let server = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let client = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (peer, info) = fresh_peer(server.address());
+        client.register(&info).unwrap();
+        let consumer = server.bind(3, 3).await.unwrap();
+        let closed = crate::streaming::control::SenderClosed::default();
+        let tx = client
+            .connect_retiring(peer, 3, 3, closed.clone())
+            .await
+            .unwrap();
+        drop(consumer);
+        tx.send_async(b"data".to_vec()).await.unwrap();
+        tx.send_async(crate::streaming::sender::cached_finalized().clone())
+            .await
+            .unwrap();
+        let retired = std::future::poll_fn(|cx| closed.poll_retired(cx));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), retired).await,
+            Ok(crate::streaming::Retirement::Discarded)
+        );
+        tokio::time::timeout(Duration::from_secs(2), server.shutdown())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), client.shutdown())
+            .await
+            .unwrap();
     }
 }

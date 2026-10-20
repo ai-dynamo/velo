@@ -78,12 +78,7 @@ struct Item {
 }
 
 async fn fresh_pair(ctx: &ScenarioCtx, tag: &str) -> Result<Pair> {
-    build_pair(
-        ctx.transport,
-        ctx.stream_transport,
-        &format!("soak-stream-{tag}"),
-    )
-    .await
+    build_pair(ctx.transport, ctx.stream_transport, &format!("soak-stream-{tag}")).await
 }
 
 // ---------------------------------------------------------------------------
@@ -323,11 +318,9 @@ async fn run_one_stream(
             }
             Ok(StreamFrame::Finalized) => break Ok(()),
             Ok(StreamFrame::Heartbeat) => unreachable!(),
-            Ok(other) => {
-                break Err(anyhow!(
-                    "{scenario}/unexpected: {other:?} (after {received} items)"
-                ));
-            }
+            Ok(other) => break Err(anyhow!(
+                "{scenario}/unexpected: {other:?} (after {received} items)"
+            )),
             Err(e) => break Err(anyhow!("{scenario}/error: {e} (after {received} items)")),
         }
     };

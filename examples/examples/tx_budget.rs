@@ -658,10 +658,8 @@ async fn tcp_pair_opts(opts: bool) -> Result<(tokio::net::TcpStream, tokio::net:
     if opts {
         for s in [&a, &b] {
             let sr = socket2::SockRef::from(s);
-            sr.set_send_buffer_size(velo::transports::tcp::DEFAULT_SOCKET_BUFFERS)
-                .ok();
-            sr.set_recv_buffer_size(velo::transports::tcp::DEFAULT_SOCKET_BUFFERS)
-                .ok();
+            sr.set_send_buffer_size(velo::transports::tcp::DEFAULT_SOCKET_BUFFERS).ok();
+            sr.set_recv_buffer_size(velo::transports::tcp::DEFAULT_SOCKET_BUFFERS).ok();
         }
     }
     Ok((a, b))
