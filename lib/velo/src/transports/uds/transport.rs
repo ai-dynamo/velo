@@ -28,10 +28,9 @@ use crate::transports::tcp::framing::DEFAULT_MAX_FRAME_SIZE;
 
 use super::listener::{UdsListener, default_shrink_threshold};
 use super::writer::UdsWriterObserver;
-use crate::transports::coalesce::{
-    EgressMetrics, TEARDOWN_FLUSH_GRACE, TeardownStop, run_coalescing_writer,
-};
+use crate::transports::coalesce::{EgressMetrics, run_coalescing_writer};
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
+use crate::transports::teardown_grace::{TEARDOWN_FLUSH_GRACE, TeardownStop};
 
 /// How long `closed()` waits for the accept loop to drop its socket. The loop
 /// exits on its next poll after teardown, so this bound only matters when the
@@ -717,16 +716,8 @@ async fn connection_writer_inner(
     // admitted, so the dial runs on until the teardown deadline, as the writes
     // after it do. A stop that is only the connection's ends it now.
     let connect = tokio::time::timeout(ctx.connect_timeout, UnixStream::connect(path));
-    tokio::pin!(connect);
-    let connected = tokio::select! {
-        _ = cancel_token.cancelled() => match ctx.teardown.deadline() {
-            Some(deadline) => match tokio::time::timeout_at(deadline, &mut connect).await {
-                Ok(connected) => connected,
-                Err(_) => return Ok(()),
-            },
-            None => return Ok(()),
-        },
-        connected = &mut connect => connected,
+    let Some(connected) = ctx.teardown.until_stopped(cancel_token, connect).await else {
+        return Ok(());
     };
     let stream = connected
         .context("UDS connect timeout")?

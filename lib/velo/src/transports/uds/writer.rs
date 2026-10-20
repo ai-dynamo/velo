@@ -19,9 +19,8 @@ use tracing::error;
 
 use velo_ext::MessageType;
 
-use crate::transports::coalesce::{
-    Coalescable, EgressMetrics, TeardownStop, WriterFailure, WriterObserver,
-};
+use crate::transports::coalesce::{Coalescable, EgressMetrics, WriterFailure, WriterObserver};
+use crate::transports::teardown_grace::TeardownStop;
 
 use super::transport::SendTask;
 

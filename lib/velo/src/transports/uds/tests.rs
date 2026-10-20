@@ -6,8 +6,8 @@
 use super::*;
 use crate::transports::AdmissionState;
 use crate::transports::address::WorkerAddressBuilder;
-use crate::transports::coalesce::TEARDOWN_FLUSH_GRACE;
 use crate::transports::tcp::TcpFrameCodec;
+use crate::transports::teardown_grace::TEARDOWN_FLUSH_GRACE;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use velo_ext::PeerInfo;
 
@@ -871,4 +871,34 @@ async fn closed_releases_running_listener() {
     assert!(std::os::unix::net::UnixStream::connect(&socket_path).is_err());
     assert!(!socket_path.exists());
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A send after teardown fails at once, with no connection and no dial: see
+/// the TCP test of the same name.
+#[tokio::test]
+async fn a_send_after_teardown_fails_at_once_without_a_dial() {
+    let (transport, _path) = make_transport();
+    // A listener, so the peer registers as reachable.
+    let dir = std::env::temp_dir().join(format!("uds-peer-{}", crate::InstanceId::new_v4()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let peer_socket = dir.join("peer.sock");
+    let _peer_listener = tokio::net::UnixListener::bind(&peer_socket).unwrap();
+    let peer = make_uds_peer(&peer_socket);
+    let peer_id = peer.instance_id();
+    transport.register(peer).unwrap();
+    transport.shutdown();
+
+    let errors = Arc::new(TrackingErrorHandler::new());
+    let _ = transport.send_message(
+        peer_id,
+        Bytes::from_static(b"hdr"),
+        Bytes::from_static(b"pay"),
+        MessageType::Message,
+        errors.clone(),
+    );
+    assert_eq!(errors.error_count(), 1, "the send fails before it returns");
+    assert!(
+        !transport.connections.contains_key(&peer_id),
+        "no connection, so no dial"
+    );
 }

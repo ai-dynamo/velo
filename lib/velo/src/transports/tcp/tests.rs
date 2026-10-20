@@ -6,8 +6,8 @@
 use super::*;
 use crate::transports::AdmissionState;
 use crate::transports::address::WorkerAddressBuilder;
-use crate::transports::coalesce::TEARDOWN_FLUSH_GRACE;
 use crate::transports::tcp::TcpFrameCodec;
+use crate::transports::teardown_grace::TEARDOWN_FLUSH_GRACE;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use velo_ext::PeerInfo;
 
@@ -1677,4 +1677,36 @@ async fn the_teardown_grace_is_the_builders() {
         started.elapsed()
     );
     assert!(errors.error_count() > 0);
+}
+
+/// A send after teardown fails at once, with no connection and no dial. A
+/// dial after teardown could only be stopped, and a frame it admitted would
+/// ride the grace meant for the frames admitted before teardown.
+#[tokio::test]
+async fn a_send_after_teardown_fails_at_once_without_a_dial() {
+    let (transport, _) = make_transport();
+    let peer_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = make_tcp_peer(peer_listener.local_addr().unwrap());
+    let peer_id = peer.instance_id();
+    transport.register(peer).unwrap();
+    transport.shutdown();
+
+    let errors = Arc::new(TrackingErrorHandler::new());
+    let _ = transport.send_message(
+        peer_id,
+        Bytes::from_static(b"hdr"),
+        Bytes::from_static(b"pay"),
+        MessageType::Message,
+        errors.clone(),
+    );
+    assert_eq!(errors.error_count(), 1, "the send fails before it returns");
+    assert!(
+        errors.reasons.lock().unwrap()[0].contains("transport shut down"),
+        "{:?}",
+        errors.reasons.lock().unwrap()
+    );
+    assert!(
+        !transport.connections.contains_key(&(peer_id, 0)),
+        "no connection, so no dial"
+    );
 }

@@ -110,93 +110,6 @@ const DEFAULT_MAX_BATCH_FRAMES: usize = 1024;
 /// flush that had to precede it failed.
 const FLUSH_FAILED: &str = "batch flush failed";
 
-/// The default for how long a TCP or UDS writer keeps writing at teardown:
-/// the frames already in its channel, the write in progress, and a dial in
-/// progress. Those frames were admitted, and a sender may act on that at once
-/// (the messenger mux reports a stream sent once the batch that ends it is
-/// admitted). A writer stops at this deadline so that a peer that does not
-/// read cannot hold teardown open. The transport builders set it
-/// (`teardown_flush_grace`): an engine whose requests take a minute to drain
-/// needs longer than a second.
-pub(crate) const TEARDOWN_FLUSH_GRACE: Duration = Duration::from_secs(1);
-
-/// How much longer than the teardown deadline `closed()` waits for the
-/// connection writers. Each one stops by that deadline on its own, so the
-/// margin only matters when the runtime that runs them is not being driven.
-const WRITERS_CLOSE_MARGIN: Duration = Duration::from_millis(500);
-
-/// The teardown a TCP or UDS connection writer may be stopped by, and the one
-/// deadline for everything it still does after: a dial in progress, the write
-/// in progress, and the frames already in its channel. The transport's
-/// `shutdown` fixes the deadline; a writer that asks first fixes it the same
-/// way, so no writer gets a grace of its own. It also counts the writers that
-/// can still write, so that `closed()` can wait for what teardown keeps.
-pub(crate) struct TeardownStop {
-    /// The transport's token: only shutdown cancels it. A connection's own
-    /// token is a child of it, so a writer that sees a stop asks here whether
-    /// that stop is teardown.
-    token: CancellationToken,
-    /// How long after the teardown the writers keep writing.
-    grace: Duration,
-    deadline: std::sync::OnceLock<tokio::time::Instant>,
-    /// One token per connection writer while it can still write.
-    writers: tokio_util::task::TaskTracker,
-}
-
-impl TeardownStop {
-    pub(crate) fn new(token: CancellationToken, grace: Duration) -> Self {
-        Self {
-            token,
-            grace,
-            deadline: std::sync::OnceLock::new(),
-            writers: tokio_util::task::TaskTracker::new(),
-        }
-    }
-
-    /// `Some(deadline)` once the transport tears down: what the writer still
-    /// holds runs until then. `None` while a stop could only be the
-    /// connection's own (an unregister, or the peer closed the socket), where
-    /// nothing could deliver the frames.
-    pub(crate) fn deadline(&self) -> Option<tokio::time::Instant> {
-        self.token.is_cancelled().then(|| {
-            *self
-                .deadline
-                .get_or_init(|| tokio::time::Instant::now() + self.grace)
-        })
-    }
-
-    /// The token a connection writer holds while it can still write.
-    pub(crate) fn writer(&self) -> tokio_util::task::task_tracker::TaskTrackerToken {
-        self.writers.token()
-    }
-
-    /// For the transport's `shutdown`, after it cancelled the token: fix the
-    /// deadline, so every writer's teardown ends at the same time.
-    pub(crate) fn begin(&self) {
-        self.deadline();
-        self.writers.close();
-    }
-
-    /// For the transport's `closed`: wait for the writers to write what
-    /// teardown kept, until the teardown deadline plus a margin. `what` names
-    /// the transport in the warning when they do not finish.
-    pub(crate) async fn wait_for_writers(&self, what: &str) {
-        let Some(deadline) = self.deadline() else {
-            return;
-        };
-        self.writers.close();
-        if tokio::time::timeout_at(deadline + WRITERS_CLOSE_MARGIN, self.writers.wait())
-            .await
-            .is_err()
-        {
-            tracing::warn!(
-                "{what}: connection writers did not finish within {:?} of teardown",
-                self.grace + WRITERS_CLOSE_MARGIN
-            );
-        }
-    }
-}
-
 /// How many frames of each [`MessageType`] one write carried.
 ///
 /// A fixed array rather than a `Vec<MessageType>` kept beside the failure
@@ -850,7 +763,8 @@ pub(crate) enum WriterExit {
     /// The channel closed with nothing left in it.
     ChannelClosed,
     /// The stop token fired and the observer kept nothing, or the teardown
-    /// deadline passed. What is still queued is the caller's to fail.
+    /// deadline passed between writes. What is still queued is the caller's
+    /// to fail. A deadline that passes during a write ends as `Failed`.
     Stopped,
     /// A write or an encode failed. Every frame it carried was reported.
     Failed,

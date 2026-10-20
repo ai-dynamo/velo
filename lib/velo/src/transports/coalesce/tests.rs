@@ -1538,38 +1538,3 @@ async fn a_stop_that_keeps_the_queue_ends_at_its_deadline() {
     assert_eq!(rx.len(), 1, "the rest is left for the caller");
     assert_eq!(observer.frames_written(), 0);
 }
-
-/// A stop keeps what is queued only once the transport tears down. Before
-/// that, a stop is the connection's own (an unregister, or the peer closed the
-/// socket), and the writer gives up at once. The deadline is fixed when it is
-/// first asked, so a writer that asks later gets the same one, not a fresh
-/// grace.
-#[tokio::test(start_paused = true)]
-async fn a_stop_is_teardown_only_once_the_transport_tears_down() {
-    let token = CancellationToken::new();
-    let stop = TeardownStop::new(token.clone(), TEARDOWN_FLUSH_GRACE);
-    assert_eq!(
-        stop.deadline(),
-        None,
-        "a connection-only stop keeps nothing"
-    );
-
-    token.cancel();
-    let deadline = stop.deadline().expect("teardown keeps what is queued");
-    assert_eq!(deadline, tokio::time::Instant::now() + TEARDOWN_FLUSH_GRACE);
-    tokio::time::advance(Duration::from_millis(300)).await;
-    assert_eq!(
-        stop.deadline(),
-        Some(deadline),
-        "one deadline for every writer"
-    );
-
-    // The grace is the transport's to set.
-    let token = CancellationToken::new();
-    let stop = TeardownStop::new(token.clone(), Duration::from_secs(90));
-    token.cancel();
-    assert_eq!(
-        stop.deadline(),
-        Some(tokio::time::Instant::now() + Duration::from_secs(90))
-    );
-}

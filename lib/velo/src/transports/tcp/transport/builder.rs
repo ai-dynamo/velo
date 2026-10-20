@@ -14,7 +14,7 @@ use velo_ext::TransportKey;
 use crate::transports::utils::interfaces::{InterfaceFilter, resolve_advertise_endpoints};
 
 use super::TcpTransport;
-use crate::transports::coalesce::{TEARDOWN_FLUSH_GRACE, TeardownStop};
+use crate::transports::teardown_grace::{TEARDOWN_FLUSH_GRACE, TeardownStop};
 use std::sync::Arc;
 
 /// Builder for TcpTransport
@@ -61,9 +61,12 @@ impl TcpTransportBuilder {
     /// `closed()` waits this long plus 0.5 s. A peer that does not read
     /// cannot hold the shutdown open for longer.
     ///
-    /// Set it to what the work behind the frames takes to finish: an LLM
-    /// engine that drains for a minute before its last responses go out
-    /// needs more than a second.
+    /// The grace starts at teardown, after the drain, and covers only what
+    /// is already queued: at most `channel_capacity` frames per connection.
+    /// Size it by those bytes and the slowest peer's read rate. The time the
+    /// work behind the frames takes to finish, an engine draining its
+    /// requests for a minute, belongs to the drain, which
+    /// `ShutdownPolicy::Timeout` bounds.
     pub fn teardown_flush_grace(mut self, grace: Duration) -> Self {
         self.teardown_flush_grace = grace;
         self

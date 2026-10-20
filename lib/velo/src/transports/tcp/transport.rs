@@ -30,10 +30,9 @@ use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey,
 use super::framing::DEFAULT_MAX_FRAME_SIZE;
 use super::listener::TcpListener;
 use super::writer::TcpWriterObserver;
-use crate::transports::coalesce::{
-    EgressMetrics, TEARDOWN_FLUSH_GRACE, TeardownStop, run_coalescing_writer,
-};
+use crate::transports::coalesce::{EgressMetrics, run_coalescing_writer};
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
+use crate::transports::teardown_grace::{TEARDOWN_FLUSH_GRACE, TeardownStop};
 
 mod builder;
 pub use builder::TcpTransportBuilder;
@@ -776,16 +775,8 @@ async fn retire_connection(
 /// after it do. A stop that is only the connection's ends it now.
 async fn dial(addr: SocketAddr, ctx: &WriterTaskContext) -> Result<Option<TcpStream>> {
     let connect = tokio::time::timeout(ctx.connect_timeout, TcpStream::connect(addr));
-    tokio::pin!(connect);
-    let connected = tokio::select! {
-        _ = ctx.cancel_token.cancelled() => match ctx.teardown.deadline() {
-            Some(deadline) => match tokio::time::timeout_at(deadline, &mut connect).await {
-                Ok(connected) => connected,
-                Err(_) => return Ok(None),
-            },
-            None => return Ok(None),
-        },
-        connected = &mut connect => connected,
+    let Some(connected) = ctx.teardown.until_stopped(&ctx.cancel_token, connect).await else {
+        return Ok(None);
     };
     let stream = connected
         .context("connect timeout")?
