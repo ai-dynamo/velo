@@ -342,11 +342,11 @@ Measured with the `stream_lifecycle` example ([Benchmarking](../operations/bench
 | Build and mode | Instructions per stream | Producer holds the stream after `finalize`, p50 / p99 |
 |---|---|---|
 | Before `retired()`, `plain` | 122,175 | — |
-| With `retired()`, not used (`plain`) | 122,209 | — |
-| With `retired()`, awaited (`retired`) | 123,651 | 82 µs / 219 µs |
+| With `retired()`, not used (`plain`) | 122,610 | — |
+| With `retired()`, awaited (`retired`) | 123,321 | 81 µs / 203 µs |
 | Consumer acknowledgement (`ack`) | 162,295 | 389 µs / 734 µs |
 
-The two `plain` builds differ by less than the spread of the runs (121,897 to 122,684 before, 121,934 to 122,354 after).
+The `before` and `ack` rows are from the first measurement, where the `plain` build with `retired()` measured 122,209 (121,934 to 122,354): the two `plain` builds differ by less than the spread of the runs (121,897 to 122,684 before). The `plain` and `retired` rows are from a later run, after the harness stopped wrapping the awaited future in a timer; the same run measured the build before the per-stream pumps reported retirement at 122,597 (122,432 to 122,839) for `plain` and 123,362 for `retired`, so that change is also within the spread.
 
 ## Heartbeats
 

@@ -4,10 +4,11 @@
 //! What it costs a producer to learn that a finished stream's output has left
 //! its node.
 //!
-//! Two `Velo` nodes in one process over loopback TCP, on the messenger mux. The
-//! producer opens `--streams` short streams, `--concurrency` at a time, each
-//! carrying `--items` items of 16 bytes, and finalizes each one. `--mode`
-//! decides what the producer does after `finalize`:
+//! Two `Velo` nodes in one process over loopback TCP, on the messenger mux, or
+//! on a per-stream TCP connection with `--path per-stream`. The producer opens
+//! `--streams` short streams, `--concurrency` at a time, each carrying
+//! `--items` items of 16 bytes, and finalizes each one. `--mode` decides what
+//! the producer does after `finalize`:
 //!
 //! - `plain`: nothing. It moves on at once, and velo may still hold the
 //!   stream's output.
@@ -43,6 +44,10 @@ struct Args {
     /// What the producer does after `finalize`.
     #[arg(long, value_enum, default_value_t = Mode::Plain)]
     mode: Mode,
+    /// How the streams cross: the messenger mux, or one TCP connection per
+    /// stream.
+    #[arg(long, value_enum, default_value_t = Path::Mux)]
+    path: Path,
     /// Streams in the measured run.
     #[arg(long, default_value_t = 200_000)]
     streams: usize,
@@ -65,6 +70,12 @@ enum Mode {
     Ack,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum Path {
+    Mux,
+    PerStream,
+}
+
 const PATIENCE: Duration = Duration::from_secs(10);
 const ACK_HANDLER: &str = "stream_lifecycle_ack";
 
@@ -77,16 +88,23 @@ fn main() -> anyhow::Result<()> {
         .block_on(run(args))
 }
 
-async fn node() -> anyhow::Result<(Velo, Registry)> {
+async fn node(path: Path) -> anyhow::Result<(Velo, Registry)> {
     let registry = Registry::new();
     let metrics = Arc::new(VeloMetrics::register(&registry)?);
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
-    let tcp = Arc::new(TcpTransportBuilder::new().from_listener(listener)?.build()?);
+    let tcp = Arc::new(
+        TcpTransportBuilder::new()
+            .from_listener(listener)?
+            .build()?,
+    );
     let velo = Velo::builder()
         .add_transport(tcp)
         .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
         .metrics(metrics)
-        .messenger_mux(MuxConfig::default())?
+        .messenger_mux(MuxConfig {
+            enabled: path == Path::Mux,
+            ..MuxConfig::default()
+        })?
         .build()
         .await?;
     Ok((velo, registry))
@@ -110,8 +128,8 @@ fn percentile(sorted: &[u128], p: f64) -> u128 {
 }
 
 async fn run(args: Args) -> anyhow::Result<()> {
-    let (producer, producer_metrics) = node().await?;
-    let (consumer, consumer_metrics) = node().await?;
+    let (producer, producer_metrics) = node(args.path).await?;
+    let (consumer, consumer_metrics) = node(args.path).await?;
     producer.register_peer(consumer.peer_info())?;
     consumer.register_peer(producer.peer_info())?;
 
@@ -132,8 +150,11 @@ async fn run(args: Args) -> anyhow::Result<()> {
         )?;
     }
     for (a, b) in [(&producer, &consumer), (&consumer, &producer)] {
-        tokio::time::timeout(PATIENCE, a.wait_for_handler(b.instance_id(), "_anchor_attach"))
-            .await??;
+        tokio::time::timeout(
+            PATIENCE,
+            a.wait_for_handler(b.instance_id(), "_anchor_attach"),
+        )
+        .await??;
     }
     tokio::time::timeout(
         PATIENCE,
@@ -146,6 +167,7 @@ async fn run(args: Args) -> anyhow::Result<()> {
         consumer: consumer.clone(),
         waiters,
         mode: args.mode,
+        path: args.path,
         items: args.items,
     };
     lane.run(args.warmup, args.concurrency).await?;
@@ -162,9 +184,10 @@ async fn run(args: Args) -> anyhow::Result<()> {
     );
     held.sort_unstable();
     println!(
-        "RESULT mode={:?} streams={} concurrency={} items={} wall_ms={} streams_per_s={:.0} \
+        "RESULT mode={:?} path={:?} streams={} concurrency={} items={} wall_ms={} streams_per_s={:.0} \
          producer_msgs_per_stream={:.3} consumer_msgs_per_stream={:.3} held_us p50={} p90={} p99={}",
         args.mode,
+        args.path,
         args.streams,
         args.concurrency,
         args.items,
@@ -185,6 +208,7 @@ struct Lane {
     consumer: Velo,
     waiters: Arc<dashmap::DashMap<u64, tokio::sync::oneshot::Sender<()>>>,
     mode: Mode,
+    path: Path,
     items: usize,
 }
 
@@ -214,10 +238,15 @@ impl Lane {
         let payload = Bytes::from_static(b"0123456789abcdef");
         let mut anchor = self.consumer.create_anchor::<Bytes>();
         let handle = anchor.handle();
-        let ticket = self
-            .consumer
-            .prebind_anchor(handle)
-            .ok_or_else(|| anyhow::anyhow!("stream {id}: no ticket"))?;
+        // A ticket is the mux's; a per-stream transport attaches instead.
+        let ticket = match self.path {
+            Path::Mux => Some(
+                self.consumer
+                    .prebind_anchor(handle)
+                    .ok_or_else(|| anyhow::anyhow!("stream {id}: no ticket"))?,
+            ),
+            Path::PerStream => None,
+        };
         let consumer = self.consumer.clone();
         let ack_to = self.producer.instance_id();
         let mode = self.mode;
@@ -244,10 +273,14 @@ impl Lane {
             self.waiters.insert(id, tx);
             rx
         });
-        let sender = self
-            .producer
-            .open_anchor_stream::<Bytes>(handle, ticket)
-            .await?;
+        let sender = match ticket {
+            Some(ticket) => {
+                self.producer
+                    .open_anchor_stream::<Bytes>(handle, ticket)
+                    .await?
+            }
+            None => self.producer.attach_anchor::<Bytes>(handle).await?,
+        };
         for _ in 0..self.items {
             sender.send_bytes(&payload).await?;
         }

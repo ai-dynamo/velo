@@ -78,9 +78,7 @@ pub fn spawn(
             Some(v) => v,
             None => {
                 if !warned {
-                    tracing::warn!(
-                        "rss sampler: final read_rss_kb() returned None; recording 0"
-                    );
+                    tracing::warn!("rss sampler: final read_rss_kb() returned None; recording 0");
                 }
                 0
             }

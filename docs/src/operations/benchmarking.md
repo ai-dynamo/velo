@@ -97,6 +97,7 @@ Run all commands from the `examples/` directory. The harness runs two nodes in o
 
 | Flag | Default | Meaning |
 |---|---|---|
+| `--path` | `mux` | `mux`: the streams ride the messenger mux. `per-stream`: one TCP connection per stream. |
 | `--streams` | 200,000 | Streams in the measured run. |
 | `--concurrency` | 64 | Streams open at once. |
 | `--items` | 4 | Items of 16 bytes in each stream. |

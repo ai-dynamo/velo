@@ -24,8 +24,8 @@ use clap::Parser;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use velo::WorkerId;
-use velo::streaming::{AnchorManager, FrameTransport};
 use velo::streaming::mpsc::{MpscAnchorConfig, MpscFrame, MpscStreamSender, SenderId};
+use velo::streaming::{AnchorManager, FrameTransport};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkItem {
