@@ -13,7 +13,7 @@ NOTE: Velo is experimental. Its design, development, and tests are still in prog
 
 Typed streams support graceful stop, cancellation, and ordered finalization, including prebound tickets. See [Stream lifecycle](docs/src/concepts/streaming.md).
 
-A producer can wait until velo has handed a stream's output on: `StreamSender::retired()` resolves to `Sent` or `Discarded`. TCP and UDS write the frames that they admitted before they close at graceful shutdown. See [Know when the output has left](docs/src/concepts/streaming.md#know-when-the-output-has-left).
+A producer can wait until velo has handed a stream's output on: `StreamSender::retired()` resolves to `Sent` or `Discarded`. TCP and UDS write the frames that they admitted before they close at graceful shutdown. See [Know when the output has left](docs/src/concepts/streaming.md#know-when-the-output-has-left), and [Known limitations](LIMITATIONS.md) for what `Sent` does not cover yet.
 
 Streams of bytes that the application already serialized can skip msgpack on both ends. `StreamSender<Bytes>::send_bytes` and `StreamAnchor<Bytes>::next_bytes` use the same frames as `send` and `next`, and the consumer gets each item as a slice of the received buffer, not a copy. See [Byte items](docs/src/concepts/streaming.md#byte-items).
 

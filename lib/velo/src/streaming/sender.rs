@@ -159,13 +159,13 @@ pub(crate) fn is_terminal_sentinel(bytes: &[u8]) -> bool {
 pub enum Retirement {
     /// The terminal (`Finalized`, `Detached` or `Dropped`) was handed on
     /// behind every record before it. Over the messenger mux, the batch that
-    /// carries the terminal was admitted by the transport. One exception, a
-    /// known limitation: an item larger than the eager budget (the stager's
-    /// threshold, `RendezvousStager::with_threshold`, 256 KiB by default) is
-    /// staged on this node and pulled by the consumer, so `Sent` can resolve
-    /// while this node still holds that item, and a shutdown right after
-    /// `Sent` can cut it; neither `Sent` nor graceful shutdown waits for the
-    /// pull. On the same worker, the terminal is in the anchor's channel. On a per-stream
+    /// carries the terminal was admitted by the transport. One exception: an
+    /// item larger than the eager budget (the stager's threshold,
+    /// `RendezvousStager::with_threshold`, 256 KiB by default) is staged on
+    /// this node until the consumer pulls it, so `Sent` can resolve while
+    /// this node still holds it; `LIMITATIONS.md` in the repository says
+    /// what that means for a shutdown. On the same worker, the terminal is in
+    /// the anchor's channel. On a per-stream
     /// transport of this crate that the `Velo` builder installed, the
     /// stream's own pump wrote the terminal to the socket (TCP), or the
     /// server took the whole stream (gRPC); on a frame transport from outside
@@ -181,8 +181,8 @@ pub enum Retirement {
     /// batch, or this node shut down. On a per-stream transport of this
     /// crate: the pump's write failed, the connection ended first, or the
     /// gRPC server did not take the stream. A per-stream TCP pump cannot see
-    /// a consumer that left before it writes; its write succeeds, and `Sent`
-    /// stands.
+    /// a consumer that left before it writes, so there `Sent` stands
+    /// (`LIMITATIONS.md` in the repository).
     Discarded,
 }
 
