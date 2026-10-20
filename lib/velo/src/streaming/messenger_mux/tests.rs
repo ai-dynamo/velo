@@ -1520,7 +1520,7 @@ async fn prebinding_node(
 /// can have run in between, so the reclamation is the drop and nothing else.
 /// That is stronger than pausing the clock and advancing it a little, and it
 /// avoids the trap in the weaker version: under `start_paused` an idle runtime
-/// auto-advances to the next deadline, which is exactly the 60 s accept window
+/// auto-advances to the next deadline, which is the configured accept window
 /// this test exists to prove is not involved.
 #[tokio::test(flavor = "multi_thread")]
 async fn unclaimed_bind_is_reclaimed_on_anchor_death_without_the_timer() {
@@ -1878,7 +1878,7 @@ async fn a_refused_prebind_gives_the_unattached_timer_back() {
 /// which is exactly the window a sender that dies right after attaching (a
 /// worker crash before its first record) sits in. If the watchdog still believes
 /// no sender exists, that death is invisible to the heartbeat watchdog and
-/// waits for the mux's 60 s accept window instead of the usual
+/// waits for the mux's configured accept window instead of the usual
 /// `DETECTION_MULTIPLIER * heartbeat_interval`.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot() {
@@ -1938,6 +1938,7 @@ async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window
     tokio::time::pause();
     let heartbeat = Duration::from_secs(25);
     let node = prebinding_node(test_config(), None).await;
+    node.mux.set_reservation_timeout(Duration::from_secs(60));
     let mut anchor = node.manager.create_anchor_with_config::<u32>(AnchorConfig {
         heartbeat_interval: Some(heartbeat),
         ..Default::default()
@@ -1989,7 +1990,7 @@ async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window
     );
 }
 
-/// An unclaimed pre-bind lives out its 60 s accept window and no longer.
+/// An unclaimed pre-bind lives out its configured accept window and no longer.
 ///
 /// The window is a deadline the credit sweep expires rather than a timer task
 /// per bind, so both edges are pinned here: just short of the window the bind
@@ -2910,4 +2911,50 @@ async fn a_removed_anchor_withdraws_its_feed() {
         "the removed entry must withdraw its feed"
     );
     drop(anchor);
+}
+
+#[tokio::test]
+async fn reservation_renewal_extends_one_deadline_without_reallocating_slots() {
+    tokio::time::pause();
+    let node = prebinding_node(test_config(), None).await;
+    node.mux.set_reservation_timeout(Duration::from_secs(3));
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let ticket = node.manager.prebind_anchor(handle).expect("ticket");
+    let reservation = crate::streaming::AnchorReservation::new(handle, Some(&ticket));
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        node.manager.renew_reservations_local(&[reservation]);
+        assert_eq!(node.mux.core.bind_deadlines.lock().unwrap().len(), 1);
+        assert_eq!(node.manager.active_anchor_count(), 1);
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    node.mux.core.expire_binds(tokio::time::Instant::now());
+    tokio::task::yield_now().await;
+    node.manager.renew_reservations_local(&[reservation]);
+    assert_eq!(node.manager.active_anchor_count(), 0);
+    node.mux.shutdown().await;
+}
+
+#[tokio::test]
+async fn stale_reservation_does_not_renew_a_replacement_binding() {
+    tokio::time::pause();
+    let node = prebinding_node(test_config(), None).await;
+    node.mux.set_reservation_timeout(Duration::from_secs(3));
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let ticket = node.manager.prebind_anchor(handle).expect("ticket");
+    let mut stale = ticket.clone();
+    stale.routing_session_id += 1;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    node.manager
+        .renew_reservations_local(&[crate::streaming::AnchorReservation::new(
+            handle,
+            Some(&stale),
+        )]);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    node.mux.core.expire_binds(tokio::time::Instant::now());
+    tokio::task::yield_now().await;
+    assert_eq!(node.manager.active_anchor_count(), 0);
+    node.mux.shutdown().await;
 }

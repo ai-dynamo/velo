@@ -312,6 +312,7 @@ pub struct VeloBuilder {
     inner: MessengerBuilder,
     stream_config: Option<StreamConfig>,
     mux_config: Option<crate::streaming::MuxConfig>,
+    reservation_config: crate::streaming::ReservationConfig,
     mux_only: bool,
     metrics: Option<Arc<VeloMetrics>>,
     /// The concrete UCX transport, kept beside the type-erased one so the
@@ -326,12 +327,19 @@ pub struct VeloBuilder {
 }
 
 impl VeloBuilder {
+    /// Configure anchor waiting lifetimes and the suggested batch renewal cadence.
+    pub fn reservation_config(mut self, config: crate::streaming::ReservationConfig) -> Self {
+        self.reservation_config = config;
+        self
+    }
+
     /// Create a new empty builder.
     pub fn new() -> Self {
         Self {
             inner: MessengerBuilder::new(),
             stream_config: None,
             mux_config: None,
+            reservation_config: Default::default(),
             mux_only: false,
             metrics: None,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -467,6 +475,7 @@ impl VeloBuilder {
         );
         // Read the override once at build so this instance keeps the same
         // transport offers for every attach.
+        self.reservation_config.validate()?;
         let config = resolve_mux_config(
             self.mux_config.unwrap_or_default(),
             messenger_mux_disabled_by_env(),
@@ -480,6 +489,7 @@ impl VeloBuilder {
                 config,
                 self.metrics.clone(),
             )?;
+            mux.set_reservation_timeout(self.reservation_config.prebind_timeout);
             Some(mux)
         } else {
             None
@@ -540,6 +550,8 @@ impl VeloBuilder {
 
         let anchor_manager = Arc::new(
             crate::streaming::AnchorManagerBuilder::default()
+                .default_unattached_timeout(self.reservation_config.unattached_timeout)
+                .reservation_renew_interval(self.reservation_config.renew_interval)
                 .worker_id(worker_id)
                 .transport(Arc::clone(&stream_transport))
                 .transport_registry(Arc::new(registry))

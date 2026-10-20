@@ -15,6 +15,9 @@
 //!   creation so that whichever cleanup path fires first cancels the token; subsequent
 //!   cancellations are no-ops.
 
+mod reservation;
+pub use reservation::{AnchorReservation, ReservationConfig};
+
 use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::{
@@ -160,6 +163,7 @@ pub(crate) struct AnchorEntry {
     /// Cancels the inactivity timeout task when a sender attaches.
     /// `None` if no timeout is configured for this anchor.
     pub timeout_cancel: Option<CancellationToken>,
+    pub(crate) expires: Option<tokio::time::Instant>,
 
     /// The configured unattached timeout for this anchor. Stored so that
     /// `detach` can respawn the timeout task with the same duration.
@@ -204,7 +208,7 @@ pub(crate) struct AnchorEntry {
 /// every one of them drops this. What it does depends on whether an `OpenSlot`
 /// has claimed the bind:
 ///
-/// - **Unclaimed** — release the bind. The 60 s accept window would collect it
+/// - **Unclaimed** — release the bind. The configured accept window would collect it
 ///   eventually and stays as the backstop, but a request that dies before its
 ///   first token knows a minute sooner than that timer does.
 /// - **Claimed** — tell the peer to abandon its egress slot. Without this a
@@ -314,6 +318,7 @@ impl AnchorEntry {
             && self.prebind.is_none()
             && let Some(duration) = self.unattached_timeout
         {
+            self.expires = Some(tokio::time::Instant::now() + duration);
             self.timeout_cancel = Some(AnchorManager::spawn_timeout_task(
                 Arc::clone(registry),
                 local_id,
@@ -973,7 +978,7 @@ impl StreamAnchor<Bytes> {
 ///
 /// Use [`AnchorManagerBuilder`] for optional configuration (e.g. `default_unattached_timeout`,
 /// `default_heartbeat_interval`), or [`AnchorManager::new`] as a convenience constructor
-/// with no unattached timeout and the protocol default heartbeat interval (5s).
+/// with a 120-second unattached timeout and a 5-second heartbeat interval.
 #[derive(Builder)]
 #[builder(pattern = "owned", build_fn(name = "build_inner", private))]
 pub struct AnchorManager {
@@ -1010,8 +1015,12 @@ pub struct AnchorManager {
     /// anchor if no sender attaches within this duration. Per-anchor overrides
     /// are supported via [`AnchorConfig::unattached_timeout`] +
     /// [`AnchorManager::create_anchor_with_config`].
-    #[builder(default, setter(into, strip_option))]
+    #[builder(default = "Some(Duration::from_secs(120))", setter(into, strip_option))]
     pub default_unattached_timeout: Option<Duration>,
+
+    /// Suggested cadence for holders to batch reservation renewals.
+    #[builder(default = "Duration::from_secs(30)")]
+    pub reservation_renew_interval: Duration,
 
     /// Default heartbeat cadence negotiated with senders attached to anchors
     /// created by this manager. Per-anchor overrides are supported via
@@ -1081,6 +1090,9 @@ impl AnchorManagerBuilder {
     /// Build the [`AnchorManager`].
     pub fn build(self) -> Result<AnchorManager, AnchorManagerBuilderError> {
         let manager = self.build_inner()?;
+        if manager.reservation_renew_interval.is_zero() {
+            return Err(String::from("reservation renewal interval must be positive").into());
+        }
         if let Some(metrics) = manager.metrics.as_ref() {
             // Weak, so the metrics registry does not keep a dropped manager's
             // anchors alive; a dropped manager counts zero.
@@ -1294,6 +1306,7 @@ impl AnchorManager {
             active_pump_token: None,
             attachment: false,
             timeout_cancel,
+            expires: unattached_timeout.map(|duration| tokio::time::Instant::now() + duration),
             unattached_timeout,
             heartbeat_interval,
             stream_cancel_handle: None, // populated on attach
@@ -1347,19 +1360,22 @@ impl AnchorManager {
         };
         let tc_clone = tc.clone();
         rt.spawn(async move {
-            tokio::select! {
-                _ = tc_clone.cancelled() => {
-                    // Attach or explicit cancel -- do nothing
-                }
-                _ = tokio::time::sleep(timeout) => {
-                    // Timeout expired -- remove anchor
-                    if let Some((_, entry)) = registry.remove_if(&local_id, |_, entry| {
-                        !tc_clone.is_cancelled() && !entry.attachment && entry.prebind.is_none()
-                    }) {
-                        entry.cancel_token.cancel();
+            let mut deadline = tokio::time::Instant::now() + timeout;
+            loop {
+                tokio::select! {
+                    _ = tc_clone.cancelled() => break,
+                    _ = tokio::time::sleep_until(deadline) => {
+                        use dashmap::mapref::entry::Entry;
+                        let Entry::Occupied(entry) = registry.entry(local_id) else { break; };
+                        if tc_clone.is_cancelled() || entry.get().attachment || entry.get().prebind.is_some() { break; }
+                        if let Some(next) = entry.get().expires
+                            && next > tokio::time::Instant::now() { deadline = next; continue; }
+                        entry.remove().cancel_token.cancel();
+                        break;
                     }
                 }
             }
+
         });
         tc
     }
@@ -1417,13 +1433,11 @@ impl AnchorManager {
     /// Must be called from a runtime context: it spawns the stream watchdog,
     /// exactly as the attach handler does for a mux bind.
     ///
-    /// The ticket may sit in a request envelope for up to the mux's 60 s
-    /// accept window before its worker opens it: heartbeat detection does not
-    /// start until an `OpenSlot` claims the bind, so nothing shorter can reap
-    /// it, and the configured `unattached_timeout` does not apply here either
-    /// — it stays paused for the whole pre-bind phase, same as at attach. A
-    /// worker that may be queued longer than that needs a longer-lived
-    /// rendezvous than this call provides.
+    /// The ticket waits for the configured reservation timeout (180 seconds
+    /// by default). Holders can extend it with [`Self::renew_reservations`].
+    /// Heartbeat detection starts when `OpenSlot` claims the bind. The ordinary
+    /// unattached timeout stays paused while the reservation exists.
+    /// Renewing a claimed, expired, cancelled, or replaced reservation is a no-op.
     ///
     /// The ticket names the mux lane with the least load on this node: its
     /// live slots from every peer, plus its pre-binds not yet claimed,
@@ -1478,7 +1492,7 @@ impl AnchorManager {
         }
 
         // Fail fast on the common "not pre-bindable" case before minting a
-        // session id or registering a bind: `mux.bind_on_lane` queues a 60 s
+        // session id or registering a bind: `mux.bind_on_lane` queues a reservation
         // accept-window deadline, and a bind registered for nothing holds its
         // buffer until that deadline passes. This is a plain read, not a lock the mutate-and-check
         // below still has to redo -- an entry can change between the two, and
@@ -1853,7 +1867,7 @@ impl AnchorManager {
     /// Give back a bind an attach handler made and then could not commit.
     ///
     /// For the mux only: its bind counts on the lane it was placed on, and
-    /// left to the 60 s accept window it would skew every unkeyed choice for
+    /// left to the configured accept window it would skew every unkeyed choice for
     /// that peer meanwhile. The same release `prebind_anchor` makes when
     /// nothing took its bind. It touches only the mux's own maps, so a caller
     /// may hold an anchor registry entry. Other transports' binds keep their
@@ -2060,6 +2074,7 @@ impl AnchorManager {
         };
 
         messenger.register_streaming_handler(anchor_attach_handler(manager.clone()))?;
+        messenger.register_drain_exempt_handler(reservation::renewal_handler(manager.clone()))?;
         // Everything but the attaches serves a stream already open, so the
         // drain gate lets it through; an attach opens a new stream.
         messenger.register_drain_exempt_handler(anchor_detach_handler(manager.clone()))?;
@@ -3736,8 +3751,8 @@ mod tests {
             .build()
             .expect("builder with required fields should succeed");
         assert!(
-            mgr.default_unattached_timeout.is_none(),
-            "default_unattached_timeout must be None when not set"
+            mgr.default_unattached_timeout == Some(Duration::from_secs(120)),
+            "default_unattached_timeout must default to 120 seconds"
         );
     }
 
@@ -3761,11 +3776,11 @@ mod tests {
 
     #[test]
     fn test_convenience_new_still_works() {
-        // AnchorManager::new must still compile and create a manager with no timeout
+        // The convenience constructor uses the same default as the builder.
         let mgr = make_manager();
         assert!(
-            mgr.default_unattached_timeout.is_none(),
-            "AnchorManager::new must produce None default_unattached_timeout"
+            mgr.default_unattached_timeout == Some(Duration::from_secs(120)),
+            "AnchorManager::new must use the 120-second default"
         );
     }
 
@@ -3799,6 +3814,43 @@ mod tests {
             !mgr.registry.contains_key(&local_id),
             "anchor must be removed after timeout expires"
         );
+    }
+
+    #[test]
+    fn manager_rejects_zero_renewal_interval() {
+        let result = AnchorManagerBuilder::default()
+            .worker_id(velo_ext::WorkerId::from_u64(42))
+            .transport(
+                Arc::new(MockTransport) as Arc<dyn crate::streaming::transport::FrameTransport>
+            )
+            .reservation_renew_interval(Duration::ZERO)
+            .build();
+        assert!(result.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ordinary_reservation_renews_until_released() {
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(velo_ext::WorkerId::from_u64(42))
+            .transport(
+                Arc::new(MockTransport) as Arc<dyn crate::streaming::transport::FrameTransport>
+            )
+            .default_unattached_timeout(Duration::from_secs(3))
+            .build()
+            .expect("manager");
+        let anchor = mgr.create_anchor::<u32>();
+        let reservation = AnchorReservation::new(anchor.handle(), None);
+        let id = anchor.handle().unpack().1;
+        for _ in 0..5 {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            mgr.renew_reservations(&[reservation]).await.expect("renew");
+            assert!(mgr.registry.contains_key(&id));
+        }
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        mgr.renew_reservations(&[reservation])
+            .await
+            .expect("expired no-op");
+        assert!(!mgr.registry.contains_key(&id));
     }
 
     #[tokio::test]

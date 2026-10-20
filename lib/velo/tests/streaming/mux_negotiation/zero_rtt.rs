@@ -1075,3 +1075,76 @@ async fn remote_detach_leaves_an_unrelated_local_anchor_attached() {
         Err(AttachError::AlreadyAttached { .. })
     ));
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bulk_reservation_renewal_is_harmless_during_and_after_attachment() {
+    let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
+    let mut anchors = Vec::new();
+    let mut tickets = Vec::new();
+    let mut reservations = Vec::new();
+    for _ in 0..300 {
+        let anchor = consumer.velo.create_anchor::<u32>();
+        let ticket = consumer
+            .velo
+            .prebind_anchor(anchor.handle())
+            .expect("ticket");
+        reservations.push(velo::streaming::AnchorReservation::new(
+            anchor.handle(),
+            Some(&ticket),
+        ));
+        tickets.push(ticket);
+        anchors.push(anchor);
+    }
+    producer
+        .velo
+        .anchor_manager()
+        .renew_reservations(&reservations)
+        .await
+        .expect("two batches");
+    let mut anchor = anchors.pop().expect("anchor");
+    let opening = producer
+        .velo
+        .open_anchor_stream::<u32>(anchor.handle(), tickets.pop().expect("ticket"));
+    let renewal = producer
+        .velo
+        .anchor_manager()
+        .renew_reservations(&reservations);
+    let (sender, renewed) = tokio::join!(opening, renewal);
+    renewed.expect("renewal racing attachment");
+    let sender = sender.expect("sender");
+    sender.send(42).await.expect("send");
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), anchor.next())
+            .await
+            .expect("bounded frame"),
+        Some(Ok(StreamFrame::Item(42)))
+    ));
+    producer
+        .velo
+        .anchor_manager()
+        .renew_reservations(&reservations)
+        .await
+        .expect("attached no-op");
+    sender.finalize().expect("finalize");
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), anchor.next())
+            .await
+            .expect("bounded frame"),
+        Some(Ok(StreamFrame::Finalized))
+    ));
+    drop(anchors);
+    producer
+        .velo
+        .anchor_manager()
+        .renew_reservations(&reservations)
+        .await
+        .expect("removed no-op");
+    producer
+        .velo
+        .shutdown(velo::ShutdownPolicy::WaitForever)
+        .await;
+    consumer
+        .velo
+        .shutdown(velo::ShutdownPolicy::WaitForever)
+        .await;
+}

@@ -172,7 +172,7 @@ let sender = match envelope.ticket {
 
 A ticket sender observes `stop_token()` and `cancellation_token()` through the mux's slot lifecycle. Stop leaves the stream open for final output. Cancel or consumer drop wakes an idle producer and ends delivery; it does not need a later send.
 
-The ticket stays valid for the 60-second accept window. After the window, the consumer reaps the bind and sees `SenderDropped`.
+The ticket stays valid for the configured accept window (180 seconds by default). After the window, the consumer reaps the bind and sees `SenderDropped`.
 
 ## Roll back
 
@@ -197,3 +197,5 @@ These changes were measured and did not help. Do not try them again without a ne
 - `async_open_ack`, as described above.
 
 [Response plane performance](../operations/response-plane-performance.md) has the measurements.
+
+For work that exceeds the initial window, renew held tickets with `AnchorManager::renew_reservations`. Configure lifetimes and cadence through `VeloBuilder::reservation_config`; see [reservation renewal](../concepts/streaming.md#reservation-renewal).

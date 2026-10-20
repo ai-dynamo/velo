@@ -75,6 +75,7 @@ pub(crate) const MAX_INGRESS_SLOTS_PER_PEER: usize = 1 << 16;
 
 /// A `bind()` waiting for the `OpenSlot` that will claim it.
 struct BindEntry {
+    expires: tokio::time::Instant,
     /// The mux-owned `C + 1` buffer whose receiver went to the anchor.
     frame_tx: flume::Sender<Vec<u8>>,
     /// Handed to the anchor's direct feed and stream watchdog at attach (or to
@@ -353,11 +354,42 @@ impl IngressRegistry {
         self.binds.insert(
             (anchor_id, session_id),
             BindEntry {
+                expires: tokio::time::Instant::now() + super::ACCEPT_TIMEOUT,
                 frame_tx,
                 drain,
                 lane,
             },
         );
+    }
+
+    pub(crate) fn renew_bind(&self, anchor: u64, session: u64, timeout: std::time::Duration) {
+        if let Some(mut bind) = self.binds.get_mut(&(anchor, session)) {
+            let now = tokio::time::Instant::now();
+            if bind.expires > now {
+                bind.expires = now + timeout;
+            }
+        }
+    }
+
+    pub(crate) fn expire_due(
+        &self,
+        anchor: u64,
+        session: u64,
+        now: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        use dashmap::mapref::entry::Entry;
+        if let Entry::Occupied(entry) = self.binds.entry((anchor, session)) {
+            if entry.get().expires > now {
+                return Some(entry.get().expires);
+            }
+            entry.remove();
+            tracing::warn!(
+                anchor_id = anchor,
+                session_id = session,
+                "messenger mux: no OpenSlot arrived before the accept window closed"
+            );
+        }
+        None
     }
 
     /// Drop an unclaimed bind, reporting whether one was there.

@@ -183,7 +183,7 @@ Batches from one peer on one lane must not be reordered. The worker writes each 
 
 ### Opening a slot
 
-The sender writes `OpenSlot` when the stream attaches, in a flush of its own. It does not wait for the first data record. `bind()` starts a 60-second accept window (`ACCEPT_TIMEOUT`). The window measures the time until a batch that carries the `OpenSlot` arrives. A lazy `OpenSlot` makes the window measure the time until the first token, and a queued request with a long prefill then expires.
+The sender writes `OpenSlot` when the stream attaches, in a flush of its own. It does not wait for the first data record. `bind()` starts a configured accept window (180 seconds by default) (`ACCEPT_TIMEOUT`). The window measures the time until a batch that carries the `OpenSlot` arrives. A lazy `OpenSlot` makes the window measure the time until the first token, and a queued request with a long prefill then expires.
 
 An `OpenSlot` for an `(anchor_id, session_id)` pair that was never registered does not fail the peer. The receiver replies `CloseSlot{UnknownSlot}` and discards the records of that slot. When the accept window closes on an unclaimed bind, the stream watchdog (or the consumer, if it sees the close first) reaps the registry entry, injects `Dropped` and increments `velo_streaming_unclaimed_bind_reaped_total`.
 
@@ -203,7 +203,7 @@ The pre-bind has these rules:
 - **Cancellation posts a close.** A zero-RTT anchor never learns a `StreamCancelHandle`. When a claimed pre-bind drops, it posts `CloseSlot{UnknownSlot}` to the producer through `close_claimed_slot`. An idle producer learns of the cancel without sending another record.
 - **Detach gives the slot back.** Both places that handle `Detached` release the pre-bind and resume the unattached timer.
 
-The ticket can wait in an envelope for the full 60-second accept window. Heartbeat detection starts only when the `OpenSlot` that claims the bind arrives. Before that, the stream watchdog does not count a silent window as a miss.
+The ticket can wait in an envelope for the full configured accept window (180 seconds by default). Heartbeat detection starts only when the `OpenSlot` that claims the bind arrives. Before that, the stream watchdog does not count a silent window as a miss.
 
 Credit is exact by construction. `prebind` sizes its buffer from the same `NegotiatedLimits` that the ticket quotes. `open_slot` emits no `CreditUpdate` on the claim, so the sender never holds 2C credit against a C+1 buffer.
 
@@ -219,7 +219,7 @@ At epoch death the batcher closes every live slot of its (peer, lane) and starts
 
 A connection that closes after the transport admitted a batch is not epoch death. The mux does not wait for a response to a batch: the send drops its response awaiter at admission. A later failure of the send goes only to the process-wide error handler of the Messenger, which logs it. QUIC and TCP dial the lane again on the next send, and the batcher keeps its epoch. A batch that still waits for admission when the connection closes is refused (`ChannelClosed` or `ConnectionReplaced`), and that refusal is epoch death. The receiver sees the lost batches as a gap in `batch_seq`, and as a gap in `frame_seq` in each slot that they carried.
 
-A slot with a gap cannot make progress. Its stream watchdog ends it after `DETECTION_MULTIPLIER` heartbeat windows, 15 to 20 s at the defaults. A slot whose `OpenSlot` was lost never opens. If the slot was pre-bound, its consumer waits until the 60 s accept window closes the bind; an attached slot is ended by its stream watchdog, like a slot with a gap. A lost reply batch loses the credit and the cancels that it carried. The consumer's account then shows that credit as out, so its watchdog ends a slot whose grant was lost. Slots that lost nothing continue.
+A slot with a gap cannot make progress. Its stream watchdog ends it after `DETECTION_MULTIPLIER` heartbeat windows, 15 to 20 s at the defaults. A slot whose `OpenSlot` was lost never opens. If the slot was pre-bound, its consumer waits until the configured accept window (180 seconds by default) closes the bind; an attached slot is ended by its stream watchdog, like a slot with a gap. A lost reply batch loses the credit and the cancels that it carried. The consumer's account then shows that credit as out, so its watchdog ends a slot whose grant was lost. Slots that lost nothing continue.
 
 Each lane has its own batcher, connection and epoch. A failure on one lane therefore touches only the slots of that lane. Streams to the same peer on other lanes continue, unless the peer fails its health check.
 

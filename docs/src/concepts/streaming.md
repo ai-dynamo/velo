@@ -127,6 +127,16 @@ sender.finalize()?;
 - If no mux is installed, `None` is the normal result, and Velo records nothing.
 - For all other causes, Velo logs at debug level and counts `outcome="error"` under `velo_streaming_anchor_operations_total{operation="prebind"}`. These causes are an MPSC anchor, the handle of another node, an anchor that is already attached or pre-bound, and an anchor that was removed. Call `prebind_anchor` only on SPSC anchors that this node created.
 
-Call `prebind_anchor` from a runtime context, because it starts tasks. A ticket that the worker never opens does not stay forever. After a 60 s accept window, the bind is reclaimed and the anchor sees `SenderDropped`. `velo_streaming_unclaimed_bind_reaped_total` counts these tickets.
+Call `prebind_anchor` from a runtime context, because it starts tasks. A ticket that the worker never opens does not stay forever. After the configured accept window (180 seconds by default), the bind is reclaimed and the anchor sees `SenderDropped`. `velo_streaming_unclaimed_bind_reaped_total` counts these tickets.
 
 Ticket senders support `stop_token()` and `cancellation_token()` through messenger mux version 2. The existing slot-open exchange carries the stream session identity; no extra stream registration is needed. A peer epoch and slot generation reject stale lifecycle signals. Applications that require this lifecycle must require `messenger-mux-v2`; legacy attach fallback does not establish that capability.
+
+## Reservation renewal
+
+`VeloBuilder::reservation_config` sets the default unattached lifetime (120 seconds), prepared-slot lifetime (180 seconds), and renewal cadence (30 seconds). The renewal cadence must be positive and shorter than both lifetimes. Per-anchor `AnchorConfig::unattached_timeout` overrides the ordinary lifetime.
+
+Capture `AnchorReservation::new(handle, ticket.as_ref())` when a request takes responsibility for a reply. Keep the reservation while that request waits or executes before attachment. Periodically pass held reservations to `AnchorManager::renew_reservations`. The call groups them by owner and sends at most 256 entries per remote batch. It does not attach a producer. Velo exposes the cadence; the application owns the collection and its renewal task.
+
+Renewal extends only a live, unattached reservation. Attached, expired, cancelled, and replaced reservations are successful no-ops, including attachment races. Renewal cannot revive an expired stream. A transport failure returns an error. Successful delivery does not prove that a reservation still exists.
+
+Release the held reservation after downstream acceptance, attachment, cancellation, or failure. Renewal does not extend an application request deadline or replace producer heartbeats. A prepared ticket still identifies one slot generation; renewal does not make that ticket reusable after detach.
