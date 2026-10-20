@@ -83,7 +83,7 @@ serde_json = { version = "1" }
 tempfile = "3"
 thiserror = { version = "2" }
 zmq = { version = "0.10" }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 tokio-stream = { version = "0.1" }
 tokio-util = { version = "0.7.17", features = ["codec", "net", "rt", "io-util"] }
 axum = { version = "0.8.4", features = ["macros"] }
