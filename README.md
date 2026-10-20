@@ -13,6 +13,8 @@ NOTE: Velo is experimental. Its design, development, and tests are still in prog
 
 Typed streams support graceful stop, cancellation, and ordered finalization, including prebound tickets. See [Stream lifecycle](docs/src/concepts/streaming.md).
 
+A producer can wait until a stream's output has left its node: `StreamSender::retired()` resolves to `Sent` or `Discarded`. TCP and UDS write the frames that they admitted before they close at graceful shutdown. See [Know when the output has left](docs/src/concepts/streaming.md#know-when-the-output-has-left).
+
 Streams of bytes that the application already serialized can skip msgpack on both ends. `StreamSender<Bytes>::send_bytes` and `StreamAnchor<Bytes>::next_bytes` use the same frames as `send` and `next`, and the consumer gets each item as a slice of the received buffer, not a copy. See [Byte items](docs/src/concepts/streaming.md#byte-items).
 
 Velo 0.19 gives Velo and Messenger explicit drop lifetimes, removes value-level Messenger cloning, and removes duplicate dispatch and cancellation APIs. See [Migrate ownership, dispatch, and cancellation](docs/src/guides/migrate-dispatch-and-cancellation.md).
