@@ -110,6 +110,13 @@ const DEFAULT_MAX_BATCH_FRAMES: usize = 1024;
 /// flush that had to precede it failed.
 const FLUSH_FAILED: &str = "batch flush failed";
 
+/// How long a TCP or UDS writer keeps writing at teardown: the frames already
+/// in its channel, and the write in progress. Those frames were admitted, and
+/// a sender may act on that at once (the messenger mux reports a stream sent
+/// once the batch that ends it is admitted). A writer stops at this deadline
+/// so that a peer that does not read cannot hold teardown open.
+pub(crate) const TEARDOWN_FLUSH_GRACE: Duration = Duration::from_secs(1);
+
 /// How many frames of each [`MessageType`] one write carried.
 ///
 /// A fixed array rather than a `Vec<MessageType>` kept beside the failure
@@ -317,6 +324,18 @@ pub(crate) trait WriterObserver {
         true
     }
 
+    /// Asked once, when the stop token fires. `Some(grace)` keeps what is
+    /// queued: the writer finishes the write in progress and writes the frames
+    /// already in its channel, for at most `grace`, and then stops. `None`, the
+    /// default, stops at once, and the caller fails what is still queued.
+    ///
+    /// TCP and UDS answer `Some` when the whole transport tears down, and
+    /// `None` when only the connection closes (an unregister, or the peer
+    /// closed the socket), where nothing could deliver the frames.
+    fn keep_queued_on_stop(&self) -> Option<Duration> {
+        None
+    }
+
     /// One batch reached the wire carrying `frames` frames. Not called for a
     /// failed write.
     ///
@@ -520,15 +539,16 @@ impl FrameBatchBuffer {
     /// The buffer is cleared whether or not the write succeeded: on failure the
     /// caller owns error reporting for the frames it staged, and retrying a
     /// partially-written frame stream would corrupt the peer's decoder.
-    async fn flush_to<W: AsyncWrite + Unpin>(
+    async fn flush_to<W: AsyncWrite + Unpin, O: WriterObserver>(
         &mut self,
         writer: &mut W,
-        cancel: Option<&CancellationToken>,
+        bound: &mut WriteBound<'_>,
+        observer: &O,
     ) -> io::Result<()> {
         if self.frames == 0 {
             return Ok(());
         }
-        let result = write_all_cancelled(writer, &self.buf, cancel).await;
+        let result = write_all_bounded(writer, &self.buf, bound, observer).await;
         self.buf.clear();
         self.frames = 0;
         result
@@ -544,6 +564,11 @@ impl FrameBatchBuffer {
 /// Drain `rx` onto `writer`, coalescing whatever is already queued into single
 /// writes, until the channel closes, `cancel` fires, a terminal item is
 /// written, or the socket fails.
+///
+/// When `cancel` fires and [`WriterObserver::keep_queued_on_stop`] gives a
+/// grace, the loop first writes what is already queued, and finishes the
+/// write in progress, until that grace runs out. It takes nothing that
+/// arrives after the channel is empty.
 ///
 /// The caller keeps ownership of `writer` and is responsible for any teardown
 /// (flush / shutdown) it wants afterwards.
@@ -566,7 +591,10 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
     T: Coalescable,
     O: WriterObserver,
 {
-    let write_cancel = cancel.filter(|_| observer.interrupt_pending_writes());
+    let mut bound = WriteBound {
+        cancel: cancel.filter(|_| observer.interrupt_pending_writes()),
+        deadline: None,
+    };
     let mut batch = FrameBatchBuffer::new();
     // One token per frame staged into `batch` but not yet written, so a failed
     // write can report every frame it was carrying rather than just the last.
@@ -575,16 +603,34 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
     let mut egress = EgressLog::new(observer);
 
     'writer: loop {
-        // Block for the first item. Cancellation is polled first so a hot send
-        // queue cannot starve shutdown.
-        let first = tokio::select! {
-            biased;
-            _ = wait_cancelled(cancel) => break 'writer,
-            recv = rx.recv_async() => match recv {
-                Ok(item) => wrap(item),
-                // `recv_async` errors only once the channel is both
-                // disconnected *and* drained, so queued items are never lost.
+        let first = match bound.deadline {
+            // Stopping, but keeping what is queued: take only what is already
+            // there, and nothing after the deadline. The caller fails the rest.
+            Some(deadline) => match rx.try_recv() {
+                Ok(item) if tokio::time::Instant::now() < deadline => wrap(item),
+                Ok(item) => {
+                    T::fail(wrap(item).into_failure_token(), TEARDOWN_DEADLINE);
+                    break 'writer;
+                }
                 Err(_) => break 'writer,
+            },
+            // Block for the first item. Cancellation is polled first so a hot
+            // send queue cannot starve shutdown.
+            None => tokio::select! {
+                biased;
+                _ = wait_cancelled(cancel) => match observer.keep_queued_on_stop() {
+                    Some(grace) => {
+                        bound.deadline = Some(tokio::time::Instant::now() + grace);
+                        continue 'writer;
+                    }
+                    None => break 'writer,
+                },
+                recv = rx.recv_async() => match recv {
+                    Ok(item) => wrap(item),
+                    // `recv_async` errors only once the channel is both
+                    // disconnected *and* drained, so queued items are never lost.
+                    Err(_) => break 'writer,
+                },
             },
         };
         egress.dequeued(observer, &first);
@@ -602,7 +648,7 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
                     writer,
                     observer,
                     &mut egress,
-                    write_cancel,
+                    &mut bound,
                 )
                 .await
             {
@@ -622,7 +668,9 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
                     "a direct write must carry exactly the one frame staged for it"
                 );
                 let started = egress.started();
-                if let Err((kind, e)) = write_frame_direct(writer, &item, write_cancel).await {
+                if let Err((kind, e)) =
+                    write_frame_direct(writer, &item, &mut bound, observer).await
+                {
                     egress.failed();
                     observer.on_failure(kind, &e, 1);
                     T::fail(item.into_failure_token(), &e.to_string());
@@ -650,7 +698,7 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
                         writer,
                         observer,
                         &mut egress,
-                        write_cancel,
+                        &mut bound,
                     )
                     .await;
                     break 'writer;
@@ -671,8 +719,13 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
             // Take whatever is already queued; never blocks. Cancellation is
             // re-checked every item so a continuously refilled queue cannot
             // keep this drain running across arbitrarily many flushes without
-            // revisiting shutdown.
-            pending = if is_cancelled(cancel) {
+            // revisiting shutdown. Once stopping with a deadline, the deadline
+            // is what bounds the drain.
+            let stop_taking = match bound.deadline {
+                None => is_cancelled(cancel),
+                Some(deadline) => tokio::time::Instant::now() >= deadline,
+            };
+            pending = if stop_taking {
                 None
             } else {
                 rx.try_recv().ok().map(&wrap)
@@ -688,7 +741,7 @@ pub(crate) async fn run_coalescing_writer<W, I, T, O>(
             writer,
             observer,
             &mut egress,
-            write_cancel,
+            &mut bound,
         )
         .await
             || terminal
@@ -716,7 +769,7 @@ async fn flush<W, T, O>(
     writer: &mut W,
     observer: &O,
     egress: &mut EgressLog,
-    cancel: Option<&CancellationToken>,
+    bound: &mut WriteBound<'_>,
 ) -> bool
 where
     W: AsyncWrite + Unpin,
@@ -741,7 +794,7 @@ where
         return true;
     }
     let started = egress.started();
-    match batch.flush_to(writer, cancel).await {
+    match batch.flush_to(writer, bound, observer).await {
         Ok(()) => {
             staged.clear();
             observer.on_flush(frames);
@@ -769,14 +822,16 @@ where
 /// out here rather than delegated so that a frame the codec rejects is
 /// reported as [`WriterFailure::Encode`] instead of being indistinguishable
 /// from a socket error.
-async fn write_frame_direct<W, T>(
+async fn write_frame_direct<W, T, O>(
     writer: &mut W,
     item: &T,
-    cancel: Option<&CancellationToken>,
+    bound: &mut WriteBound<'_>,
+    observer: &O,
 ) -> Result<(), (WriterFailure, io::Error)>
 where
     W: AsyncWrite + Unpin,
     T: Coalescable,
+    O: WriterObserver,
 {
     let header = item.header();
     let payload = item.payload();
@@ -798,28 +853,81 @@ where
         None => &[&preamble[..], header, payload],
     };
     for segment in segments {
-        write_all_cancelled(writer, segment, cancel)
+        write_all_bounded(writer, segment, bound, observer)
             .await
             .map_err(|e| (WriterFailure::Write, e))?;
     }
     Ok(())
 }
 
+/// When a write in progress gives up.
+struct WriteBound<'a> {
+    /// Stops a blocked write, unless the observer keeps what is queued. `None`
+    /// when nothing interrupts a write.
+    cancel: Option<&'a CancellationToken>,
+    /// Set once the writer stops but keeps what is queued: every write from
+    /// then on runs until this deadline instead.
+    deadline: Option<tokio::time::Instant>,
+}
+
+#[cfg(test)]
+impl WriteBound<'_> {
+    /// Nothing interrupts the write.
+    fn unbounded() -> Self {
+        Self {
+            cancel: None,
+            deadline: None,
+        }
+    }
+}
+
+/// Reason handed to [`Coalescable::fail`] when teardown's deadline passed
+/// before the item was written.
+const TEARDOWN_DEADLINE: &str = "transport torn down before the frame was written";
+
 /// Complete an immediately writable frame, but stop a blocked write during
-/// teardown. The caller must discard the connection after a partial write.
-async fn write_all_cancelled<W: AsyncWrite + Unpin>(
+/// teardown, or bound it by the teardown deadline when the observer keeps what
+/// is queued. The caller must discard the connection after a partial write.
+async fn write_all_bounded<W: AsyncWrite + Unpin, O: WriterObserver>(
     writer: &mut W,
     bytes: &[u8],
-    cancel: Option<&CancellationToken>,
+    bound: &mut WriteBound<'_>,
+    observer: &O,
 ) -> io::Result<()> {
-    let Some(cancel) = cancel else {
+    if let Some(deadline) = bound.deadline {
+        return write_by(writer.write_all(bytes), deadline).await;
+    }
+    let Some(cancel) = bound.cancel else {
         return writer.write_all(bytes).await;
     };
+    let write = writer.write_all(bytes);
+    tokio::pin!(write);
     tokio::select! {
         biased;
-        result = writer.write_all(bytes) => result,
-        () = cancel.cancelled() => Err(io::Error::new(io::ErrorKind::Interrupted, "transport torn down during write")),
+        result = &mut write => return result,
+        () = cancel.cancelled() => {}
     }
+    match observer.keep_queued_on_stop() {
+        Some(grace) => {
+            let deadline = tokio::time::Instant::now() + grace;
+            bound.deadline = Some(deadline);
+            write_by(write, deadline).await
+        }
+        None => Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "transport torn down during write",
+        )),
+    }
+}
+
+/// Finish `write`, or fail it once `deadline` passes.
+async fn write_by(
+    write: impl std::future::Future<Output = io::Result<()>>,
+    deadline: tokio::time::Instant,
+) -> io::Result<()> {
+    tokio::time::timeout_at(deadline, write)
+        .await
+        .unwrap_or_else(|_| Err(io::Error::new(io::ErrorKind::TimedOut, TEARDOWN_DEADLINE)))
 }
 
 /// Completes when `cancel` fires; never completes when there is no token.

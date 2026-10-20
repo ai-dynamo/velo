@@ -164,6 +164,9 @@ struct TestObserver {
     dequeues: Mutex<Vec<Duration>>,
     /// One entry per `on_write`: what the write carried, and how long it took.
     writes: Mutex<Vec<WriteReport>>,
+    /// Answer to `keep_queued_on_stop`. `None` by default, as for every
+    /// writer but a tearing-down TCP or UDS one.
+    keep_queued: Option<Duration>,
 }
 
 impl TestObserver {
@@ -224,6 +227,9 @@ impl WriterObserver for TestObserver {
     }
     fn on_write(&self, tally: &FrameTally, elapsed: Duration) {
         self.writes.lock().push((tally.counts().collect(), elapsed));
+    }
+    fn keep_queued_on_stop(&self) -> Option<Duration> {
+        self.keep_queued
     }
 }
 
@@ -634,7 +640,14 @@ async fn batch_bytes_identical_to_sequential_writes() {
     }
     assert_eq!(batch.frame_count(), frames.len());
     let mut batched = Vec::new();
-    batch.flush_to(&mut batched, None).await.unwrap();
+    batch
+        .flush_to(
+            &mut batched,
+            &mut WriteBound::unbounded(),
+            &TestObserver::default(),
+        )
+        .await
+        .unwrap();
 
     assert_eq!(batched, sequential, "batched bytes must match sequential");
     assert_eq!(batch.frame_count(), 0, "flush resets the buffer");
@@ -651,7 +664,14 @@ async fn coalesced_batch_decodes_frame_by_frame() {
             .expect("push");
     }
     let mut wire = RecordingSink::default();
-    batch.flush_to(&mut wire, None).await.unwrap();
+    batch
+        .flush_to(
+            &mut wire,
+            &mut WriteBound::unbounded(),
+            &TestObserver::default(),
+        )
+        .await
+        .unwrap();
 
     let decoded = wire.decode_frames();
     assert_eq!(decoded.len(), 32);
@@ -756,7 +776,14 @@ async fn large_frames_never_enter_the_staging_buffer() {
             batch.push(MessageType::Message, &[], &[7u8; 4096]).unwrap();
         }
         let mut sink = RecordingSink::default();
-        batch.flush_to(&mut sink, None).await.unwrap();
+        batch
+            .flush_to(
+                &mut sink,
+                &mut WriteBound::unbounded(),
+                &TestObserver::default(),
+            )
+            .await
+            .unwrap();
     }
     assert!(
         batch.capacity() <= 4 * DEFAULT_MAX_BATCH_BYTES,
@@ -778,7 +805,14 @@ async fn staging_a_large_frame_would_retain_its_capacity() {
         .push(MessageType::Message, &[], &vec![0u8; BIG])
         .unwrap();
     let mut sink = RecordingSink::default();
-    batch.flush_to(&mut sink, None).await.unwrap();
+    batch
+        .flush_to(
+            &mut sink,
+            &mut WriteBound::unbounded(),
+            &TestObserver::default(),
+        )
+        .await
+        .unwrap();
 
     assert_eq!(batch.frame_count(), 0, "flush resets the frame count");
     assert!(
@@ -1419,4 +1453,87 @@ async fn cancellation_interrupts_a_blocked_write() {
         assert_eq!(factory.errors().len(), 1);
         assert_eq!(observer.frames_written(), 0);
     }
+}
+
+/// A stop that keeps what is queued finishes the blocked write and writes the
+/// frames queued behind it before the loop ends. Those frames were admitted,
+/// and teardown must not turn that into a failure.
+#[tokio::test]
+async fn a_stop_that_keeps_the_queue_writes_it_first() {
+    for size in [32, COALESCE_THRESHOLD + 1] {
+        let factory = ItemFactory::new();
+        let observer = TestObserver {
+            keep_queued: Some(Duration::from_secs(30)),
+            ..TestObserver::default()
+        };
+        let state = Arc::new(Mutex::new(ParkState::default()));
+        let mut sink = ParkingSink {
+            state: state.clone(),
+        };
+        let cancel = CancellationToken::new();
+        let (tx, rx) = flume::unbounded();
+        tx.send(factory.item("blocked", vec![0; size])).unwrap();
+        let write = run_coalescing_writer(
+            &mut sink,
+            &rx,
+            std::convert::identity,
+            Some(&cancel),
+            &observer,
+        );
+        tokio::pin!(write);
+        assert!(futures::poll!(&mut write).is_pending());
+        assert!(
+            state.lock().waker.is_some(),
+            "write must reach the blocked socket"
+        );
+        // Admitted while the socket is blocked, then teardown.
+        tx.send(factory.item("queued-1", vec![0; size])).unwrap();
+        tx.send(factory.item("queued-2", vec![0; size])).unwrap();
+        cancel.cancel();
+        assert!(futures::poll!(&mut write).is_pending());
+        release(&state);
+        tokio::time::timeout(Duration::from_secs(2), write)
+            .await
+            .expect("the loop ends once the queue is written");
+        assert!(factory.errors().is_empty(), "{:?}", factory.errors());
+        assert_eq!(observer.frames_written(), 3);
+        assert!(rx.is_empty());
+    }
+}
+
+/// A stop that keeps the queue is still bounded: a peer that never reads
+/// cannot hold the loop past its grace. The blocked write fails, and what is
+/// still queued stays for the caller to fail.
+#[tokio::test(start_paused = true)]
+async fn a_stop_that_keeps_the_queue_ends_at_its_deadline() {
+    let factory = ItemFactory::new();
+    let observer = TestObserver {
+        keep_queued: Some(Duration::from_millis(100)),
+        ..TestObserver::default()
+    };
+    let mut sink = ParkingSink {
+        state: Arc::new(Mutex::new(ParkState::default())),
+    };
+    let cancel = CancellationToken::new();
+    let (tx, rx) = flume::unbounded();
+    tx.send(factory.item("blocked", vec![0; 32])).unwrap();
+    let write = run_coalescing_writer(
+        &mut sink,
+        &rx,
+        std::convert::identity,
+        Some(&cancel),
+        &observer,
+    );
+    tokio::pin!(write);
+    assert!(futures::poll!(&mut write).is_pending());
+    tx.send(factory.item("queued", vec![0; 32])).unwrap();
+    cancel.cancel();
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(2), write)
+        .await
+        .expect("the deadline ends the loop");
+    assert!(started.elapsed() >= Duration::from_millis(100));
+    assert_eq!(factory.errors().len(), 1, "the blocked write fails");
+    assert_eq!(rx.len(), 1, "the rest is left for the caller");
+    assert_eq!(observer.frames_written(), 0);
 }

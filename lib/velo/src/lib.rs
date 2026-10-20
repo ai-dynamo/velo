@@ -814,7 +814,7 @@ impl Velo {
     /// together, rather than giving each phase the full duration. Joining mux
     /// tasks comes after the drain and needs the owning runtime to make
     /// progress. The transports' close step also comes on top: it is bounded by each
-    /// transport's own [`Transport::closed`] (QUIC: 2.5 s), not by the policy,
+    /// transport's own [`Transport::closed`] (QUIC, TCP, UDS: 2.5 s), not by the policy,
     /// because cutting it short would discard frames already written.
     /// Under [`ShutdownPolicy::WaitForever`] the sweep still takes
     /// [`RdmaConfig::shutdown_timeout`], because a peer that crashed

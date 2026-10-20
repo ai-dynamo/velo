@@ -462,3 +462,79 @@ where
     );
     handle_b.streams.shutdown_state.teardown_token().cancel();
 }
+
+/// Every frame the transport admitted before teardown reaches the peer, and
+/// none fails: teardown writes what its writers already queued before it
+/// closes them, and `closed()` waits for those writes.
+///
+/// Admission is the promise a sender acts on. The messenger mux, for one,
+/// reports a stream sent once the batch that ends it is admitted, and its
+/// producer may shut down right after. A writer that dropped its queue at
+/// teardown broke that promise for whatever it had not yet written, which on
+/// a busy connection is most of the queue.
+///
+/// The frames are large, so most of them still wait in the writer's channel
+/// when teardown lands. They are no more than the channel holds, so every one
+/// was admitted and none waits in the admission gate. TCP and UDS only: QUIC
+/// still fails frames queued at teardown.
+pub async fn admitted_frames_are_written_across_teardown<C: ShutdownTestClient>()
+where
+    C::Transport: 'static,
+{
+    const FRAMES: usize = 256;
+    const PAYLOAD: usize = 64 * 1024;
+    let handle_a = C::new_handle().await.unwrap();
+    let handle_b = C::new_handle().await.unwrap();
+    handle_a.register_peer(&handle_b).unwrap();
+
+    for i in 0..FRAMES {
+        handle_a.send(
+            handle_b.instance_id,
+            (i as u32).to_be_bytes().to_vec(),
+            vec![0u8; PAYLOAD],
+            MessageType::Response,
+        );
+    }
+    // Tear down once frames are flowing, so it lands mid-stream.
+    let (first, _) = timeout(
+        Duration::from_secs(5),
+        handle_b.streams.response_stream.recv_async(),
+    )
+    .await
+    .expect("the first frame arrives")
+    .expect("recv");
+    let mut delivered = vec![first];
+    handle_a.streams.shutdown_state.teardown_token().cancel();
+    handle_a.transport.shutdown();
+    timeout(Duration::from_secs(5), handle_a.transport.closed())
+        .await
+        .expect("closed() bounds its wait");
+
+    while delivered.len() < FRAMES {
+        match timeout(
+            Duration::from_secs(3),
+            handle_b.streams.response_stream.recv_async(),
+        )
+        .await
+        {
+            Ok(Ok((header, _))) => delivered.push(header),
+            _ => break,
+        }
+    }
+    let failed = handle_a.error_handler.get_errors();
+    assert!(
+        delivered.len() == FRAMES && failed.is_empty(),
+        "{} of {FRAMES} admitted frames delivered, {} failed at teardown: {:?}",
+        delivered.len(),
+        failed.len(),
+        failed.first().map(|(_, _, error)| error)
+    );
+    for (i, header) in delivered.iter().enumerate() {
+        assert_eq!(
+            u32::from_be_bytes(header[..].try_into().expect("a 4-byte header")) as usize,
+            i,
+            "frames arrive in the order they were admitted"
+        );
+    }
+    handle_b.streams.shutdown_state.teardown_token().cancel();
+}

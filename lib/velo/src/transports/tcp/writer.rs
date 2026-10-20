@@ -12,13 +12,17 @@
 //! it is queued for one.
 
 use std::net::SocketAddr;
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use tokio_util::sync::CancellationToken;
 
 use tracing::error;
 
 use velo_ext::MessageType;
 
-use crate::transports::coalesce::{Coalescable, EgressMetrics, WriterFailure, WriterObserver};
+use crate::transports::coalesce::{
+    Coalescable, EgressMetrics, TEARDOWN_FLUSH_GRACE, WriterFailure, WriterObserver,
+};
 
 use super::transport::SendTask;
 
@@ -72,9 +76,16 @@ pub(super) struct TcpWriterObserver {
     pub(super) lane: u16,
     pub(super) addr: SocketAddr,
     pub(super) egress: Option<EgressMetrics>,
+    /// The transport's own token. Cancelled, the writer's stop is teardown,
+    /// which keeps what is queued; otherwise only this connection closes.
+    pub(super) teardown: CancellationToken,
 }
 
 impl WriterObserver for TcpWriterObserver {
+    fn keep_queued_on_stop(&self) -> Option<Duration> {
+        self.teardown.is_cancelled().then_some(TEARDOWN_FLUSH_GRACE)
+    }
+
     fn on_failure(&self, kind: WriterFailure, err: &std::io::Error, frames: usize) {
         match kind {
             WriterFailure::Write => error!(

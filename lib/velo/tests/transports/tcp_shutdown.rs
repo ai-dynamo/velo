@@ -10,6 +10,16 @@ use common::{OUTER_TEST_TIMEOUT, TcpShutdownClient, shutdown_scenarios};
 
 transport_shutdown_tests!(tcp, TcpShutdownClient);
 
+#[tokio::test]
+async fn test_tcp_admitted_frames_are_written_across_teardown() {
+    tokio::time::timeout(
+        OUTER_TEST_TIMEOUT,
+        shutdown_scenarios::admitted_frames_are_written_across_teardown::<TcpShutdownClient>(),
+    )
+    .await
+    .expect("admitted_frames_are_written_across_teardown timed out");
+}
+
 // --- Codec-level test (not transport-specific, but lives here for TCP coverage) ---
 #[test]
 fn test_shutting_down_frame_roundtrip() {

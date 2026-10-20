@@ -28,7 +28,8 @@ use crate::transports::tcp::framing::DEFAULT_MAX_FRAME_SIZE;
 
 use super::listener::{UdsListener, default_shrink_threshold};
 use crate::transports::coalesce::{
-    Coalescable, EgressMetrics, WriterFailure, WriterObserver, run_coalescing_writer,
+    Coalescable, EgressMetrics, TEARDOWN_FLUSH_GRACE, WriterFailure, WriterObserver,
+    run_coalescing_writer,
 };
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
 
@@ -36,6 +37,12 @@ use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
 /// exits on its next poll after teardown, so this bound only matters when the
 /// runtime that runs it is not being driven.
 const LISTENER_CLOSE_WAIT: Duration = Duration::from_secs(1);
+
+/// How long `closed()` waits for the connection writers. Each one writes what
+/// teardown kept for at most TEARDOWN_FLUSH_GRACE after it sees the stop; the
+/// margin covers a writer that sees it late.
+const WRITERS_CLOSE_WAIT: Duration =
+    TEARDOWN_FLUSH_GRACE.saturating_add(Duration::from_millis(500));
 
 /// UDS transport with lock-free concurrent access
 ///
@@ -65,6 +72,9 @@ pub struct UdsTransport {
 
     // The accept loop, so `closed()` can wait until its socket is gone.
     listener_tasks: tokio_util::task::TaskTracker,
+    // One token per connection writer while it writes, so `closed()` can wait
+    // for the frames teardown keeps.
+    writers: tokio_util::task::TaskTracker,
 
     // Listener read-buffer shrink threshold (bytes). Plumbed into UdsListener
     // at start() time. Resolved from env or default in new().
@@ -153,6 +163,7 @@ impl UdsTransport {
             connect_timeout,
             metrics: OnceLock::new(),
             listener_tasks: tokio_util::task::TaskTracker::new(),
+            writers: tokio_util::task::TaskTracker::new(),
             shrink_threshold: default_shrink_threshold(),
             dialed_ctx: OnceLock::new(),
         }
@@ -265,6 +276,8 @@ impl UdsTransport {
             WriterTaskContext {
                 connections: Arc::clone(&self.connections),
                 cancel_token: handle.cancel.clone(),
+                teardown: self.cancel_token.clone(),
+                writing: self.writers.token(),
                 connect_timeout: self.connect_timeout,
                 reader_ctx: self.dialed_ctx.get().cloned(),
                 metrics: self.metrics.get().cloned(),
@@ -543,15 +556,32 @@ impl Transport for UdsTransport {
         }
         self.cancel_token.cancel();
 
-        // Clear connections
+        // Clear connections. Their writers write what they already queued,
+        // for up to TEARDOWN_FLUSH_GRACE; `closed()` waits for that.
         self.connections.clear();
+        self.writers.close();
         self.update_connection_gauge();
     }
 
+    /// Wait for the connection writers to write what teardown kept, then for
+    /// the accept loop to close its socket. Bounded by TEARDOWN_FLUSH_GRACE
+    /// plus LISTENER_CLOSE_WAIT.
     fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
         Box::pin(async move {
             if !self.cancel_token.is_cancelled() {
                 return;
+            }
+            // Each writer stops by its own deadline, so this bound only
+            // matters when the runtime that runs them is not being driven.
+            self.writers.close();
+            if tokio::time::timeout(WRITERS_CLOSE_WAIT, self.writers.wait())
+                .await
+                .is_err()
+            {
+                warn!(
+                    "UDS writers on {:?} did not finish within {:?}",
+                    self.socket_path, WRITERS_CLOSE_WAIT
+                );
             }
             // `shutdown()` cancelled teardown, so the accept loop is exiting.
             // Wait for it, so no peer can connect once this returns and the
@@ -626,6 +656,11 @@ struct WriterTaskContext {
     connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
     /// The connection's token: shutdown and unregister both cancel it.
     cancel_token: CancellationToken,
+    /// The transport's token: only shutdown cancels it. It tells the writer
+    /// that its stop is teardown, which writes what is queued first.
+    teardown: CancellationToken,
+    /// Held while the writer can still write, so `closed()` can wait for it.
+    writing: tokio_util::task::task_tracker::TaskTrackerToken,
     connect_timeout: Duration,
     reader_ctx: Option<DialedReaderContext>,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
@@ -645,6 +680,8 @@ async fn connection_writer_task(
     let WriterTaskContext {
         connections,
         cancel_token,
+        teardown,
+        writing,
         connect_timeout,
         reader_ctx,
         metrics,
@@ -653,12 +690,17 @@ async fn connection_writer_task(
         &path,
         instance_id,
         &rx,
-        &cancel_token,
+        WriterStops {
+            connection: &cancel_token,
+            teardown,
+        },
         connect_timeout,
         reader_ctx,
         metrics.clone(),
     )
     .await;
+    // Nothing more reaches the socket: what is still queued fails below.
+    drop(writing);
 
     retire_connection(instance_id, tx, rx, &connections).await;
     if let Some(metrics) = metrics.as_ref() {
@@ -693,11 +735,15 @@ async fn connection_writer_inner(
     path: &Path,
     instance_id: crate::InstanceId,
     rx: &flume::Receiver<SendTask>,
-    cancel_token: &CancellationToken,
+    stops: WriterStops<'_>,
     connect_timeout: Duration,
     reader_ctx: Option<DialedReaderContext>,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
 ) -> Result<()> {
+    let WriterStops {
+        connection: cancel_token,
+        teardown,
+    } = stops;
     debug!("Connecting to UDS {:?}", path);
 
     let stream = tokio::select! {
@@ -750,6 +796,7 @@ async fn connection_writer_inner(
             instance_id,
             path,
             egress: metrics.map(EgressMetrics::new),
+            teardown,
         },
     )
     .await;
@@ -819,9 +866,25 @@ struct UdsWriterObserver<'a> {
     instance_id: crate::InstanceId,
     path: &'a Path,
     egress: Option<EgressMetrics>,
+    /// The transport's own token. Cancelled, the writer's stop is teardown,
+    /// which keeps what is queued; otherwise only this connection closes.
+    teardown: CancellationToken,
+}
+
+/// The two tokens a connection writer stops on. Bundled to keep
+/// `connection_writer_inner` under clippy's argument limit.
+struct WriterStops<'a> {
+    /// The connection's token: shutdown and unregister both cancel it.
+    connection: &'a CancellationToken,
+    /// The transport's token: only shutdown cancels it.
+    teardown: CancellationToken,
 }
 
 impl WriterObserver for UdsWriterObserver<'_> {
+    fn keep_queued_on_stop(&self) -> Option<Duration> {
+        self.teardown.is_cancelled().then_some(TEARDOWN_FLUSH_GRACE)
+    }
+
     fn on_failure(&self, kind: WriterFailure, err: &std::io::Error, frames: usize) {
         match kind {
             WriterFailure::Write => error!(

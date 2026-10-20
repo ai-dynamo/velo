@@ -240,6 +240,8 @@ async fn test_writer_task_cleans_up_on_write_error() {
         WriterTaskContext {
             connections: conns,
             cancel_token: cancel,
+            teardown: CancellationToken::new(),
+            writing: tokio_util::task::TaskTracker::new().token(),
             connect_timeout: Duration::from_secs(5),
             reader_ctx: None,
             metrics: None,
@@ -460,6 +462,8 @@ async fn test_writer_task_drains_on_connect_failure() {
         WriterTaskContext {
             connections: conns,
             cancel_token: cancel,
+            teardown: CancellationToken::new(),
+            writing: tokio_util::task::TaskTracker::new().token(),
             connect_timeout: Duration::from_secs(5),
             reader_ctx: None,
             metrics: None,
@@ -678,6 +682,7 @@ async fn the_egress_queue_wait_spans_the_admission_gate() {
                     instance_id,
                     path: &socket_path,
                     egress: Some(EgressMetrics::new(handle)),
+                    teardown: CancellationToken::new(),
                 },
             )
             .await;

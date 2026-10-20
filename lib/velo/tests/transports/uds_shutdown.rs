@@ -11,3 +11,13 @@ mod common;
 use common::{OUTER_TEST_TIMEOUT, UdsShutdownClient, shutdown_scenarios};
 
 transport_shutdown_tests!(uds, UdsShutdownClient);
+
+#[tokio::test]
+async fn test_uds_admitted_frames_are_written_across_teardown() {
+    tokio::time::timeout(
+        OUTER_TEST_TIMEOUT,
+        shutdown_scenarios::admitted_frames_are_written_across_teardown::<UdsShutdownClient>(),
+    )
+    .await
+    .expect("admitted_frames_are_written_across_teardown timed out");
+}
