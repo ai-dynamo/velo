@@ -901,6 +901,8 @@ async fn a_send_after_teardown_fails_at_once_without_a_dial() {
         !transport.connections.contains_key(&peer_id),
         "no connection, so no dial"
     );
+    drop(_peer_listener);
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// `closed()` returns only once the connection writers are done with what

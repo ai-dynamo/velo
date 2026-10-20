@@ -58,8 +58,9 @@ impl TcpTransportBuilder {
     /// that ends it is admitted. At teardown each writer finishes the write
     /// in progress, or the dial in progress, and writes what is already in
     /// its channel, until this much time has passed; then it fails the rest.
-    /// `closed()` waits this long plus 0.5 s. A peer that does not read
-    /// cannot hold the shutdown open for longer.
+    /// `closed()` waits this long plus 0.5 s for the writers, then up to 1 s
+    /// for the accept loop. A peer that does not read cannot hold the
+    /// shutdown open for longer.
     ///
     /// The grace starts at teardown, after the drain, and covers only what
     /// is already queued: at most `channel_capacity` frames per connection.

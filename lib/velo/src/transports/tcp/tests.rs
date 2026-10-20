@@ -1556,10 +1556,11 @@ async fn teardown_keeps_a_pending_dial_until_its_deadline() {
     let stopped = tokio::time::Instant::now();
     teardown.cancel();
     writer.await.unwrap();
-    assert!(
-        stopped.elapsed() >= TEARDOWN_FLUSH_GRACE,
-        "the dial was given up after {:?}",
-        stopped.elapsed()
+    assert_eq!(
+        stopped.elapsed(),
+        TEARDOWN_FLUSH_GRACE,
+        "the dial ends at the teardown deadline: not before it, and not at the \
+         5 s connect timeout"
     );
     assert_eq!(
         error_handler.error_count(),

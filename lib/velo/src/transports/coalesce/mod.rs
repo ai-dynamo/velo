@@ -323,7 +323,8 @@ pub(crate) trait WriterObserver {
     /// default, stops at once, and the caller fails what is still queued.
     ///
     /// TCP and UDS answer `Some` when the whole transport tears down, with
-    /// the one deadline of [`TeardownStop`], and `None` when only the
+    /// the one deadline of
+    /// [`TeardownStop`](crate::transports::teardown_grace::TeardownStop), and `None` when only the
     /// connection closes (an unregister, or the peer closed the socket),
     /// where nothing could deliver the frames.
     fn keep_queued_on_stop(&self) -> Option<tokio::time::Instant> {

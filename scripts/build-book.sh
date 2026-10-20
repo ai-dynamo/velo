@@ -40,3 +40,20 @@ mdbook build "${root}/docs"
 
 # With more than one renderer, mdBook writes the HTML to book/html/.
 test -f "${root}/docs/book/html/index.html"
+
+# The book links to sections of LIMITATIONS.md by anchor, and the link checker
+# does not follow web links. Check each anchor against the file's headings, so
+# a renamed heading fails here instead of leaving a dead link.
+limitations="${root}/LIMITATIONS.md"
+headings="$(grep -E '^## ' "${limitations}" \
+  | sed -E 's/^## //; s/`//g' \
+  | tr '[:upper:]' '[:lower:]' \
+  | sed -E 's/[^a-z0-9 -]//g; s/ /-/g')"
+status=0
+for anchor in $(grep -rhoE 'LIMITATIONS\.md#[a-z0-9-]+' "${root}/docs/src" | sed 's/.*#//' | sort -u); do
+  if ! grep -qx "${anchor}" <<<"${headings}"; then
+    echo "docs link to LIMITATIONS.md#${anchor}, which is not a heading there" >&2
+    status=1
+  fi
+done
+exit "${status}"
