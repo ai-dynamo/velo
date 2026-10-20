@@ -22,6 +22,7 @@ velo-hub = { path = "../lib/velo-hub", features = ["server", "client"] }
 anyhow = "1"
 bytes = { version = "1", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
+dashmap = "6.1"
 flume = "0.12.0"
 futures = "0.3"
 rmp-serde = "1"
@@ -56,6 +57,9 @@ name = "batched_streaming"
 
 [[example]]
 name = "response_plane_bench"
+
+[[example]]
+name = "stream_lifecycle"
 
 [[example]]
 name = "rendezvous_rdma_two_proc"
