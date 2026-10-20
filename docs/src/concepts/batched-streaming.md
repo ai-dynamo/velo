@@ -333,7 +333,7 @@ On the per-stream path, the egress pump writes a terminal, discards anything que
 - A guard that is dropped reports `Discarded`. A refused batch, an epoch death, a teardown, and a batcher task that is aborted all drop the guards that they hold.
 - A slot that closes while it still holds its producer's lifecycle reports `Discarded`. The terminal path takes the lifecycle out of the slot first. So every other close reports the loss: the `CloseSlot{UnknownSlot}` that a consumer sends when it cancels or drops its anchor, an epoch death when the consumer's process goes away, and the teardown of the producer's node.
 
-The state is two bits in the per-stream allocation that the sender and its slot already share, and a list of wakers that stays empty until a `Retired` future waits. No message crosses the wire for it. The first outcome stands. A stream that nobody watches pays one compare-exchange when it retires, and no wake.
+The state is three bits in the per-stream allocation that the sender and its slot already share (the outcome, and whether anyone waits), and a list of wakers that stays empty until a `Retired` future waits. No message crosses the wire for it. The first outcome stands. A stream that nobody watches pays one compare-exchange when it retires, and no wake.
 
 The alternative is an acknowledgement from the consumer in the application's own protocol. It costs one more active message for each stream, a table of waiters on the producer, and a round trip before the producer knows.
 

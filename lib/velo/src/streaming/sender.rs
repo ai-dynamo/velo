@@ -159,18 +159,23 @@ pub enum Retirement {
     /// eager budget stays staged on this node until the consumer pulls it,
     /// and neither this nor graceful shutdown waits for that pull. On the
     /// same worker, the terminal is in the anchor's channel. On a per-stream
-    /// transport of this crate, the stream's own pump wrote the terminal to
-    /// the socket (TCP), or the server took the whole stream (gRPC); on a
-    /// frame transport from outside velo, the terminal is in the stream's
-    /// egress channel.
+    /// transport of this crate that the `Velo` builder installed, the
+    /// stream's own pump wrote the terminal to the socket (TCP), or the
+    /// server took the whole stream (gRPC); on a frame transport from outside
+    /// velo, or under an `AnchorManager` built by hand, the terminal is in
+    /// the stream's egress channel.
     ///
     /// It says nothing about the consumer: not that the bytes were written to
     /// a socket, and not that they were received.
     Sent,
-    /// The stream's output was thrown away before it was handed on: the
-    /// consumer cancelled or dropped its anchor, the consumer's process went
-    /// away, the transport refused the batch, a per-stream pump's write
-    /// failed or its connection ended first, or this node shut down.
+    /// The stream's output was thrown away before it was handed on. Over the
+    /// messenger mux and on the same worker: the consumer cancelled or dropped
+    /// its anchor, the consumer's process went away, the transport refused the
+    /// batch, or this node shut down. On a per-stream transport of this
+    /// crate: the pump's write failed, the connection ended first, or the
+    /// gRPC server did not take the stream. A per-stream TCP pump cannot see
+    /// a consumer that left before it writes; its write succeeds, and `Sent`
+    /// stands.
     Discarded,
 }
 
@@ -526,6 +531,12 @@ impl<T> StreamSender<T> {
     /// `detach`, which consume the sender.
     pub fn retired(&self) -> Retired {
         Retired(self.closed.clone())
+    }
+
+    /// Who reports this stream's retirement, for tests of the wiring.
+    #[cfg(test)]
+    pub(crate) fn retires_on(&self) -> RetiresOn {
+        self.retires_on
     }
 
     /// The flag `send_terminal` reports this stream's retirement through, when

@@ -3372,4 +3372,79 @@ mod tests {
             "a notice parked in admission to a stalled peer kept the Messenger alive after its final drop"
         );
     }
+
+    /// The per-stream transports of this crate report a stream's retirement
+    /// from their pump, but only because the builder names them to the anchor
+    /// manager. A sender over either of them retires on its transport; a
+    /// builder that forgot to install them would silently fall back to
+    /// reporting as the terminal enters the channel.
+    async fn per_stream_node(config: StreamConfig) -> Velo {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        Velo::builder()
+            .add_transport(Arc::new(
+                crate::transports::tcp::TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ))
+            .stream_config(config)
+            .unwrap()
+            .messenger_mux(crate::streaming::MuxConfig {
+                enabled: false,
+                ..crate::streaming::MuxConfig::default()
+            })
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+    }
+
+    async fn per_stream_sender_retires_on_its_transport(
+        config: impl Fn() -> StreamConfig,
+        key: &str,
+    ) {
+        let consumer = per_stream_node(config()).await;
+        let producer = per_stream_node(config()).await;
+        consumer.register_peer(producer.peer_info()).unwrap();
+        producer.register_peer(consumer.peer_info()).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            producer.wait_for_handler(consumer.instance_id(), "_anchor_attach"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let anchor = consumer.create_anchor::<u32>();
+        let sender = producer
+            .attach_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        assert_eq!(sender.negotiated_transport().map(|k| k.as_str()), Some(key));
+        assert_eq!(
+            sender.retires_on(),
+            crate::streaming::sender::RetiresOn::Transport,
+            "the builder must name its per-stream transport to the anchor manager"
+        );
+        drop(anchor);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tcp_per_stream_sender_retires_on_its_transport() {
+        per_stream_sender_retires_on_its_transport(|| StreamConfig::Tcp(None), "tcp-stream").await;
+    }
+
+    #[cfg(feature = "grpc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grpc_per_stream_sender_retires_on_its_transport() {
+        per_stream_sender_retires_on_its_transport(
+            || {
+                StreamConfig::Grpc(Some(GrpcConfig {
+                    bind_addr: "127.0.0.1:0".parse().unwrap(),
+                }))
+            },
+            "grpc-stream",
+        )
+        .await;
+    }
 }
