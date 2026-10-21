@@ -17,7 +17,7 @@
 
 mod reservation;
 use crate::streaming::deadline::deadline_after;
-use crate::streaming::sweep::{DeadlineSweep, Due, SweepOwner, SweepTarget, expire_due};
+use crate::streaming::sweep::{DeadlineSweep, Due, Expiring, SweepOwner, SweepTarget, expire_due};
 use reservation::DEFAULT_UNATTACHED_TIMEOUT;
 pub use reservation::{AnchorReservation, ReservationConfig};
 
@@ -141,15 +141,28 @@ pub(crate) const ANCHOR_FIRST_LOOK: Duration = Duration::from_secs(1);
 /// within one recheck.
 pub(crate) const ANCHOR_RECHECK: Duration = Duration::from_secs(60);
 
-/// What the sweep does with an anchor's due entry.
-fn anchor_due(anchor: &AnchorEntry, now: tokio::time::Instant) -> Due {
-    // Attach and pre-bind clear `expires`. The flags are checked too, so a
-    // stale wake never reaps a live stream even if a path sets one without
-    // the other.
-    if anchor.attachment || anchor.prebind.is_some() {
-        return Due::Drop;
+impl Expiring for AnchorEntry {
+    fn due(&self, now: tokio::time::Instant) -> Due {
+        // Attach and pre-bind clear `expires`. The flags are checked too, so
+        // a stale wake never reaps a live stream even if a path sets one
+        // without the other.
+        if self.attachment || self.prebind.is_some() {
+            return Due::Drop;
+        }
+        Due::at(self.expires, now)
     }
-    Due::at(anchor.expires, now)
+
+    fn queued(&self) -> Option<tokio::time::Instant> {
+        self.queued
+    }
+
+    fn set_queued(&mut self, at: tokio::time::Instant) {
+        self.queued = Some(at);
+    }
+
+    fn expire(self) {
+        self.cancel_token.cancel();
+    }
 }
 
 /// The unattached deadlines of one [`AnchorManager`], swept by one task.
@@ -170,9 +183,7 @@ impl SweepTarget for DashMap<u64, AnchorEntry> {
         now: tokio::time::Instant,
         renewed: &mut Vec<(tokio::time::Instant, u64)>,
     ) {
-        expire_due(self, due, now, renewed, anchor_due, |entry| {
-            entry.cancel_token.cancel()
-        });
+        expire_due(self, due, now, renewed);
     }
 }
 
@@ -436,12 +447,7 @@ impl AnchorEntry {
         {
             let expires = deadline_after(duration);
             self.expires = Some(expires);
-            let live = self
-                .queued
-                .is_some_and(|at| tokio::time::Instant::now() < at && at <= expires);
-            if !live {
-                self.queued = Some(queue.push(registry, expires, local_id));
-            }
+            queue.arm(registry, &mut self.queued, expires, local_id);
         } else {
             self.pause_unattached_timeout();
         }
@@ -1484,7 +1490,8 @@ impl AnchorManager {
         // `queued` names it, or it drops that entry as stale.
         let mut entry = self.registry.entry(local_id).insert(entry);
         if let Some(deadline) = expires {
-            entry.queued = Some(self.deadline_queue.push(&self.registry, deadline, local_id));
+            self.deadline_queue
+                .arm(&self.registry, &mut entry.queued, deadline, local_id);
         }
         drop(entry);
 
@@ -2871,17 +2878,20 @@ impl AnchorManager {
             next_sender_id: 1,
             unattached_timeout,
             expires,
+            queued: None,
             deadlines: Arc::clone(&self.mpsc_deadlines),
             heartbeat_interval,
             max_senders: config.max_senders,
         };
 
-        self.mpsc_registry.insert(local_id, entry);
-        // Only after the insert: the sweep reads `expires` from the entry.
+        // Queue while holding the inserted entry: the sweep must not see the
+        // queue entry before `queued` names it, or it drops it as stale.
+        let mut entry = self.mpsc_registry.entry(local_id).insert(entry);
         if let Some(deadline) = expires {
             self.mpsc_deadlines
-                .push(&self.mpsc_registry, deadline, local_id);
+                .arm(&self.mpsc_registry, &mut entry.queued, deadline, local_id);
         }
+        drop(entry);
 
         crate::streaming::mpsc::MpscStreamAnchor::new(
             handle,

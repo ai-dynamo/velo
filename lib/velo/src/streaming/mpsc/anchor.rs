@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use crate::streaming::sweep::{DeadlineSweep, Due, SweepTarget, expire_due};
+use crate::streaming::sweep::{DeadlineSweep, Due, Expiring, SweepTarget, expire_due};
 use dashmap::DashMap;
 use futures::Stream;
 use serde::de::DeserializeOwned;
@@ -64,6 +64,9 @@ pub(crate) struct MpscAnchorEntry {
     /// sender is attached, and when there is no timeout. Renewal does not
     /// reach an MPSC anchor, so this moves only when the last sender leaves.
     pub expires: Option<tokio::time::Instant>,
+    /// When this anchor's live entry in the deadline queue comes due. The
+    /// sweep drops a popped entry whose instant differs, as a stale copy.
+    pub queued: Option<tokio::time::Instant>,
     /// The manager's MPSC deadline queue, held here so that each path that
     /// removes the last sender can re-arm the timeout.
     pub deadlines: Arc<MpscDeadlines>,
@@ -323,8 +326,10 @@ pub(crate) fn remove_sender_slot(
         let expires = crate::streaming::deadline::deadline_after(duration);
         entry.expires = Some(expires);
         // Under the shard lock. That is safe: the push takes only a queue
-        // shard lock, and the sweep reads `expires` after this guard is gone.
-        entry.deadlines.push(registry, expires, local_id);
+        // shard lock, and the sweep reads `expires` and `queued` after this
+        // guard is gone.
+        let entry = &mut *entry;
+        entry.queued = Some(entry.deadlines.push(registry, expires, local_id));
     }
     Some(slot)
 }
@@ -333,11 +338,27 @@ pub(crate) fn remove_sender_slot(
 /// task. See [`crate::streaming::anchor::AnchorDeadlineQueue`].
 pub(crate) type MpscDeadlines = DeadlineSweep<DashMap<u64, MpscAnchorEntry>>;
 
-fn mpsc_due(entry: &MpscAnchorEntry, now: tokio::time::Instant) -> Due {
-    if !entry.senders.is_empty() {
-        return Due::Drop;
+impl Expiring for MpscAnchorEntry {
+    fn due(&self, now: tokio::time::Instant) -> Due {
+        if !self.senders.is_empty() {
+            return Due::Drop;
+        }
+        Due::at(self.expires, now)
     }
-    Due::at(entry.expires, now)
+
+    fn queued(&self) -> Option<tokio::time::Instant> {
+        self.queued
+    }
+
+    fn set_queued(&mut self, at: tokio::time::Instant) {
+        self.queued = Some(at);
+    }
+
+    /// Dropping the entry drops its `frame_tx` clone. Remaining sender
+    /// clones keep the receiver alive until they drop.
+    fn expire(self) {
+        self.cancel_token.cancel();
+    }
 }
 
 impl SweepTarget for DashMap<u64, MpscAnchorEntry> {
@@ -346,14 +367,10 @@ impl SweepTarget for DashMap<u64, MpscAnchorEntry> {
 
     fn on_due(
         &self,
-        due: Vec<u64>,
+        due: Vec<(tokio::time::Instant, u64)>,
         now: tokio::time::Instant,
         renewed: &mut Vec<(tokio::time::Instant, u64)>,
     ) {
-        // Dropping the entry drops its `frame_tx` clone. Remaining sender
-        // clones keep the receiver alive until they drop.
-        expire_due(self, due, now, renewed, mpsc_due, |entry| {
-            entry.cancel_token.cancel()
-        });
+        expire_due(self, due, now, renewed);
     }
 }

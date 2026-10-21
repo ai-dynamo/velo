@@ -200,6 +200,29 @@ impl<T: SweepTarget> DeadlineSweep<T> {
         requeue_at(now, deadline, T::RECHECK)
     }
 
+    /// Arm `key` to come due by `expires`, for a target that keeps one live
+    /// entry per key and records its instant in `queued`.
+    ///
+    /// Queues nothing while the live entry is still ahead and not after
+    /// `expires`: that entry reads the new deadline from the target when it
+    /// comes due. Otherwise queues a new entry and records it. Without this,
+    /// each re-arm queued one more entry, and the sweep requeued every copy.
+    ///
+    /// The caller holds the target lock that guards `queued`, so the sweep
+    /// cannot pop the new entry before `queued` names it.
+    pub(crate) fn arm(
+        self: &Arc<Self>,
+        target: &Arc<T>,
+        queued: &mut Option<Instant>,
+        expires: Instant,
+        key: u64,
+    ) {
+        let live = queued.is_some_and(|at| Instant::now() < at && at <= expires);
+        if !live {
+            *queued = Some(self.push(target, expires, key));
+        }
+    }
+
     #[cold]
     fn start(self: &Arc<Self>, target: &Arc<T>) {
         if self.stopped.is_cancelled() {
@@ -279,7 +302,7 @@ impl<T: SweepTarget> DeadlineSweep<T> {
 /// What a sweep does with a due key, decided from the state of its entry.
 pub(crate) enum Due {
     /// Nothing waits on the deadline (a sender is attached, or there is no
-    /// timeout): forget the queue entry.
+    /// timeout), or the queue entry is a stale copy: forget the queue entry.
     Drop,
     /// A renewal moved the deadline past now: look again then.
     Requeue(Instant),
@@ -296,41 +319,69 @@ impl Due {
             None => Self::Drop,
         }
     }
+
+    /// The verdict for the queue entry of `entry` that came due `at`.
+    fn of<V: Expiring>(entry: &V, at: Instant, now: Instant) -> Self {
+        // The entry queued a later copy: that one does the work. Acting on
+        // both would requeue each, and the copies would pile up.
+        if entry.queued() != Some(at) {
+            return Self::Drop;
+        }
+        entry.due(now)
+    }
+}
+
+/// An entry of a registry whose deadline a [`DeadlineSweep`] keeps.
+///
+/// The entry has one live entry in the queue, and records when it comes due,
+/// so the sweep can tell it from a stale copy. [`DeadlineSweep::arm`] queues
+/// it, and [`expire_due`] requeues it.
+pub(crate) trait Expiring {
+    /// What to do with the entry at `now`, from its own state.
+    fn due(&self, now: Instant) -> Due;
+    /// When the entry's live queue entry comes due.
+    fn queued(&self) -> Option<Instant>;
+    /// Record the instant of a requeued entry.
+    fn set_queued(&mut self, at: Instant);
+    /// End an entry that the sweep removed. Runs after the shard lock is
+    /// released.
+    fn expire(self);
 }
 
 /// Act on the due keys of a registry whose entries expire.
 ///
-/// A read lock decides each key: most belong to entries that a sender took
-/// or that ended, and a write lock per key would contend with attach and
-/// detach. Only an expiry takes the write lock, and decides again under it,
-/// because a renewal or an attach can land between the two. The removed
-/// entry goes to `expire` after its shard lock is released.
-pub(crate) fn expire_due<V>(
+/// A read lock decides each key: most belong to entries that a sender took,
+/// that ended, or that are stale copies, and a write lock per key would
+/// contend with attach and detach. A requeue records its new instant in the
+/// entry, and an expiry removes it, so both take the write lock and decide
+/// again: a renewal, attach or re-arm can land in between.
+pub(crate) fn expire_due<V: Expiring>(
     registry: &DashMap<u64, V>,
-    due: Vec<u64>,
+    due: Vec<(Instant, u64)>,
     now: Instant,
     renewed: &mut Vec<(Instant, u64)>,
-    decide: impl Fn(&V, Instant) -> Due,
-    expire: impl Fn(V),
-) {
+) where
+    DashMap<u64, V>: SweepTarget,
+{
     use dashmap::mapref::entry::Entry;
-    for key in due {
-        let Some(verdict) = registry.get(&key).map(|entry| decide(&entry, now)) else {
+    for (at, key) in due {
+        let Some(verdict) = registry.get(&key).map(|entry| Due::of(&*entry, at, now)) else {
             continue; // already removed
         };
-        match verdict {
-            Due::Drop => {}
-            Due::Requeue(deadline) => renewed.push((deadline, key)),
-            Due::Expire => {
-                let Entry::Occupied(entry) = registry.entry(key) else {
-                    continue;
-                };
-                match decide(entry.get(), now) {
-                    Due::Expire => expire(entry.remove()),
-                    Due::Requeue(deadline) => renewed.push((deadline, key)),
-                    Due::Drop => {}
-                }
+        if matches!(verdict, Due::Drop) {
+            continue;
+        }
+        let Entry::Occupied(mut entry) = registry.entry(key) else {
+            continue;
+        };
+        match Due::of(entry.get(), at, now) {
+            Due::Expire => entry.remove().expire(),
+            Due::Requeue(deadline) => {
+                let requeue_at = DeadlineSweep::<DashMap<u64, V>>::requeue_at(now, deadline);
+                entry.get_mut().set_queued(requeue_at);
+                renewed.push((requeue_at, key));
             }
+            Due::Drop => {}
         }
     }
 }
