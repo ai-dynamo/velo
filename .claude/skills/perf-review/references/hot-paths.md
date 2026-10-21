@@ -141,6 +141,9 @@ A file that is not compiled (docs, CI, scripts) has no tier. Check for
 
 ## Observability on these paths: T1
 
+Metrics are off by default (`VeloBuilder::metrics`), but production and the
+mux harnesses install them, so these are T1 when metrics are on.
+
 - `observability.rs`: `TransportMetricsHandle::record_frame` (pre-bound
   arrays; its `with_label_values` arm is a debug-assert fallback),
   `record_frames_written`, `record_egress_*`, `egress_children` (a

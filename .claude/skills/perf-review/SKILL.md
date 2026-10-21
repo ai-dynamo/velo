@@ -206,7 +206,8 @@ Start one verifier for each finder that returned anything (in inline mode,
 one verifier). In parallel, start one more verifier that checks every
 candidate the finder rated major or above (in audit mode, high impact),
 from scratch, without the first verdict. This second verifier runs in
-inline mode too. If the two disagree, the lower rating stands. Use at most
+inline mode too, unless a Stage 0 count already proves the candidate. If
+the two disagree, the lower rating stands. Use at most
 4 verifiers per round in every mode; with more finders, give each
 verifier the candidates of several. When every candidate can only be
 minor (a constant T2 cost, or inferred evidence only), skip this stage and
@@ -217,9 +218,10 @@ these questions in order. The first "no" decides.
 
 1. **Frequency.** Walk the chain yourself. Does the line run per
    operation? Or only once per connection, burst, or 128 messages? Or only
-   on an error, slow, first-use or non-default-feature path? A fallback
-   path (for example the per-stream path, used when the mux is not
-   negotiated) stays T1, but say which path it is.
+   on an error, slow or first-use path? A path that a non-default cargo
+   feature or a runtime option enables (metrics, `distributed-tracing`),
+   or a fallback path (the per-stream path, used when the mux is not
+   negotiated), stays T1 when it is on; say which.
 2. **Novelty** (regressions only). Run `git show $BASE_SHA:<file>`. Did
    the base already pay this cost, perhaps in code that moved or was
    renamed? If so, it is an opportunity, not a regression.
@@ -355,7 +357,8 @@ review.
 
 ## Calibration
 
-- Finders: sonnet. Verifiers and any judgment call: opus.
+- Finders: sonnet. Verifiers and any judgment call: opus. In inline mode
+  the finder pass is yours, so it is not independent; the verifiers are.
 - Cost: an inline review is 1 or 2 agents per round. A review with
   finders, or an audit, is at most 8 agents in all.
 - Silence is a valid outcome. Most changes on a hot path add no cost. "0

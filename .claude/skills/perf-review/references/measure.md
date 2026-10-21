@@ -104,7 +104,9 @@ strings "$S/bin/root/<harness>" | grep -c "$S/base/"   # 0
   A lib-test binary is built from relative source paths, so grep it for
   the tree's root (`$S/root/`), not for `lib/velo/src`.
 - Each arm builds its dependencies once. To save that time, you may seed
-  an arm's target directory with `cp -a` of a warm one. Then run
+  an arm's target directory with `cp -a` of a warm one: only `debug/` for
+  a lib test, only `release/` for a harness, because a whole target
+  directory is several GB. Then run
   `find "$S/<arm>" -name '*.rs' -exec touch {} +` before you build, so
   that cargo cannot treat a copied velo build as fresh.
 - Build both arms with the same features (rule 7). Do not use

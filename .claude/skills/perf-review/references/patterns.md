@@ -201,6 +201,10 @@ that pins it now.
   twin. See `connection_teardown` and `note_timer_arm`.
 - **Tasks:** `tokio::runtime::Handle::current().metrics().num_alive_tasks()`
   against a baseline.
+- **Label lookups:** after `bind_*`, remove every pre-bound child with
+  `remove_label_values`, run the code, and assert that `registry.gather()`
+  shows none of them again. Only a `with_label_values` lookup creates a
+  removed child again, so this needs no seam.
 - **Writes and batches:** the recording writer in
   `transports/coalesce/tests.rs`. End to end, the ratios from
   `observability::test_helpers::MetricSnapshot` (the `test-helpers`
