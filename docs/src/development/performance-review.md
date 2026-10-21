@@ -85,7 +85,9 @@ count fail when the cost comes back.
 
   The test counts only builds that go through the seam. New code that builds
   the same future somewhere else escapes the test, so a review must check for
-  that.
+  that. To prove a bypass, add the seam call back at the new site in a
+  scratch copy and run the test: if it fails there, the change went around
+  it.
 - **Tasks.** Compare `Handle::current().metrics().num_alive_tasks()` with a
   baseline after the work ends.
 - **Writes and batches.** Use the recording writer in
@@ -97,10 +99,12 @@ fails. See rule 11 in [Measurement rules](../operations/benchmarking.md#measurem
 
 ## Compare two commits on one machine
 
-1. **Build both arms from one tree.** Make a worktree for each commit, build
-   each with the same features and a shared `CARGO_TARGET_DIR`, and copy each
-   binary out before the next build overwrites it. If the two binaries are
-   the same, the change did not reach the binary.
+1. **Build each arm in its own worktree and target directory.** Use the same
+   features for both. Do not share one `CARGO_TARGET_DIR` between two
+   worktrees of this repo: cargo gives velo's build the same name in both
+   and decides freshness by file times, so one arm can run the other arm's
+   code with no warning. Check that each binary names its own worktree's
+   source paths (`strings <binary> | grep <worktree>`).
 2. **Count before you time.** A count of allocations, timer arms, tasks or
    writes is a fact on any machine. Next best is `perf stat -e instructions:u`
    divided by the work done. Wall time comes last.

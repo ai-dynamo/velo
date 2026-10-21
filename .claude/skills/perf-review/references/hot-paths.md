@@ -1,8 +1,8 @@
 # Hot paths
 
-The tier is how often a *cost* is paid, not where the code sits. To confirm a
-tier, walk the callers from the changed function up to an entry point below,
-and count the loops on the way. A function that is not in this map is not
+The tier is how often a *cost* is paid, not where the code sits. Tier each
+changed line, not the function around it: walk the callers from the changed
+line up to an entry point below, and count the loops on the way. A function that is not in this map is not
 cold; trace it. Find each symbol with `grep -rn 'fn <name>' lib/`. This file
 has no line numbers on purpose: they go stale.
 
@@ -18,6 +18,11 @@ Examples where the code site misleads:
   per-byte cost, so it is T1.
 - A walk over every slot runs once per batch, but its work grows with the
   slot count. That is a per-record cost, so it is T1.
+- An error branch inside a per-frame loop is T3, and so is a log line before
+  the loop starts (T2 at most).
+
+A file that is not compiled (docs, CI, scripts) has no tier. Check for
+`include_str!` before you call a file uncompiled.
 
 ## Budgets, for scale
 
@@ -104,7 +109,8 @@ Examples where the code site misleads:
   (`ingress/slot.rs`). `DirtySlots::{mark, take}` (`ingress/dirty.rs`).
 - Consumer: `StreamAnchor::poll_next` (`streaming/anchor.rs`); the direct
   feed (`streaming/control/feed.rs`).
-- The per-stream path (`--legacy` in the harnesses): `reader_pump`
+- The per-stream path, used when the mux is not negotiated (`--legacy` in
+  the harnesses). It is still T1 on that path: `reader_pump`
   (`streaming/control/pump.rs`), `streaming/tcp_transport.rs`,
   `streaming/grpc_transport.rs`.
 - T2: the credit sweep (`messenger_mux/sweep.rs`), `lane_choice.rs`, the
@@ -148,7 +154,7 @@ Examples where the code site misleads:
 | Default | Where | Measured in |
 |---|---|---|
 | `COALESCE_THRESHOLD` 64 KiB, `DIRECT_PREFIX_CAP` 256 B | `transports/tcp/framing.rs` | concepts/transports.md, "Coalescing writer" |
-| `DEFAULT_MAX_BATCH_BYTES`, `DEFAULT_MAX_BATCH_FRAMES` 1024 | `transports/coalesce/mod.rs` | same |
+| `DEFAULT_MAX_BATCH_BYTES`, `DEFAULT_MAX_BATCH_FRAMES` 1024 | `transports/coalesce/mod.rs` | concepts/batched-streaming.md, "Per-stream coalescing cannot reach the forward-pass shape" |
 | `DEFAULT_SOCKET_BUFFERS` 2 MiB; `socket_buffers(None)` | `transports/tcp/listener.rs`, `transports/tcp/transport/builder.rs` | concepts/transports.md, "Socket buffers are set before data flows" |
 | `DEFAULT_SHRINK_THRESHOLD`, `SHRINK_RESET_CAPACITY` | `transports/tcp/framing.rs` | code comments |
 | `channel_capacity` 256 | `transports/tcp/transport/builder.rs`, `transports/uds/transport.rs` | `tx_budget --channel-capacity` |

@@ -25,7 +25,7 @@ References (agents read them; do not paste them into prompts):
 - `references/patterns.md`: reference costs (R-ids), rules, regression
   patterns (P-ids), pinning tests and idioms, the not-a-lever list, diff
   hints.
-- `references/measure.md`: how to measure base against head.
+- `references/measure.md`: how to build and measure base against head.
 
 ## Resolve the target once
 
@@ -40,20 +40,20 @@ Set `HEAD_SHA=$(git rev-parse <head>)`. Set `BASE_SHA` to
 `git merge-base <base> <head>` for a `...` range, or to `<base>` for a
 `..` range.
 
-Set `REVIEW_ROOT`, the directory whose files are at `HEAD_SHA`:
-- the repo root, when `HEAD_SHA` is checked out and `git status` is clean;
-- otherwise `git worktree add --detach "$SCRATCH/perf-review/root" "$HEAD_SHA"`.
+**Audit mode.** `HEAD_SHA=$(git rev-parse HEAD)`. `AUDIT_PATH` is the
+argument. There is no base.
 
-An agent that reads the live tree while the review is about another commit
-reviews the wrong code.
+`$SCRATCH` is the session's scratchpad directory, or a fresh `mktemp -d`
+when there is none. `$S` is `$SCRATCH/perf-review`.
 
-**Audit mode.** `HEAD_SHA=$(git rev-parse HEAD)`. `REVIEW_ROOT` is the
-clean repo root. `AUDIT_PATH` is the argument. There is no base.
+**Read `HEAD_SHA`, never the live tree.** Someone may edit or commit in the
+live tree while the review runs. Stage 0 reads files with
+`git show $HEAD_SHA:<path>`. From Stage 0 step 5 on, `REVIEW_ROOT` is a
+detached worktree at `HEAD_SHA`, made when first needed:
+`git worktree add --detach "$S/root" "$HEAD_SHA"`.
 
 Every agent prompt carries: the mode, `REVIEW_RANGE` or `AUDIT_PATH`,
 `BASE_SHA`, `HEAD_SHA`, `REVIEW_ROOT`, and the paths of the references.
-`$SCRATCH` is the session's scratchpad directory, or a fresh `mktemp -d`
-when there is none.
 
 ## Ground rules (a violation invalidates the review)
 
@@ -61,40 +61,68 @@ when there is none.
   - Commit the code under review first.
   - Finders and verifiers are read-only, and every prompt says so.
   - Mutations, scratch tests and builds happen only in worktrees under
-    `$SCRATCH`.
-  - At the end, `git status` is clean.
-- Finders do not build or benchmark. Only Stage 4 runs code.
+    `$S`.
+- Only Stage 0 step 6 and Stage 4 run code. Finders and verifiers do not
+  build or benchmark.
+- Each tree that is built gets its own `CARGO_TARGET_DIR` (measure.md,
+  "Build"). Two worktrees of this repo that share one target directory can
+  run each other's code, with no warning.
 - No number without a source: an R-id, a book section, a code comment that
   records a measurement, or a Stage 4 result. Otherwise the finding says
   "unquantified".
-- The tier is how often the cost is paid, not where the code sits.
+- The tier is how often the changed line's cost is paid, not where the
+  code sits.
   - Socket setup that collapses the TCP window is a per-byte cost.
   - A per-batch walk over every slot is a per-record cost.
-- At the end, `git worktree list` shows no perf-review worktrees.
+  - An error branch inside a per-frame loop is T3.
+- Each stage waits for all of its agents before the next starts. Run them
+  in the foreground or in one Workflow. Never remove a worktree while an
+  agent may still read it.
+- If an agent cannot be started (a concurrency limit, for example), do its
+  work yourself, and say in the report that the check was not independent.
+- At the end, every worktree this review created is removed, and the live
+  tree's `git status` is what it was at the start.
 
 ## Stage 0: classify (no agents)
 
-1. Run `git diff --stat $REVIEW_RANGE`. Tier each touched function with
-   hot-paths.md. `HOT_FILES` is the list of files with a T1 or T2 change.
+1. Run `git diff --stat $REVIEW_RANGE`. Tier each changed line, not the
+   function around it, with hot-paths.md. A file that is not compiled
+   (docs, CI, scripts) has no tier; check `include_str!` first.
+   `HOT_FILES` is the list of files with a T1 or T2 change.
 2. Flag each of these:
-   - a changed measured default (the table in hot-paths.md);
+   - a changed or new measured default (the table in hot-paths.md);
    - a changed perf-sensitive dependency in any `Cargo.toml` or
      `Cargo.lock`;
-   - a changed pinning test (patterns.md, P24).
-3. Run the diff hints from patterns.md over `HOT_FILES`, on both added and
-   removed lines. Hints are leads for finders, not findings.
-4. Claims: grep `git log --format=%B $BASE_SHA..$HEAD_SHA` and the PR body
-   for perf, faster, speedup, latency, throughput, CPU, alloc, ns and µs.
-5. Map check: grep for each hot-paths.md symbol that lives in a touched
-   file. If one is missing, the map is stale; put that in the report.
-6. If a pinning test lives in a touched file, run just that test in
-   `REVIEW_ROOT`, with `CARGO_TARGET_DIR="$SCRATCH/perf-review/target"` so
-   that the dependencies build only once (for example
-   `cargo test -p velo --lib <test name>`). A failure is a blocker, and no
-   agent is needed for it.
+   - a changed pinning test (patterns.md, P24), wherever it lives;
+   - a changed measured number in the book.
+3. If `HOT_FILES` is not empty, run the diff hints from patterns.md over
+   it, on added and removed lines. Hints are leads for finders, not
+   findings. A reworded log line with the same arguments is not a lead.
+4. Claims: run the claim grep from patterns.md over
+   `git log --format=%B $BASE_SHA..$HEAD_SHA`, and over the PR body when
+   there is a PR.
+5. Map check: for each touched file, check that the hot-paths.md symbols
+   it names still exist in `REVIEW_ROOT`. When a touched file is a book
+   page the references cite, check that the cited headings and rule
+   numbers still exist. A missing one goes in the report.
+6. Pins: when a touched function has a T1 or T2 change, or a pin changed,
+   run the pins that patterns.md names for the matched patterns and the
+   touched module's own tests, in `REVIEW_ROOT` (measure.md, "Build", for
+   the target directory and the provenance check).
+   - Run each test by its full path with `--exact`.
+   - If one fails, run it again at `BASE_SHA` in its own worktree. It is a
+     blocker only if it passes at base. A failing pin is a confirmed
+     blocker: it needs no verifier and no Stage 4.
+   - If the diff removes a `note_*()` seam call, or does the same work
+     beside it without one, add the call back at the new site in a
+     scratch worktree and run the pin. If it fails then, the pin is
+     bypassed, and that result is the count for the P24 finding.
+   - Put every pin result into the verifier prompts, because verifiers do
+     not run code.
 
 If nothing is T1 or T2 and nothing was flagged, report "No hot path
-touched" with the files and their tiers, and stop. That is a pass.
+touched" with the files and their tiers, plus the Scope and Housekeeping
+sections of Stage 5, and stop. That is a pass.
 
 In audit mode: list the T1 and T2 functions under `AUDIT_PATH` from
 hot-paths.md, then plan the shards (Stage 1).
@@ -109,10 +137,11 @@ hot-paths.md, then plan the shards (Stage 1).
 
 **Small diffs run inline.** When the T1 and T2 part of the diff is about 80
 changed lines or fewer, in at most 3 functions, do the F1 to F3 pass
-yourself, and send the candidates to one verifier. Do not start a Workflow.
+yourself, and send the candidates to the verifiers. Do not start finder
+agents.
 
-**Otherwise, run one Workflow** with at most 3 finders. Drop a finder
-whose families cannot apply. Each finder:
+**Otherwise, run the finders** (in one Workflow, or as foreground agents),
+at most 3. Drop a finder whose families cannot apply. Each finder:
 - reads hot-paths.md and patterns.md first;
 - runs `git diff $REVIEW_RANGE` itself, and reads the whole of each
   touched function under `REVIEW_ROOT`;
@@ -120,9 +149,11 @@ whose families cannot apply. Each finder:
 - greps each touched file for comments that record a measured cost (the
   command is in patterns.md), and engages with any near its finding;
 - reports a **regression** when the diff added the cost, and an
-  **opportunity** when the cost already exists in a touched function or on
-  its call chain. Before it reports an opportunity, it reads the
-  not-a-lever list.
+  **opportunity** when the cost already exists in a touched function, or
+  one call away from it (its direct callers and callees). Before it
+  reports an opportunity, it reads the not-a-lever list. The same pattern
+  further away goes under "Related, out of scope" in the report, as one
+  line.
 
 **In audit mode**, the same finders ask "what does this code pay now?".
 When the T1 and T2 code under `AUDIT_PATH` spans more than 3 subsystems,
@@ -130,7 +161,8 @@ shard by subsystem instead: one finder per shard, all families, at most 5
 finders. If 5 is not enough, ask the user to narrow the path.
 
 Each finding is thermonuclear's `{file, line, claim, why-it-breaks,
-severity}`, plus these fields:
+severity}`, plus these fields. `severity` is for regressions only; an
+opportunity has `impact` instead.
 
 ```
 kind:      regression | opportunity
@@ -141,34 +173,49 @@ delta:     BASE_SHA does ..., HEAD_SHA does ...   (regressions; quote both)
 mechanism: alloc | copy | lock | atomic | token | upgrade | spawn | hop | wake |
            timer | syscall | label | log | walk | growth | default | dependency | pin
 cost:      "about N ns per <unit> (R-id or source)", or "unquantified"
-evidence:  inferred | sourced | counted | measured
+evidence:  inferred < sourced < counted < measured (give the strongest one
+           that supports the cost)
 pin:       the test that covers it now, or the idiom for a new one
 fix:       one line, the direction only; opportunities add effort (S, M or L)
            and what must stay true
+impact:    opportunities only: high | medium | low
 ```
 
 `why-it-breaks` gives the chain, the mechanism and the cost in one
 paragraph. No chain, no finding.
 
+For a P24 finding (a pin weakened, removed or bypassed), `chain` is the
+chain of the code the pin guards, `delta` quotes the test change, and
+`cost` is the cost the pin guards against, with that incident's R-id.
+
 ## Stage 2: verify (opus, prompted to refute)
 
 Start one verifier for each finder that returned anything (in inline mode,
-one verifier). One more verifier checks every candidate at major or above
-again from scratch, without the first verdict. If the two disagree, the
-lower severity stands. That is at most 4 verifiers.
+one verifier). In parallel, start one more verifier that checks every
+candidate the finder rated major or above, from scratch, without the
+first verdict. If the two disagree, the lower severity stands. That is at
+most 4 verifiers per round. When every candidate can only be minor (a
+constant T2 cost, or inferred evidence only), skip this stage and report
+them as minor and unverified.
 
 Each verifier reads the real code, not the finder's summary, and answers
 these questions in order. The first "no" decides.
 
 1. **Frequency.** Walk the chain yourself. Does the line run per
    operation? Or only once per connection, burst, or 128 messages? Or only
-   on an error, slow, first-use or non-default-feature path?
+   on an error, slow, first-use or non-default-feature path? A fallback
+   path (for example the per-stream path, used when the mux is not
+   negotiated) stays T1, but say which path it is.
 2. **Novelty** (regressions only). Run `git show $BASE_SHA:<file>`. Did
    the base already pay this cost, perhaps in code that moved or was
    renamed? If so, it is an opportunity, not a regression.
-3. **Reality.** Does the cost exist? `Bytes::clone` is a reference count.
-   `#[cfg(test)]` seams and `debug_assert!` vanish in release. A fast path
-   may skip the line.
+3. **Reality.** Does the cost exist? `#[cfg(test)]` seams and
+   `debug_assert!` vanish in release. A fast path may skip the line.
+   `Bytes::clone` of a shared `Bytes` is a reference count, but the first
+   clone of a `Bytes` frozen from a `Vec` allocates. Check the current
+   dependency's source, not memory: `Sleep::reset` to a later deadline is
+   a lock-free CAS on tokio 1.54 (R21). For P24, judge the cost the pin
+   guards against.
 4. **Size.** Cite an R-id, and compare with the budget in hot-paths.md.
    Under 1% of the budget, with no lock, wake, syscall or timer, is minor
    at most.
@@ -181,15 +228,21 @@ these questions in order. The first "no" decides.
 7. **Pinned?** Would an existing test fail? If yes, and the diff did not
    change or bypass that test, keep the finding and say that CI catches it.
 
-Answer CONFIRMED, DOWNGRADED (with the new severity and why), or REFUTED
-(with why). Correct any field that was wrong.
+Answer CONFIRMED, DOWNGRADED (with the new severity and why), MERGED (the
+same cause and fix as another finding; name it), or REFUTED (with why).
+Correct any field that was wrong.
 
-Regression severity:
+Regression severity. When more than one rule matches, the highest wins.
 - **blocker:**
   - a P-pattern or rule from patterns.md on a T1 path, with evidence that
     is sourced or better;
   - a pinning test weakened, removed or bypassed, with no measurement;
+  - a pinning test that fails at head and passes at base;
   - a measured T1 regression of 5% or more.
+
+  A measured percentage is a share of the whole T1 path's cost, from a
+  harness that runs that path. Turn a microbenchmark result into ns per
+  operation and compare it with the budget in hot-paths.md instead.
 - **major:**
   - a new lock, contended atomic, token poll, spawn, hop, wake, timer,
     syscall or allocation per operation on a T1 path;
@@ -204,8 +257,9 @@ Regression severity:
 - T3 costs are not reported.
 
 Opportunities never block. Rank them by impact first:
-- high: T1 and 100 ns or more, or a rule;
-- medium: a smaller T1 cost, or T2 work that grows with load;
+- high: T1 and 100 ns or more, a rule, or a lock that many connections
+  or streams share;
+- medium: T1 and 20 ns or more, or T2 work that grows with load;
 - low: the rest.
 
 Then rank by effort (S, M or L; a `velo-ext` trait change is L, and it is a
@@ -214,25 +268,35 @@ semver event), and then by evidence.
 ## Stage 3: loop until dry
 
 Run one more round with fresh finders, only for the families that had new
-confirmed findings. Tell them what is already found. Stop when a round
-confirms nothing new, or after 3 rounds.
+confirmed regressions, and tell them what is already found. Opportunities
+do not start a round. A new finding needs a fix of its own; a sub-point of
+an existing finding is not new. Stage 1 is round 1.
+
+Skip this stage in inline mode, unless a verifier named a missed
+candidate (then verify that one). Skip it also when the only confirmed
+regression is fixed by reverting the diff. Stop when a round confirms
+nothing new, or after 3 rounds.
 
 ## Stage 4: measure (only when triggered)
 
 Measure when any of these holds:
 - `--measure` was given;
-- a major or blocker regression on a T1 path was confirmed;
+- a major or blocker regression on a T1 path was confirmed by a verifier
+  (not by a failing pin, which is already a count);
 - the diff claims a speedup.
 
 Never measure in audit mode. Follow references/measure.md:
-- Build both arms in worktrees under `$SCRATCH`.
-- Prefer a count to a time.
-- Interleave the reps.
+- Build each arm in its own worktree and target directory.
+- Stop at the first evidence that settles the question: a count, then
+  instructions, then time.
 - A difference is real only when the ranges do not overlap.
 - Numbers from a dev box are "directional".
 
-The result updates each finding's evidence and severity. A claimed speedup
-that does not show is "not reproduced here"; it is not a regression.
+The result updates each finding's evidence and severity, but only when
+the harness reaches the mechanism. A harness with one connection cannot
+show contention between connections; then keep the pattern's severity and
+say why. A claimed speedup that does not show is "not reproduced here"; it
+is not a regression.
 
 ## Stage 5: report
 
@@ -242,7 +306,7 @@ markdown with these sections:
 1. **Scope:**
    - the mode, the range and the SHAs;
    - the hot files by tier;
-   - the Stage 0 flags;
+   - the Stage 0 flags and the pins that ran;
    - whether Stage 4 ran.
 2. **Regressions**, from blocker to minor. Each gives:
    - `file:line`, the P-id and its incident;
@@ -256,10 +320,14 @@ markdown with these sections:
 3. **Opportunities**, ranked, at most 10 in review mode. Each gives the
    chain, the cost with its source, the effort, what must stay true, and
    how to measure it.
-4. **Claims:** reproduced, not reproduced, or not measured. Say whether
+4. **Related, out of scope:** at most 3 lines, for the same pattern at a
+   site the diff does not touch (a sibling transport, for example).
+5. **Claims:** reproduced, not reproduced, or not measured. Say whether
    the book carries the number with its setup.
-5. **Refuted:** one line each, with the reason.
-6. **Housekeeping:** stale map symbols, worktrees removed, `git status`.
+6. **Refuted:** one line each, with the reason.
+7. **Housekeeping:** stale map symbols and references, comments or book
+   sections the diff makes false, worktrees removed, `git status`, and
+   any check that was not independent.
 
 Do not apply fixes. The caller decides what to fix, and then reruns the
 review.
