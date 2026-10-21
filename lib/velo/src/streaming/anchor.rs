@@ -5824,6 +5824,29 @@ mod tests {
         );
     }
 
+    /// A queue entry left behind by a re-arm to an earlier deadline is
+    /// dropped as a stale copy when it comes due, not requeued.
+    ///
+    /// A shorter timeout queues a new entry ahead of the live one, and the
+    /// old one stays in the queue. If the sweep acted on both, each would be
+    /// requeued, and the anchor would keep two entries until it ends.
+    #[tokio::test(start_paused = true)]
+    async fn a_stale_queue_entry_is_dropped_not_requeued() {
+        let mgr = queue_manager(DEFAULT_UNATTACHED_TIMEOUT);
+        let anchor = mgr.create_anchor::<u32>();
+        let id = anchor.handle().unpack().1;
+        // The first look at 1 s requeues the entry to 61 s.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        // Due at 12 s, ahead of the 61 s entry: a second entry, at 3 s.
+        anchor.set_timeout(Some(Duration::from_secs(10)));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        // Live entry at 12 s is in time for 205 s: no new entry.
+        anchor.set_timeout(Some(Duration::from_secs(200)));
+        tokio::time::sleep(Duration::from_secs(57)).await;
+        assert!(mgr.registry.contains_key(&id), "not yet expired");
+        assert_eq!(queue_of(&mgr).len(), 1, "the 61 s copy was stale");
+    }
+
     /// A standalone manager that drops cancels the MPSC anchors still in its
     /// registry.
     ///
