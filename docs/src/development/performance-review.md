@@ -124,7 +124,8 @@ fails. See rule 11 in [Measurement rules](../operations/benchmarking.md#measurem
    yields, and glibc keeps freed pages. Read `num_alive_tasks()` and RSS
    after `malloc_trim(0)` before you call it a leak. In
    `anchor_setup_bench`, two tasks per stream grew RSS to 24 GB at 16M
-   lifecycles, and `malloc_trim(0)` gave it all back.
+   lifecycles (a measured peak). In a run of 512k lifecycles,
+   `malloc_trim(0)` after the run took RSS from 777 MiB to 6 MiB.
 7. **Label the result.** A number from a shared or dev machine is
    directional. A number for this book needs an exclusive node and the
    [Measurement rules](../operations/benchmarking.md#measurement-rules).

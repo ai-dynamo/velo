@@ -189,8 +189,8 @@ for each operation.
 
 Example: `anchor_setup_bench` (64 tasks, 8 threads) on a base with two
 tasks per stream grew about 1.5 KiB per finished stream, to 24 GB at 16M
-lifecycles. It was not a leak: after the run, `malloc_trim(0)` took RSS
-from 777 MiB to 6 MiB. The cause was a backlog of the two tasks per
+lifecycles. It was not a leak: in a run of 512k lifecycles, `malloc_trim(0)`
+after the run took RSS from 777 MiB to 6 MiB. The cause was a backlog of the two tasks per
 stream, which the non-yielding loop could not let exit. With no task per
 stream, 2M lifecycles peaked at 74 MiB instead of about 3 GB.
 
