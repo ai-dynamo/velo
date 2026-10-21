@@ -143,11 +143,13 @@ The tests `unattached_anchors_share_one_sweep_task` and `ended_anchors_leave_the
 
 Removed, measured with `anchor_setup_bench` and `stream_lifecycle`: each SPSC and MPSC sender spawned one heartbeat task that lived as long as its stream. Now one task per `AnchorManager` beats every remote sender, from the same kind of queue. A sender on the anchor's own worker does not beat at all, because no watchdog reads its beats. Same host and settings as above, median of three interleaved runs, against the deadline queue alone:
 
-| Path | Measure | Task per sender | One heartbeat task |
+The two rows measure two different parts of the change. A same-worker sender now does not beat at all, so the same-worker row shows the cost of a heartbeat task per stream, not the cost of the sweep. Only the mux row exercises the sweep. Both arms of each row have the deadline queue. The same-worker runs are 1.28M lifecycles, which end before the anchor sweep pops anything, in both arms.
+
+| Path | Measure | Heartbeat task per sender | This change |
 |---|---|---|---|
-| Same worker (`anchor_setup_bench`) | Lifecycles per second | 1.49M | 2.19M |
-| Same worker | Lifecycle p50 / p99 / p99.9 | 4.30 / 11.26 / 22.11 µs | 3.06 / 5.22 / 7.15 µs |
-| Mux, 4 items per stream (`stream_lifecycle`) | Streams per second | 134,546 | 137,856 |
+| Same worker (`anchor_setup_bench`): no beat | Lifecycles per second | 1.49M | 2.19M |
+| Same worker: no beat | Lifecycle p50 / p99 / p99.9 | 4.30 / 11.26 / 22.11 µs | 3.06 / 5.22 / 7.15 µs |
+| Mux, 4 items per stream (`stream_lifecycle`): one heartbeat sweep | Streams per second | 134,546 | 137,856 |
 
 On the mux path the difference is inside the spread of the runs. The test `senders_share_one_heartbeat_task` holds the task count, and `a_silent_remote_stream_outlives_the_watchdog_window` holds an idle remote stream open for 10 heartbeat intervals.
 

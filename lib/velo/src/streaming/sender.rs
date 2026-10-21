@@ -1318,6 +1318,23 @@ mod tests {
         ));
     }
 
+    /// Every call hands out the same observer, so a call costs a clone.
+    ///
+    /// A fresh child token per call locks the stream token and allocates,
+    /// and the doc example calls `cancellation_token` once per item. The
+    /// only visible sign of the cached observer is that a cancel of one
+    /// returned token shows in the next.
+    #[tokio::test]
+    async fn every_call_returns_the_one_cached_observer() {
+        let (sender, _rx) = make_sender();
+        sender.cancellation_token().cancel();
+        assert!(sender.cancellation_token().is_cancelled());
+        assert!(
+            !sender.cancel_token.is_cancelled(),
+            "the stream is not cancelled"
+        );
+    }
+
     /// A registry cancel fires the observer token, whenever it was taken.
     #[tokio::test]
     async fn a_registry_cancel_fires_the_observer_token() {
