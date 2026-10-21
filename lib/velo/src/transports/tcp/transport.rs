@@ -604,8 +604,17 @@ impl Transport for TcpTransport {
         // channel. Left alone, a gate's driver went on admitting its queue
         // during teardown, and a frame it admitted after the writer stopped
         // was failed at once, after its sender was told it was admitted.
-        for connection in self.connections.iter() {
-            connection.gate.fail_all(AdmissionError::ChannelClosed);
+        // The gates are collected first: a refusal runs the sender's error
+        // hook on this thread, and a hook may call back into this map (to
+        // unregister the peer), which would wait on a shard this iterator
+        // holds.
+        let gates: Vec<_> = self
+            .connections
+            .iter()
+            .map(|connection| connection.gate.clone())
+            .collect();
+        for gate in gates {
+            gate.fail_all(AdmissionError::ChannelClosed);
         }
 
         // Cancel the teardown token (Phase 3) to stop the listener and connection handlers
