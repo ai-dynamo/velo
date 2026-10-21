@@ -167,3 +167,15 @@ velo-ext = "0.5"  # exact pin tracked by velo's workspace
 - For ZMQ socket options that need non-Send thread isolation, use `OnceLock` for set-once values (lock-free reads) instead of `Mutex<Option<T>>` when the value never needs to be cleared.
 - The review skills' 1000-line-file threshold applies to `src` files, not test modules (`tests.rs`, `#[cfg(test)] mod tests`, `tests/*.rs`). Splitting a test file to dodge it routinely costs more than it buys — a `tests/*.rs` split needs a matching `[[test]]` entry in `lib/velo/Cargo.toml` and can break a hard-coded `--test <name>` invocation elsewhere (CI, a rig script). Note the length in review, don't split on sight.
 - Before a PR that changes code run per message, frame or record (the T1 and T2 paths in `.claude/skills/perf-review/references/hot-paths.md`), run the `perf-review` skill on the diff. A functional test cannot see a perf regression. `thermonuclear-review` runs the same regression pass as its performance dimension. A hard-earned perf lesson goes into a test that counts the cost (allocations, timer arms, tasks, writes), not into a comment.
+
+## Performance-sensitive changes
+
+A change is performance-sensitive when it adds, removes, or moves work on a T1 or T2 path of `.claude/skills/perf-review/references/hot-paths.md`: work per message, frame, record, or byte, or per stream open or close. Examples: a task, a timer, a lock, an allocation, or a channel per stream.
+
+1. Flag the change. Write "performance-sensitive" and the affected path in the commit message and in the PR description.
+2. If you can show that the effect on the path is small, do not measure it. Write the reason in the commit message. Example: the change adds one atomic load per stream, and the path already takes a lock per stream.
+3. Otherwise, measure the change in isolation, before and after, on the same host. Use the smallest harness that runs only the changed mechanism. `.claude/skills/perf-review/references/measure.md` gives the layout: one worktree and one `CARGO_TARGET_DIR` for each arm.
+4. For a claim about a mechanism, write a counting test: tasks spawned, timer arms, lock acquisitions, or queue length. A counting test is deterministic, so it stays in the suite as the regression guard. `a_thousand_records_arm_the_heartbeat_timer_a_handful_of_times` in `lib/velo/src/streaming/control/tests.rs` is the pattern.
+5. For time, memory, or throughput, use a bench binary in `examples/examples/` that drives only the changed path. Report the setup, the value before, the value after, and the median of three runs or more.
+6. If you cannot isolate the change, or if the isolated numbers do not agree with the expected result, run a full end-to-end bench (`response_plane_bench`, a cluster sweep).
+7. Put the numbers in the PR description. If the change sets a default or a constant, also put the numbers and their setup in the book.
