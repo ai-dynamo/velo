@@ -141,6 +141,16 @@ Rejected: one lock for the whole queue. Every create takes a lock on the queue. 
 
 The tests `unattached_anchors_share_one_sweep_task` and `ended_anchors_leave_the_queue_within_the_first_look` hold the task count and the queue length. MPSC anchors still spawn one task for their unattached timeout.
 
+Removed, measured with `anchor_setup_bench` and `stream_lifecycle`: each SPSC and MPSC sender spawned one heartbeat task that lived as long as its stream. Now one task per `AnchorManager` beats every remote sender, from the same kind of queue. A sender on the anchor's own worker does not beat at all, because no watchdog reads its beats. Same host and settings as above, median of three interleaved runs, against the deadline queue alone:
+
+| Path | Measure | Task per sender | One heartbeat task |
+|---|---|---|---|
+| Same worker (`anchor_setup_bench`) | Lifecycles per second | 1.49M | 2.19M |
+| Same worker | Lifecycle p50 / p99 / p99.9 | 4.30 / 11.26 / 22.11 µs | 3.06 / 5.22 / 7.15 µs |
+| Mux, 4 items per stream (`stream_lifecycle`) | Streams per second | 134,546 | 137,856 |
+
+On the mux path the difference is inside the spread of the runs. The test `senders_share_one_heartbeat_task` holds the task count, and `a_silent_remote_stream_outlives_the_watchdog_window` holds an idle remote stream open for 10 heartbeat intervals.
+
 These costs are counted from source, not measured:
 
 - **The per-record copy.** Ingress copies each record body into a `Vec` (one allocation and one `memcpy`, estimated at 35 to 55 ns). Removing it needs `Bytes` from the slot buffer through to the consumer, and it is not done (see [Batched streaming design](../development/batched-streaming-design.md#ingress-copies-each-record-out-of-its-batch)). On the microbenchmark below, `memcpy` was 0.5% of frontend CPU. A typed `Bytes` consumer copies each payload a second time, in serde. [Byte items](../concepts/streaming.md#byte-items) remove that second copy.
