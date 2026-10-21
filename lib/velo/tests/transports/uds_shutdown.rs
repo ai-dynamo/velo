@@ -31,3 +31,13 @@ async fn test_uds_a_frame_admitted_while_dialing_survives_teardown() {
     .await
     .expect("a_frame_admitted_while_dialing_survives_teardown timed out");
 }
+
+#[tokio::test]
+async fn test_uds_teardown_admits_nothing_from_the_gate() {
+    tokio::time::timeout(
+        OUTER_TEST_TIMEOUT,
+        shutdown_scenarios::teardown_admits_nothing_from_the_gate::<UdsShutdownClient>(),
+    )
+    .await
+    .expect("teardown_admits_nothing_from_the_gate timed out");
+}

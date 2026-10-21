@@ -578,3 +578,76 @@ where
     assert!(failed.is_empty(), "{:?}", failed.first().map(|(_, _, e)| e));
     handle_b.streams.shutdown_state.teardown_token().cancel();
 }
+
+/// Teardown admits nothing more from the admission gate: a frame that still
+/// waits there when teardown starts is refused, not admitted.
+///
+/// Admission is the promise a sender acts on (the messenger mux reports a
+/// stream sent on it), and teardown writes only what is already in the
+/// writer's channel. `shutdown()` removed each connection from the map
+/// without failing its gate, so the gate's driver went on admitting its queue
+/// into the channel during teardown. A frame it admitted after the writer
+/// stopped, at the first empty read or at the teardown deadline, was failed at
+/// once by `retire_connection`, after its sender had been told it was
+/// admitted.
+///
+/// More frames than the channel holds, and teardown right after them, so most
+/// still wait in the gate. One frame may be in the driver's hands already when
+/// the gate fails, and it may still land; nothing else may.
+pub async fn teardown_admits_nothing_from_the_gate<C: ShutdownTestClient>()
+where
+    C::Transport: 'static,
+{
+    const FRAMES: usize = 2048;
+    const PAYLOAD: usize = 64 * 1024;
+    let handle_a = C::new_handle().await.unwrap();
+    let handle_b = C::new_handle().await.unwrap();
+    handle_a.register_peer(&handle_b).unwrap();
+
+    let tearing_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let admitted_late = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut queued = Vec::new();
+    for i in 0..FRAMES {
+        let outcome = handle_a.send_admission(
+            handle_b.instance_id,
+            (i as u32).to_be_bytes().to_vec(),
+            vec![0u8; PAYLOAD],
+            MessageType::Response,
+        );
+        if let Some(pending) = outcome.into_pending() {
+            let tearing_down = Arc::clone(&tearing_down);
+            let admitted_late = Arc::clone(&admitted_late);
+            queued.push(pending.on_resolved(move |result| {
+                if result.is_ok() && tearing_down.load(std::sync::atomic::Ordering::SeqCst) {
+                    admitted_late.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+    }
+    assert!(!queued.is_empty(), "frames must wait in the admission gate");
+
+    tearing_down.store(true, std::sync::atomic::Ordering::SeqCst);
+    handle_a.streams.shutdown_state.teardown_token().cancel();
+    handle_a.transport.shutdown();
+    timeout(Duration::from_secs(5), handle_a.transport.closed())
+        .await
+        .expect("closed() bounds its wait");
+    timeout(Duration::from_secs(5), async {
+        while queued
+            .iter()
+            .any(|pending| pending.state() == velo_ext::AdmissionState::Pending)
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("every queued frame resolves once its connection is gone");
+
+    let late = admitted_late.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        late <= 1,
+        "{late} of {} frames queued in the gate were admitted after teardown began",
+        queued.len()
+    );
+    handle_b.streams.shutdown_state.teardown_token().cancel();
+}

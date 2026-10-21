@@ -599,6 +599,15 @@ impl Transport for TcpTransport {
     fn shutdown(&self) {
         info!("Shutting down TCP transport");
 
+        // Refuse what still waits in each admission gate, before the writers
+        // start teardown: the grace covers only what is already in a writer's
+        // channel. Left alone, a gate's driver went on admitting its queue
+        // during teardown, and a frame it admitted after the writer stopped
+        // was failed at once, after its sender was told it was admitted.
+        for connection in self.connections.iter() {
+            connection.gate.fail_all(AdmissionError::ChannelClosed);
+        }
+
         // Cancel the teardown token (Phase 3) to stop the listener and connection handlers
         if let Some(state) = self.shutdown_state.get() {
             state.teardown_token().cancel();
