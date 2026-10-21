@@ -1,6 +1,6 @@
 # Benchmarking
 
-Use this chapter to measure the streaming response plane. It describes the three in-repo harnesses, the external serving rig, and the measurement rules that earlier mistakes made necessary. [Response plane performance](response-plane-performance.md) has the results.
+Use this chapter to measure the streaming response plane. It describes the three in-repo harnesses, the external serving rig, and the measurement rules that earlier mistakes made necessary. [Response plane performance](response-plane-performance.md) has the results. To compare two commits on one machine, see [Review for performance](../development/performance-review.md#compare-two-commits-on-one-machine).
 
 ## Select the harness
 
