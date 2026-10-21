@@ -187,33 +187,76 @@ impl SweepTarget for DashMap<u64, AnchorEntry> {
     const RECHECK: Duration = ANCHOR_RECHECK;
 
     /// A read lock decides each entry: most belong to anchors that attached
-    /// or ended, and a write lock per entry would contend with attach and
-    /// detach. Only an expiry takes the write lock, and decides again under
-    /// it, because a renewal or an attach can land between the two.
+    /// or ended, or are stale copies, and a write lock per entry would
+    /// contend with attach and detach. A requeue records its new instant in
+    /// the entry, and an expiry removes it, so both take the write lock and
+    /// decide again: a renewal, attach or re-arm can land in between.
     fn on_due(
         &self,
-        due: Vec<u64>,
+        due: Vec<(tokio::time::Instant, u64)>,
         now: tokio::time::Instant,
         renewed: &mut Vec<(tokio::time::Instant, u64)>,
     ) {
         use dashmap::mapref::entry::Entry;
-        for local_id in due {
-            let Some(due) = self.get(&local_id).map(|anchor| Due::of(&anchor, now)) else {
+        for (at, local_id) in due {
+            let Some(due) = self.get(&local_id).map(|anchor| Due::of(&anchor, at, now)) else {
                 continue; // already removed
             };
-            match due {
-                Due::Drop => {}
-                Due::Requeue(deadline) => renewed.push((deadline, local_id)),
-                Due::Expire => {
-                    let Entry::Occupied(entry) = self.entry(local_id) else {
-                        continue;
-                    };
-                    match Due::of(entry.get(), now) {
-                        Due::Expire => entry.remove().cancel_token.cancel(),
-                        Due::Requeue(deadline) => renewed.push((deadline, local_id)),
-                        Due::Drop => {}
-                    }
+            if matches!(due, Due::Drop) {
+                continue;
+            }
+            let Entry::Occupied(mut entry) = self.entry(local_id) else {
+                continue;
+            };
+            match Due::of(entry.get(), at, now) {
+                Due::Expire => entry.remove().cancel_token.cancel(),
+                Due::Requeue(deadline) => {
+                    let requeue_at = AnchorDeadlineQueue::requeue_at(now, deadline);
+                    entry.get_mut().queued = Some(requeue_at);
+                    renewed.push((requeue_at, local_id));
                 }
+                Due::Drop => {}
+            }
+        }
+    }
+}
+
+/// The manager's own handle on its deadline queue: when the manager drops,
+/// it stops the sweep and cancels the anchors still in the registry.
+///
+/// A field that acts on drop does this without a `Drop` impl on
+/// [`AnchorManager`], which would stop callers from moving its public fields
+/// out.
+#[derive(Default)]
+pub(crate) struct ManagerDeadlines {
+    sweep: SweepOwner<DashMap<u64, AnchorEntry>>,
+    /// The manager's registry, set by [`AnchorManagerBuilder::build`].
+    registry: Option<Arc<DashMap<u64, AnchorEntry>>>,
+}
+
+impl std::ops::Deref for ManagerDeadlines {
+    type Target = Arc<AnchorDeadlineQueue>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sweep
+    }
+}
+
+impl Drop for ManagerDeadlines {
+    /// A `StreamAnchor` keeps the registry alive past the manager, and with
+    /// the sweep stopped nothing would reap its anchor. So cancel them all,
+    /// as `stop()` does. After `stop()`, which `Velo` calls, the registry is
+    /// already empty.
+    fn drop(&mut self) {
+        self.sweep.stop();
+        let Some(registry) = self.registry.take() else {
+            return;
+        };
+        // Remove entries outside shard guards: their Drop may close a mux slot.
+        let ids: Vec<u64> = registry.iter().map(|entry| *entry.key()).collect();
+        for id in ids {
+            if let Some((_, entry)) = registry.remove(&id) {
+                entry.cancel_token.cancel();
             }
         }
     }
@@ -1230,7 +1273,7 @@ pub struct AnchorManager {
 
     /// The unattached deadlines of this manager's SPSC anchors.
     #[builder(setter(skip), default)]
-    pub(crate) deadline_queue: SweepOwner<DashMap<u64, AnchorEntry>>,
+    pub(crate) deadline_queue: ManagerDeadlines,
 
     /// The heartbeats of this manager's remote senders.
     #[builder(setter(skip), default)]

@@ -51,8 +51,9 @@ impl SweepTarget for Heartbeats {
     /// more than one interval ahead.
     const RECHECK: Duration = Duration::MAX;
 
-    fn on_due(&self, due: Vec<u64>, now: Instant, renewed: &mut Vec<(Instant, u64)>) {
-        for key in due {
+    /// A sender has one entry, so the instant it was queued at says nothing.
+    fn on_due(&self, due: Vec<(Instant, u64)>, now: Instant, renewed: &mut Vec<(Instant, u64)>) {
+        for (_, key) in due {
             let Some(mut beat) = self.beats.get_mut(&key) else {
                 continue; // the sender finished
             };

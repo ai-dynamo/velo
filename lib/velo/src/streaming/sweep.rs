@@ -17,7 +17,7 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
-use crate::streaming::deadline::DeadlineQueue;
+use crate::streaming::deadline::{DeadlineQueue, requeue_at};
 
 /// How many independently locked parts the queue has. A key's entries always
 /// go to the part that the key selects.
@@ -41,12 +41,17 @@ pub(crate) trait SweepTarget: Send + Sync + 'static {
     /// The longest a requeued entry waits before the sweep looks again.
     const RECHECK: Duration;
 
-    /// Act on the keys whose entry came due by `now`. Push into `renewed`
-    /// each key to look at again, with a time after `now`.
+    /// Act on the entries that came due by `now`, each a key with the
+    /// instant it was queued at. Push into `renewed` each key to look at
+    /// again, with a time after `now`.
     ///
     /// Called with no queue lock held, so it can take the target's own
-    /// locks. A key may be stale: its stream may have ended or moved on.
-    fn on_due(&self, due: Vec<u64>, now: Instant, renewed: &mut Vec<(Instant, u64)>);
+    /// locks. A key may be stale: its stream may have ended or moved on. A
+    /// target that keeps one live entry per key tells its own entry from a
+    /// stale copy by the instant. Such a target records the instant of a
+    /// requeue from [`DeadlineSweep::requeue_at`], which is the instant the
+    /// queue holds.
+    fn on_due(&self, due: Vec<(Instant, u64)>, now: Instant, renewed: &mut Vec<(Instant, u64)>);
 }
 
 /// A sharded deadline queue and the one task that sweeps it.
@@ -173,13 +178,25 @@ impl<T: SweepTarget> DeadlineSweep<T> {
     /// The sweep is woken when the entry is the earliest of its shard. That
     /// is not always the earliest of the queue, and then the wake only costs
     /// the sweep a fresh look at the shards.
-    pub(crate) fn push(self: &Arc<Self>, target: &Arc<T>, deadline: Instant, key: u64) {
-        if self.shard(key).push(deadline, key) {
+    ///
+    /// Returns when the entry comes due, after the [`SweepTarget::FIRST_LOOK`]
+    /// cap. A target that keeps one live entry per key records it, under the
+    /// target lock it holds, before the sweep can pop the entry.
+    pub(crate) fn push(self: &Arc<Self>, target: &Arc<T>, deadline: Instant, key: u64) -> Instant {
+        let pushed = self.shard(key).push(deadline, key);
+        if pushed.earliest {
             self.earlier.notify_one();
         }
         if !self.alive.load(Ordering::Acquire) {
             self.start(target);
         }
+        pushed.at
+    }
+
+    /// When the sweep, requeuing at `now`, queues an entry for `deadline`:
+    /// at most [`SweepTarget::RECHECK`] after `now`.
+    pub(crate) fn requeue_at(now: Instant, deadline: Instant) -> Instant {
+        requeue_at(now, deadline, T::RECHECK)
     }
 
     #[cold]
