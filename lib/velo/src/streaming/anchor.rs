@@ -206,6 +206,35 @@ pub(crate) struct AnchorDeadlineQueue {
     sweep_alive: AtomicBool,
 }
 
+/// The manager's own handle on its deadline queue: it stops the sweep when
+/// the manager drops.
+///
+/// Anchors and senders hold the queue too, so the sweep cannot learn from the
+/// queue itself that the manager is gone. A field that stops it on drop does
+/// this without a `Drop` impl on [`AnchorManager`], which would stop callers
+/// from moving its public fields out.
+pub(crate) struct ManagerDeadlines(Arc<AnchorDeadlineQueue>);
+
+impl Default for ManagerDeadlines {
+    fn default() -> Self {
+        Self(AnchorDeadlineQueue::new())
+    }
+}
+
+impl std::ops::Deref for ManagerDeadlines {
+    type Target = Arc<AnchorDeadlineQueue>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl Drop for ManagerDeadlines {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
 /// Clears [`AnchorDeadlineQueue::sweep_alive`] when the sweep ends.
 ///
 /// Built before the spawn and moved into the task, not created inside it: a
@@ -1384,16 +1413,8 @@ pub struct AnchorManager {
     mux: std::sync::OnceLock<Arc<crate::streaming::messenger_mux::MessengerMuxTransport>>,
 
     /// The unattached deadlines of this manager's SPSC anchors.
-    #[builder(setter(skip), default = "AnchorDeadlineQueue::new()")]
-    pub(crate) deadline_queue: Arc<AnchorDeadlineQueue>,
-}
-
-impl Drop for AnchorManager {
-    /// Ends the deadline sweep. Anchors and senders still hold the queue, so
-    /// the sweep cannot learn from the queue itself that the manager is gone.
-    fn drop(&mut self) {
-        self.deadline_queue.stop();
-    }
+    #[builder(setter(skip), default)]
+    pub(crate) deadline_queue: ManagerDeadlines,
 }
 
 impl AnchorManagerBuilder {
