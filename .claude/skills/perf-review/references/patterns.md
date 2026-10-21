@@ -190,6 +190,14 @@ that pins it now.
   `allocations_in` closure narrowed, or new code that does the same work
   without calling the `note_*` seam. A blocker unless a measurement comes
   with it.
+- **P25. State kept after an operation ends.** Memory that grows with the
+  operations that ended, not with the ones that are live: a map entry, a
+  queue entry, an `Arc` or a buffer that nothing removes when a stream,
+  request or connection ends. Cost: RSS without bound; about 1 KiB for
+  each finished stream in the anchor lifecycle (measure.md, section 6).
+  An allocation count per operation does not see it, because the
+  allocation is made once. Pin: run N operations, then assert that each
+  registry and queue is empty again; measure.md, section 6, for RSS.
 
 ## Pinning idioms (for the `pin` field)
 

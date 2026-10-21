@@ -117,6 +117,11 @@ fails. See rule 11 in [Measurement rules](../operations/benchmarking.md#measurem
    reps of each, and change which arm goes first.
 5. **Call a difference real only when the ranges do not overlap.** Report
    latency beside throughput.
-6. **Label the result.** A number from a shared or dev machine is
+6. **Check the memory kept per operation.** Run each arm at N and at 4N
+   operations, and divide the RSS difference by 3N. A leak passes every
+   count and every timing: no extra allocation per operation, and no
+   extra time. It shows only as memory that grows with the operations
+   that ended.
+7. **Label the result.** A number from a shared or dev machine is
    directional. A number for this book needs an exclusive node and the
    [Measurement rules](../operations/benchmarking.md#measurement-rules).

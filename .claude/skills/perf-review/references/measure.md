@@ -158,7 +158,33 @@ fi
 - Report latency beside throughput (rule 10).
 - Label every number "directional: dev box, <n> cores, load <x>".
 
-## 6. Clean up
+## 6. Check memory retained per operation
+
+A leak passes every check above: no extra allocation per operation, empty
+registries, the same time. It shows only as memory that grows with the
+operations that ended, not with the ones still live. Check it when the
+diff touches setup or teardown (a stream open or close, a connection, a
+slot), or keeps state for each operation.
+
+- Run each arm at two lengths, N and 4N operations, at the same
+  concurrency. Record the peak RSS of each run (`/usr/bin/time -f %M`,
+  in KiB), or the RSS the harness prints at the end.
+- Memory retained per operation is (RSS at 4N - RSS at N) / 3N. With a
+  constant number of live operations, it is about zero in a correct arm.
+- Read the harness's own counters first: for `anchor_setup_bench`,
+  `active_anchor_count()` and the length of the sender registry after the
+  run. Empty registries with a growing RSS mean that the state is held
+  somewhere else.
+- Report it for both arms. A head that keeps more per operation than base
+  is a regression with mechanism `growth` (patterns.md, P25). A base that
+  already keeps memory goes under "Related, out of scope", as a finding of
+  its own.
+
+Example: in `anchor_setup_bench` (64 tasks, 8 threads), no anchor and no
+sender was left after the run, but RSS was 133 MiB after 128k lifecycles
+and 532 MiB after 512k: about 1 KiB kept for each finished stream.
+
+## 7. Clean up
 
 ```shell
 git worktree remove --force "$S/base"

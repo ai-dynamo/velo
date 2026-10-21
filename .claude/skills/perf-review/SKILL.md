@@ -140,7 +140,7 @@ sections of Stage 5, and stop. That is a pass.
 
 | Finder | Pattern families (patterns.md) |
 |---|---|
-| F1, data movement | copies, allocation, serialization, buffer growth, label lookups and registry recounts, logging, work that grows with slots or peers |
+| F1, data movement | copies, allocation, serialization, buffer growth, label lookups and registry recounts, logging, work that grows with slots or peers, state kept after an operation ends |
 | F2, sync and scheduling | locks, atomics, cancellation tokens, `Weak` upgrades, spawns, task hops, wakes, timers, a blocked worker, round trips |
 | F3, I/O and flow control | syscalls per frame, coalescer bypass, large-frame writes, socket options, batch, credit and linger defaults, QUIC packet size, order |
 
@@ -313,7 +313,9 @@ Measure when any of these holds:
   (not by a failing pin, which is already a count);
 - the diff claims a speedup.
 
-Never measure in audit mode. Follow references/measure.md:
+Never measure in audit mode. When the diff touches setup or teardown, or
+keeps state for each operation, also report the memory kept per operation
+(measure.md, section 6). Follow references/measure.md:
 - Build each arm in its own worktree and target directory.
 - Stop at the first evidence that settles the question: a count, then
   instructions, then time.
