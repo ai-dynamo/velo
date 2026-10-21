@@ -241,6 +241,11 @@ struct MuxCore {
 }
 
 impl MessengerMuxTransport {
+    /// Extend an unclaimed bind's accept window, if it has not closed.
+    ///
+    /// Called with an anchor registry entry held, like
+    /// [`release_bind`](Self::release_bind): it touches only the mux's own
+    /// maps and must never reach back into the anchor registry.
     pub(crate) fn renew_reservation(&self, anchor: u64, session: u64) {
         self.core
             .ingress

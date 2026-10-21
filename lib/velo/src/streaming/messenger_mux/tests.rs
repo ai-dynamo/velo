@@ -1562,7 +1562,7 @@ async fn prebinding_node_with_window(
 /// Zero-RTT setup binds a slot at request registration, so a request that dies
 /// before its first token — a client that hangs up, a prompt that is refused —
 /// leaves one behind. The accept window would collect it eventually and stays
-/// as the backstop, but at the rate a frontend registers requests, a minute of
+/// as the backstop, but at the rate a frontend registers requests, a whole window of
 /// leaked bind, drain signal and stream watchdog per abandoned one is not a
 /// reclamation policy.
 ///

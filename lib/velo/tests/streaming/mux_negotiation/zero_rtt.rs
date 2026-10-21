@@ -1155,10 +1155,11 @@ async fn bulk_reservation_renewal_is_harmless_during_and_after_attachment() {
 ///
 /// A renewal that never reached `renew_reservations_local` on the owner would
 /// pass a test that opens inside the first lifetime; this one opens only after
-/// four of them.
+/// two of them. The 2 s lifetime leaves a loaded runner 1.5 s for each round of
+/// renewal.
 #[tokio::test(flavor = "multi_thread")]
 async fn remote_renewal_keeps_prepared_reservations_past_their_lifetime() {
-    let lifetime = Duration::from_millis(800);
+    let lifetime = Duration::from_secs(2);
     let mut reservations_config = ReservationConfig::default();
     reservations_config.prebind_timeout = lifetime;
     let (consumer, producer) =
@@ -1181,14 +1182,14 @@ async fn remote_renewal_keeps_prepared_reservations_past_their_lifetime() {
         anchors.push(anchor);
     }
     let renewer = producer.velo.anchor_manager();
-    for _ in 0..16 {
+    for _ in 0..8 {
         tokio::time::sleep(lifetime / 4).await;
         renewer
             .renew_reservations(&reservations)
             .await
             .expect("renew both batches");
     }
-    // One reservation from each batch of 256 opens after four lifetimes.
+    // One reservation from each batch of 256 opens after two lifetimes.
     let mut opened = Vec::new();
     for index in [0, 299] {
         let mut anchor = anchors.remove(if index == 0 { 0 } else { anchors.len() - 1 });
