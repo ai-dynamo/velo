@@ -183,9 +183,12 @@ pub enum Retirement {
     /// 20 seconds.
     Sent,
     /// The stream's output was thrown away before it was handed on. Over the
-    /// messenger mux and on the same worker: the consumer cancelled or dropped
-    /// its anchor, the consumer's process went away, the transport refused the
-    /// batch, or this node shut down. On a per-stream transport of this
+    /// messenger mux: the consumer cancelled or dropped its anchor, the
+    /// consumer's process went away, the transport refused the batch, or this
+    /// node shut down. On the same worker: the consumer dropped its anchor,
+    /// so the terminal had no channel to enter; a cancel through a
+    /// `StreamController` while the anchor lives leaves the terminal in the
+    /// anchor's channel, which is `Sent`. On a per-stream transport of this
     /// crate: the pump's write failed, the connection ended first, or the
     /// gRPC server did not take the stream. A per-stream TCP pump cannot see
     /// a consumer that left before it writes, so there `Sent` stands
@@ -412,8 +415,8 @@ impl<T: Serialize> StreamSender<T> {
     ///
     /// - [`SendError::SerializationError`] if `rmp_serde::to_vec` fails.
     /// - [`SendError::ItemTooLarge`] if the encoded item is larger than the
-    ///   stream's transport carries in one frame (per-stream gRPC: 16 MiB);
-    ///   nothing is sent, and the stream stays open.
+    ///   stream's transport carries in one frame (per-stream TCP and gRPC:
+    ///   16 MiB); nothing is sent, and the stream stays open.
     /// - [`SendError::ChannelClosed`] if the receiver has been dropped or the
     ///   stream has been cancelled. A cancel through `SenderEntry::cancel` is
     ///   seen at once; a direct cancel of [`Self::cancellation_token`] once

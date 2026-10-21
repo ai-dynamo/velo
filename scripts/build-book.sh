@@ -48,9 +48,9 @@ limitations="${root}/LIMITATIONS.md"
 headings="$(grep -E '^## ' "${limitations}" \
   | sed -E 's/^## //; s/`//g' \
   | tr '[:upper:]' '[:lower:]' \
-  | sed -E 's/[^a-z0-9 -]//g; s/ /-/g')"
+  | sed -E 's/[^a-z0-9_ -]//g; s/ /-/g')"
 status=0
-for anchor in $(grep -rhoE 'LIMITATIONS\.md#[a-z0-9-]+' "${root}/docs/src" | sed 's/.*#//' | sort -u); do
+for anchor in $(grep -rhoE 'LIMITATIONS\.md#[A-Za-z0-9_-]+' "${root}/docs/src" "${root}/README.md" | sed 's/.*#//' | tr '[:upper:]' '[:lower:]' | sort -u); do
   if ! grep -qx "${anchor}" <<<"${headings}"; then
     echo "docs link to LIMITATIONS.md#${anchor}, which is not a heading there" >&2
     status=1

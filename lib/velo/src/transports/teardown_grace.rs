@@ -166,6 +166,20 @@ mod tests {
         );
     }
 
+    /// `begin` fixes the deadline at the shutdown, so a writer that first
+    /// asks later gets a deadline measured from the shutdown, not a fresh
+    /// grace of its own.
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_is_fixed_at_the_shutdown() {
+        let token = CancellationToken::new();
+        let stop = TeardownStop::new(token.clone(), Duration::from_secs(2));
+        token.cancel();
+        let shutdown = tokio::time::Instant::now();
+        stop.begin();
+        tokio::time::advance(Duration::from_millis(1500)).await;
+        assert_eq!(stop.deadline(), Some(shutdown + Duration::from_secs(2)));
+    }
+
     /// A grace of "forever" is a deadline that never comes, not a panic in
     /// the shutdown hook.
     #[tokio::test(start_paused = true)]

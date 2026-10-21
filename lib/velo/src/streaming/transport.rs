@@ -7,6 +7,14 @@
 
 pub use velo_ext::streaming::FrameTransport;
 
+/// The largest encoded item the per-stream transports of this crate carry in
+/// one frame: the TCP streaming codec's frame limit, 16 MiB, which the gRPC
+/// transport adopts so that one limit holds on every per-stream path. A
+/// `StreamSender` on such a transport refuses a larger item at `send`
+/// (`SendError::ItemTooLarge`); the gRPC server decodes, and its client
+/// encodes, with this value plus the message envelope.
+pub const MAX_ITEM_BYTES: usize = crate::transports::tcp::framing::DEFAULT_MAX_FRAME_SIZE as usize;
+
 /// A frame transport of this crate that reports a stream's retirement itself:
 /// `Sent` once its pump has written the terminal, `Discarded` when the write
 /// fails or the connection ends first. A transport that is only a

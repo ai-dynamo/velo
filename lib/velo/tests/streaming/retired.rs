@@ -15,6 +15,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use bytes::Bytes;
 use futures::{FutureExt, StreamExt};
 use prometheus::Registry;
 use velo::observability::VeloMetrics;
@@ -480,9 +481,6 @@ async fn sent_resolves_while_a_staged_item_is_still_held() {
     drop(anchor);
 }
 
-/// Over gRPC, the per-stream pump reports `Sent` once the server has taken the
-/// whole request stream, terminal included: the call's response ends only
-/// then.
 /// A node whose streams ride per-stream gRPC.
 #[cfg(feature = "grpc")]
 async fn grpc_node() -> Node {
@@ -532,6 +530,9 @@ async fn grpc_pair() -> (Node, Node) {
     (producer, consumer)
 }
 
+/// Over gRPC, the per-stream pump reports `Sent` once the server has taken the
+/// whole request stream, terminal included: the call's response ends only
+/// then.
 #[cfg(feature = "grpc")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_per_stream_grpc_transport_retires_once_its_terminal_is_taken() {
@@ -559,49 +560,129 @@ async fn a_per_stream_grpc_transport_retires_once_its_terminal_is_taken() {
     read_to_the_end(&mut anchor).await;
 }
 
-/// Over per-stream gRPC an item larger than the transport carries in one
-/// frame fails at `send`, before anything leaves the producer, and the
-/// stream stays open; one just under the limit crosses. The limit is the
-/// one the server decodes with, so a frame the producer lets through is
-/// never one the server refuses.
-#[cfg(feature = "grpc")]
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_item_over_the_grpc_limit_fails_at_send() {
-    use velo::streaming::SendError;
-    const LIMIT: usize = velo::streaming::grpc_transport::MAX_ITEM_BYTES;
-    // The msgpack wrapper around an item adds a few bytes: a payload of the
-    // limit's size encodes over it, one 64 bytes shorter encodes under it.
-    const OVER: usize = LIMIT;
-    const UNDER: usize = LIMIT - 64;
+/// Items of a few bytes under and over the per-stream frame limit, as byte
+/// items: a msgpack `bin` is one copy, where 16 million serde elements would
+/// take seconds in a debug build.
+const FRAME_LIMIT: usize = velo::streaming::MAX_ITEM_BYTES;
+/// A payload of the limit's size encodes a few bytes over it.
+const OVER_THE_LIMIT: usize = FRAME_LIMIT;
+/// One 64 bytes shorter encodes under it.
+const UNDER_THE_LIMIT: usize = FRAME_LIMIT - 64;
 
-    let (producer, consumer) = grpc_pair().await;
-    let mut anchor = consumer.velo.create_anchor::<Vec<u8>>();
+/// A per-stream sender refuses an item larger than its transport carries in
+/// one frame at `send`, before anything leaves the producer, and the stream
+/// stays open; one just under the limit crosses. The limit is one value on
+/// every per-stream transport of this crate, and the gRPC server decodes
+/// with it, so a frame the producer lets through is never one the far end
+/// refuses.
+async fn an_item_over_the_limit_fails_at_send(producer: &Node, consumer: &Node) {
+    use velo::streaming::SendError;
+    let mut anchor = consumer.velo.create_anchor::<Bytes>();
     let sender = producer
         .velo
-        .attach_anchor::<Vec<u8>>(anchor.handle())
+        .attach_anchor::<Bytes>(anchor.handle())
         .await
         .expect("attach");
-    let refused = sender.send(vec![0u8; OVER]).await;
+    let refused = sender.send_bytes(vec![0u8; OVER_THE_LIMIT]).await;
     assert!(
-        matches!(refused, Err(SendError::ItemTooLarge { limit, .. }) if limit == LIMIT),
+        matches!(refused, Err(SendError::ItemTooLarge { limit, .. }) if limit == FRAME_LIMIT),
         "{refused:?}"
     );
     sender
-        .send(vec![1u8; UNDER])
+        .send_bytes(vec![1u8; UNDER_THE_LIMIT])
         .await
         .expect("an item under the limit");
     let retired = sender.retired();
     sender.finalize().expect("finalize");
+    // A 16 MiB item over loopback: a wait wider than PATIENCE, for a slow
+    // runner.
+    let wide = Duration::from_secs(30);
+    assert_eq!(
+        tokio::time::timeout(wide, retired).await,
+        Ok(Retirement::Sent)
+    );
+    match tokio::time::timeout(wide, anchor.next_bytes()).await {
+        Ok(Some(Ok(StreamFrame::Item(item)))) if item.len() == UNDER_THE_LIMIT => {}
+        other => panic!("the item under the limit: {other:?}"),
+    }
+    match tokio::time::timeout(wide, anchor.next_bytes()).await {
+        Ok(Some(Ok(StreamFrame::Finalized))) => {}
+        other => panic!("expected Finalized: {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_item_over_the_tcp_limit_fails_at_send() {
+    let (producer, consumer) = pair(MuxConfig {
+        enabled: false,
+        ..MuxConfig::default()
+    })
+    .await;
+    an_item_over_the_limit_fails_at_send(&producer, &consumer).await;
+}
+
+#[cfg(feature = "grpc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_item_over_the_grpc_limit_fails_at_send() {
+    let (producer, consumer) = grpc_pair().await;
+    an_item_over_the_limit_fails_at_send(&producer, &consumer).await;
+}
+
+/// An MPSC sender on a per-stream transport refuses an oversize item the same
+/// way, and keeps sending after it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_mpsc_item_over_the_tcp_limit_fails_at_send() {
+    use velo::streaming::{MpscFrame, SendError};
+    let (producer, consumer) = pair(MuxConfig {
+        enabled: false,
+        ..MuxConfig::default()
+    })
+    .await;
+    let mut anchor = consumer.velo.create_mpsc_anchor::<Vec<u8>>();
+    let sender = producer
+        .velo
+        .attach_mpsc_anchor::<Vec<u8>>(anchor.handle())
+        .await
+        .expect("attach");
+    let refused = sender.send(vec![0u8; OVER_THE_LIMIT]).await;
+    assert!(
+        matches!(refused, Err(SendError::ItemTooLarge { limit, .. }) if limit == FRAME_LIMIT),
+        "{refused:?}"
+    );
+    sender.send(vec![1u8; 16]).await.expect("a small item");
+    drop(sender);
+    match tokio::time::timeout(PATIENCE, anchor.next()).await {
+        Ok(Some(Ok((_, MpscFrame::Item(item))))) if item.len() == 16 => {}
+        other => panic!("the small item: {other:?}"),
+    }
+}
+
+/// On the same worker a cancel through a `StreamController`, with the anchor
+/// kept, leaves the terminal in the anchor's channel: that is `Sent`, as the
+/// docs say; only the anchor's drop gives `Discarded` there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_same_worker_cancel_through_a_controller_leaves_the_terminal_queued() {
+    let node = node(window(256)).await;
+    let anchor = node.velo.create_anchor::<u32>();
+    let sender = node
+        .velo
+        .attach_anchor::<u32>(anchor.handle())
+        .await
+        .expect("attach");
+    let retired = sender.retired();
+    anchor.controller().cancel();
+    // The cancel reached the sender: its token fired, and a send is refused.
+    tokio::time::timeout(PATIENCE, sender.cancellation_token().cancelled())
+        .await
+        .expect("the cancel reaches the sender");
+    assert!(matches!(
+        sender.send(2).await,
+        Err(velo::streaming::SendError::ChannelClosed)
+    ));
+    let _ = sender.finalize();
     assert_eq!(
         tokio::time::timeout(PATIENCE, retired).await,
         Ok(Retirement::Sent)
     );
-    match tokio::time::timeout(PATIENCE, anchor.next()).await {
-        Ok(Some(Ok(StreamFrame::Item(item)))) if item.len() == UNDER => {}
-        other => panic!("the item under the limit: {other:?}"),
-    }
-    match tokio::time::timeout(PATIENCE, anchor.next()).await {
-        Ok(Some(Ok(StreamFrame::Finalized))) => {}
-        other => panic!("expected Finalized: {other:?}"),
-    }
+    drop(anchor);
 }

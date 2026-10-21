@@ -609,6 +609,12 @@ impl RetiringFrameTransport for TcpFrameTransport {
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
         self.connect_with(peer, anchor_id, session_id, Some(RetireGuard::new(closed)))
     }
+
+    /// The codec's frame limit. `EgressFrame` carries no header, so an item
+    /// at this size is exactly what the codec still encodes.
+    fn item_limit(&self) -> Option<usize> {
+        Some(crate::streaming::transport::MAX_ITEM_BYTES)
+    }
 }
 
 impl FrameTransport for TcpFrameTransport {

@@ -346,33 +346,7 @@ Measured with the `stream_lifecycle` example ([Benchmarking](../operations/bench
 | `retired`: `retired()` awaited | 124,470 | 124,443 to 124,702 | 76 µs / 195 µs |
 | `ack`: consumer acknowledgement | 161,890 | 161,753 to 161,928 | 276 µs / 500 µs |
 
-Awaiting `retired()` costs about 600 instructions per stream here, under 0.5 percent; the acknowledgement costs about 38,000, 30 percent, and a round trip. A stream that nobody watches pays one compare-exchange when it retires, which is below what this run can resolve.
-
-`velo_streaming_mux_live_slots` must return to zero at teardown. A leaked slot holds credit and byte budget for the rest of the epoch, and unlike a leaked socket it does not show in `lsof`.
-
-### Retirement
-
-`StreamSender::retired()` resolves when the producer's node has handed on all of the stream's output (see [Streaming](streaming.md#know-when-the-output-has-left)). Under the mux, the batcher reports it:
-
-- When egress writes a terminal into the open batch, it moves a guard for the stream into the batch. When the batch is admitted, each guard reports `Sent`. A terminal that goes alone through rendezvous gives its guard to the task that waits for its admission.
-- A guard that is dropped reports `Discarded`. A refused batch, an epoch death, a teardown, and a batcher task that is aborted all drop the guards that they hold.
-- An item larger than the eager budget goes alone, as a handle the consumer pulls. Its guard reports `Sent` when that handle's batch is admitted, while the item is still staged on the producer ([known limitation](https://github.com/ai-dynamo/velo/blob/main/LIMITATIONS.md#sent-while-a-staged-item-is-still-held)).
-- A slot that closes while it still holds its producer's lifecycle reports `Discarded`. The terminal path takes the lifecycle out of the slot first. So every other close reports the loss: the `CloseSlot{UnknownSlot}` that a consumer sends when it cancels or drops its anchor, an epoch death when the consumer's process goes away, and the teardown of the producer's node.
-
-The state is three bits in the per-stream allocation that the sender and its slot already share (the outcome, and whether anyone waits), and a list of wakers that stays empty until a `Retired` future waits. No message crosses the wire for it. The first outcome stands. A stream that nobody watches pays one compare-exchange when it retires, and no wake.
-
-The alternative is an acknowledgement from the consumer in the application's own protocol. It costs one more active message for each stream, a table of waiters on the producer, and a round trip before the producer knows.
-
-Measured with the `stream_lifecycle` example ([Benchmarking](../operations/benchmarking.md#run-stream_lifecycle)): two nodes in one process over loopback TCP, 200,000 streams of four 16-byte items, 64 at once, on an Apple M5 with 10 cores. Instructions are for the whole process, divided by the streams, median of nine runs (three for `ack`):
-
-| Build and mode | Instructions per stream | Producer holds the stream after `finalize`, p50 / p99 |
-|---|---|---|
-| Before `retired()`, `plain` | 122,175 | — |
-| With `retired()`, not used (`plain`) | 122,610 | — |
-| With `retired()`, awaited (`retired`) | 123,321 | 81 µs / 203 µs |
-| Consumer acknowledgement (`ack`) | 162,295 | 389 µs / 734 µs |
-
-The `before` and `ack` rows are from the first measurement, where the `plain` build with `retired()` measured 122,209 (121,934 to 122,354): the two `plain` builds differ by less than the spread of the runs (121,897 to 122,684 before). The `plain` and `retired` rows are from a later run, after the harness stopped wrapping the awaited future in a timer; the same run measured the build before the per-stream pumps reported retirement at 122,597 (122,432 to 122,839) for `plain` and 123,362 for `retired`, so that change is also within the spread.
+Awaiting `retired()` costs about 600 instructions per stream here, under 0.5 percent; the acknowledgement costs about 38,000, 30 percent, and a round trip. A stream that nobody watches pays one compare-exchange when it retires; this run has no build without retirement, so it does not measure that.
 
 ## Heartbeats
 

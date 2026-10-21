@@ -67,15 +67,10 @@ const SESSION_ID_META: &str = "x-session-id";
 /// so the heartbeat watchdog is what reports a wedged consumer, not this.
 const TERMINAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// The largest encoded item a per-stream gRPC transport carries: the same
-/// 16 MiB as the TCP streaming codec's frame limit. The producer refuses a
-/// larger item at `send` (`SendError::ItemTooLarge`), and the server's decode
-/// limit is set from this value plus the message envelope, so the two sides
-/// cannot disagree.
-pub const MAX_ITEM_BYTES: usize = crate::transports::tcp::framing::DEFAULT_MAX_FRAME_SIZE as usize;
+use crate::streaming::transport::MAX_ITEM_BYTES;
 
-/// Room for the protobuf envelope around an item at the limit: field tags and
-/// lengths, and the empty preamble and header fields.
+/// Room for the protobuf envelope around an item at the limit: a few bytes
+/// of field tags and lengths, with margin to spare.
 const MESSAGE_ENVELOPE: usize = 64 * 1024;
 
 /// How long `shutdown` lets open HTTP/2 connections finish GOAWAY before it
@@ -1078,60 +1073,90 @@ mod tests {
             .unwrap();
     }
 
-    /// A frame the server cannot receive, here one past the decode limit the
-    /// server sets from `MAX_ITEM_BYTES` (a `StreamSender` refuses it at
-    /// `send`; this writes to the channel directly), ends the request stream
-    /// with an error. The terminal behind it never reaches the consumer,
-    /// which reads `Dropped`. The call must end with an error too, so the
-    /// producer reads `Discarded`; a call that ended cleanly said `Sent` for
-    /// a stream the consumer never got. The control item, well under the
-    /// limit, is `Sent`.
+    /// Open a call on `server` for stream `session` through a raw tonic
+    /// client with no encode limit, as a client from another velo might,
+    /// send one frame of `len` bytes and then the terminal, and return
+    /// whether the response ended cleanly.
+    async fn call_ends_cleanly_after(
+        server: &GrpcFrameTransport,
+        session: u64,
+        len: usize,
+    ) -> bool {
+        let addr = SocketAddr::new(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            server.bound_addr().port(),
+        );
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = VeloStreamingClient::new(channel).max_encoding_message_size(usize::MAX);
+        let (tx, req_rx) = tokio::sync::mpsc::channel::<FramedData>(8);
+        let mut request = Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+        request
+            .metadata_mut()
+            .insert(ANCHOR_ID_META, session.to_string().parse().unwrap());
+        request
+            .metadata_mut()
+            .insert(SESSION_ID_META, session.to_string().parse().unwrap());
+        let mut inbound = client.stream(request).await.unwrap().into_inner();
+        let framed = |payload: Vec<u8>| FramedData {
+            preamble: vec![],
+            header: vec![],
+            payload,
+        };
+        tx.send(framed(vec![7u8; len])).await.unwrap();
+        tx.send(framed(crate::streaming::sender::cached_finalized().clone()))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut clean = true;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(item) = inbound.next().await {
+                if item.is_err() {
+                    clean = false;
+                }
+            }
+        })
+        .await
+        .expect("the call ends");
+        clean
+    }
+
+    /// A frame the server cannot receive, one past the decode limit it sets
+    /// from `MAX_ITEM_BYTES`, ends the request stream with an error; the
+    /// terminal behind it never reaches the consumer, which reads `Dropped`.
+    /// The call must end with an error too, so that a client's pump reads
+    /// `Discarded`: a call that ended cleanly here said `Sent` for a stream
+    /// the consumer never got. A velo client never sends such a frame (its
+    /// sender refuses it, and its encoder would too), so the frame comes
+    /// from a raw client with no encode limit. The control, well under the
+    /// limit, ends cleanly with its item and terminal delivered.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_frame_the_server_cannot_receive_retires_the_stream_as_discarded() {
+    async fn a_frame_the_server_cannot_receive_ends_the_call_with_an_error() {
         const OVER_THE_DECODE_LIMIT: usize = MAX_ITEM_BYTES + (1 << 20);
         const UNDER_IT: usize = 1 << 20;
         let server = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
-        let client = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
-            .await
-            .unwrap();
-        let (peer, info) = fresh_peer(server.address());
-        client.register(&info).unwrap();
 
-        for (session, len, expected) in [
-            (4, UNDER_IT, crate::streaming::Retirement::Sent),
-            (
-                5,
-                OVER_THE_DECODE_LIMIT,
-                crate::streaming::Retirement::Discarded,
-            ),
-        ] {
-            let consumer = server.bind(session, session).await.unwrap();
-            let closed = crate::streaming::control::SenderClosed::default();
-            let tx = client
-                .connect_retiring(peer, session, session, closed.clone())
-                .await
-                .unwrap();
-            let item =
-                rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(vec![7u8; len]))
-                    .unwrap();
-            tx.send_async(item).await.unwrap();
-            tx.send_async(crate::streaming::sender::cached_finalized().clone())
-                .await
-                .unwrap();
-            let retired = std::future::poll_fn(|cx| closed.poll_retired(cx));
-            assert_eq!(
-                tokio::time::timeout(Duration::from_secs(10), retired).await,
-                Ok(expected),
-                "an item of {len} bytes"
-            );
-            drop(consumer);
-        }
+        let consumer = server.bind(4, 4).await.unwrap();
+        assert!(call_ends_cleanly_after(&server, 4, UNDER_IT).await);
+        let item = consumer.recv_async().await.unwrap();
+        assert_eq!(item.len(), UNDER_IT);
+        assert_eq!(
+            consumer.recv_async().await.unwrap(),
+            *crate::streaming::sender::cached_finalized()
+        );
+
+        let consumer = server.bind(5, 5).await.unwrap();
+        assert!(!call_ends_cleanly_after(&server, 5, OVER_THE_DECODE_LIMIT).await);
+        assert_eq!(
+            consumer.recv_async().await.unwrap(),
+            *crate::streaming::sender::cached_dropped()
+        );
         tokio::time::timeout(Duration::from_secs(2), server.shutdown())
-            .await
-            .unwrap();
-        tokio::time::timeout(Duration::from_secs(2), client.shutdown())
             .await
             .unwrap();
     }

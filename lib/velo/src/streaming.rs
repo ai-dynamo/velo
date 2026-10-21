@@ -60,4 +60,4 @@ pub use mpsc::{
 };
 pub use sender::{Retired, Retirement, StreamSender};
 pub use tcp_transport::TcpFrameTransport;
-pub use transport::FrameTransport;
+pub use transport::{FrameTransport, MAX_ITEM_BYTES};

@@ -112,7 +112,7 @@ cargo build --release --example stream_lifecycle
 
 On Linux, use `perf stat -e instructions` instead of `/usr/bin/time -l`. [Batched streaming](../concepts/batched-streaming.md#retirement) has the results for the mux.
 
-On the per-stream path (`--path per-stream`), keep `--streams` to a few thousand and leave time between runs: each stream opens a connection, and the ephemeral ports run out. Provisional, on the same laptop and under the same conditions as the mux table, with `--streams 4000 --warmup 400`, the two modes interleaved, median of five: `plain` 525,586 instructions per stream (520,910 to 526,380) and `retired` 527,360 (526,161 to 529,770). The spreads overlap, so the pump's report of the retirement costs nothing this run can resolve; most of each figure is the connection each stream opens. The producer holds a stream for about 130 µs p50 and 500 µs p99 after `finalize` while it waits for the write. To be confirmed on dedicated hardware.
+On the per-stream path (`--path per-stream`), keep `--streams` to a few thousand and leave time between runs: each stream opens a connection, and the ephemeral ports run out. Provisional, on the same laptop and under the same conditions as the mux table, with `--streams 4000 --warmup 400`, the two modes interleaved, median of five: `plain` 525,586 instructions per stream (520,910 to 526,380) and `retired` 527,360 (526,161 to 529,770). The spreads overlap, so awaiting `retired()` costs nothing this run can resolve; the pump reports the retirement in both modes, and most of each figure is the connection each stream opens. The producer holds a stream for about 130 µs p50 and 500 µs p99 after `finalize` while it waits for the write. To be confirmed on dedicated hardware.
 
 ## The external serving rig
 
