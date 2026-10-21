@@ -46,6 +46,14 @@ pub(crate) fn renew_if_live(expires: &mut Instant, lifetime: Duration) {
 /// ahead. Queued at the key's own deadline instead, a `Duration::MAX` timeout
 /// came due in 30 years, and every key ever queued stayed in the heap for the
 /// life of the process.
+/// What [`DeadlineQueue::push`] did.
+pub(crate) struct Pushed {
+    /// When the entry comes due.
+    pub(crate) at: Instant,
+    /// Whether the entry is now the earliest in the queue.
+    pub(crate) earliest: bool,
+}
+
 pub(crate) struct DeadlineQueue<K> {
     heap: Mutex<BinaryHeap<Reverse<(Instant, K)>>>,
     first_look: Duration,
@@ -65,28 +73,38 @@ impl<K: Ord> DeadlineQueue<K> {
 
     /// Queue a look at `key` by `deadline`, at most `first_look` from now.
     ///
-    /// Returns whether the entry is now the earliest, so a task parked on the
-    /// old head can wake and retarget. A push behind the head needs no wake.
-    pub(crate) fn push(&self, deadline: Instant, key: K) -> bool {
+    /// Returns when the entry comes due, after the cap, so an owner can tell
+    /// its own entry from a stale one when it pops. Also returns whether the
+    /// entry is now the earliest, so a task parked on the old head can wake
+    /// and retarget. A push behind the head needs no wake.
+    pub(crate) fn push(&self, deadline: Instant, key: K) -> Pushed {
         let at = deadline.min(deadline_after(self.first_look));
         let mut heap = self.heap.lock();
         let earliest = heap.peek().is_none_or(|head| at < head.0.0);
         heap.push(Reverse((at, key)));
-        earliest
+        Pushed { at, earliest }
     }
 
-    /// Pop at most `max` keys whose entry is due by `now`.
+    /// Pop at most `max` entries that are due by `now`, each with the instant
+    /// it was queued at.
     ///
     /// Bounded because every push takes this lock: a sweep that pops a whole
     /// burst in one hold stalls every new stream for as long as that takes.
-    /// A result of `max` keys means more can be due; call again.
-    pub(crate) fn pop_due(&self, now: Instant, max: usize) -> Vec<K> {
+    /// A result of `max` entries means more can be due; call again.
+    pub(crate) fn pop_due(&self, now: Instant, max: usize) -> Vec<(Instant, K)> {
         let mut heap = self.heap.lock();
         let mut due = Vec::new();
         while due.len() < max && heap.peek().is_some_and(|entry| entry.0.0 <= now) {
-            due.push(heap.pop().expect("due entry").0.1);
+            due.push(heap.pop().expect("due entry").0);
         }
         due
+    }
+
+    /// When [`requeue`](Self::requeue) at `now` queues an entry for
+    /// `deadline`: at most `recheck` after `now`.
+    pub(crate) fn requeue_at(&self, now: Instant, deadline: Instant) -> Instant {
+        now.checked_add(self.recheck)
+            .map_or(deadline, |cap| deadline.min(cap))
     }
 
     /// Queue every key in `renewed` again, each at most `recheck` after
@@ -98,12 +116,11 @@ impl<K: Ord> DeadlineQueue<K> {
     /// thousands deep would stall new streams. It is decided after the
     /// requeue, so a sweep never shrinks a queue it is about to refill.
     pub(crate) fn requeue(&self, now: Instant, renewed: impl IntoIterator<Item = (Instant, K)>) {
-        let cap = now.checked_add(self.recheck);
         let mut heap = self.heap.lock();
         heap.extend(
-            renewed.into_iter().map(|(deadline, key)| {
-                Reverse((cap.map_or(deadline, |cap| deadline.min(cap)), key))
-            }),
+            renewed
+                .into_iter()
+                .map(|(deadline, key)| Reverse((self.requeue_at(now, deadline), key))),
         );
         if heap.len() <= 1024 && heap.capacity() > 8192 {
             heap.shrink_to(2048);
@@ -144,7 +161,12 @@ mod tests {
     async fn push_caps_an_entry_at_the_first_look() {
         let q = queue();
         let now = Instant::now();
-        q.push(deadline_after(Duration::MAX), 1);
+        let pushed = q.push(deadline_after(Duration::MAX), 1);
+        assert_eq!(
+            pushed.at,
+            now + FIRST_LOOK,
+            "push reports the capped instant"
+        );
         assert_eq!(head(&q), Some(now + FIRST_LOOK));
         q.push(now + Duration::from_millis(10), 2);
         assert_eq!(head(&q), Some(now + Duration::from_millis(10)));
@@ -167,17 +189,20 @@ mod tests {
     async fn push_reports_only_a_new_head() {
         let q = queue();
         let now = Instant::now();
-        assert!(q.push(now + Duration::from_millis(500), 1), "empty queue");
         assert!(
-            !q.push(now + Duration::from_millis(800), 2),
+            q.push(now + Duration::from_millis(500), 1).earliest,
+            "empty queue"
+        );
+        assert!(
+            !q.push(now + Duration::from_millis(800), 2).earliest,
             "behind the head"
         );
         assert!(
-            !q.push(now + Duration::from_millis(500), 3),
+            !q.push(now + Duration::from_millis(500), 3).earliest,
             "tied with the head"
         );
         assert!(
-            q.push(now + Duration::from_millis(100), 4),
+            q.push(now + Duration::from_millis(100), 4).earliest,
             "ahead of the head"
         );
     }
@@ -193,8 +218,20 @@ mod tests {
         }
         q.push(now + Duration::from_millis(900), 99);
         let later = now + Duration::from_millis(100);
-        assert_eq!(q.pop_due(later, 4), vec![0, 1, 2, 3]);
-        assert_eq!(q.pop_due(later, 100), vec![4, 5, 6, 7, 8, 9]);
+        let keys = |due: Vec<(Instant, u64)>| -> Vec<u64> {
+            due.into_iter()
+                .map(|(at, key)| {
+                    assert_eq!(
+                        at,
+                        now + Duration::from_millis(key),
+                        "popped with its instant"
+                    );
+                    key
+                })
+                .collect()
+        };
+        assert_eq!(keys(q.pop_due(later, 4)), vec![0, 1, 2, 3]);
+        assert_eq!(keys(q.pop_due(later, 100)), vec![4, 5, 6, 7, 8, 9]);
         assert!(q.pop_due(later, 100).is_empty(), "99 is not due");
         assert_eq!(q.heap().len(), 1);
     }

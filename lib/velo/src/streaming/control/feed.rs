@@ -419,6 +419,7 @@ mod tests {
             active_pump_token: None,
             attachment: false,
             expires: None,
+            queued: None,
             unattached_timeout: None,
             heartbeat_interval: std::time::Duration::from_secs(5),
             stream_cancel_handle: None,

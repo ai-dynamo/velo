@@ -581,7 +581,7 @@ impl MuxCore {
             }
             let more = due.len() == EXPIRE_BATCH;
             let mut renewed = Vec::new();
-            for (anchor_id, session_id) in due {
+            for (_, (anchor_id, session_id)) in due {
                 if let Some(deadline) = self.ingress.expire_due(anchor_id, session_id, now) {
                     renewed.push((deadline, (anchor_id, session_id)));
                 } else {
