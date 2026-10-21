@@ -426,15 +426,27 @@ async fn a_per_stream_transport_retires_once_its_terminal_is_written() {
 /// the drain does not wait for the pull either. A later fix shows up here as
 /// a change to what this test asserts.
 ///
-/// The consumer never registers the producer, so it cannot pull: the staged
-/// handle is still held when `Sent` resolves, with nothing racing it.
+/// The consumer runs on a runtime of its own, with one worker, and that worker
+/// is held while the item is sent, so the consumer cannot pull it. An earlier
+/// version relied on the consumer not having registered the producer, but the
+/// messenger pulls a staged message from wherever it came from, so the pull
+/// raced this check, and on a loaded runner it won.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn sent_resolves_while_a_staged_item_is_still_held() {
     /// Well over the default eager budget (256 KiB), so the item is staged.
     const STAGED: usize = 1 << 20;
 
+    let consumer_runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .expect("consumer runtime");
+    let consumer_handle = consumer_runtime.handle().clone();
+    let consumer = consumer_handle
+        .spawn(node(window(256)))
+        .await
+        .expect("build the consumer on its own runtime");
     let producer = node(window(256)).await;
-    let consumer = node(window(256)).await;
     producer
         .velo
         .register_peer(consumer.velo.peer_info())
@@ -459,6 +471,19 @@ async fn sent_resolves_while_a_staged_item_is_still_held() {
         .open_anchor_stream::<Vec<u8>>(anchor.handle(), ticket)
         .await
         .expect("open stream");
+
+    // Hold the consumer's only worker: it reads nothing until released.
+    let held = Arc::new(std::sync::Barrier::new(2));
+    let (holding_tx, holding_rx) = tokio::sync::oneshot::channel();
+    consumer_handle.spawn({
+        let held = Arc::clone(&held);
+        async move {
+            let _ = holding_tx.send(());
+            held.wait();
+        }
+    });
+    holding_rx.await.expect("the consumer's worker is held");
+
     sender.send(vec![7u8; STAGED]).await.expect("send");
     let retired = sender.retired();
     sender.finalize().expect("finalize");
@@ -469,16 +494,18 @@ async fn sent_resolves_while_a_staged_item_is_still_held() {
 
     // The first slot the producer staged: the item, still here.
     let handle = velo::DataHandle::pack(producer.velo.instance_id().worker_id(), 1);
-    let staged = producer
-        .velo
-        .metadata(handle)
+    let staged = producer.velo.metadata(handle).await;
+    tokio::task::spawn_blocking(move || held.wait())
         .await
-        .expect("the staged item is still held when Sent resolves");
+        .expect("release the consumer");
+    let staged = staged.expect("the staged item is still held when Sent resolves");
     assert!(
         staged.total_len as usize >= STAGED,
         "the staged slot is the item: {staged:?}"
     );
     drop(anchor);
+    drop(consumer);
+    consumer_runtime.shutdown_background();
 }
 
 /// A node whose streams ride per-stream gRPC.
