@@ -94,9 +94,13 @@ for arm in root base; do
   mkdir -p "$S/bin/$arm"
   cp "$S/target-$arm/release/examples/<harness>" "$S/bin/$arm/"
 done
-# Provenance: each binary names the tree it was built from.
-strings "$S/bin/root/<harness>" | grep -c "$S/root/"   # > 0
-strings "$S/bin/root/<harness>" | grep -c "$S/base/"   # 0
+# Provenance: each binary names the tree it was built from. No pipe and
+# no `grep -c`: under `set -e`, a grep that finds nothing exits 1, which
+# is the expected result for the second check.
+grep -qaF "$S/root/" "$S/bin/root/<harness>"   # must match, or stop here
+if grep -qaF "$S/base/" "$S/bin/root/<harness>"; then
+  echo "head binary was built from the base tree" >&2; exit 1
+fi
 ```
 
 - If a build fails, stop. A seeded target directory still holds an old

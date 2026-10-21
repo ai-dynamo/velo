@@ -38,7 +38,10 @@ References (agents read them; do not paste them into prompts):
 
 Set `HEAD_SHA=$(git rev-parse <head>)`. Set `BASE_SHA` to
 `git merge-base <base> <head>` for a `...` range, or to `<base>` for a
-`..` range.
+`..` range. Then freeze the range: `REVIEW_RANGE=$BASE_SHA..$HEAD_SHA`.
+A symbolic range such as `origin/main...HEAD` moves when someone commits
+or fetches while the review runs; the frozen range gives every later
+`git diff` the same diff.
 
 **Audit mode.** `HEAD_SHA=$(git rev-parse HEAD)`. `AUDIT_PATH` is the
 argument, plus its module root file (`<AUDIT_PATH>.rs`) when there is one.
@@ -290,6 +293,12 @@ confirmed regressions, and tell them what is already found. Opportunities
 do not start a round. A new finding needs a fix of its own; a sub-point of
 an existing finding is not new. Stage 1 is round 1.
 
+Every round spends from one budget of 8 agents (Calibration). When the
+finders and verifiers of a round do not fit in what is left, do that
+round's finder pass yourself and spend what is left on verifiers. When
+nothing is left, stop, and say in the report which families were not
+checked again.
+
 Skip this stage in audit mode. Skip it in inline mode, unless a verifier
 named a missed candidate (then verify that one). Skip it also when the
 only confirmed regression is fixed by reverting the diff. Stop when a
@@ -360,7 +369,8 @@ review.
 - Finders: sonnet. Verifiers and any judgment call: opus. In inline mode
   the finder pass is yours, so it is not independent; the verifiers are.
 - Cost: an inline review is 1 or 2 agents per round. A review with
-  finders, or an audit, is at most 8 agents in all.
+  finders, or an audit, is at most 8 agents in all, across every round
+  (Stage 3).
 - Silence is a valid outcome. Most changes on a hot path add no cost. "0
   confirmed regressions" with the refuted list is a pass.
 - Never call a clone, a `Box` or a `match` expensive without a chain and an
