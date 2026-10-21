@@ -299,6 +299,77 @@ impl<T: SweepTarget> DeadlineSweep<T> {
     }
 }
 
+/// A manager's own handle on the sweep of one of its registries: when the
+/// manager drops, it stops the sweep and expires the entries still in the
+/// registry.
+///
+/// An anchor keeps its registry alive past the manager, and with the sweep
+/// stopped nothing would reap it. After `stop()`, which `Velo` calls, the
+/// registry is already empty. A field that acts on drop does this without a
+/// `Drop` impl on the manager, which would stop callers from moving its
+/// public fields out.
+pub(crate) struct ManagerDeadlines<V: Expiring>
+where
+    DashMap<u64, V>: SweepTarget,
+{
+    sweep: SweepOwner<DashMap<u64, V>>,
+    /// The manager's registry, set when the manager is built.
+    registry: Option<Arc<DashMap<u64, V>>>,
+}
+
+impl<V: Expiring> Default for ManagerDeadlines<V>
+where
+    DashMap<u64, V>: SweepTarget,
+{
+    fn default() -> Self {
+        Self {
+            sweep: SweepOwner::default(),
+            registry: None,
+        }
+    }
+}
+
+impl<V: Expiring> ManagerDeadlines<V>
+where
+    DashMap<u64, V>: SweepTarget,
+{
+    /// Expire the entries of  when this handle drops.
+    pub(crate) fn set_registry(&mut self, registry: Arc<DashMap<u64, V>>) {
+        self.registry = Some(registry);
+    }
+}
+
+impl<V: Expiring> std::ops::Deref for ManagerDeadlines<V>
+where
+    DashMap<u64, V>: SweepTarget,
+{
+    type Target = Arc<DeadlineSweep<DashMap<u64, V>>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sweep
+    }
+}
+
+impl<V: Expiring> Drop for ManagerDeadlines<V>
+where
+    DashMap<u64, V>: SweepTarget,
+{
+    fn drop(&mut self) {
+        self.sweep.stop();
+        let Some(registry) = self.registry.take() else {
+            return;
+        };
+        // Remove entries outside shard guards: an SPSC entry's Drop may close
+        // a mux slot.
+        let ids: Vec<u64> = registry.iter().map(|entry| *entry.key()).collect();
+        for id in ids {
+            if let Some((_, entry)) = registry.remove(&id) {
+                entry.expire();
+            }
+        }
+    }
+}
+
 /// What a sweep does with a due key, decided from the state of its entry.
 pub(crate) enum Due {
     /// Nothing waits on the deadline (a sender is attached, or there is no

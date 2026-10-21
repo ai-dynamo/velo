@@ -17,7 +17,9 @@
 
 mod reservation;
 use crate::streaming::deadline::deadline_after;
-use crate::streaming::sweep::{DeadlineSweep, Due, Expiring, SweepOwner, SweepTarget, expire_due};
+use crate::streaming::sweep::{
+    DeadlineSweep, Due, Expiring, ManagerDeadlines, SweepTarget, expire_due,
+};
 use reservation::DEFAULT_UNATTACHED_TIMEOUT;
 pub use reservation::{AnchorReservation, ReservationConfig};
 
@@ -184,47 +186,6 @@ impl SweepTarget for DashMap<u64, AnchorEntry> {
         renewed: &mut Vec<(tokio::time::Instant, u64)>,
     ) {
         expire_due(self, due, now, renewed);
-    }
-}
-
-/// The manager's own handle on its deadline queue: when the manager drops,
-/// it stops the sweep and cancels the anchors still in the registry.
-///
-/// A field that acts on drop does this without a `Drop` impl on
-/// [`AnchorManager`], which would stop callers from moving its public fields
-/// out.
-#[derive(Default)]
-pub(crate) struct ManagerDeadlines {
-    sweep: SweepOwner<DashMap<u64, AnchorEntry>>,
-    /// The manager's registry, set by [`AnchorManagerBuilder::build`].
-    registry: Option<Arc<DashMap<u64, AnchorEntry>>>,
-}
-
-impl std::ops::Deref for ManagerDeadlines {
-    type Target = Arc<AnchorDeadlineQueue>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.sweep
-    }
-}
-
-impl Drop for ManagerDeadlines {
-    /// A `StreamAnchor` keeps the registry alive past the manager, and with
-    /// the sweep stopped nothing would reap its anchor. So cancel them all,
-    /// as `stop()` does. After `stop()`, which `Velo` calls, the registry is
-    /// already empty.
-    fn drop(&mut self) {
-        self.sweep.stop();
-        let Some(registry) = self.registry.take() else {
-            return;
-        };
-        // Remove entries outside shard guards: their Drop may close a mux slot.
-        let ids: Vec<u64> = registry.iter().map(|entry| *entry.key()).collect();
-        for id in ids {
-            if let Some((_, entry)) = registry.remove(&id) {
-                entry.cancel_token.cancel();
-            }
-        }
     }
 }
 
@@ -1234,7 +1195,7 @@ pub struct AnchorManager {
 
     /// The unattached deadlines of this manager's SPSC anchors.
     #[builder(setter(skip), default)]
-    pub(crate) deadline_queue: ManagerDeadlines,
+    pub(crate) deadline_queue: ManagerDeadlines<AnchorEntry>,
 
     /// The heartbeats of this manager's remote senders.
     #[builder(setter(skip), default)]
@@ -1242,15 +1203,19 @@ pub struct AnchorManager {
 
     /// The unattached deadlines of this manager's MPSC anchors.
     #[builder(setter(skip), default)]
-    pub(crate) mpsc_deadlines:
-        SweepOwner<DashMap<u64, crate::streaming::mpsc::anchor::MpscAnchorEntry>>,
+    pub(crate) mpsc_deadlines: ManagerDeadlines<crate::streaming::mpsc::anchor::MpscAnchorEntry>,
 }
 
 impl AnchorManagerBuilder {
     /// Build the [`AnchorManager`].
     pub fn build(self) -> Result<AnchorManager, AnchorManagerBuilderError> {
         let mut manager = self.build_inner()?;
-        manager.deadline_queue.registry = Some(Arc::clone(&manager.registry));
+        manager
+            .deadline_queue
+            .set_registry(Arc::clone(&manager.registry));
+        manager
+            .mpsc_deadlines
+            .set_registry(Arc::clone(&manager.mpsc_registry));
         if let Some(metrics) = manager.metrics.as_ref() {
             // Weak, so the metrics registry does not keep a dropped manager's
             // anchors alive; a dropped manager counts zero.
@@ -5857,5 +5822,31 @@ mod tests {
             !mgr.mpsc_registry.contains_key(&id),
             "the MPSC anchor must be reaped at its timeout"
         );
+    }
+
+    /// A standalone manager that drops cancels the MPSC anchors still in its
+    /// registry.
+    ///
+    /// The manager's drop stops the MPSC sweep, but an `MpscStreamAnchor`
+    /// keeps the registry alive. So an unattached MPSC anchor of a dropped
+    /// manager stayed in the registry forever, and its stream never ended.
+    /// `Velo` never hit this, because it calls `stop()` first, and that
+    /// empties the registry.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_manager_cancels_its_unattached_mpsc_anchors() {
+        let mgr = queue_manager(DEFAULT_UNATTACHED_TIMEOUT);
+        let registry = Arc::clone(&mgr.mpsc_registry);
+        let mut anchor =
+            mgr.create_mpsc_anchor_with_config::<u32>(mpsc_config(Duration::from_secs(1)));
+        let id = anchor.handle().unpack().1;
+        tokio::task::yield_now().await;
+        drop(mgr);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !registry.contains_key(&id),
+            "the MPSC anchor outlived its dropped manager past its timeout"
+        );
+        let end = tokio::time::timeout(Duration::from_secs(1), anchor.next()).await;
+        assert!(matches!(end, Ok(None)), "the MPSC anchor's stream must end");
     }
 }

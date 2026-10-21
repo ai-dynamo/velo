@@ -161,7 +161,7 @@ Ticket senders support `stop_token()` and `cancellation_token()` through messeng
 
 ## Reservation renewal
 
-`VeloBuilder::reservation_config` sets the default unattached lifetime (120 seconds) and the accept window of the messenger mux (180 seconds). The accept window applies to every mux bind: a prepared slot and an ordinary attach. The per-stream TCP transport keeps its own fixed 60-second accept window. Per-anchor `AnchorConfig::unattached_timeout` overrides the ordinary lifetime. The unattached default applies to SPSC anchors only. An MPSC anchor has an unattached timeout only when `MpscAnchorConfig::unattached_timeout` sets one, and renewal does not extend it. To make anchors wait for a sender with no limit, set `unattached_timeout` to `Duration::MAX`. An `AnchorManager` that drops cancels the SPSC anchors still in its registry, as stopping it does.
+`VeloBuilder::reservation_config` sets the default unattached lifetime (120 seconds) and the accept window of the messenger mux (180 seconds). The accept window applies to every mux bind: a prepared slot and an ordinary attach. The per-stream TCP transport keeps its own fixed 60-second accept window. Per-anchor `AnchorConfig::unattached_timeout` overrides the ordinary lifetime. The unattached default applies to SPSC anchors only. An MPSC anchor has an unattached timeout only when `MpscAnchorConfig::unattached_timeout` sets one, and renewal does not extend it. To make anchors wait for a sender with no limit, set `unattached_timeout` to `Duration::MAX`. An `AnchorManager` that drops cancels the SPSC and MPSC anchors still in its registries, as stopping it does.
 
 `ReservationConfig` is `#[non_exhaustive]`, so start from the default and change its fields:
 
