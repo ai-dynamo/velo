@@ -509,6 +509,7 @@ mod tests {
             registry: Arc::new(dashmap::DashMap::new()),
             mpsc_registry: Arc::new(dashmap::DashMap::new()),
             metrics: None,
+            deadline_queue: None,
         };
         ctx.registry.insert(1, entry());
 

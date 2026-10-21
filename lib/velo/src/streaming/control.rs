@@ -690,7 +690,11 @@ pub(crate) fn anchor_detach_handler(manager: Weak<AnchorManager>) -> crate::mess
                         // its own `tokio::spawn` — the call never runs
                         // synchronously and never touches this registry, so
                         // there is nothing here for it to deadlock against.
-                        entry.restart_unattached_timeout(&manager.registry, local_id);
+                        entry.restart_unattached_timeout(
+                            &manager.registry,
+                            local_id,
+                            manager.deadline_queue(),
+                        );
                         // Take the child token (leaves None) so the next attach creates a fresh one,
                         // cancel it and withdraw the feed here, before the shard lock drops and
                         // before the `released_prebind` below is dropped. Retiring first is
@@ -791,7 +795,11 @@ pub(crate) fn anchor_abort_attach_handler(
                     let feed = entry.feed.current();
                     entry.retire_pump();
                     let prebind = entry.prebind.take();
-                    entry.restart_unattached_timeout(&manager.registry, local_id);
+                    entry.restart_unattached_timeout(
+                        &manager.registry,
+                        local_id,
+                        manager.deadline_queue(),
+                    );
                     (feed, prebind)
                 };
                 // Mux release enters other locks. Release the anchor guard first.

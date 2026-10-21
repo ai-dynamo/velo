@@ -79,6 +79,7 @@ async fn reader_pump_watchdog_firing_increments_counter() {
         registry: base_ctx.registry,
         mpsc_registry: base_ctx.mpsc_registry,
         metrics: Some(metrics.clone()),
+        deadline_queue: None,
     };
 
     // Open transport channel that never delivers a frame: the receiver
@@ -159,6 +160,7 @@ async fn stream_watchdog_unclaimed_bind_reap_increments_counter() {
         registry: base_ctx.registry,
         mpsc_registry: base_ctx.mpsc_registry,
         metrics: Some(metrics.clone()),
+        deadline_queue: None,
     };
 
     let local_id = 999u64;
@@ -254,6 +256,7 @@ async fn reader_pump_watchdog_saturated_channel_drops_sentinel_silently() {
         registry: base_ctx.registry,
         mpsc_registry: base_ctx.mpsc_registry,
         metrics: Some(metrics.clone()),
+        deadline_queue: None,
     };
 
     // Transport channel that never delivers: watchdog will fire after
@@ -834,6 +837,7 @@ fn make_pump_test_infra() -> (
         registry: registry.clone(),
         mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
         metrics: None,
+        deadline_queue: None,
     };
     tokio::spawn(reader_pump(
         transport_rx,
@@ -927,6 +931,7 @@ fn make_watchdog_test_infra(
         registry: registry.clone(),
         mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
         metrics: None,
+        deadline_queue: None,
     };
     tokio::spawn(stream_watchdog(
         Arc::new(super::DirectFeed {
@@ -1163,6 +1168,7 @@ async fn a_thousand_records_arm_the_heartbeat_timer_a_handful_of_times() {
         registry: std::sync::Arc::new(dashmap::DashMap::new()),
         mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
         metrics: None,
+        deadline_queue: None,
     };
 
     tokio::spawn(TIMER_ARMS.scope(
@@ -1266,6 +1272,7 @@ async fn a_stream_under_traffic_never_fires_its_heartbeat_timer() {
         registry: std::sync::Arc::new(dashmap::DashMap::new()),
         mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
         metrics: None,
+        deadline_queue: None,
     };
 
     tokio::spawn(TIMER_FIRES.scope(
@@ -1367,6 +1374,7 @@ async fn a_stream_that_stops_is_caught_a_detection_window_after_its_last_record(
         registry: std::sync::Arc::new(dashmap::DashMap::new()),
         mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
         metrics: None,
+        deadline_queue: None,
     };
 
     let pump = tokio::spawn(TIMER_FIRES.scope(
@@ -1504,6 +1512,7 @@ async fn reader_pump_does_not_count_a_blocked_forward_as_heartbeat_silence() {
         registry: registry.clone(),
         mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
         metrics: None,
+        deadline_queue: None,
     };
     tokio::spawn(reader_pump(
         transport_rx,
@@ -1716,6 +1725,7 @@ async fn test_child_token_reattach_pump_survives() {
         registry: registry.clone(),
         mpsc_registry: mpsc_reg.clone(),
         metrics: None,
+        deadline_queue: None,
     };
     tokio::spawn(reader_pump(
         rx1,
@@ -1760,6 +1770,7 @@ async fn test_child_token_reattach_pump_survives() {
         registry: registry.clone(),
         mpsc_registry: mpsc_reg.clone(),
         metrics: None,
+        deadline_queue: None,
     };
     tokio::spawn(reader_pump(
         rx2,

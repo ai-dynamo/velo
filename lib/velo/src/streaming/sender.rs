@@ -59,6 +59,11 @@ pub(crate) struct StreamSenderCancelInfo {
     /// The largest encoded item the stream's transport carries, when it has
     /// a limit the producer should meet before the frame leaves.
     pub item_limit: Option<usize>,
+    /// The manager's shared deadline queue, when the unattached timeout is
+    /// tracked on it. `detach` pushes a deadline here instead of spawning a
+    /// per-anchor task, which is what lets a detach on a thread with no
+    /// runtime still arm the reaper.
+    pub deadline_queue: Option<Arc<crate::streaming::anchor::AnchorDeadlineQueue>>,
 }
 
 /// Who reports a stream's retirement when its terminal is handed to the
@@ -258,6 +263,10 @@ pub struct StreamSender<T> {
     sent_terminal: bool,
     /// Registry reference for clearing the attachment flag on detach.
     local_registry: Option<Arc<DashMap<u64, AnchorEntry>>>,
+    /// The manager's shared deadline queue, when the unattached timeout is
+    /// tracked on it. Paired with `local_registry` on the same-worker detach
+    /// path; `None` for a per-anchor-task manager.
+    deadline_queue: Option<Arc<crate::streaming::anchor::AnchorDeadlineQueue>>,
     /// User-facing cancellation signal: fires when _stream_cancel is received.
     cancel_token: CancellationToken,
     /// Checked per record instead of the token, which takes a lock.
@@ -327,6 +336,7 @@ impl<T: Serialize> StreamSender<T> {
             closed,
             retires_on,
             item_limit,
+            deadline_queue,
         } = cancel;
         let stop_token = sender_registry
             .senders
@@ -370,6 +380,7 @@ impl<T: Serialize> StreamSender<T> {
             stop_token,
             sent_terminal: false,
             local_registry: negotiated_transport.is_none().then_some(registry),
+            deadline_queue,
             cancel_token,
             closed,
             retires_on,
@@ -532,6 +543,7 @@ impl<T: Serialize> StreamSender<T> {
         let bytes = cached_detached().clone();
         self.sent_terminal = true;
         let registry = self.local_registry.clone();
+        let deadline_queue = self.deadline_queue.clone();
         let (worker_id, local_id) = self.handle.unpack();
         let sender_stream_id = self.sender_stream_id;
         let runtime = self.runtime.clone();
@@ -547,7 +559,7 @@ impl<T: Serialize> StreamSender<T> {
                     .is_some_and(|handle| handle.unpack() == (worker_id, sender_stream_id))
             {
                 entry.attachment = false;
-                entry.restart_unattached_timeout(&registry, local_id);
+                entry.restart_unattached_timeout(&registry, local_id, deadline_queue.as_deref());
             }
         })?;
         // Clean up sender registry entry
@@ -862,6 +874,7 @@ mod tests {
                 closed: Default::default(),
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
+                deadline_queue: None,
             },
             Duration::from_secs(5),
             None,
@@ -903,6 +916,7 @@ mod tests {
                 closed,
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
+                deadline_queue: None,
             },
             Duration::from_secs(5),
             None,
@@ -1154,6 +1168,7 @@ mod tests {
                 closed: Default::default(),
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
+                deadline_queue: None,
             },
             Duration::from_secs(5),
             None,
@@ -1199,6 +1214,7 @@ mod tests {
                 closed: Default::default(),
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
+                deadline_queue: None,
             },
             Duration::from_secs(5),
             None,

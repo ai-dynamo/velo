@@ -109,6 +109,9 @@ impl<T: Serialize> MpscStreamSender<T> {
             // nobody polls.
             retires_on: _,
             item_limit,
+            // MPSC anchors keep their own per-anchor timeout task; the SPSC
+            // shared deadline queue does not track them.
+            deadline_queue: _,
         } = cancel;
         let heartbeat_cancel = cancel_token.child_token();
 
@@ -447,6 +450,7 @@ mod tests {
                 closed: Default::default(),
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
+                deadline_queue: None,
             },
             heartbeat,
             None,
