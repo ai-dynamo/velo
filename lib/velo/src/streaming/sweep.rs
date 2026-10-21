@@ -51,11 +51,17 @@ pub(crate) trait SweepTarget: Send + Sync + 'static {
 
 /// A sharded deadline queue and the one task that sweeps it.
 ///
-/// The sweep starts on the first push that finds none running, on the
-/// runtime of that push. So the queue outlives the runtime that first swept
-/// it: when that runtime drops the sweep, the next push from a live runtime
-/// starts a new one, and the entries are still queued. A push from a thread
-/// with no runtime still queues its entry for the next sweep.
+/// The sweep starts on the first push that finds none running. It runs on
+/// the runtime given to [`pin_runtime`](Self::pin_runtime), or else on the
+/// runtime of that push. The entries live in the queue, not in the task:
+/// when a runtime drops the sweep, the next push starts a new one, and
+/// nothing queued is lost. A push from a thread with no runtime still queues
+/// its entry for the next sweep.
+///
+/// Without a pinned runtime, entries that are already queued wait for the
+/// next push after their sweep's runtime is gone. Pin the runtime that the
+/// owner's work runs on, when there is one, so the sweep lives as long as
+/// that work.
 pub(crate) struct DeadlineSweep<T> {
     shards: [DeadlineQueue<u64>; SHARDS],
     /// Signalled by `push` when the new entry is the earliest of its shard,
@@ -67,6 +73,8 @@ pub(crate) struct DeadlineSweep<T> {
     /// Whether a sweep task exists. Cleared by [`Alive`] when that task ends
     /// or is dropped.
     alive: AtomicBool,
+    /// The runtime to sweep on, once the owner knows one.
+    runtime: std::sync::OnceLock<tokio::runtime::Handle>,
     target: PhantomData<fn(&T)>,
 }
 
@@ -120,6 +128,7 @@ impl<T: SweepTarget> DeadlineSweep<T> {
             earlier: tokio::sync::Notify::new(),
             stopped: CancellationToken::new(),
             alive: AtomicBool::new(false),
+            runtime: std::sync::OnceLock::new(),
             target: PhantomData,
         })
     }
@@ -150,6 +159,11 @@ impl<T: SweepTarget> DeadlineSweep<T> {
         self.stopped.cancel();
     }
 
+    /// Start every later sweep on `runtime`. The first call wins.
+    pub(crate) fn pin_runtime(&self, runtime: tokio::runtime::Handle) {
+        let _ = self.runtime.set(runtime);
+    }
+
     /// Queue a look at `key` by `deadline`, and start a sweep if none runs.
     ///
     /// Callers can hold a lock of the target: this takes only a queue shard
@@ -173,9 +187,14 @@ impl<T: SweepTarget> DeadlineSweep<T> {
         if self.stopped.is_cancelled() {
             return;
         }
-        // The caller may run on an executor that is not tokio. The entry
-        // stays queued for the next push that has a runtime.
-        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+        // The caller may run on an executor that is not tokio. With no pinned
+        // runtime, the entry stays queued for the next push that has one.
+        let Some(rt) = self
+            .runtime
+            .get()
+            .cloned()
+            .or_else(|| tokio::runtime::Handle::try_current().ok())
+        else {
             return;
         };
         if self

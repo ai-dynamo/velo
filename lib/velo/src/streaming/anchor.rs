@@ -2260,6 +2260,13 @@ impl AnchorManager {
             crate::streaming::mpsc::control::mpsc_anchor_cancel_handler(manager),
         )?;
 
+        // The sweeps run on the messenger's runtime from here on. Remote
+        // streams need that runtime anyway, and a sweep on it does not die
+        // with a shorter-lived runtime that happened to push first.
+        let runtime = messenger.runtime().clone();
+        self.deadline_queue.pin_runtime(runtime.clone());
+        self.heartbeats.pin_runtime(runtime);
+
         self.messenger_lock
             .set(messenger)
             .map_err(|_| anyhow::anyhow!("register_handlers called twice"))?;

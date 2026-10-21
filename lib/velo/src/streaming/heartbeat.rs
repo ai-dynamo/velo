@@ -149,6 +149,11 @@ impl ManagerHeartbeats {
     pub(crate) fn stop(&self) {
         self.sweep.stop();
     }
+
+    /// Sweep on `runtime`: the messenger's, which carries the beats.
+    pub(crate) fn pin_runtime(&self, runtime: tokio::runtime::Handle) {
+        self.sweep.pin_runtime(runtime);
+    }
 }
 
 #[cfg(test)]
@@ -270,6 +275,42 @@ mod tests {
                 "and the sender of the dropped runtime"
             );
         });
+    }
+
+    /// A pinned sweep keeps beating every sender when a runtime that
+    /// registered one is gone, with no later registration.
+    ///
+    /// Unpinned, the sweep ran on the runtime of the first registration. A
+    /// sender registered from another runtime while that sweep ran did not
+    /// start one of its own. When the first runtime dropped the sweep,
+    /// nothing beat that sender until some later registration, and its
+    /// remote stream was reaped. A task per sender ran on its own runtime
+    /// and kept beating.
+    #[test]
+    fn a_pinned_sweep_outlives_the_runtime_that_started_it() {
+        let main = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let heartbeats = ManagerHeartbeats::default();
+        heartbeats.pin_runtime(main.handle().clone());
+        let handle = heartbeats.handle();
+        let interval = Duration::from_millis(20);
+        let first = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let (early_tx, early_rx) = flume::bounded::<Vec<u8>>(64);
+        let _early =
+            first.block_on(async { handle.register(early_tx, interval, SenderClosed::default()) });
+        let (late_tx, late_rx) = flume::bounded::<Vec<u8>>(64);
+        let _late =
+            main.block_on(async { handle.register(late_tx, interval, SenderClosed::default()) });
+        drop(first);
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(beats_in(&early_rx) >= 1, "the early sender still beats");
+        assert!(beats_in(&late_rx) >= 1, "the late sender still beats");
     }
 
     /// The entries of senders that finished leave the queue within the first
