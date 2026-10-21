@@ -85,7 +85,7 @@ If you want batching with a time limit, use `FlushPolicy::Auto(AutoFlush { on_ad
 
 ## Settings reference
 
-All settings are fields of `MuxConfig`. Always build it with `..Default::default()` so that a new field does not break your code.
+The settings below are fields of `MuxConfig`. Always build it with `..Default::default()` so that a new field does not break your code. The accept window of each bind is not a `MuxConfig` field: `ReservationConfig::prebind_timeout` sets it (180 seconds by default).
 
 | Field | Default | What it controls |
 |---|---|---|
@@ -94,7 +94,7 @@ All settings are fields of `MuxConfig`. Always build it with `..Default::default
 | `initial_credit` | 32 | Data credit C per slot. Each slot buffer holds C+1 records. Zero is refused at build time. |
 | `slot_byte_budget` | 1 MiB | Bytes one slot can hold in flight, and the cap on its withheld queue. Zero means the default. |
 | `peer_byte_budget` | 8 MiB | Bytes all slots of one peer, on all its lanes, can hold in flight on the receive side. |
-| `credit_sweep_interval` | 200 ms | Period of the whole-table credit walk, the batcher eviction check, and the check that closes expired accept windows. An unclaimed bind is reclaimed up to one interval after its 60 s window. Zero is refused at build time. |
+| `credit_sweep_interval` | 200 ms | Period of the whole-table credit walk, the batcher eviction check, and the check that closes expired accept windows. An unclaimed bind is reclaimed up to one interval after its accept window closes. Zero is refused at build time. |
 | `drain_visit_floor` | 2 ms | Shortest gap between two doorbell visits to the same (peer, lane). Zero turns the floor off. Values above 1 hour are clamped. |
 | `batcher_idle_ttl` | 60 s | How long a batcher with no slots stays alive before eviction. |
 | `flush_policy` | `Auto` with `on_admission: true` | When a batcher writes. See [Select a flush policy](#select-a-flush-policy). |

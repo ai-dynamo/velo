@@ -1092,8 +1092,9 @@ async fn test_watchdog_reaps_an_ordinary_attach_with_unclaimed_mux_drain_after_m
 /// attach whose peer died before its first `OpenSlot`) relying solely on the
 /// heartbeat watchdog to reap it. That race is not always won: the watchdog
 /// restarts counting from whenever this arm's caller stopped exempting it,
-/// while the accept window is a fixed 60 s from bind creation, so at
-/// `heartbeat_interval >= 20 s` the window always closes first -- and, before
+/// while the accept window is a fixed span from bind creation, so when
+/// `DETECTION_MULTIPLIER * heartbeat_interval` is longer than that span (a
+/// 60 s interval against the 180 s default) the window always closes first -- and, before
 /// this fix, closing first left the registry entry behind forever, with the
 /// consumer's `StreamAnchor` wedged on `Poll::Pending`.
 #[tokio::test]

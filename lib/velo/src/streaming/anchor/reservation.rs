@@ -1,22 +1,35 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Reservation lifetimes before a producer opens its stream.
 
 use super::*;
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
+
+pub(crate) const DEFAULT_UNATTACHED_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const DEFAULT_PREBIND_TIMEOUT: Duration = Duration::from_secs(180);
+/// Most reservations in one `_anchor_renew` message. A wire limit: the handler
+/// refuses a larger batch, so a sender and its peer must agree on it.
+const RENEW_BATCH: usize = 256;
 
 /// Receiver lifetimes before a producer attaches.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ReservationConfig {
-    /// Ordinary anchors wait this long for attachment. Defaults to 120 seconds.
+    /// SPSC anchors wait this long for attachment. Defaults to 120 seconds.
+    /// `Duration::MAX` means they never time out.
     pub unattached_timeout: Duration,
-    /// Prepared slots wait this long for opening or renewal. Defaults to 180 seconds.
+    /// The accept window of every messenger-mux bind: a prepared slot waits
+    /// this long for its `OpenSlot` or its next renewal, and an ordinary attach
+    /// waits this long for its first batch. Defaults to 180 seconds.
     pub prebind_timeout: Duration,
 }
 impl Default for ReservationConfig {
     fn default() -> Self {
         Self {
-            unattached_timeout: Duration::from_secs(120),
-            prebind_timeout: Duration::from_secs(180),
+            unattached_timeout: DEFAULT_UNATTACHED_TIMEOUT,
+            prebind_timeout: DEFAULT_PREBIND_TIMEOUT,
         }
     }
 }
@@ -27,8 +40,8 @@ impl ReservationConfig {
             "unattached timeout must be positive"
         );
         anyhow::ensure!(
-            self.prebind_timeout.as_millis() > 0,
-            "reservation timeout must be at least one millisecond"
+            !self.prebind_timeout.is_zero(),
+            "prebind timeout must be positive"
         );
         Ok(())
     }
@@ -56,6 +69,8 @@ impl AnchorReservation {
 impl AnchorManager {
     /// Renew held reservations, grouped by owner in batches of at most 256.
     /// Attached, cancelled, expired, or replaced reservations are no-ops.
+    /// A ticket reservation whose pre-bind was released renews the anchor's
+    /// unattached timer.
     /// The caller schedules renewal and bounds the call with its own deadline.
     /// Only transport failures return an error; successful delivery does not
     /// prove that a reservation still exists.
@@ -72,7 +87,8 @@ impl AnchorManager {
                 peers.entry(worker).or_default().push(*reservation);
             }
         }
-        let Some(messenger) = self.messenger.as_ref() else {
+        // The messenger `register_handlers` installed, as the attach paths use.
+        let Some(messenger) = self.messenger_lock.get().or(self.messenger.as_ref()) else {
             anyhow::ensure!(peers.is_empty(), "remote renewal requires a messenger");
             return Ok(());
         };
@@ -80,13 +96,14 @@ impl AnchorManager {
         for (worker, reservations) in peers {
             let messenger = Arc::clone(messenger);
             calls.push(async move {
-                for batch in reservations.chunks(256) {
+                for batch in reservations.chunks(RENEW_BATCH) {
                     messenger
                         .typed_unary_streaming::<()>("_anchor_renew")
                         .payload(batch)?
                         .worker(worker)
                         .send()
-                        .await?;
+                        .await
+                        .with_context(|| format!("renew reservations on {worker}"))?;
                 }
                 Ok::<_, anyhow::Error>(())
             });
@@ -119,13 +136,15 @@ impl AnchorManager {
                         mux.renew_reservation(bind.anchor_id, session);
                     }
                 }
-                (None, None) => {
-                    let now = tokio::time::Instant::now();
-                    if let (Some(expires), Some(timeout)) =
-                        (entry.expires, entry.unattached_timeout)
-                        && expires > now
+                // No pre-bind: the anchor waits on its unattached timer. A
+                // ticket whose pre-bind a refusal or a detach released still
+                // stands for the holder's open request, so it renews the
+                // timer too.
+                (_, None) => {
+                    if let Some(timeout) = entry.unattached_timeout
+                        && let Some(expires) = entry.expires.as_mut()
                     {
-                        entry.expires = Some(now + timeout);
+                        crate::streaming::deadline::renew_if_live(expires, timeout);
                     }
                 }
                 _ => {}
@@ -143,8 +162,8 @@ pub(crate) fn renewal_handler(
             let manager = manager.clone();
             async move {
                 anyhow::ensure!(
-                    cx.input.len() <= 256,
-                    "reservation renewal batch exceeds 256 entries"
+                    cx.input.len() <= RENEW_BATCH,
+                    "reservation renewal batch exceeds {RENEW_BATCH} entries"
                 );
                 if let Some(manager) = manager.upgrade() {
                     manager.renew_reservations_local(&cx.input);
@@ -171,7 +190,7 @@ mod tests {
         config.unattached_timeout = Duration::from_millis(1);
         config.prebind_timeout = Duration::ZERO;
         assert!(config.validate().is_err());
-        config.prebind_timeout = Duration::from_millis(1);
+        config.prebind_timeout = Duration::from_micros(500);
         assert!(config.validate().is_ok());
     }
 }

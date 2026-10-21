@@ -168,6 +168,7 @@ fn register_on(
         tx,
         Arc::clone(&drain),
         LaneReservation::uncounted(lane),
+        tokio::time::Instant::now(),
     );
     Consumer { rx, drain }
 }
@@ -337,6 +338,7 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
         incumbent_tx,
         test_drain(),
         LaneReservation::uncounted(LaneIndex::ZERO),
+        tokio::time::Instant::now(),
     );
     // A second bind, for the collider to try to claim.
     let (rival_tx, rival_rx) = flume::bounded(depth);
@@ -346,6 +348,7 @@ fn a_colliding_open_slot_is_rejected_and_the_incumbent_survives() {
         rival_tx,
         test_drain(),
         LaneReservation::uncounted(LaneIndex::ZERO),
+        tokio::time::Instant::now(),
     );
 
     let incumbent = slot(0, 0);
@@ -442,6 +445,7 @@ fn a_duplicate_open_retires_the_incumbent_through_the_ordinary_close() {
         first_tx,
         test_drain(),
         LaneReservation::uncounted(LaneIndex::ZERO),
+        tokio::time::Instant::now(),
     );
     registry.register_bind(
         ANCHOR,
@@ -449,6 +453,7 @@ fn a_duplicate_open_retires_the_incumbent_through_the_ordinary_close() {
         second_tx,
         test_drain(),
         LaneReservation::uncounted(LaneIndex::ZERO),
+        tokio::time::Instant::now(),
     );
 
     let id = slot(0, 0);
@@ -703,6 +708,7 @@ fn hold_overflow_closes_that_slot_and_leaves_the_others_alone() {
         tx_a,
         test_drain(),
         LaneReservation::uncounted(LaneIndex::ZERO),
+        tokio::time::Instant::now(),
     );
     registry.register_bind(
         ANCHOR,
@@ -710,6 +716,7 @@ fn hold_overflow_closes_that_slot_and_leaves_the_others_alone() {
         tx_b,
         test_drain(),
         LaneReservation::uncounted(LaneIndex::ZERO),
+        tokio::time::Instant::now(),
     );
 
     let a = slot(0, 0);
@@ -1288,6 +1295,7 @@ fn the_grant_is_what_the_pump_counted_not_what_the_channel_holds() {
         tx.clone(),
         Arc::clone(&drain),
         LaneReservation::uncounted(LaneIndex::ZERO),
+        tokio::time::Instant::now(),
     );
     let consumer = Consumer { rx, drain };
     let id = slot(0, 0);
@@ -1774,6 +1782,7 @@ fn a_claim_and_its_wake_name_the_arrival_lane() {
         tx,
         Arc::clone(&drain),
         LaneReservation::uncounted(LaneIndex::ZERO),
+        tokio::time::Instant::now(),
     );
     let consumer = Consumer { rx, drain };
     let one = PeerLane::new(peer().peer, LaneIndex::new(1));

@@ -115,7 +115,7 @@ mod test_support;
 mod tests;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -146,9 +146,6 @@ pub(crate) use self::lane_choice::LaneReservation;
 /// is compared against — a caller that had to spell the string itself would be
 /// re-deriving the one value negotiation is keyed on.
 pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
-
-/// Default wait for a producer to claim a reserved mux slot.
-const ACCEPT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// Attempts `connect` makes before giving up on a batcher that keeps retiring
 /// underneath it. Two is already generous — losing the race twice requires two
@@ -183,9 +180,9 @@ pub(crate) struct MessengerMuxTransport {
     key: TransportKey,
 }
 
-/// State shared between the transport, its batchers and the ingress handler.
 type BindDeadline = std::cmp::Reverse<(tokio::time::Instant, (u64, u64))>;
 
+/// State shared between the transport, its batchers and the ingress handler.
 struct MuxCore {
     messenger: Arc<Messenger>,
     config: MuxConfig,
@@ -220,11 +217,15 @@ struct MuxCore {
     /// `bind` returns. Take-once: whoever collects it owns it, and the bind
     /// expiry that already exists drops any that was never collected.
     drains: DashMap<(u64, u64), Arc<ingress::DrainSignal>>,
-    /// One expiry entry per bind. Renewal changes the bind's deadline in its
-    /// shard; the sweep requeues that entry when its earlier deadline arrives.
-    /// A heap permits different configured lifetimes without scanning all binds.
+    /// One expiry entry per bind, earliest first. Renewal moves the deadline
+    /// stored with the bind, not this entry; when the entry comes due, the
+    /// sweep reads the stored deadline and queues the entry again if it moved.
+    /// A requeued entry lands behind newer binds, so this is a heap and not a
+    /// FIFO queue.
     bind_deadlines: std::sync::Mutex<std::collections::BinaryHeap<BindDeadline>>,
-    reservation_timeout_ms: AtomicU64,
+    /// The accept window of every bind, attach or pre-bind
+    /// (`ReservationConfig::prebind_timeout`).
+    accept_window: Duration,
     /// A barrier handed to every batcher this core spawns, installed by the
     /// tests that need one held mid-wake. See [`peer_batcher::test_hooks`].
     #[cfg(test)]
@@ -240,19 +241,15 @@ struct MuxCore {
 }
 
 impl MessengerMuxTransport {
-    pub(crate) fn set_reservation_timeout(&self, timeout: Duration) {
-        self.core.reservation_timeout_ms.store(
-            timeout.as_millis().min(u64::MAX as u128) as u64,
-            Ordering::Relaxed,
-        );
-    }
-
+    /// Extend an unclaimed bind's accept window, if it has not closed.
+    ///
+    /// Called with an anchor registry entry held, like
+    /// [`release_bind`](Self::release_bind): it touches only the mux's own
+    /// maps and must never reach back into the anchor registry.
     pub(crate) fn renew_reservation(&self, anchor: u64, session: u64) {
-        self.core.ingress.renew_bind(
-            anchor,
-            session,
-            Duration::from_millis(self.core.reservation_timeout_ms.load(Ordering::Relaxed)),
-        );
+        self.core
+            .ingress
+            .renew_bind(anchor, session, self.core.accept_window);
     }
 
     /// Ask the sender of a claimed slot to stop, through the batcher of the
@@ -313,6 +310,7 @@ impl MessengerMuxTransport {
         messenger: Arc<Messenger>,
         config: MuxConfig,
         metrics: Option<Arc<VeloMetrics>>,
+        accept_window: Duration,
     ) -> Result<Arc<Self>> {
         let limits = NegotiatedLimits::from_wire(config.initial_credit, config.slot_byte_budget)
             .map_err(|error| anyhow!("messenger mux: {error}"))?;
@@ -344,7 +342,7 @@ impl MessengerMuxTransport {
             drain_rx,
             drains: DashMap::new(),
             bind_deadlines: std::sync::Mutex::default(),
-            reservation_timeout_ms: AtomicU64::new(180_000),
+            accept_window,
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -579,15 +577,20 @@ impl MuxCore {
             }
             due
         };
+        let mut renewed = Vec::new();
         for (anchor_id, session_id) in due {
             if let Some(deadline) = self.ingress.expire_due(anchor_id, session_id, now) {
-                self.bind_deadlines
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(std::cmp::Reverse((deadline, (anchor_id, session_id))));
+                renewed.push(std::cmp::Reverse((deadline, (anchor_id, session_id))));
             } else {
                 self.drains.remove(&(anchor_id, session_id));
             }
+        }
+        // One lock for every requeue: binds take this lock too.
+        if !renewed.is_empty() {
+            self.bind_deadlines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(renewed);
         }
     }
 
@@ -645,8 +648,11 @@ fn open_bind(
     let drain = Arc::new(ingress::DrainSignal::new(core.drain_tx.clone()));
     core.drains
         .insert((anchor_id, session_id), Arc::clone(&drain));
+    // One deadline, stored with the bind and queued below. Renewal moves the
+    // stored one; the queued one only says when to look again.
+    let expires = crate::streaming::deadline::deadline_after(core.accept_window);
     core.ingress
-        .register_bind(anchor_id, session_id, frame_tx, drain, lane);
+        .register_bind(anchor_id, session_id, frame_tx, drain, lane, expires);
 
     // Close the race with shutdown between the initial check and registration.
     if core.tasks.is_stopped() {
@@ -658,18 +664,10 @@ fn open_bind(
     // A deadline, not a task: the sweep expires it (`MuxCore::expire_binds`).
     // Nothing here may pin the core either, which a task holding a strong
     // handle would, for the full window after the last owner dropped it.
-    // The clock is read under the lock, so pushes land in deadline order.
-    let mut deadlines = core
-        .bind_deadlines
+    core.bind_deadlines
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let timeout = Duration::from_millis(core.reservation_timeout_ms.load(Ordering::Relaxed));
-    core.ingress.renew_bind(anchor_id, session_id, timeout);
-    deadlines.push(std::cmp::Reverse((
-        tokio::time::Instant::now() + timeout,
-        (anchor_id, session_id),
-    )));
-    drop(deadlines);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(std::cmp::Reverse((expires, (anchor_id, session_id))));
 
     Ok(frame_rx)
 }
@@ -736,8 +734,8 @@ impl MessengerMuxTransport {
     /// to ask.
     ///
     /// Nothing about the resulting bind is special. A peer's `OpenSlot` claims
-    /// it by the same `(anchor_id, session_id)` lookup, the accept window runs
-    /// the same 60 s, and [`release_bind`](Self::release_bind) is what an owner
+    /// it by the same `(anchor_id, session_id)` lookup, the accept window is
+    /// the same configured lifetime, and [`release_bind`](Self::release_bind) is what an owner
     /// that gives up before then calls.
     pub(crate) fn bind_on_lane(
         &self,
@@ -758,9 +756,9 @@ impl MessengerMuxTransport {
     ///
     /// The accept window does the same thing when it expires, and stays as the
     /// backstop. This is for the owner that already knows: a pre-bound anchor
-    /// whose request died before its first token knows a minute earlier than
-    /// the timer does, and at the rate a frontend registers requests that
-    /// minute is thousands of leaked binds.
+    /// whose request died before its first token knows up to a whole window
+    /// earlier than the timer does, and at the rate a frontend registers
+    /// requests that window is thousands of leaked binds.
     ///
     /// Idempotent: a bind already claimed or already released is not there to
     /// remove, and removing nothing is the right answer for both.

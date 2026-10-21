@@ -75,6 +75,9 @@ pub(crate) const MAX_INGRESS_SLOTS_PER_PEER: usize = 1 << 16;
 
 /// A `bind()` waiting for the `OpenSlot` that will claim it.
 struct BindEntry {
+    /// When the accept window closes. This is the deadline that counts:
+    /// renewal moves it, and the entry in `MuxCore::bind_deadlines` only says
+    /// when the sweep reads it again.
     expires: tokio::time::Instant,
     /// The mux-owned `C + 1` buffer whose receiver went to the anchor.
     frame_tx: flume::Sender<Vec<u8>>,
@@ -350,11 +353,12 @@ impl IngressRegistry {
         frame_tx: flume::Sender<Vec<u8>>,
         drain: Arc<DrainSignal>,
         lane: LaneReservation,
+        expires: tokio::time::Instant,
     ) {
         self.binds.insert(
             (anchor_id, session_id),
             BindEntry {
-                expires: tokio::time::Instant::now() + super::ACCEPT_TIMEOUT,
+                expires,
                 frame_tx,
                 drain,
                 lane,
@@ -364,10 +368,7 @@ impl IngressRegistry {
 
     pub(crate) fn renew_bind(&self, anchor: u64, session: u64, timeout: std::time::Duration) {
         if let Some(mut bind) = self.binds.get_mut(&(anchor, session)) {
-            let now = tokio::time::Instant::now();
-            if bind.expires > now {
-                bind.expires = now + timeout;
-            }
+            crate::streaming::deadline::renew_if_live(&mut bind.expires, timeout);
         }
     }
 
