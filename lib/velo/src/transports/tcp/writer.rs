@@ -12,6 +12,7 @@
 //! it is queued for one.
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::Instant;
 
 use tracing::error;
@@ -19,6 +20,7 @@ use tracing::error;
 use velo_ext::MessageType;
 
 use crate::transports::coalesce::{Coalescable, EgressMetrics, WriterFailure, WriterObserver};
+use crate::transports::teardown_grace::TeardownStop;
 
 use super::transport::SendTask;
 
@@ -72,9 +74,16 @@ pub(super) struct TcpWriterObserver {
     pub(super) lane: u16,
     pub(super) addr: SocketAddr,
     pub(super) egress: Option<EgressMetrics>,
+    /// Whether a stop is teardown, which keeps what is queued until its
+    /// deadline; otherwise only this connection closes.
+    pub(super) teardown: Arc<TeardownStop>,
 }
 
 impl WriterObserver for TcpWriterObserver {
+    fn keep_queued_on_stop(&self) -> Option<tokio::time::Instant> {
+        self.teardown.deadline()
+    }
+
     fn on_failure(&self, kind: WriterFailure, err: &std::io::Error, frames: usize) {
         match kind {
             WriterFailure::Write => error!(

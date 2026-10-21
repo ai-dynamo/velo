@@ -218,6 +218,11 @@ name = "streaming_mpsc_remote_integration"
 path = "tests/streaming/mpsc_remote_integration.rs"
 
 [[test]]
+name = "streaming_retired"
+path = "tests/streaming/retired.rs"
+required-features = ["test-helpers"]
+
+[[test]]
 name = "streaming_tcp_batching"
 path = "tests/streaming/tcp_batching.rs"
 required-features = ["test-helpers"]

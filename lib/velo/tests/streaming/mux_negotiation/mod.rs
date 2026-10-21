@@ -25,7 +25,9 @@ use velo::observability::VeloMetrics;
 use velo::observability::test_helpers::MetricSnapshot;
 use velo::streaming::control::{AnchorAttachResponse, StreamCancelHandle};
 use velo::streaming::mpsc::{MpscAnchorAttachRequest, MpscAnchorAttachResponse};
-use velo::streaming::{FrameTransport, MpscFrame, MuxConfig, StreamAnchorHandle, StreamFrame};
+use velo::streaming::{
+    FrameTransport, MpscFrame, MuxConfig, ReservationConfig, StreamAnchorHandle, StreamFrame,
+};
 use velo::transports::tcp::TcpTransportBuilder;
 use velo::{Velo, VeloBuilder};
 use velo_ext::WorkerId;
@@ -162,12 +164,17 @@ impl Node {
 }
 
 async fn node(mux: Option<MuxConfig>) -> Node {
+    node_with_reservations(mux, ReservationConfig::default()).await
+}
+
+async fn node_with_reservations(mux: Option<MuxConfig>, reservations: ReservationConfig) -> Node {
     let registry = Registry::new();
     let metrics = Arc::new(VeloMetrics::register(&registry).expect("register metrics"));
     let mut builder: VeloBuilder = Velo::builder()
         .add_transport(tcp_transport())
         .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
-        .metrics(metrics);
+        .metrics(metrics)
+        .reservation_config(reservations);
     // `None` is a node without the mux. The builder installs one by default,
     // so a node without it has to say so.
     let config = mux.unwrap_or(MuxConfig {
@@ -181,7 +188,16 @@ async fn node(mux: Option<MuxConfig>) -> Node {
 
 /// Two cross-registered nodes: `consumer` owns the anchors, `producer` attaches.
 async fn pair(consumer: Option<MuxConfig>, producer: Option<MuxConfig>) -> (Node, Node) {
-    let consumer = node(consumer).await;
+    pair_with_reservations(consumer, producer, ReservationConfig::default()).await
+}
+
+/// [`pair`], with the consumer's reservation lifetimes set.
+async fn pair_with_reservations(
+    consumer: Option<MuxConfig>,
+    producer: Option<MuxConfig>,
+    reservations: ReservationConfig,
+) -> (Node, Node) {
+    let consumer = node_with_reservations(consumer, reservations).await;
     let producer = node(producer).await;
     consumer
         .velo

@@ -27,10 +27,10 @@ use velo_ext::{MessageType, PeerInfo, Transport, TransportAdapter, TransportKey,
 use crate::transports::tcp::framing::DEFAULT_MAX_FRAME_SIZE;
 
 use super::listener::{UdsListener, default_shrink_threshold};
-use crate::transports::coalesce::{
-    Coalescable, EgressMetrics, WriterFailure, WriterObserver, run_coalescing_writer,
-};
+use super::writer::UdsWriterObserver;
+use crate::transports::coalesce::{EgressMetrics, run_coalescing_writer};
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
+use crate::transports::teardown_grace::{TEARDOWN_FLUSH_GRACE, TeardownStop};
 
 /// How long `closed()` waits for the accept loop to drop its socket. The loop
 /// exits on its next poll after teardown, so this bound only matters when the
@@ -65,6 +65,9 @@ pub struct UdsTransport {
 
     // The accept loop, so `closed()` can wait until its socket is gone.
     listener_tasks: tokio_util::task::TaskTracker,
+    // Whether a stop is teardown, the one deadline for what the writers still
+    // hold then, and the writers themselves, so `closed()` can wait for them.
+    teardown: Arc<TeardownStop>,
 
     // Listener read-buffer shrink threshold (bytes). Plumbed into UdsListener
     // at start() time. Resolved from env or default in new().
@@ -107,11 +110,11 @@ impl ConnectionHandle {
 }
 
 /// Task sent to writer task containing pre-encoded frame
-struct SendTask {
-    msg_type: MessageType,
-    header: Bytes,
-    payload: Bytes,
-    on_error: Arc<dyn TransportErrorHandler>,
+pub(super) struct SendTask {
+    pub(super) msg_type: MessageType,
+    pub(super) header: Bytes,
+    pub(super) payload: Bytes,
+    pub(super) on_error: Arc<dyn TransportErrorHandler>,
     /// When the transport accepted this frame, or `None` when nothing is
     /// watching.
     ///
@@ -121,11 +124,11 @@ struct SendTask {
     /// gate is where the frames actually are. The clock read is skipped
     /// entirely when the transport has no observability handle, because the
     /// writer would have nowhere to report it.
-    queued_at: Option<Instant>,
+    pub(super) queued_at: Option<Instant>,
 }
 
 impl SendTask {
-    fn on_error(self, error: impl Into<String>) {
+    pub(super) fn on_error(self, error: impl Into<String>) {
         self.on_error
             .on_error(self.header, self.payload, error.into());
     }
@@ -140,6 +143,7 @@ impl UdsTransport {
         channel_capacity: usize,
         connect_timeout: Duration,
     ) -> Self {
+        let cancel_token = CancellationToken::new();
         Self {
             key,
             socket_path,
@@ -147,12 +151,13 @@ impl UdsTransport {
             peers: Arc::new(DashMap::new()),
             connections: Arc::new(DashMap::new()),
             runtime: OnceLock::new(),
-            cancel_token: CancellationToken::new(),
+            cancel_token: cancel_token.clone(),
             shutdown_state: OnceLock::new(),
             channel_capacity,
             connect_timeout,
             metrics: OnceLock::new(),
             listener_tasks: tokio_util::task::TaskTracker::new(),
+            teardown: Arc::new(TeardownStop::new(cancel_token, TEARDOWN_FLUSH_GRACE)),
             shrink_threshold: default_shrink_threshold(),
             dialed_ctx: OnceLock::new(),
         }
@@ -242,6 +247,12 @@ impl UdsTransport {
         instance_id: crate::InstanceId,
         rt: &tokio::runtime::Handle,
     ) -> Result<ConnectionHandle> {
+        // After teardown a connection could only dial to be stopped, and a
+        // frame it admitted would ride the teardown deadline meant for the
+        // frames admitted before it. Refuse it, so the send fails at once.
+        if self.cancel_token.is_cancelled() {
+            anyhow::bail!("transport shut down");
+        }
         let path = self
             .peers
             .get(&instance_id)
@@ -265,6 +276,8 @@ impl UdsTransport {
             WriterTaskContext {
                 connections: Arc::clone(&self.connections),
                 cancel_token: handle.cancel.clone(),
+                teardown: Arc::clone(&self.teardown),
+                writing: self.teardown.writer(),
                 connect_timeout: self.connect_timeout,
                 reader_ctx: self.dialed_ctx.get().cloned(),
                 metrics: self.metrics.get().cloned(),
@@ -537,22 +550,48 @@ impl Transport for UdsTransport {
     fn shutdown(&self) {
         info!("Shutting down UDS transport");
 
+        // Refuse what still waits in each admission gate, before the writers
+        // start teardown: the grace covers only what is already in a writer's
+        // channel. Left alone, a gate's driver went on admitting its queue
+        // during teardown, and a frame it admitted after the writer stopped
+        // was failed at once, after its sender was told it was admitted.
+        // The gates are collected first: a refusal runs the sender's error
+        // hook on this thread, and a hook may call back into this map (to
+        // unregister the peer), which would wait on a shard this iterator
+        // holds.
+        let gates: Vec<_> = self
+            .connections
+            .iter()
+            .map(|connection| connection.gate.clone())
+            .collect();
+        for gate in gates {
+            gate.fail_all(AdmissionError::ChannelClosed);
+        }
+
         // Cancel the teardown token (Phase 3) to stop the listener and connection handlers
         if let Some(state) = self.shutdown_state.get() {
             state.teardown_token().cancel();
         }
-        self.cancel_token.cancel();
+        // Cancels `cancel_token` (the teardown's token) and fixes the deadline.
+        self.teardown.begin();
 
-        // Clear connections
+        // Clear connections. Their writers write what they already queued,
+        // until the teardown deadline; `closed()` waits for that.
         self.connections.clear();
         self.update_connection_gauge();
     }
 
+    /// Wait for the connection writers to write what teardown kept (the
+    /// teardown grace, 1 s unless the builder set it, plus 0.5 s), then for
+    /// the accept loop to close its socket (LISTENER_CLOSE_WAIT: 1 s).
     fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
         Box::pin(async move {
             if !self.cancel_token.is_cancelled() {
                 return;
             }
+            self.teardown
+                .wait_for_writers(&format!("UDS transport on {:?}", self.socket_path))
+                .await;
             // `shutdown()` cancelled teardown, so the accept loop is exiting.
             // Wait for it, so no peer can connect once this returns and the
             // socket file is gone.
@@ -626,6 +665,11 @@ struct WriterTaskContext {
     connections: Arc<DashMap<crate::InstanceId, ConnectionHandle>>,
     /// The connection's token: shutdown and unregister both cancel it.
     cancel_token: CancellationToken,
+    /// Whether a stop is teardown, which finishes the dial and writes what
+    /// is queued first, and the deadline for that.
+    teardown: Arc<TeardownStop>,
+    /// Held while the writer can still write, so `closed()` can wait for it.
+    writing: tokio_util::task::task_tracker::TaskTrackerToken,
     connect_timeout: Duration,
     reader_ctx: Option<DialedReaderContext>,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
@@ -642,27 +686,13 @@ async fn connection_writer_task(
     tx: flume::Sender<SendTask>,
     ctx: WriterTaskContext,
 ) -> Result<()> {
-    let WriterTaskContext {
-        connections,
-        cancel_token,
-        connect_timeout,
-        reader_ctx,
-        metrics,
-    } = ctx;
-    let result = connection_writer_inner(
-        &path,
-        instance_id,
-        &rx,
-        &cancel_token,
-        connect_timeout,
-        reader_ctx,
-        metrics.clone(),
-    )
-    .await;
+    let result = connection_writer_inner(&path, instance_id, &rx, &ctx).await;
+    // Nothing more reaches the socket: what is still queued fails below.
+    drop(ctx.writing);
 
-    retire_connection(instance_id, tx, rx, &connections).await;
-    if let Some(metrics) = metrics.as_ref() {
-        metrics.set_active_connections(connections.len());
+    retire_connection(instance_id, tx, rx, &ctx.connections).await;
+    if let Some(metrics) = ctx.metrics.as_ref() {
+        metrics.set_active_connections(ctx.connections.len());
     }
 
     debug!("UDS connection to {} ({:?}) closed", instance_id, path);
@@ -693,19 +723,23 @@ async fn connection_writer_inner(
     path: &Path,
     instance_id: crate::InstanceId,
     rx: &flume::Receiver<SendTask>,
-    cancel_token: &CancellationToken,
-    connect_timeout: Duration,
-    reader_ctx: Option<DialedReaderContext>,
-    metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
+    ctx: &WriterTaskContext,
 ) -> Result<()> {
+    let cancel_token = &ctx.cancel_token;
+    let reader_ctx = ctx.reader_ctx.clone();
+    let metrics = ctx.metrics.clone();
     debug!("Connecting to UDS {:?}", path);
 
-    let stream = tokio::select! {
-        _ = cancel_token.cancelled() => return Ok(()),
-        res = tokio::time::timeout(connect_timeout, UnixStream::connect(path)) => {
-            res.context("UDS connect timeout")?.context("UDS connect failed")?
-        },
+    // Teardown does not end the dial at once: the frames queued behind it were
+    // admitted, so the dial runs on until the teardown deadline, as the writes
+    // after it do. A stop that is only the connection's ends it now.
+    let connect = tokio::time::timeout(ctx.connect_timeout, UnixStream::connect(path));
+    let Some(connected) = ctx.teardown.until_stopped(cancel_token, connect).await else {
+        return Ok(());
     };
+    let stream = connected
+        .context("UDS connect timeout")?
+        .context("UDS connect failed")?;
 
     // Set large buffers for high throughput (2MB each)
     let sock = socket2::SockRef::from(&stream);
@@ -750,6 +784,7 @@ async fn connection_writer_inner(
             instance_id,
             path,
             egress: metrics.map(EgressMetrics::new),
+            teardown: Arc::clone(&ctx.teardown),
         },
     )
     .await;
@@ -771,72 +806,6 @@ struct DialedReaderErrorHandler;
 impl TransportErrorHandler for DialedReaderErrorHandler {
     fn on_error(&self, _header: Bytes, _payload: Bytes, error: String) {
         warn!("UDS transport error: {}", error);
-    }
-}
-
-impl Coalescable for SendTask {
-    /// A staged task *is* its own failure token: what
-    /// [`TransportErrorHandler::on_error`] needs — the header, the payload,
-    /// and the handler — is every field but a one-byte `Copy` enum, and all
-    /// three are refcounted handles. Splitting them into a second struct would
-    /// have the same footprint, so the writer just keeps the task. Retaining
-    /// it holds no payload bytes beyond the ones the sender already owns.
-    type FailureToken = Self;
-
-    fn msg_type(&self) -> MessageType {
-        self.msg_type
-    }
-
-    fn header(&self) -> &[u8] {
-        &self.header
-    }
-
-    fn payload(&self) -> &[u8] {
-        &self.payload
-    }
-
-    fn queued_at(&self) -> Option<Instant> {
-        self.queued_at
-    }
-
-    fn into_failure_token(self) -> Self {
-        self
-    }
-
-    fn fail(token: Self, reason: &str) {
-        token.on_error(format!("Failed to write to UDS stream: {}", reason));
-    }
-}
-
-/// Attaches the connection's identity to the writer loop's log lines, and
-/// carries the transport's pre-bound metrics handle so the per-frame egress
-/// path does no label lookup.
-///
-/// Answers [`WriterObserver::egress`] with that handle, which TCP shares
-/// byte-for-byte — the only thing that differs per transport is the failure
-/// log text below.
-struct UdsWriterObserver<'a> {
-    instance_id: crate::InstanceId,
-    path: &'a Path,
-    egress: Option<EgressMetrics>,
-}
-
-impl WriterObserver for UdsWriterObserver<'_> {
-    fn on_failure(&self, kind: WriterFailure, err: &std::io::Error, frames: usize) {
-        match kind {
-            WriterFailure::Write => error!(
-                "Write error to {} ({:?}): {} ({} message(s) in batch)",
-                self.instance_id, self.path, err, frames
-            ),
-            WriterFailure::Encode => error!(
-                "Encode error to {} ({:?}): {}",
-                self.instance_id, self.path, err
-            ),
-        }
-    }
-
-    fn egress(&self) -> Option<&EgressMetrics> {
-        self.egress.as_ref()
     }
 }
 
@@ -865,6 +834,7 @@ pub struct UdsTransportBuilder {
     channel_capacity: usize,
     connect_timeout: Duration,
     shrink_threshold: Option<usize>,
+    teardown_flush_grace: Duration,
 }
 
 impl UdsTransportBuilder {
@@ -876,7 +846,16 @@ impl UdsTransportBuilder {
             channel_capacity: 256,
             connect_timeout: Duration::from_secs(5),
             shrink_threshold: None,
+            teardown_flush_grace: TEARDOWN_FLUSH_GRACE,
         }
+    }
+
+    /// How long the connection writers keep writing after the transport
+    /// tears down at graceful shutdown (default: 1 s). See
+    /// [`TcpTransportBuilder::teardown_flush_grace`](crate::transports::tcp::TcpTransportBuilder::teardown_flush_grace).
+    pub fn teardown_flush_grace(mut self, grace: Duration) -> Self {
+        self.teardown_flush_grace = grace;
+        self
     }
 
     /// Set the socket path
@@ -936,6 +915,10 @@ impl UdsTransportBuilder {
         if let Some(t) = self.shrink_threshold {
             transport.shrink_threshold = t;
         }
+        transport.teardown = Arc::new(TeardownStop::new(
+            transport.cancel_token.clone(),
+            self.teardown_flush_grace,
+        ));
         Ok(transport)
     }
 }

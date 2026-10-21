@@ -114,7 +114,6 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -148,27 +147,6 @@ pub(crate) use self::lane_choice::LaneReservation;
 /// re-deriving the one value negotiation is keyed on.
 pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
 
-/// How long a bind waits for the `OpenSlot` that claims it.
-///
-/// Deliberately the same 60 s the TCP transport gives a pending session, and
-/// deliberately measuring the same thing: "time until a batch bearing this
-/// `OpenSlot` arrives". That sentence holds without qualification for the
-/// attach path's bind: a sender has already asked by
-/// the time the bind exists, so the window is one response leg plus one batch
-/// leg, and `OpenSlot` is eager precisely so it cannot quietly become "time
-/// until the producer produces its first token" there.
-///
-/// It does not hold for the zero-RTT pre-bind (`AnchorManager::prebind_anchor`),
-/// where the same clock starts before any sender has asked at all: the window
-/// there is envelope transit plus however long the ticket sits in a request
-/// envelope before its worker calls `open_anchor_stream`, which can be exactly
-/// the producer-side wait the paragraph above rules out for `bind`. See
-/// `AnchorManager::prebind_anchor`'s doc for that bound. An attach that adopts
-/// an existing pre-bind does not restart this timer either way — adoption
-/// takes over the bind the pre-bind already registered rather than binding
-/// again, so it inherits whatever is left of the 60 s, not a fresh one.
-const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
-
 /// Attempts `connect` makes before giving up on a batcher that keeps retiring
 /// underneath it. Two is already generous — losing the race twice requires two
 /// eviction sweeps inside one attach.
@@ -201,6 +179,17 @@ pub(crate) struct MessengerMuxTransport {
     core: Arc<MuxCore>,
     key: TransportKey,
 }
+
+type BindDeadline = std::cmp::Reverse<(tokio::time::Instant, (u64, u64))>;
+
+/// The longest an expiry entry waits before the sweep looks at its bind.
+///
+/// A claimed or released bind leaves its entry queued, and only the sweep
+/// drops it. Queued at the bind's own deadline, that entry lived for the whole
+/// accept window: 30 years for a `Duration::MAX` window, so the queue grew for
+/// the life of the process. Capped here, a stale entry goes within 60 s at any
+/// window. A bind still open past it costs one requeue per recheck.
+const BIND_RECHECK: Duration = Duration::from_secs(60);
 
 /// State shared between the transport, its batchers and the ingress handler.
 struct MuxCore {
@@ -237,17 +226,18 @@ struct MuxCore {
     /// `bind` returns. Take-once: whoever collects it owns it, and the bind
     /// expiry that already exists drops any that was never collected.
     drains: DashMap<(u64, u64), Arc<ingress::DrainSignal>>,
-    /// Accept-window deadlines, one per bind, oldest first.
-    ///
-    /// Every bind gets the same `ACCEPT_TIMEOUT`, so pushing at bind time keeps
-    /// the queue in deadline order and the sweep only ever pops its front. A
-    /// bind claimed or released early stays queued and costs a failed lookup
-    /// when its deadline comes; that is cheaper than finding and removing it.
-    /// It used to be one timer task per bind, which nothing but shutdown
-    /// cancelled: a claimed bind's task lived out the full minute, so a
-    /// frontend opening 2,000 streams a second carried about 120,000 idle
-    /// tasks.
-    bind_deadlines: std::sync::Mutex<VecDeque<(tokio::time::Instant, (u64, u64))>>,
+    /// One expiry entry per bind, earliest first. Renewal moves the deadline
+    /// stored with the bind, not this entry; when the entry comes due, the
+    /// sweep reads the stored deadline and queues the entry again if it moved.
+    /// A requeued entry lands behind newer binds, so this is a heap and not a
+    /// FIFO queue. A bind claimed or released early leaves its entry here, and
+    /// that entry costs a failed lookup when it comes due; that is cheaper than
+    /// finding and removing it on the claim path. No entry is queued more than
+    /// [`BIND_RECHECK`] ahead, so a stale one does not outlive that.
+    bind_deadlines: std::sync::Mutex<std::collections::BinaryHeap<BindDeadline>>,
+    /// The accept window of every bind, attach or pre-bind
+    /// (`ReservationConfig::prebind_timeout`).
+    accept_window: Duration,
     /// A barrier handed to every batcher this core spawns, installed by the
     /// tests that need one held mid-wake. See [`peer_batcher::test_hooks`].
     #[cfg(test)]
@@ -263,6 +253,17 @@ struct MuxCore {
 }
 
 impl MessengerMuxTransport {
+    /// Extend an unclaimed bind's accept window, if it has not closed.
+    ///
+    /// Called with an anchor registry entry held, like
+    /// [`release_bind`](Self::release_bind): it touches only the mux's own
+    /// maps and must never reach back into the anchor registry.
+    pub(crate) fn renew_reservation(&self, anchor: u64, session: u64) {
+        self.core
+            .ingress
+            .renew_bind(anchor, session, self.core.accept_window);
+    }
+
     /// Ask the sender of a claimed slot to stop, through the batcher of the
     /// lane its `OpenSlot` arrived on.
     pub(crate) fn request_stop(&self, key: PeerLane, slot: protocol::SlotId, session_id: u64) {
@@ -321,6 +322,7 @@ impl MessengerMuxTransport {
         messenger: Arc<Messenger>,
         config: MuxConfig,
         metrics: Option<Arc<VeloMetrics>>,
+        accept_window: Duration,
     ) -> Result<Arc<Self>> {
         let limits = NegotiatedLimits::from_wire(config.initial_credit, config.slot_byte_budget)
             .map_err(|error| anyhow!("messenger mux: {error}"))?;
@@ -352,6 +354,7 @@ impl MessengerMuxTransport {
             drain_rx,
             drains: DashMap::new(),
             bind_deadlines: std::sync::Mutex::default(),
+            accept_window,
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -566,37 +569,44 @@ impl MuxCore {
     /// Close the accept window on every bind whose deadline has passed.
     ///
     /// Runs on the sweep tick, so a window closes up to one
-    /// `credit_sweep_interval` late -- 200 ms on a 60 s window by default.
+    /// `credit_sweep_interval` late -- 200 ms on a 180 s window by default.
     fn expire_binds(&self, now: tokio::time::Instant) {
         let due: Vec<(u64, u64)> = {
             let mut deadlines = self
                 .bind_deadlines
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let ready = deadlines.partition_point(|(deadline, _)| *deadline <= now);
-            let due = deadlines.drain(..ready).map(|(_, key)| key).collect();
-            // A burst of binds leaves the queue's capacity behind it. Give it
-            // back only once the queue is nearly empty: the shrink copies what
-            // is left while holding the lock every bind takes, so shrinking a
-            // queue still tens of thousands deep would stall new streams.
-            if deadlines.len() <= 1024 && deadlines.capacity() > 8192 {
-                deadlines.shrink_to(2048);
+            let mut due = Vec::new();
+            while deadlines.peek().is_some_and(|entry| entry.0.0 <= now) {
+                due.push(deadlines.pop().expect("due entry").0.1);
             }
             due
         };
+        if due.is_empty() {
+            return;
+        }
+        let mut renewed = Vec::new();
         for (anchor_id, session_id) in due {
-            // Whether or not the bind was still there, drop any drain signal
-            // no attach collected. Without this an attach that failed between
-            // `bind` and `take_drain_signal` would leak one entry per attempt
-            // for the process's life.
-            self.drains.remove(&(anchor_id, session_id));
-            if self.ingress.expire_bind(anchor_id, session_id) {
-                tracing::warn!(
-                    anchor_id,
-                    session_id,
-                    "messenger mux: no OpenSlot arrived before the accept window closed"
-                );
+            if let Some(deadline) = self.ingress.expire_due(anchor_id, session_id, now) {
+                let recheck = deadline.min(now.checked_add(BIND_RECHECK).unwrap_or(deadline));
+                renewed.push(std::cmp::Reverse((recheck, (anchor_id, session_id))));
+            } else {
+                self.drains.remove(&(anchor_id, session_id));
             }
+        }
+        // One lock for every requeue: binds take this lock too.
+        let mut deadlines = self
+            .bind_deadlines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        deadlines.extend(renewed);
+        // A burst of binds leaves the queue's capacity behind it. Give it back
+        // only once the queue is nearly empty: the shrink copies what is left
+        // while holding the lock every bind takes, so shrinking a queue still
+        // tens of thousands deep would stall new streams. Decided after the
+        // requeue, so a sweep never shrinks a queue it is about to refill.
+        if deadlines.len() <= 1024 && deadlines.capacity() > 8192 {
+            deadlines.shrink_to(2048);
         }
     }
 
@@ -654,8 +664,12 @@ fn open_bind(
     let drain = Arc::new(ingress::DrainSignal::new(core.drain_tx.clone()));
     core.drains
         .insert((anchor_id, session_id), Arc::clone(&drain));
+    // The deadline that counts is stored with the bind, and renewal moves it.
+    // The queue entry below only says when to look again, at most
+    // `BIND_RECHECK` ahead.
+    let expires = crate::streaming::deadline::deadline_after(core.accept_window);
     core.ingress
-        .register_bind(anchor_id, session_id, frame_tx, drain, lane);
+        .register_bind(anchor_id, session_id, frame_tx, drain, lane, expires);
 
     // Close the race with shutdown between the initial check and registration.
     if core.tasks.is_stopped() {
@@ -667,16 +681,13 @@ fn open_bind(
     // A deadline, not a task: the sweep expires it (`MuxCore::expire_binds`).
     // Nothing here may pin the core either, which a task holding a strong
     // handle would, for the full window after the last owner dropped it.
-    // The clock is read under the lock, so pushes land in deadline order.
-    let mut deadlines = core
-        .bind_deadlines
+    core.bind_deadlines
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    deadlines.push_back((
-        tokio::time::Instant::now() + ACCEPT_TIMEOUT,
-        (anchor_id, session_id),
-    ));
-    drop(deadlines);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(std::cmp::Reverse((
+            expires.min(crate::streaming::deadline::deadline_after(BIND_RECHECK)),
+            (anchor_id, session_id),
+        )));
 
     Ok(frame_rx)
 }
@@ -743,8 +754,8 @@ impl MessengerMuxTransport {
     /// to ask.
     ///
     /// Nothing about the resulting bind is special. A peer's `OpenSlot` claims
-    /// it by the same `(anchor_id, session_id)` lookup, the accept window runs
-    /// the same 60 s, and [`release_bind`](Self::release_bind) is what an owner
+    /// it by the same `(anchor_id, session_id)` lookup, the accept window is
+    /// the same configured lifetime, and [`release_bind`](Self::release_bind) is what an owner
     /// that gives up before then calls.
     pub(crate) fn bind_on_lane(
         &self,
@@ -765,9 +776,9 @@ impl MessengerMuxTransport {
     ///
     /// The accept window does the same thing when it expires, and stays as the
     /// backstop. This is for the owner that already knows: a pre-bound anchor
-    /// whose request died before its first token knows a minute earlier than
-    /// the timer does, and at the rate a frontend registers requests that
-    /// minute is thousands of leaked binds.
+    /// whose request died before its first token knows up to a whole window
+    /// earlier than the timer does, and at the rate a frontend registers
+    /// requests that window is thousands of leaked binds.
     ///
     /// Idempotent: a bind already claimed or already released is not there to
     /// remove, and removing nothing is the right answer for both.

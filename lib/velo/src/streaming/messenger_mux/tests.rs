@@ -83,11 +83,16 @@ async fn mux_pair(config: MuxConfig) -> Pair {
         Arc::clone(&m_consumer),
         config.clone(),
         Some(Arc::clone(&metrics)),
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .expect("consumer mux");
-    let producer =
-        MessengerMuxTransport::new(Arc::clone(&m_producer), config, Some(Arc::clone(&metrics)))
-            .expect("producer mux");
+    let producer = MessengerMuxTransport::new(
+        Arc::clone(&m_producer),
+        config,
+        Some(Arc::clone(&metrics)),
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("producer mux");
     let consumer_worker = m_consumer.instance_id().worker_id();
     let producer_worker = m_producer.instance_id().worker_id();
     Pair {
@@ -260,6 +265,7 @@ fn aborting_a_retiring_batchers_final_flush_stops_the_mux() {
                 ..MuxConfig::default()
             },
             None,
+            crate::streaming::ReservationConfig::default().prebind_timeout,
         )
         .unwrap();
         let hooks = Arc::new(TestHooks::default());
@@ -316,7 +322,13 @@ async fn a_batcher_dropped_by_stop_sending_leaves_slots_to_shutdown() {
     messenger
         .register_peer(velo_ext::PeerInfo::new(peer, stalling_address()))
         .unwrap();
-    let mux = MessengerMuxTransport::new(messenger, MuxConfig::default(), None).unwrap();
+    let mux = MessengerMuxTransport::new(
+        messenger,
+        MuxConfig::default(),
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .unwrap();
     let hooks = Arc::new(TestHooks::default());
     assert!(mux.core.hooks.set(hooks.clone()).is_ok());
     let receiver = mux.bind(1, 1).await.unwrap();
@@ -534,6 +546,7 @@ async fn a_zero_sweep_interval_is_refused_when_the_mux_is_built() {
             ..MuxConfig::default()
         },
         None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .err()
     .expect("a zero sweep interval cannot tick, so the build must say so");
@@ -549,6 +562,7 @@ async fn a_zero_sweep_interval_is_refused_when_the_mux_is_built() {
             ..MuxConfig::default()
         },
         None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .expect("the same messenger takes a mux with a positive interval");
 }
@@ -733,8 +747,8 @@ async fn live_slots_returns_to_zero_when_the_producers_go_away() {
 /// Dropping the transports themselves has to reach zero too, and promptly.
 ///
 /// The failure this guards against is a strong reference held across `bind`'s
-/// 60-second accept window: the transport would keep every slot, batcher task
-/// and ingress entry alive for a minute after its last owner let go, and the
+/// accept window: the transport would keep every slot, batcher task
+/// and ingress entry alive for the whole window after its last owner let go, and the
 /// gauge would come back only when the timers did.
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_the_transports_tears_every_slot_down_promptly() {
@@ -805,10 +819,20 @@ async fn a_remote_stream_preserves_send_order_under_a_slow_consumer() {
     let consumer_worker = m_consumer.instance_id().worker_id();
     let producer_worker = m_producer.instance_id().worker_id();
 
-    let mux_consumer =
-        MessengerMuxTransport::new(Arc::clone(&m_consumer), test_config(), None).expect("mux a");
-    let mux_producer =
-        MessengerMuxTransport::new(Arc::clone(&m_producer), test_config(), None).expect("mux b");
+    let mux_consumer = MessengerMuxTransport::new(
+        Arc::clone(&m_consumer),
+        test_config(),
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("mux a");
+    let mux_producer = MessengerMuxTransport::new(
+        Arc::clone(&m_producer),
+        test_config(),
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("mux b");
 
     let am_consumer = Arc::new(
         AnchorManagerBuilder::default()
@@ -933,6 +957,7 @@ async fn one_flush_reaches_every_peer_batcher() {
         Arc::clone(&producer_messenger),
         config.clone(),
         Some(Arc::clone(&metrics)),
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .expect("producer mux");
 
@@ -940,8 +965,13 @@ async fn one_flush_reaches_every_peer_batcher() {
     let mut senders = Vec::new();
     let mut consumer_muxes = Vec::new();
     for (peer, messenger) in consumers.iter().enumerate() {
-        let mux = MessengerMuxTransport::new(Arc::clone(messenger), config.clone(), None)
-            .expect("consumer mux");
+        let mux = MessengerMuxTransport::new(
+            Arc::clone(messenger),
+            config.clone(),
+            None,
+            crate::streaming::ReservationConfig::default().prebind_timeout,
+        )
+        .expect("consumer mux");
         let worker = messenger.instance_id().worker_id();
         for slot in 0..SLOTS_PER_PEER {
             let id = (peer as u64 + 1) * 100 + slot;
@@ -1046,10 +1076,16 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
         Arc::clone(&consumer_messenger),
         config.clone(),
         Some(Arc::clone(&consumer_metrics)),
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .expect("consumer mux");
-    let producer = MessengerMuxTransport::new(Arc::clone(&producer_messenger), config, None)
-        .expect("producer mux");
+    let producer = MessengerMuxTransport::new(
+        Arc::clone(&producer_messenger),
+        config,
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("producer mux");
 
     let rx = consumer.bind(1, 1).await.expect("bind");
     let tx = producer
@@ -1484,12 +1520,27 @@ async fn prebinding_node(
     config: MuxConfig,
     unattached_timeout: Option<Duration>,
 ) -> PrebindingNode {
+    prebinding_node_with_window(
+        config,
+        unattached_timeout,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .await
+}
+
+/// [`prebinding_node`] with the mux's accept window set.
+async fn prebinding_node_with_window(
+    config: MuxConfig,
+    unattached_timeout: Option<Duration>,
+    accept_window: Duration,
+) -> PrebindingNode {
     let messenger = Messenger::builder()
         .add_transport(tcp_transport())
         .build()
         .await
         .expect("messenger");
-    let mux = MessengerMuxTransport::new(Arc::clone(&messenger), config, None).expect("mux");
+    let mux = MessengerMuxTransport::new(Arc::clone(&messenger), config, None, accept_window)
+        .expect("mux");
     let mut builder = AnchorManagerBuilder::default()
         .worker_id(messenger.instance_id().worker_id())
         .transport(Arc::clone(&mux) as Arc<dyn crate::streaming::transport::FrameTransport>);
@@ -1510,8 +1561,8 @@ async fn prebinding_node(
 ///
 /// Zero-RTT setup binds a slot at request registration, so a request that dies
 /// before its first token — a client that hangs up, a prompt that is refused —
-/// leaves one behind. [`ACCEPT_TIMEOUT`] would collect it eventually and stays
-/// as the backstop, but at the rate a frontend registers requests, a minute of
+/// leaves one behind. The accept window would collect it eventually and stays
+/// as the backstop, but at the rate a frontend registers requests, a whole window of
 /// leaked bind, drain signal and stream watchdog per abandoned one is not a
 /// reclamation policy.
 ///
@@ -1520,7 +1571,7 @@ async fn prebinding_node(
 /// can have run in between, so the reclamation is the drop and nothing else.
 /// That is stronger than pausing the clock and advancing it a little, and it
 /// avoids the trap in the weaker version: under `start_paused` an idle runtime
-/// auto-advances to the next deadline, which is exactly the 60 s accept window
+/// auto-advances to the next deadline, which is the configured accept window
 /// this test exists to prove is not involved.
 #[tokio::test(flavor = "multi_thread")]
 async fn unclaimed_bind_is_reclaimed_on_anchor_death_without_the_timer() {
@@ -1878,7 +1929,7 @@ async fn a_refused_prebind_gives_the_unattached_timer_back() {
 /// which is exactly the window a sender that dies right after attaching (a
 /// worker crash before its first record) sits in. If the watchdog still believes
 /// no sender exists, that death is invisible to the heartbeat watchdog and
-/// waits for the mux's 60 s accept window instead of the usual
+/// waits for the mux's configured accept window instead of the usual
 /// `DETECTION_MULTIPLIER * heartbeat_interval`.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot() {
@@ -1923,7 +1974,7 @@ async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot(
 /// End-to-end version of the reap-on-reclaim fix (`control::reap_unclaimed`,
 /// run by the stream watchdog or the consumer), driven through the real
 /// `AnchorManager` / mux stack rather than a synthetic fixture: at a heartbeat interval the watchdog alone cannot
-/// beat the 60 s accept window with (`>= 20 s` -- `DETECTION_MULTIPLIER`
+/// beat the 60 s accept window this test sets with (`>= 20 s` -- `DETECTION_MULTIPLIER`
 /// is 3, so the watchdog's earliest fire from a fresh window is `3 *
 /// heartbeat`), an adopted pre-bind whose sender never delivers its
 /// `OpenSlot` must still be reaped once the accept window closes, and the
@@ -1931,13 +1982,13 @@ async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot(
 /// forever.
 ///
 /// The sibling above uses a 50 ms heartbeat, so its watchdog always wins the
-/// race against the 60 s window and this path never runs there -- this test
+/// race against the accept window and this path never runs there -- this test
 /// is the one that actually exercises the accept window as the reaper.
 #[tokio::test]
 async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window() {
     tokio::time::pause();
     let heartbeat = Duration::from_secs(25);
-    let node = prebinding_node(test_config(), None).await;
+    let node = prebinding_node_with_window(test_config(), None, Duration::from_secs(60)).await;
     let mut anchor = node.manager.create_anchor_with_config::<u32>(AnchorConfig {
         heartbeat_interval: Some(heartbeat),
         ..Default::default()
@@ -1967,7 +2018,7 @@ async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window
     );
 
     // The watchdog alone would not fire until 25 s * (0 + DETECTION_MULTIPLIER)
-    // = 75 s from adoption -- after the fixed 60 s accept window, not before.
+    // = 75 s from adoption -- after the 60 s accept window set above, not before.
     // Advance well past both so whichever fires first has already run.
     tokio::time::sleep(Duration::from_secs(65)).await;
 
@@ -1989,7 +2040,7 @@ async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window
     );
 }
 
-/// An unclaimed pre-bind lives out its 60 s accept window and no longer.
+/// An unclaimed pre-bind lives out its configured accept window and no longer.
 ///
 /// The window is a deadline the credit sweep expires rather than a timer task
 /// per bind, so both edges are pinned here: just short of the window the bind
@@ -2008,7 +2059,10 @@ async fn an_unclaimed_prebind_closes_at_its_accept_window_and_not_before() {
         .prebind_anchor(handle)
         .expect("a mux is installed, so a ticket is minted");
 
-    tokio::time::sleep(ACCEPT_TIMEOUT - Duration::from_millis(500)).await;
+    tokio::time::sleep(
+        crate::streaming::ReservationConfig::default().prebind_timeout - Duration::from_millis(500),
+    )
+    .await;
     assert!(
         node.manager.registry.contains_key(&local_id),
         "the accept window has not closed yet, so the pre-bound anchor must still be registered"
@@ -2849,7 +2903,7 @@ async fn a_stale_detached_spares_a_prebind_installed_mid_poll() {
 
 /// Dropping an anchor before any sender opened its slot gives the bind back.
 ///
-/// The bind would otherwise wait out the 60 s accept window, one per request
+/// The bind would otherwise wait out the accept window, one per request
 /// a frontend abandoned before its worker got to it.
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_an_anchor_before_its_sender_opens_releases_the_bind() {
@@ -2910,4 +2964,216 @@ async fn a_removed_anchor_withdraws_its_feed() {
         "the removed entry must withdraw its feed"
     );
     drop(anchor);
+}
+
+#[tokio::test]
+async fn reservation_renewal_extends_one_deadline_without_reallocating_slots() {
+    tokio::time::pause();
+    let node = prebinding_node_with_window(test_config(), None, Duration::from_secs(3)).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let ticket = node.manager.prebind_anchor(handle).expect("ticket");
+    let reservation = crate::streaming::AnchorReservation::new(handle, Some(&ticket));
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        node.manager.renew_reservations_local(&[reservation]);
+        assert_eq!(node.mux.core.bind_deadlines.lock().unwrap().len(), 1);
+        assert_eq!(node.manager.active_anchor_count(), 1);
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    node.mux.core.expire_binds(tokio::time::Instant::now());
+    tokio::task::yield_now().await;
+    node.manager.renew_reservations_local(&[reservation]);
+    assert_eq!(node.manager.active_anchor_count(), 0);
+    node.mux.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_reservation_for_another_session_does_not_renew_the_bind() {
+    tokio::time::pause();
+    let node = prebinding_node_with_window(test_config(), None, Duration::from_secs(3)).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let ticket = node.manager.prebind_anchor(handle).expect("ticket");
+    let mut stale = ticket.clone();
+    stale.routing_session_id += 1;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    node.manager
+        .renew_reservations_local(&[crate::streaming::AnchorReservation::new(
+            handle,
+            Some(&stale),
+        )]);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    node.mux.core.expire_binds(tokio::time::Instant::now());
+    tokio::task::yield_now().await;
+    assert_eq!(node.manager.active_anchor_count(), 0);
+    node.mux.shutdown().await;
+}
+
+/// A prepared-slot lifetime keeps its full precision. Stored in whole
+/// milliseconds, 1.5 ms became 1 ms, so a bind expired before the lifetime the
+/// caller configured, and a renewal cadence that fit the configured lifetime
+/// arrived too late.
+#[tokio::test]
+async fn a_sub_millisecond_reservation_lifetime_is_not_truncated() {
+    tokio::time::pause();
+    let node = prebinding_node_with_window(test_config(), None, Duration::from_micros(1500)).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    node.manager
+        .prebind_anchor(anchor.handle())
+        .expect("ticket");
+    tokio::time::advance(Duration::from_micros(1200)).await;
+    node.mux.core.expire_binds(tokio::time::Instant::now());
+    tokio::task::yield_now().await;
+    assert_eq!(
+        node.manager.active_anchor_count(),
+        1,
+        "1.2 ms into a 1.5 ms lifetime the bind is still live"
+    );
+    node.mux.shutdown().await;
+}
+
+/// A huge prepared-slot lifetime means "never" and must not panic on
+/// `Instant + Duration` overflow, at bind or at renewal.
+#[tokio::test]
+async fn an_oversized_reservation_lifetime_does_not_panic() {
+    tokio::time::pause();
+    let node = prebinding_node_with_window(test_config(), None, Duration::MAX).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let ticket = node.manager.prebind_anchor(handle).expect("ticket");
+    node.manager
+        .renew_reservations_local(&[crate::streaming::AnchorReservation::new(
+            handle,
+            Some(&ticket),
+        )]);
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    node.mux.core.expire_binds(tokio::time::Instant::now());
+    tokio::task::yield_now().await;
+    assert_eq!(node.manager.active_anchor_count(), 1);
+    node.mux.shutdown().await;
+}
+
+/// A ticket reservation keeps its anchor after the pre-bind is released.
+///
+/// A refused adoption (or a detach) gives the pre-bind back and resumes the
+/// anchor's unattached timer. The holder's request is still open and the
+/// anchor still waits for a sender, so renewing with the ticket must extend
+/// that timer; a no-op here let the anchor expire under a holder whose every
+/// renewal returned `Ok`.
+#[tokio::test]
+async fn a_ticket_reservation_renews_the_anchor_after_its_prebind_is_released() {
+    const UNATTACHED: Duration = Duration::from_secs(2);
+    let node = prebinding_node(test_config(), Some(UNATTACHED)).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let (_, local_id) = handle.unpack();
+    let ticket = node.manager.prebind_anchor(handle).expect("ticket");
+    let reservation = crate::streaming::AnchorReservation::new(handle, Some(&ticket));
+    let request = crate::streaming::control::AnchorAttachRequest {
+        handle,
+        session_id: 1,
+        stream_cancel_handle: crate::streaming::control::StreamCancelHandle::pack(
+            WorkerId::from_u64(7),
+            1,
+        ),
+        supported_transport_keys: vec![velo_ext::TransportKey::new(
+            crate::streaming::tcp_transport::TCP_STREAM_KEY,
+        )],
+        lane_key: None,
+    };
+    assert!(matches!(
+        node.manager.adopt_prebind(local_id, &request),
+        crate::streaming::anchor::PrebindAdoption::Refused(_)
+    ));
+    tokio::time::pause();
+    for _ in 0..8 {
+        tokio::time::sleep(UNATTACHED / 2).await;
+        node.manager.renew_reservations_local(&[reservation]);
+        assert!(
+            node.manager.registry.contains_key(&local_id),
+            "renewal with the ticket keeps the anchor"
+        );
+    }
+    tokio::time::sleep(UNATTACHED * 2).await;
+    assert!(!node.manager.registry.contains_key(&local_id));
+    drop(anchor);
+    node.mux.shutdown().await;
+}
+
+/// A released bind's expiry entry leaves the queue within the recheck horizon,
+/// whatever the accept window.
+///
+/// The queue does not remove an entry when its bind is claimed or released;
+/// the sweep drops it when it comes due. Queued at the bind's own deadline, an
+/// entry for a `Duration::MAX` window came due in 30 years, so every claimed
+/// or released bind grew the queue for the life of the process.
+#[tokio::test]
+async fn a_released_bind_leaves_the_queue_within_the_recheck_horizon() {
+    tokio::time::pause();
+    let node = prebinding_node_with_window(test_config(), None, Duration::MAX).await;
+    let released = node.manager.create_anchor::<u32>();
+    node.manager
+        .prebind_anchor(released.handle())
+        .expect("ticket");
+    let held = node.manager.create_anchor::<u32>();
+    node.manager.prebind_anchor(held.handle()).expect("ticket");
+    drop(released);
+    eventually(|| node.mux.pending_binds() == 1).await;
+    assert_eq!(node.mux.core.bind_deadlines.lock().unwrap().len(), 2);
+
+    tokio::time::advance(super::BIND_RECHECK + Duration::from_secs(1)).await;
+    node.mux.core.expire_binds(tokio::time::Instant::now());
+    assert_eq!(
+        node.mux.core.bind_deadlines.lock().unwrap().len(),
+        1,
+        "the released bind's entry is gone; the held one is queued again"
+    );
+    assert_eq!(node.mux.pending_binds(), 1, "the held bind is still open");
+    drop(held);
+    node.mux.shutdown().await;
+}
+
+/// The sweep sizes the queue after it requeues the binds that are still open.
+///
+/// It decided on the shrink first. A sweep that found thousands of held binds
+/// due at once saw a nearly empty queue, gave the capacity back, and then grew
+/// it again to requeue them: one shrink and one grow under the lock every bind
+/// takes, each `BIND_RECHECK` for as long as the binds were held.
+#[tokio::test]
+async fn the_sweep_does_not_shrink_the_queue_it_is_about_to_refill() {
+    const HELD: u64 = 9_000;
+    tokio::time::pause();
+    let node = prebinding_node_with_window(test_config(), None, Duration::MAX).await;
+    let core = &node.mux.core;
+    let due = tokio::time::Instant::now() + Duration::from_secs(1);
+    let capacity = {
+        let mut deadlines = core.bind_deadlines.lock().unwrap();
+        deadlines.reserve(16_384);
+        for anchor in 1..=HELD {
+            let (tx, _rx) = flume::bounded(1);
+            core.ingress.register_bind(
+                anchor,
+                1,
+                tx,
+                Arc::new(ingress::DrainSignal::new(core.drain_tx.clone())),
+                LaneReservation::uncounted(LaneIndex::ZERO),
+                crate::streaming::deadline::deadline_after(Duration::MAX),
+            );
+            deadlines.push(std::cmp::Reverse((due, (anchor, 1))));
+        }
+        deadlines.capacity()
+    };
+    tokio::time::advance(Duration::from_secs(2)).await;
+    core.expire_binds(tokio::time::Instant::now());
+    let (len, after) = {
+        let deadlines = core.bind_deadlines.lock().unwrap();
+        (deadlines.len(), deadlines.capacity())
+    };
+    assert_eq!(len, HELD as usize, "every held bind is queued again");
+    assert_eq!(
+        after, capacity,
+        "the queue kept its capacity instead of shrinking and growing back"
+    );
+    node.mux.shutdown().await;
 }

@@ -1021,7 +1021,7 @@ async fn a_finished_zero_rtt_stream_leaves_no_task_behind() {
     }
     drop(anchors);
 
-    // Far inside the 60 s window: a per-bind timer still holds its task here.
+    // Far inside the 180 s window: a per-bind timer still holds its task here.
     let settled = tokio::time::timeout(Duration::from_secs(2), async {
         while alive() > base + STREAMS / 20 {
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1074,4 +1074,161 @@ async fn remote_detach_leaves_an_unrelated_local_anchor_attached() {
             .await,
         Err(AttachError::AlreadyAttached { .. })
     ));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn bulk_reservation_renewal_is_harmless_during_and_after_attachment() {
+    let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
+    let mut anchors = Vec::new();
+    let mut tickets = Vec::new();
+    let mut reservations = Vec::new();
+    for _ in 0..300 {
+        let anchor = consumer.velo.create_anchor::<u32>();
+        let ticket = consumer
+            .velo
+            .prebind_anchor(anchor.handle())
+            .expect("ticket");
+        reservations.push(velo::streaming::AnchorReservation::new(
+            anchor.handle(),
+            Some(&ticket),
+        ));
+        tickets.push(ticket);
+        anchors.push(anchor);
+    }
+    producer
+        .velo
+        .anchor_manager()
+        .renew_reservations(&reservations)
+        .await
+        .expect("two batches");
+    let mut anchor = anchors.pop().expect("anchor");
+    let opening = producer
+        .velo
+        .open_anchor_stream::<u32>(anchor.handle(), tickets.pop().expect("ticket"));
+    let renewal = producer
+        .velo
+        .anchor_manager()
+        .renew_reservations(&reservations);
+    let (sender, renewed) = tokio::join!(opening, renewal);
+    renewed.expect("renewal racing attachment");
+    let sender = sender.expect("sender");
+    sender.send(42).await.expect("send");
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), anchor.next())
+            .await
+            .expect("bounded frame"),
+        Some(Ok(StreamFrame::Item(42)))
+    ));
+    producer
+        .velo
+        .anchor_manager()
+        .renew_reservations(&reservations)
+        .await
+        .expect("attached no-op");
+    sender.finalize().expect("finalize");
+    assert!(matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(3), anchor.next())
+            .await
+            .expect("bounded frame"),
+        Some(Ok(StreamFrame::Finalized))
+    ));
+    drop(anchors);
+    producer
+        .velo
+        .anchor_manager()
+        .renew_reservations(&reservations)
+        .await
+        .expect("removed no-op");
+    producer
+        .velo
+        .shutdown(velo::ShutdownPolicy::WaitForever)
+        .await;
+    consumer
+        .velo
+        .shutdown(velo::ShutdownPolicy::WaitForever)
+        .await;
+}
+
+/// Remote renewal extends prepared reservations past their lifetime, across
+/// both batches of a renewal larger than one batch, and stops extending them
+/// once the holder stops renewing.
+///
+/// A renewal that never reached `renew_reservations_local` on the owner would
+/// pass a test that opens inside the first lifetime; this one opens only after
+/// two of them. The 2 s lifetime leaves a loaded runner 1.5 s for each round of
+/// renewal.
+#[tokio::test(flavor = "multi_thread")]
+async fn remote_renewal_keeps_prepared_reservations_past_their_lifetime() {
+    let lifetime = Duration::from_secs(2);
+    let mut reservations_config = ReservationConfig::default();
+    reservations_config.prebind_timeout = lifetime;
+    let (consumer, producer) =
+        pair_with_reservations(Some(mux_config()), Some(mux_config()), reservations_config).await;
+    ready(&producer, consumer.velo.instance_id(), "_anchor_renew").await;
+    let mut anchors = Vec::new();
+    let mut tickets = Vec::new();
+    let mut reservations = Vec::new();
+    for _ in 0..300 {
+        let anchor = consumer.velo.create_anchor::<u32>();
+        let ticket = consumer
+            .velo
+            .prebind_anchor(anchor.handle())
+            .expect("ticket");
+        reservations.push(velo::streaming::AnchorReservation::new(
+            anchor.handle(),
+            Some(&ticket),
+        ));
+        tickets.push(ticket);
+        anchors.push(anchor);
+    }
+    let renewer = producer.velo.anchor_manager();
+    for _ in 0..8 {
+        tokio::time::sleep(lifetime / 4).await;
+        renewer
+            .renew_reservations(&reservations)
+            .await
+            .expect("renew both batches");
+    }
+    // One reservation from each batch of 256 opens after two lifetimes.
+    let mut opened = Vec::new();
+    for index in [0, 299] {
+        let mut anchor = anchors.remove(if index == 0 { 0 } else { anchors.len() - 1 });
+        let ticket = tickets.remove(if index == 0 { 0 } else { tickets.len() - 1 });
+        let sender = producer
+            .velo
+            .open_anchor_stream::<u32>(anchor.handle(), ticket)
+            .await
+            .expect("renewed reservation opens");
+        sender.send(7).await.expect("send");
+        assert!(matches!(
+            tokio::time::timeout(PATIENCE, anchor.next())
+                .await
+                .expect("bounded frame"),
+            Some(Ok(StreamFrame::Item(7)))
+        ));
+        opened.push((anchor, sender));
+    }
+    // Renewal stops: the unopened reservations expire; the open ones stay.
+    let manager = consumer.velo.anchor_manager();
+    let deadline = tokio::time::Instant::now() + lifetime * 5;
+    while manager.active_anchor_count() > opened.len() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "{} anchors outlived their last renewal",
+            manager.active_anchor_count() - opened.len()
+        );
+        tokio::time::sleep(lifetime / 10).await;
+    }
+    for (_, sender) in opened {
+        sender.finalize().expect("finalize");
+    }
+    drop(anchors);
+    producer
+        .velo
+        .shutdown(velo::ShutdownPolicy::WaitForever)
+        .await;
+    consumer
+        .velo
+        .shutdown(velo::ShutdownPolicy::WaitForever)
+        .await;
 }

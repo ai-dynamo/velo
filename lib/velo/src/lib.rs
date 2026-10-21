@@ -312,6 +312,7 @@ pub struct VeloBuilder {
     inner: MessengerBuilder,
     stream_config: Option<StreamConfig>,
     mux_config: Option<crate::streaming::MuxConfig>,
+    reservation_config: crate::streaming::ReservationConfig,
     mux_only: bool,
     metrics: Option<Arc<VeloMetrics>>,
     /// The concrete UCX transport, kept beside the type-erased one so the
@@ -326,12 +327,19 @@ pub struct VeloBuilder {
 }
 
 impl VeloBuilder {
+    /// Configure anchor waiting lifetimes.
+    pub fn reservation_config(mut self, config: crate::streaming::ReservationConfig) -> Self {
+        self.reservation_config = config;
+        self
+    }
+
     /// Create a new empty builder.
     pub fn new() -> Self {
         Self {
             inner: MessengerBuilder::new(),
             stream_config: None,
             mux_config: None,
+            reservation_config: Default::default(),
             mux_only: false,
             metrics: None,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -465,6 +473,7 @@ impl VeloBuilder {
             !self.mux_only || self.stream_config.is_none(),
             "mux_only cannot be combined with stream_config or stream_bind_addr"
         );
+        self.reservation_config.validate()?;
         // Read the override once at build so this instance keeps the same
         // transport offers for every attach.
         let config = resolve_mux_config(
@@ -479,6 +488,7 @@ impl VeloBuilder {
                 Arc::clone(&messenger),
                 config,
                 self.metrics.clone(),
+                self.reservation_config.prebind_timeout,
             )?;
             Some(mux)
         } else {
@@ -540,6 +550,7 @@ impl VeloBuilder {
 
         let anchor_manager = Arc::new(
             crate::streaming::AnchorManagerBuilder::default()
+                .default_unattached_timeout(self.reservation_config.unattached_timeout)
                 .worker_id(worker_id)
                 .transport(Arc::clone(&stream_transport))
                 .transport_registry(Arc::new(registry))
@@ -548,6 +559,20 @@ impl VeloBuilder {
                 .build()
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
         );
+        // The per-stream transport of this crate reports a stream's
+        // retirement from its pump; the registry's public type cannot say so.
+        if let Some(owned) = &owned_stream_transport {
+            let retiring: Arc<dyn crate::streaming::transport::RetiringFrameTransport> = match owned
+            {
+                OwnedStreamTransport::Tcp(tcp) => Arc::clone(tcp) as _,
+                #[cfg(feature = "grpc")]
+                OwnedStreamTransport::Grpc(grpc) => Arc::clone(grpc) as _,
+            };
+            anchor_manager.install_retiring_transports(std::collections::HashMap::from([(
+                stream_transport.key().as_str().to_string(),
+                retiring,
+            )]));
+        }
 
         if let Some(mux) = mux {
             anchor_manager.install_mux(mux)?;
@@ -803,7 +828,8 @@ impl Velo {
     /// together, rather than giving each phase the full duration. Joining mux
     /// tasks comes after the drain and needs the owning runtime to make
     /// progress. The transports' close step also comes on top: it is bounded by each
-    /// transport's own [`Transport::closed`] (QUIC: 2.5 s), not by the policy,
+    /// transport's own [`Transport::closed`] (QUIC: 2.5 s; TCP and UDS: their
+    /// teardown grace, 1 s unless the builder set it, plus 1.5 s), not by the policy,
     /// because cutting it short would discard frames already written.
     /// Under [`ShutdownPolicy::WaitForever`] the sweep still takes
     /// [`RdmaConfig::shutdown_timeout`], because a peer that crashed
@@ -3345,5 +3371,80 @@ mod tests {
             gone.is_ok() && !still_alive,
             "a notice parked in admission to a stalled peer kept the Messenger alive after its final drop"
         );
+    }
+
+    /// The per-stream transports of this crate report a stream's retirement
+    /// from their pump, but only because the builder names them to the anchor
+    /// manager. A sender over either of them retires on its transport; a
+    /// builder that forgot to install them would silently fall back to
+    /// reporting as the terminal enters the channel.
+    async fn per_stream_node(config: StreamConfig) -> Velo {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        Velo::builder()
+            .add_transport(Arc::new(
+                crate::transports::tcp::TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ))
+            .stream_config(config)
+            .unwrap()
+            .messenger_mux(crate::streaming::MuxConfig {
+                enabled: false,
+                ..crate::streaming::MuxConfig::default()
+            })
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+    }
+
+    async fn per_stream_sender_retires_on_its_transport(
+        config: impl Fn() -> StreamConfig,
+        key: &str,
+    ) {
+        let consumer = per_stream_node(config()).await;
+        let producer = per_stream_node(config()).await;
+        consumer.register_peer(producer.peer_info()).unwrap();
+        producer.register_peer(consumer.peer_info()).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            producer.wait_for_handler(consumer.instance_id(), "_anchor_attach"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let anchor = consumer.create_anchor::<u32>();
+        let sender = producer
+            .attach_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        assert_eq!(sender.negotiated_transport().map(|k| k.as_str()), Some(key));
+        assert_eq!(
+            sender.retires_on(),
+            crate::streaming::sender::RetiresOn::Transport,
+            "the builder must name its per-stream transport to the anchor manager"
+        );
+        drop(anchor);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tcp_per_stream_sender_retires_on_its_transport() {
+        per_stream_sender_retires_on_its_transport(|| StreamConfig::Tcp(None), "tcp-stream").await;
+    }
+
+    #[cfg(feature = "grpc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grpc_per_stream_sender_retires_on_its_transport() {
+        per_stream_sender_retires_on_its_transport(
+            || {
+                StreamConfig::Grpc(Some(GrpcConfig {
+                    bind_addr: "127.0.0.1:0".parse().unwrap(),
+                }))
+            },
+            "grpc-stream",
+        )
+        .await;
     }
 }

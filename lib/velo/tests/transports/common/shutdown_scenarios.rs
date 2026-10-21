@@ -462,3 +462,194 @@ where
     );
     handle_b.streams.shutdown_state.teardown_token().cancel();
 }
+
+/// Every frame the transport admitted before teardown reaches the peer, and
+/// none fails: teardown writes what its writers already queued before it
+/// closes them, and `closed()` waits for those writes.
+///
+/// Admission is the promise a sender acts on. The messenger mux, for one,
+/// reports a stream sent once the batch that ends it is admitted, and its
+/// producer may shut down right after. A writer that dropped its queue at
+/// teardown broke that promise for whatever it had not yet written, which on
+/// a busy connection is most of the queue.
+///
+/// The frames are large, so most of them still wait in the writer's channel
+/// when teardown lands. They are no more than the channel holds, so every one
+/// was admitted and none waits in the admission gate. TCP and UDS only: QUIC
+/// still fails frames queued at teardown.
+pub async fn admitted_frames_are_written_across_teardown<C: ShutdownTestClient>()
+where
+    C::Transport: 'static,
+{
+    const FRAMES: usize = 256;
+    const PAYLOAD: usize = 64 * 1024;
+    let handle_a = C::new_handle().await.unwrap();
+    let handle_b = C::new_handle().await.unwrap();
+    handle_a.register_peer(&handle_b).unwrap();
+
+    for i in 0..FRAMES {
+        handle_a.send(
+            handle_b.instance_id,
+            (i as u32).to_be_bytes().to_vec(),
+            vec![0u8; PAYLOAD],
+            MessageType::Response,
+        );
+    }
+    // Tear down once frames are flowing, so it lands mid-stream.
+    let (first, _) = timeout(
+        Duration::from_secs(5),
+        handle_b.streams.response_stream.recv_async(),
+    )
+    .await
+    .expect("the first frame arrives")
+    .expect("recv");
+    let mut delivered = vec![first];
+    handle_a.streams.shutdown_state.teardown_token().cancel();
+    handle_a.transport.shutdown();
+    timeout(Duration::from_secs(5), handle_a.transport.closed())
+        .await
+        .expect("closed() bounds its wait");
+
+    while delivered.len() < FRAMES {
+        match timeout(
+            Duration::from_secs(3),
+            handle_b.streams.response_stream.recv_async(),
+        )
+        .await
+        {
+            Ok(Ok((header, _))) => delivered.push(header),
+            _ => break,
+        }
+    }
+    let failed = handle_a.error_handler.get_errors();
+    assert!(
+        delivered.len() == FRAMES && failed.is_empty(),
+        "{} of {FRAMES} admitted frames delivered, {} failed at teardown: {:?}",
+        delivered.len(),
+        failed.len(),
+        failed.first().map(|(_, _, error)| error)
+    );
+    for (i, header) in delivered.iter().enumerate() {
+        assert_eq!(
+            u32::from_be_bytes(header[..].try_into().expect("a 4-byte header")) as usize,
+            i,
+            "frames arrive in the order they were admitted"
+        );
+    }
+    handle_b.streams.shutdown_state.teardown_token().cancel();
+}
+
+/// A frame admitted to a connection that is still dialing reaches the peer
+/// when teardown lands before the socket exists. The first send to a peer
+/// creates the connection, and the writer dials; a sender may act on the
+/// admission at once (the messenger mux reports a stream sent when its batch
+/// is admitted, which on a new lane is before any socket). A writer that gave
+/// the dial up at teardown failed the frame instead.
+pub async fn a_frame_admitted_while_dialing_survives_teardown<C: ShutdownTestClient>()
+where
+    C::Transport: 'static,
+{
+    let handle_a = C::new_handle().await.unwrap();
+    let handle_b = C::new_handle().await.unwrap();
+    handle_a.register_peer(&handle_b).unwrap();
+
+    // No earlier traffic: this send creates the connection.
+    handle_a.send(
+        handle_b.instance_id,
+        b"cold".to_vec(),
+        vec![0u8; 64],
+        MessageType::Response,
+    );
+    handle_a.streams.shutdown_state.teardown_token().cancel();
+    handle_a.transport.shutdown();
+    timeout(Duration::from_secs(5), handle_a.transport.closed())
+        .await
+        .expect("closed() bounds its wait");
+
+    let (header, _) = timeout(
+        Duration::from_secs(3),
+        handle_b.streams.response_stream.recv_async(),
+    )
+    .await
+    .expect("the frame admitted while dialing arrives")
+    .expect("recv");
+    assert_eq!(&header[..], b"cold");
+    let failed = handle_a.error_handler.get_errors();
+    assert!(failed.is_empty(), "{:?}", failed.first().map(|(_, _, e)| e));
+    handle_b.streams.shutdown_state.teardown_token().cancel();
+}
+
+/// Teardown admits nothing more from the admission gate: a frame that still
+/// waits there when teardown starts is refused, not admitted.
+///
+/// Admission is the promise a sender acts on (the messenger mux reports a
+/// stream sent on it), and teardown writes only what is already in the
+/// writer's channel. `shutdown()` removed each connection from the map
+/// without failing its gate, so the gate's driver went on admitting its queue
+/// into the channel during teardown. A frame it admitted after the writer
+/// stopped, at the first empty read or at the teardown deadline, was failed at
+/// once by `retire_connection`, after its sender had been told it was
+/// admitted.
+///
+/// More frames than the channel holds, and teardown right after them, so most
+/// still wait in the gate. One frame may be in the driver's hands already when
+/// the gate fails, and it may still land; nothing else queued before teardown
+/// may. A send that races `shutdown()` itself can still take the gate's fresh
+/// epoch; closing that needs a terminal state on `AdmissionGate`.
+pub async fn teardown_admits_nothing_from_the_gate<C: ShutdownTestClient>()
+where
+    C::Transport: 'static,
+{
+    const FRAMES: usize = 2048;
+    const PAYLOAD: usize = 64 * 1024;
+    let handle_a = C::new_handle().await.unwrap();
+    let handle_b = C::new_handle().await.unwrap();
+    handle_a.register_peer(&handle_b).unwrap();
+
+    let tearing_down = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let admitted_late = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut queued = Vec::new();
+    for i in 0..FRAMES {
+        let outcome = handle_a.send_admission(
+            handle_b.instance_id,
+            (i as u32).to_be_bytes().to_vec(),
+            vec![0u8; PAYLOAD],
+            MessageType::Response,
+        );
+        if let Some(pending) = outcome.into_pending() {
+            let tearing_down = Arc::clone(&tearing_down);
+            let admitted_late = Arc::clone(&admitted_late);
+            queued.push(pending.on_resolved(move |result| {
+                if result.is_ok() && tearing_down.load(std::sync::atomic::Ordering::SeqCst) {
+                    admitted_late.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }));
+        }
+    }
+    assert!(!queued.is_empty(), "frames must wait in the admission gate");
+
+    tearing_down.store(true, std::sync::atomic::Ordering::SeqCst);
+    handle_a.streams.shutdown_state.teardown_token().cancel();
+    handle_a.transport.shutdown();
+    timeout(Duration::from_secs(5), handle_a.transport.closed())
+        .await
+        .expect("closed() bounds its wait");
+    timeout(Duration::from_secs(5), async {
+        while queued
+            .iter()
+            .any(|pending| pending.state() == velo_ext::AdmissionState::Pending)
+        {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("every queued frame resolves once its connection is gone");
+
+    let late = admitted_late.load(std::sync::atomic::Ordering::SeqCst);
+    assert!(
+        late <= 1,
+        "{late} of {} frames queued in the gate were admitted after teardown began",
+        queued.len()
+    );
+    handle_b.streams.shutdown_state.teardown_token().cancel();
+}

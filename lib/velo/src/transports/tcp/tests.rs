@@ -7,6 +7,7 @@ use super::*;
 use crate::transports::AdmissionState;
 use crate::transports::address::WorkerAddressBuilder;
 use crate::transports::tcp::TcpFrameCodec;
+use crate::transports::teardown_grace::TEARDOWN_FLUSH_GRACE;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use velo_ext::PeerInfo;
 
@@ -151,6 +152,10 @@ async fn writer_observer_publishes_egress_into_the_bound_handle() {
             lane: 0,
             addr: "127.0.0.1:1".parse().unwrap(),
             egress: Some(EgressMetrics::new(handle)),
+            teardown: Arc::new(TeardownStop::new(
+                CancellationToken::new(),
+                TEARDOWN_FLUSH_GRACE,
+            )),
         },
     )
     .await;
@@ -257,6 +262,10 @@ async fn the_egress_queue_wait_spans_the_admission_gate() {
                     lane: 0,
                     addr: "127.0.0.1:1".parse().unwrap(),
                     egress: Some(EgressMetrics::new(handle)),
+                    teardown: Arc::new(TeardownStop::new(
+                        CancellationToken::new(),
+                        TEARDOWN_FLUSH_GRACE,
+                    )),
                 },
             )
             .await;
@@ -484,6 +493,11 @@ async fn test_writer_task_cleans_up_on_write_error() {
         WriterTaskContext {
             connections: conns,
             cancel_token: cancel,
+            teardown: Arc::new(TeardownStop::new(
+                CancellationToken::new(),
+                TEARDOWN_FLUSH_GRACE,
+            )),
+            writing: tokio_util::task::TaskTracker::new().token(),
             connect_timeout: Duration::from_secs(5),
             reader_ctx: None,
             metrics: None,
@@ -634,6 +648,11 @@ async fn test_writer_task_drains_on_connect_failure() {
         WriterTaskContext {
             connections: conns,
             cancel_token: cancel,
+            teardown: Arc::new(TeardownStop::new(
+                CancellationToken::new(),
+                TEARDOWN_FLUSH_GRACE,
+            )),
+            writing: tokio_util::task::TaskTracker::new().token(),
             connect_timeout: Duration::from_secs(5),
             reader_ctx: None,
             metrics: None,
@@ -1470,4 +1489,225 @@ async fn closed_releases_running_listener() {
     transport.shutdown();
     transport.closed().await;
     assert!(std::net::TcpStream::connect(address).is_err());
+}
+
+/// Teardown while the first connection is still dialing keeps the dial, and so
+/// the frames queued behind it, until the teardown deadline. Those frames were
+/// admitted, and a sender may already act on that (the messenger mux reports a
+/// stream sent once its batch is admitted, which on a new lane is before the
+/// socket exists). A writer that gave the dial up at once failed them. The
+/// deadline is the one the writes after the dial run to, so the dial does not
+/// add a grace of its own.
+///
+/// TEST-NET-1 (192.0.2.0/24) is reserved and not routed, so a SYN there gets no
+/// answer and the dial stays pending. A host with no route at all refuses at
+/// once; then there is no pending dial to test, and the test says so and stops.
+/// Time is paused: the deadline is reached as soon as nothing else can run.
+#[tokio::test(start_paused = true)]
+async fn teardown_keeps_a_pending_dial_until_its_deadline() {
+    let addr: SocketAddr = "192.0.2.1:9".parse().unwrap();
+    if tokio::time::timeout(Duration::from_millis(200), TcpStream::connect(addr))
+        .await
+        .is_ok()
+    {
+        eprintln!("skipped: no route holds a dial to {addr} pending on this host");
+        return;
+    }
+
+    let iid = crate::InstanceId::new_v4();
+    let (handle, rx) = make_handle(8);
+    let tx = handle.tx.clone();
+    let connections: Arc<DashMap<LaneKey, ConnectionHandle>> = Arc::new(DashMap::new());
+    connections.insert((iid, 0), handle);
+    let error_handler = Arc::new(TrackingErrorHandler::new());
+    tx.send(SendTask {
+        msg_type: MessageType::Message,
+        header: Bytes::from_static(b"hdr"),
+        payload: Bytes::from_static(b"pay"),
+        on_error: error_handler.clone(),
+        queued_at: None,
+    })
+    .unwrap();
+
+    let teardown = CancellationToken::new();
+    let writer = connection_writer_task(
+        addr,
+        (iid, 0),
+        rx,
+        tx.clone(),
+        WriterTaskContext {
+            connections: Arc::clone(&connections),
+            cancel_token: teardown.child_token(),
+            teardown: Arc::new(TeardownStop::new(teardown.clone(), TEARDOWN_FLUSH_GRACE)),
+            writing: tokio_util::task::TaskTracker::new().token(),
+            connect_timeout: Duration::from_secs(5),
+            reader_ctx: None,
+            metrics: None,
+            socket_buffers: None,
+        },
+    );
+    tokio::pin!(writer);
+    assert!(
+        futures::poll!(&mut writer).is_pending(),
+        "the dial is pending"
+    );
+    drop(tx);
+
+    let stopped = tokio::time::Instant::now();
+    teardown.cancel();
+    writer.await.unwrap();
+    assert_eq!(
+        stopped.elapsed(),
+        TEARDOWN_FLUSH_GRACE,
+        "the dial ends at the teardown deadline: not before it, and not at the \
+         5 s connect timeout"
+    );
+    assert_eq!(
+        error_handler.error_count(),
+        1,
+        "the queued frame fails once the deadline passes"
+    );
+    assert!(!connections.contains_key(&(iid, 0)));
+}
+
+/// `closed()` returns only once the connection writers are done with what
+/// teardown kept. A peer that does not read blocks the writer until the
+/// teardown deadline, and `closed()` waits that long: a `closed()` that
+/// returned at once would let the process exit with the writer still holding
+/// admitted frames. Time is paused, so the deadline is reached as soon as the
+/// writer blocks, and the test takes no real second.
+#[tokio::test(start_paused = true)]
+async fn closed_waits_for_a_writer_blocked_on_its_peer() {
+    let (transport, errors, _peer_listener) = blocked_on_its_peer(TEARDOWN_FLUSH_GRACE);
+    transport.shutdown();
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), transport.closed())
+        .await
+        .expect("closed() bounds its wait");
+    assert!(
+        started.elapsed() >= TEARDOWN_FLUSH_GRACE,
+        "closed() returned after {:?}, before the writer's deadline",
+        started.elapsed()
+    );
+    assert!(
+        errors.error_count() > 0,
+        "the frames the peer never read fail at the deadline"
+    );
+}
+
+/// A transport whose one connection writer is blocked on a peer that never
+/// reads, with `grace` as its teardown grace. The listener is returned so it
+/// stays open: the kernel completes the handshake and buffers what it can,
+/// then the writer blocks.
+fn blocked_on_its_peer(
+    grace: Duration,
+) -> (
+    TcpTransport,
+    Arc<TrackingErrorHandler>,
+    std::net::TcpListener,
+) {
+    const FRAMES: usize = 128;
+    const PAYLOAD: usize = 256 * 1024;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let transport = TcpTransportBuilder::new()
+        .from_listener(listener)
+        .unwrap()
+        .teardown_flush_grace(grace)
+        .build()
+        .unwrap();
+    transport
+        .runtime
+        .set(tokio::runtime::Handle::current())
+        .ok();
+    let peer_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = make_tcp_peer(peer_listener.local_addr().unwrap());
+    let peer_id = peer.instance_id();
+    transport.register(peer).unwrap();
+
+    let errors = Arc::new(TrackingErrorHandler::new());
+    for _ in 0..FRAMES {
+        let _ = transport.send_message(
+            peer_id,
+            Bytes::from_static(b"hdr"),
+            Bytes::from(vec![0u8; PAYLOAD]),
+            MessageType::Response,
+            errors.clone(),
+        );
+    }
+    (transport, errors, peer_listener)
+}
+
+/// The builder's teardown grace is what the writers get. A longer one keeps a
+/// blocked writer trying past the default second, failing nothing until the
+/// grace has passed; a shorter one ends the wait sooner. An engine that drains
+/// for a minute sets a grace to match.
+#[tokio::test(start_paused = true)]
+async fn the_teardown_grace_is_the_builders() {
+    let (transport, errors, _peer_listener) = blocked_on_its_peer(Duration::from_secs(3));
+    transport.shutdown();
+    let started = tokio::time::Instant::now();
+    let closed = transport.closed();
+    tokio::pin!(closed);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(2), &mut closed)
+            .await
+            .is_err(),
+        "a 3 s grace keeps writing past the default second"
+    );
+    assert_eq!(
+        errors.error_count(),
+        0,
+        "nothing fails before the grace passes"
+    );
+    tokio::time::timeout(Duration::from_secs(5), closed)
+        .await
+        .expect("closed() bounds its wait");
+    assert!(started.elapsed() >= Duration::from_secs(3));
+    assert!(errors.error_count() > 0);
+
+    let (transport, errors, _peer_listener) = blocked_on_its_peer(Duration::from_millis(200));
+    transport.shutdown();
+    let started = tokio::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(5), transport.closed())
+        .await
+        .expect("closed() bounds its wait");
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "a 200 ms grace stops before the default second: {:?}",
+        started.elapsed()
+    );
+    assert!(errors.error_count() > 0);
+}
+
+/// A send after teardown fails at once, with no connection and no dial. A
+/// dial after teardown could only be stopped, and a frame it admitted would
+/// ride the grace meant for the frames admitted before teardown.
+#[tokio::test]
+async fn a_send_after_teardown_fails_at_once_without_a_dial() {
+    let (transport, _) = make_transport();
+    let peer_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let peer = make_tcp_peer(peer_listener.local_addr().unwrap());
+    let peer_id = peer.instance_id();
+    transport.register(peer).unwrap();
+    transport.shutdown();
+
+    let errors = Arc::new(TrackingErrorHandler::new());
+    let _ = transport.send_message(
+        peer_id,
+        Bytes::from_static(b"hdr"),
+        Bytes::from_static(b"pay"),
+        MessageType::Message,
+        errors.clone(),
+    );
+    assert_eq!(errors.error_count(), 1, "the send fails before it returns");
+    assert!(
+        errors.reasons.lock().unwrap()[0].contains("transport shut down"),
+        "{:?}",
+        errors.reasons.lock().unwrap()
+    );
+    assert!(
+        !transport.connections.contains_key(&(peer_id, 0)),
+        "no connection, so no dial"
+    );
 }

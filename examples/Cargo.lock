@@ -3070,6 +3070,7 @@ dependencies = [
  "bytes",
  "clap",
  "crc32fast",
+ "dashmap",
  "flume",
  "futures",
  "hdrhistogram",

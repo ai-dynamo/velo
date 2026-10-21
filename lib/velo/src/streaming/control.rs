@@ -259,7 +259,8 @@ pub(crate) use pump::{PumpContext, note_timer_arm, note_timer_fire, reader_pump}
 #[cfg(test)]
 pub(crate) use pump::{TIMER_ARMS, TIMER_FIRES};
 pub(crate) use registry::{
-    CloseOnCancel, create_stream_stop_handler, request_sender_cancel, request_sender_stop,
+    CloseOnCancel, RetireGuard, create_stream_stop_handler, request_sender_cancel,
+    request_sender_stop,
 };
 pub use registry::{SenderClosed, SenderEntry, SenderRegistry, create_stream_cancel_handler};
 pub use ticket::StreamOpenTicket;

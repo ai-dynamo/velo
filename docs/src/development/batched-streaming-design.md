@@ -146,7 +146,7 @@ The batcher awaits each flush's admission, so a congested peer parks the batcher
 
 ### Eager OpenSlot, and credit from the attach response
 
-`OpenSlot` goes out when the stream attaches, so the 60-second accept window measures "time until the `OpenSlot` arrives" and not "time until the first token". Otherwise a long prefill expires the window and kills a healthy request.
+`OpenSlot` goes out when the stream attaches, so the accept window (`ReservationConfig::prebind_timeout`, 180 seconds by default) measures "time until the `OpenSlot` arrives" and not "time until the first token". Otherwise a long prefill expires the window and kills a healthy request.
 
 The slot opens already holding the window from the attach response. Before negotiation, the receiver sent a `CreditUpdate` on `OpenSlot`, which cost a round trip per stream. Both together grant 2C against a C+1 buffer, so the change was a swap.
 
@@ -188,7 +188,7 @@ A grant threshold (grant only when half the window has drained) was built and me
 - **No protocol version bump.** The ticket rides the application's envelope as an optional field. A version bump breaks an old worker outright. An absent field makes the worker attach the ordinary way.
 - **The watchdog exemption is gated on `WatchdogContext::prebound`, not on the drain claim alone.** The mux parks a `DrainSignal` for every bind. The signal reads as unclaimed until the peer's `OpenSlot` arrives, which is after the attach response returned. `prebound` tells a real pre-bind (no sender yet) from an ordinary attach whose `OpenSlot` is still in flight. It is an `Arc<AtomicBool>` so that `PreBind::adopt` can clear it at once when a sender attaches the long way.
 - **The exemption lets the accept window be the true backstop.** Counting silence before a sender exists caps the wait at `DETECTION_MULTIPLIER × heartbeat_interval` (15 s at the default), whatever the application configured.
-- **Adoption does not restart the accept window.** An adopted attach inherits what is left of the 60 s. Whichever deadline comes first catches a sender that dies before its first record: the watchdog, measured from adoption, or the remaining accept window. With a heartbeat interval of 20 s or more, the accept window wins; it closes up to one `credit_sweep_interval` late, so at exactly 20 s the two can land together.
+- **Adoption does not restart the accept window.** An adopted attach inherits what is left of the accept window. Whichever deadline comes first catches a sender that dies before its first record: the watchdog, measured from adoption, or the remaining accept window. The watchdog fires `DETECTION_MULTIPLIER` (3) heartbeat intervals after adoption. So with the 180-second default, a heartbeat interval of 60 s or more lets the accept window win. The window closes up to one `credit_sweep_interval` late, so at exactly a third of the window the two can land together.
 
 ### async_open_ack fences only when admission is pending
 
