@@ -159,8 +159,10 @@ struct Args {
     #[arg(long, value_enum, default_value_t = TransportType::Tcp)]
     transport: TransportType,
 
-    /// Unattached-anchor timeout, in milliseconds. Hold it small to make
-    /// unattached timeouts fire at load.
+    /// Unattached-anchor timeout, in milliseconds. Hold it small so that
+    /// unattached deadlines come due during the run, but above the attach
+    /// latency: a request anchor that expires before its sender attaches
+    /// fails the run.
     #[arg(long)]
     unattached_timeout_ms: Option<u64>,
 }

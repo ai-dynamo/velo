@@ -120,7 +120,8 @@ A file that is not compiled (docs, CI, scripts) has no tier. Check for
   `stream_watchdog` (`streaming/control/feed.rs`; it wakes once per
   window). The unattached deadlines: `AnchorDeadlineQueue::push` on
   anchor create and detach, and its sweep (`streaming/anchor.rs`); the
-  bind expiry `MuxCore::expire_binds` (`streaming/deadline.rs`).
+  bind expiry `MuxCore::expire_binds` (`streaming/messenger_mux/mod.rs`),
+  on the shared `DeadlineQueue` (`streaming/deadline.rs`).
 
 ## Other transports: T1 per frame
 

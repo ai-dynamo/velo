@@ -66,14 +66,18 @@ impl FrameTransport for NoTransport {
 }
 
 /// Resident set size of this process, in MiB.
+///
+/// Read from `VmRSS`, which the kernel reports in KiB. `/proc/self/statm`
+/// counts pages, and a fixed page size misreads hosts with 64 KiB pages.
 fn rss_mib() -> f64 {
-    let statm = std::fs::read_to_string("/proc/self/statm").unwrap_or_default();
-    let pages: f64 = statm
-        .split_whitespace()
-        .nth(1)
-        .and_then(|p| p.parse().ok())
+    let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let kib: f64 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("VmRSS:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kib| kib.parse().ok())
         .unwrap_or(0.0);
-    pages * 4096.0 / (1024.0 * 1024.0)
+    kib / 1024.0
 }
 
 async fn lifecycles(manager: Arc<AnchorManager>, streams: usize) -> Result<Vec<u64>> {
