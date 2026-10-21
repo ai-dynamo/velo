@@ -3,8 +3,11 @@
 
 //! Renewable deadlines, shared by anchor reservations and mux binds.
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use tokio::time::Instant;
 
 /// `now + lifetime`, saturating 30 years out as `tokio::time::sleep` does.
@@ -25,5 +28,151 @@ pub(crate) fn deadline_after(lifetime: Duration) -> Instant {
 pub(crate) fn renew_if_live(expires: &mut Instant, lifetime: Duration) {
     if *expires > Instant::now() {
         *expires = deadline_after(lifetime);
+    }
+}
+
+/// When to look at each key again, earliest first.
+///
+/// An entry is a hint, not the deadline: the owner stores the deadline that
+/// counts with the key, and renewal moves that one. When an entry comes due,
+/// the owner reads the stored deadline and requeues the key if it moved. So
+/// an entry is never removed early. A key that leaves its owner (claimed,
+/// attached, released) leaves its entry behind, and that entry costs one
+/// failed lookup when it comes due. That is cheaper than finding it in the
+/// heap on the claim path, which every stream takes.
+///
+/// What bounds the stale entries is the cap: no entry is queued more than
+/// `recheck` ahead. Queued at the key's own deadline instead, a
+/// `Duration::MAX` timeout came due in 30 years, and every key ever queued
+/// stayed in the heap for the life of the process.
+pub(crate) struct DeadlineQueue<K> {
+    heap: Mutex<BinaryHeap<Reverse<(Instant, K)>>>,
+    recheck: Duration,
+}
+
+impl<K: Ord> DeadlineQueue<K> {
+    /// A queue that holds no entry more than `recheck` ahead.
+    pub(crate) const fn new(recheck: Duration) -> Self {
+        Self {
+            heap: Mutex::new(BinaryHeap::new()),
+            recheck,
+        }
+    }
+
+    /// Queue a look at `key` by `deadline`, at most `recheck` from now.
+    pub(crate) fn push(&self, deadline: Instant, key: K) {
+        let at = deadline.min(deadline_after(self.recheck));
+        self.heap.lock().push(Reverse((at, key)));
+    }
+
+    /// Pop at most `max` keys whose entry is due by `now`.
+    ///
+    /// Bounded because every push takes this lock: a sweep that pops a whole
+    /// burst in one hold stalls every new stream for as long as that takes.
+    /// A result of `max` keys means more can be due; call again.
+    pub(crate) fn pop_due(&self, now: Instant, max: usize) -> Vec<K> {
+        let mut heap = self.heap.lock();
+        let mut due = Vec::new();
+        while due.len() < max && heap.peek().is_some_and(|entry| entry.0.0 <= now) {
+            due.push(heap.pop().expect("due entry").0.1);
+        }
+        due
+    }
+
+    /// Queue every key in `renewed` again, each at most `recheck` after
+    /// `now`, under one lock.
+    ///
+    /// Then give back the capacity a burst left behind, but only once the
+    /// queue is nearly empty. The shrink copies what is left while holding
+    /// the lock every push takes, so shrinking a queue still tens of
+    /// thousands deep would stall new streams. It is decided after the
+    /// requeue, so a sweep never shrinks a queue it is about to refill.
+    pub(crate) fn requeue(&self, now: Instant, renewed: impl IntoIterator<Item = (Instant, K)>) {
+        let cap = now.checked_add(self.recheck);
+        let mut heap = self.heap.lock();
+        heap.extend(
+            renewed.into_iter().map(|(deadline, key)| {
+                Reverse((cap.map_or(deadline, |cap| deadline.min(cap)), key))
+            }),
+        );
+        if heap.len() <= 1024 && heap.capacity() > 8192 {
+            heap.shrink_to(2048);
+        }
+    }
+
+    /// The heap itself, for tests that read its length or capacity, or plant
+    /// entries directly.
+    #[cfg(test)]
+    pub(crate) fn heap(&self) -> parking_lot::MutexGuard<'_, BinaryHeap<Reverse<(Instant, K)>>> {
+        self.heap.lock()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const RECHECK: Duration = Duration::from_secs(60);
+
+    fn queue() -> DeadlineQueue<u64> {
+        DeadlineQueue::new(RECHECK)
+    }
+
+    fn head(q: &DeadlineQueue<u64>) -> Option<Instant> {
+        q.heap().peek().map(|head| head.0.0)
+    }
+
+    /// A key pushed with a far deadline comes due at the recheck cap, not at
+    /// its deadline. This is what bounds how long a stale entry lives.
+    #[tokio::test(start_paused = true)]
+    async fn push_caps_an_entry_at_the_recheck() {
+        let q = queue();
+        let now = Instant::now();
+        q.push(deadline_after(Duration::MAX), 1);
+        assert_eq!(head(&q), Some(now + RECHECK));
+        q.push(now + Duration::from_millis(10), 2);
+        assert_eq!(head(&q), Some(now + Duration::from_millis(10)));
+    }
+
+    /// A requeued key is capped at the recheck after the sweep's `now`.
+    #[tokio::test(start_paused = true)]
+    async fn requeue_caps_at_the_recheck() {
+        let q = queue();
+        let now = Instant::now();
+        q.requeue(now, [(deadline_after(Duration::MAX), 1)]);
+        assert_eq!(head(&q), Some(now + RECHECK));
+        q.requeue(now, [(now + Duration::from_secs(5), 2)]);
+        assert_eq!(head(&q), Some(now + Duration::from_secs(5)));
+    }
+
+    /// A sweep pops at most `max` keys per call, earliest first, and leaves
+    /// entries that are not due.
+    #[tokio::test(start_paused = true)]
+    async fn pop_due_is_bounded_and_ordered() {
+        let q = queue();
+        let now = Instant::now();
+        for key in (0..10).rev() {
+            q.push(now + Duration::from_millis(key), key);
+        }
+        q.push(now + Duration::from_millis(900), 99);
+        let later = now + Duration::from_millis(100);
+        assert_eq!(q.pop_due(later, 4), vec![0, 1, 2, 3]);
+        assert_eq!(q.pop_due(later, 100), vec![4, 5, 6, 7, 8, 9]);
+        assert!(q.pop_due(later, 100).is_empty(), "99 is not due");
+        assert_eq!(q.heap().len(), 1);
+    }
+
+    /// After a burst drains, the queue gives its capacity back.
+    #[tokio::test(start_paused = true)]
+    async fn a_drained_burst_gives_its_capacity_back() {
+        let q = queue();
+        let now = Instant::now();
+        for key in 0..20_000 {
+            q.push(now, key);
+        }
+        while !q.pop_due(now, 4096).is_empty() {}
+        assert!(q.heap().capacity() > 8192);
+        q.requeue(now, []);
+        assert!(q.heap().capacity() <= 4096, "{}", q.heap().capacity());
     }
 }
