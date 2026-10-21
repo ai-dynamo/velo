@@ -59,6 +59,9 @@ name = "batched_streaming"
 name = "response_plane_bench"
 
 [[example]]
+name = "anchor_setup_bench"
+
+[[example]]
 name = "stream_lifecycle"
 
 [[example]]
