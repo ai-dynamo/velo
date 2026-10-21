@@ -140,9 +140,19 @@ pub(crate) const ANCHOR_FIRST_LOOK: Duration = Duration::from_secs(1);
 /// within one recheck.
 pub(crate) const ANCHOR_RECHECK: Duration = Duration::from_secs(60);
 
-/// The most entries one hold of the queue lock pops. Every anchor create and
-/// detach takes that lock.
+/// The most entries one hold of a shard lock pops. Every anchor create and
+/// detach takes a shard lock.
 const ANCHOR_EXPIRE_BATCH: usize = 4096;
+
+/// How many independently locked parts the deadline queue has. An anchor's
+/// entries always go to the part that its id selects.
+///
+/// Every anchor create takes a lock on the queue. With one lock, creates on
+/// different worker threads waited on each other: in `anchor_setup_bench`
+/// at 8 threads, the p99.9 of a create-attach-finish cycle was 110 us,
+/// against 25 us with a task per anchor. With 1 or 2 threads, the single
+/// lock was faster than the task at every percentile.
+const ANCHOR_QUEUE_SHARDS: usize = 16;
 
 /// What the sweep does with a due entry, decided from the anchor's state.
 enum Due {
@@ -184,7 +194,7 @@ impl Due {
 /// entry. The next push from a runtime thread starts the sweep, and it
 /// expires every due entry.
 pub(crate) struct AnchorDeadlineQueue {
-    deadlines: DeadlineQueue<u64>,
+    shards: [DeadlineQueue<u64>; ANCHOR_QUEUE_SHARDS],
     /// Signalled by `push` when the new entry is the earliest, so the sweep
     /// retargets its wait.
     earlier: tokio::sync::Notify,
@@ -213,17 +223,26 @@ impl Drop for SweepAlive {
 impl AnchorDeadlineQueue {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
-            deadlines: DeadlineQueue::new(ANCHOR_FIRST_LOOK, ANCHOR_RECHECK),
+            shards: std::array::from_fn(|_| DeadlineQueue::new(ANCHOR_FIRST_LOOK, ANCHOR_RECHECK)),
             earlier: tokio::sync::Notify::new(),
             stopped: CancellationToken::new(),
             sweep_alive: AtomicBool::new(false),
         })
     }
 
+    fn shard(&self, local_id: u64) -> &DeadlineQueue<u64> {
+        &self.shards[(local_id % ANCHOR_QUEUE_SHARDS as u64) as usize]
+    }
+
+    /// When the earliest entry of any shard comes due.
+    fn next_due(&self) -> Option<tokio::time::Instant> {
+        self.shards.iter().filter_map(DeadlineQueue::next_due).min()
+    }
+
     /// How many entries are queued, stale ones included.
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.deadlines.heap().len()
+        self.shards.iter().map(|shard| shard.heap().len()).sum()
     }
 
     /// Whether a sweep task exists on this queue.
@@ -241,15 +260,20 @@ impl AnchorDeadlineQueue {
     /// runs.
     ///
     /// Callers hold the anchor's registry shard lock. That is safe: this
-    /// takes only the queue lock, and the sweep never holds the queue lock
-    /// while it takes a shard lock. A spawn does not run the task in place.
+    /// takes only a queue shard lock, and the sweep never holds a queue shard
+    /// lock while it takes a registry shard lock. A spawn does not run the
+    /// task in place.
+    ///
+    /// The sweep is woken when the entry is the earliest of its queue shard.
+    /// That is not always the earliest of the queue, and then the wake only
+    /// costs the sweep a fresh look at the shards.
     pub(crate) fn push(
         self: &Arc<Self>,
         registry: &Arc<DashMap<u64, AnchorEntry>>,
         deadline: tokio::time::Instant,
         local_id: u64,
     ) {
-        if self.deadlines.push(deadline, local_id) {
+        if self.shard(local_id).push(deadline, local_id) {
             self.earlier.notify_one();
         }
         if !self.sweep_alive.load(Ordering::Acquire) {
@@ -287,7 +311,7 @@ impl AnchorDeadlineQueue {
     async fn sweep(alive: SweepAlive, registry: std::sync::Weak<DashMap<u64, AnchorEntry>>) {
         let queue = &alive.0;
         loop {
-            let next = queue.deadlines.next_due();
+            let next = queue.next_due();
             tokio::select! {
                 biased;
                 () = queue.stopped.cancelled() => return,
@@ -310,17 +334,28 @@ impl AnchorDeadlineQueue {
         }
     }
 
-    /// Pop the due entries in bounded batches and act on each.
+    /// Pop the due entries of each queue shard in bounded batches, and act on
+    /// each entry.
     ///
     /// A read lock decides each entry: most belong to anchors that attached
     /// or ended, and a write lock per entry would contend with attach and
     /// detach. Only an expiry takes the write lock, and decides again under
-    /// it, because a renewal or an attach can land between the two. The
-    /// queue lock is never held while a shard lock is taken.
+    /// it, because a renewal or an attach can land between the two. A queue
+    /// shard lock is never held while a registry shard lock is taken.
     async fn expire_due(&self, registry: &DashMap<u64, AnchorEntry>, now: tokio::time::Instant) {
+        for shard in &self.shards {
+            Self::expire_due_in(shard, registry, now).await;
+        }
+    }
+
+    async fn expire_due_in(
+        shard: &DeadlineQueue<u64>,
+        registry: &DashMap<u64, AnchorEntry>,
+        now: tokio::time::Instant,
+    ) {
         use dashmap::mapref::entry::Entry;
         loop {
-            let due = self.deadlines.pop_due(now, ANCHOR_EXPIRE_BATCH);
+            let due = shard.pop_due(now, ANCHOR_EXPIRE_BATCH);
             let more = due.len() == ANCHOR_EXPIRE_BATCH;
             let mut renewed = Vec::new();
             for local_id in due {
@@ -343,8 +378,9 @@ impl AnchorDeadlineQueue {
                 }
             }
             // Every requeued deadline is after `now`, so this loop never pops
-            // its own requeues.
-            self.deadlines.requeue(now, renewed);
+            // its own requeues. A requeued id goes back to the shard it came
+            // from, because the shard is a function of the id.
+            shard.requeue(now, renewed);
             if !more {
                 return;
             }
