@@ -38,6 +38,10 @@ pub(crate) mod coalesce;
 /// read half of their dialed connections.
 pub(crate) mod ingress;
 
+/// What the TCP and UDS connection writers keep doing after their transport
+/// tears down, and for how long.
+pub(crate) mod teardown_grace;
+
 pub mod tcp;
 
 /// Shared utility functions for transport implementations.

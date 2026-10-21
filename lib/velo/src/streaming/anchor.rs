@@ -1016,6 +1016,16 @@ pub struct AnchorManager {
     pub transport_registry:
         Arc<HashMap<String, Arc<dyn crate::streaming::transport::FrameTransport>>>,
 
+    /// The transports of the registry that report a stream's retirement
+    /// themselves, by the same key. Installed once, after the build, by
+    /// [`install_retiring_transports`](Self::install_retiring_transports);
+    /// a key that is not here connects through the registry, and its sender
+    /// reports `Sent` as the terminal enters the channel.
+    #[builder(setter(skip), default)]
+    pub(crate) retiring_transports: std::sync::OnceLock<
+        HashMap<String, Arc<dyn crate::streaming::transport::RetiringFrameTransport>>,
+    >,
+
     /// Default inactivity timeout for newly created SPSC anchors. MPSC
     /// anchors do not inherit it; see [`crate::streaming::mpsc::MpscAnchorConfig`].
     /// `create_anchor` spawns a timeout task that auto-removes the
@@ -1113,6 +1123,14 @@ impl AnchorManagerBuilder {
         }
         Ok(manager)
     }
+}
+
+/// What `AnchorManager::connect_streaming` hands back: the stream's egress
+/// channel, who reports its retirement, and the transport's item limit.
+struct Connected {
+    tx: flume::Sender<Vec<u8>>,
+    retires_on: crate::streaming::sender::RetiresOn,
+    item_limit: Option<usize>,
 }
 
 impl AnchorManager {
@@ -1909,13 +1927,18 @@ impl AnchorManager {
     /// a negotiated slot opens already holding the window the receiver
     /// advertised, which is what removes the round trip an `OpenSlot`-time
     /// `CreditUpdate` used to cost.
+    ///
+    /// Also answers who reports the stream's retirement: the mux slot, a
+    /// per-stream transport of this crate once it wrote the terminal, or the
+    /// sender itself as the terminal enters the channel.
     async fn connect_streaming(
         &self,
         ticket: &crate::streaming::control::StreamOpenTicket,
         peer: velo_ext::WorkerId,
         anchor_id: u64,
-        lifecycle: Option<crate::streaming::control::SenderEntry>,
-    ) -> Result<flume::Sender<Vec<u8>>, AttachError> {
+        lifecycle: crate::streaming::control::SenderEntry,
+    ) -> Result<Connected, AttachError> {
+        use crate::streaming::sender::RetiresOn;
         let key = &ticket.streaming_transport_key;
         let session_id = ticket.routing_session_id;
         let initial_credit = ticket.initial_credit;
@@ -1931,18 +1954,52 @@ impl AnchorManager {
                 // The lane the receiver named, clamped to the lanes this node
                 // keeps to it. A receiver from before lanes names none: lane 0.
                 let key = mux.sender_lane(peer, ticket.lane);
-                Ok(mux
-                    .connect_controlled(key, anchor_id, session_id, limits, lifecycle)
-                    .await?)
+                let tx = mux
+                    .connect_controlled(key, anchor_id, session_id, limits, Some(lifecycle))
+                    .await?;
+                Ok(Connected {
+                    tx,
+                    retires_on: RetiresOn::Transport,
+                    item_limit: None,
+                })
             }
             Ok(crate::streaming::negotiation::Connect::Legacy) => {
+                let retiring = self
+                    .retiring_transports
+                    .get()
+                    .and_then(|transports| transports.get(key.as_str()));
+                if let Some(transport) = retiring {
+                    let tx = transport
+                        .connect_retiring(peer, anchor_id, session_id, lifecycle.closed)
+                        .await?;
+                    return Ok(Connected {
+                        tx,
+                        retires_on: RetiresOn::Transport,
+                        item_limit: transport.item_limit(),
+                    });
+                }
                 let transport = self.resolve_transport(key)?;
-                Ok(transport.connect(peer, anchor_id, session_id).await?)
+                let tx = transport.connect(peer, anchor_id, session_id).await?;
+                Ok(Connected {
+                    tx,
+                    retires_on: RetiresOn::Queue,
+                    item_limit: None,
+                })
             }
             Err(error) => Err(AttachError::TransportError(anyhow::anyhow!(
                 "peer answered with {key} but {error}"
             ))),
         }
+    }
+
+    /// Name the transports of the registry that report a stream's retirement
+    /// themselves. Once, after the build: the registry's type is public and
+    /// cannot carry them.
+    pub(crate) fn install_retiring_transports(
+        &self,
+        transports: HashMap<String, Arc<dyn crate::streaming::transport::RetiringFrameTransport>>,
+    ) {
+        let _ = self.retiring_transports.set(transports);
     }
 
     /// Resolve a FrameTransport by streaming-transport key.
@@ -2407,16 +2464,15 @@ impl AnchorManager {
 
         // Resolve the local FrameTransport that matches the remote worker's
         // bound streaming transport, then connect by WorkerId.
-        let frame_tx = match self
-            .connect_streaming(
-                ticket,
-                handle_worker_id,
-                local_id,
-                Some(identity.entry.clone()),
-            )
+        let Connected {
+            tx: frame_tx,
+            retires_on,
+            item_limit,
+        } = match self
+            .connect_streaming(ticket, handle_worker_id, local_id, identity.entry.clone())
             .await
         {
-            Ok(frame_tx) => frame_tx,
+            Ok(connected) => connected,
             Err(err) => {
                 self.record_streaming_operation(
                     StreamingOp::Open,
@@ -2443,6 +2499,8 @@ impl AnchorManager {
                 sender_stream_id,
                 sender_registry: self.sender_registry.clone(),
                 closed: identity.entry.closed.clone(),
+                retires_on,
+                item_limit,
             },
             Duration::from_millis(ticket.heartbeat_interval_ms),
             self.metrics.clone(),
@@ -2653,6 +2711,8 @@ impl AnchorManager {
                             sender_stream_id,
                             sender_registry: self.sender_registry.clone(),
                             closed,
+                            retires_on: crate::streaming::sender::RetiresOn::Queue,
+                            item_limit: None,
                         },
                         heartbeat_interval,
                         self.metrics.clone(),
@@ -2836,6 +2896,8 @@ impl AnchorManager {
                 sender_stream_id: identity.sender_stream_id,
                 sender_registry: self.sender_registry.clone(),
                 closed: identity.entry.closed.clone(),
+                retires_on: crate::streaming::sender::RetiresOn::Queue,
+                item_limit: None,
             },
             heartbeat_interval,
             self.metrics.clone(),
@@ -2913,7 +2975,11 @@ impl AnchorManager {
                 } else {
                     sender_stream_id
                 };
-                let frame_tx = match self
+                let Connected {
+                    tx: frame_tx,
+                    retires_on,
+                    item_limit,
+                } = match self
                     .connect_streaming(
                         &crate::streaming::control::StreamOpenTicket {
                             streaming_transport_key: streaming_transport_key.clone(),
@@ -2925,11 +2991,11 @@ impl AnchorManager {
                         },
                         handle_worker_id,
                         local_id,
-                        Some(identity.entry.clone()),
+                        identity.entry.clone(),
                     )
                     .await
                 {
-                    Ok(frame_tx) => frame_tx,
+                    Ok(connected) => connected,
                     Err(error) => {
                         self.rollback_remote_attach(
                             handle,
@@ -2955,6 +3021,8 @@ impl AnchorManager {
                         sender_stream_id,
                         sender_registry: self.sender_registry.clone(),
                         closed: identity.entry.closed.clone(),
+                        retires_on,
+                        item_limit,
                     },
                     Duration::from_millis(heartbeat_interval_ms),
                     self.metrics.clone(),
@@ -4957,6 +5025,100 @@ mod tests {
             );
             drop(anchor);
         }
+    }
+
+    /// An `AnchorManager` built by hand over `TcpFrameTransport` has no one
+    /// to name the transport as one that reports retirement from its pump:
+    /// only the `Velo` builder does that. Its senders report `Sent` as the
+    /// terminal enters the egress channel, which the docs say.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_hand_built_manager_retires_as_the_terminal_is_queued() {
+        use crate::streaming::sender::RetiresOn;
+        use crate::streaming::tcp_transport::TcpFrameTransport;
+        use crate::streaming::transport::FrameTransport;
+
+        let m_consumer = crate::messenger::Messenger::builder()
+            .add_transport(tcp_messenger_transport())
+            .build()
+            .await
+            .expect("consumer messenger");
+        let m_producer = crate::messenger::Messenger::builder()
+            .add_transport(tcp_messenger_transport())
+            .build()
+            .await
+            .expect("producer messenger");
+        m_consumer
+            .register_peer(m_producer.peer_info())
+            .expect("register producer on consumer");
+        m_producer
+            .register_peer(m_consumer.peer_info())
+            .expect("register consumer on producer");
+
+        let tcp_consumer = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .expect("consumer stream transport");
+        let tcp_producer = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+            .await
+            .expect("producer stream transport");
+        tcp_producer
+            .register(&velo_ext::PeerInfo::new(
+                m_consumer.instance_id(),
+                tcp_consumer.address(),
+            ))
+            .expect("register consumer stream address");
+        tcp_consumer
+            .register(&velo_ext::PeerInfo::new(
+                m_producer.instance_id(),
+                tcp_producer.address(),
+            ))
+            .expect("register producer stream address");
+
+        fn manager(
+            messenger: &Arc<crate::messenger::Messenger>,
+            tcp: &Arc<TcpFrameTransport>,
+        ) -> Arc<AnchorManager> {
+            let mut registry = HashMap::new();
+            registry.insert(
+                tcp.key().as_str().to_string(),
+                Arc::clone(tcp) as Arc<dyn crate::streaming::transport::FrameTransport>,
+            );
+            let manager = Arc::new(
+                AnchorManagerBuilder::default()
+                    .worker_id(messenger.instance_id().worker_id())
+                    .transport(
+                        Arc::clone(tcp) as Arc<dyn crate::streaming::transport::FrameTransport>
+                    )
+                    .transport_registry(Arc::new(registry))
+                    .messenger(Some(Arc::clone(messenger)))
+                    .build()
+                    .expect("anchor manager"),
+            );
+            manager
+                .register_handlers(Arc::clone(messenger))
+                .expect("handlers");
+            manager
+        }
+        let am_consumer = manager(&m_consumer, &tcp_consumer);
+        let am_producer = manager(&m_producer, &tcp_producer);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            m_producer.wait_for_handler(m_consumer.instance_id(), "_anchor_attach"),
+        )
+        .await
+        .expect("handshake timed out")
+        .expect("handshake");
+
+        let anchor = am_consumer.create_anchor::<u32>();
+        let sender = am_producer
+            .attach_stream_anchor::<u32>(anchor.handle())
+            .await
+            .expect("attach");
+        assert_eq!(
+            sender.negotiated_transport().map(|k| k.as_str()),
+            Some("tcp-stream")
+        );
+        assert_eq!(sender.retires_on(), RetiresOn::Queue);
+        drop(anchor);
     }
 
     /// Remote renewal must reach the peer through the messenger that

@@ -59,6 +59,6 @@ pub use messenger_mux::{AutoFlush, FlushPolicy, MESSENGER_MUX_KEY, MuxConfig};
 pub use mpsc::{
     MpscAnchorConfig, MpscFrame, MpscStreamAnchor, MpscStreamController, MpscStreamSender, SenderId,
 };
-pub use sender::StreamSender;
+pub use sender::{Retired, Retirement, StreamSender};
 pub use tcp_transport::TcpFrameTransport;
-pub use transport::FrameTransport;
+pub use transport::{FrameTransport, MAX_ITEM_BYTES};

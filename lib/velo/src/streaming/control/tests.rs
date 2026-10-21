@@ -2203,3 +2203,110 @@ async fn reader_pump_cancel_ends_a_send_waiting_on_a_full_channel() {
         .expect("a cancelled pump kept waiting on a full channel")
         .unwrap();
 }
+
+// -----------------------------------------------------------------------
+// Retirement
+// -----------------------------------------------------------------------
+
+/// Several `Retired` futures of one stream, each polled from its own task.
+/// Retirement wakes every one of them, and a waiter that gave up (its future
+/// dropped after it registered) strands none of the others. One stored waker
+/// would keep only the last registration, and wake only that task.
+#[test]
+fn retirement_wakes_every_waiting_future() {
+    use futures::task::{ArcWake, waker};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    struct Counter(AtomicUsize);
+    impl ArcWake for Counter {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let counters: Vec<Arc<Counter>> = (0..3)
+        .map(|_| Arc::new(Counter(AtomicUsize::new(0))))
+        .collect();
+    let wakers: Vec<_> = counters.iter().map(|c| waker(c.clone())).collect();
+
+    let closed = SenderClosed::default();
+    for w in &wakers {
+        let mut cx = Context::from_waker(w);
+        let mut registration = None;
+        assert_eq!(
+            closed.poll_retired(&mut cx, &mut registration),
+            Poll::Pending
+        );
+        // The same future polling again keeps its one entry.
+        assert_eq!(
+            closed.poll_retired(&mut cx, &mut registration),
+            Poll::Pending
+        );
+    }
+    assert_eq!(closed.waiting(), 3);
+    // The last waiter gives up: its future goes, its waker stays registered.
+    drop(wakers);
+
+    closed.retire(crate::streaming::Retirement::Sent);
+    for (i, counter) in counters.iter().enumerate().take(2) {
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "waiter {i} was not woken"
+        );
+    }
+
+    let again = waker(counters[0].clone());
+    let mut cx = Context::from_waker(&again);
+    assert_eq!(
+        closed.poll_retired(&mut cx, &mut None),
+        Poll::Ready(crate::streaming::Retirement::Sent)
+    );
+    // A later report changes nothing, and wakes nobody.
+    closed.retire(crate::streaming::Retirement::Discarded);
+    assert_eq!(
+        closed.poll_retired(&mut cx, &mut None),
+        Poll::Ready(crate::streaming::Retirement::Sent)
+    );
+    assert_eq!(counters[0].0.load(Ordering::SeqCst), 1);
+}
+
+/// A `Retired` future that is dropped before the stream retires takes its
+/// waker with it.
+///
+/// Each one registered its task's waker and left it behind. A long-lived
+/// stream whose retirement was awaited under a timeout, from a new task each
+/// time, kept one waker per abandoned wait, and with it each task's
+/// allocation, until the stream retired; retirement then woke all of them.
+#[test]
+fn a_dropped_retired_future_takes_its_waker_with_it() {
+    use futures::task::{ArcWake, waker};
+    use std::future::Future;
+    use std::task::{Context, Poll};
+
+    struct Task;
+    impl ArcWake for Task {
+        fn wake_by_ref(_: &Arc<Self>) {}
+    }
+    let closed = SenderClosed::default();
+    let live_waker = waker(Arc::new(Task));
+    let mut live = Box::pin(crate::streaming::Retired::new(closed.clone()));
+    assert_eq!(
+        live.as_mut().poll(&mut Context::from_waker(&live_waker)),
+        Poll::Pending
+    );
+    for _ in 0..8 {
+        let task = waker(Arc::new(Task));
+        let mut abandoned = Box::pin(crate::streaming::Retired::new(closed.clone()));
+        assert_eq!(
+            abandoned.as_mut().poll(&mut Context::from_waker(&task)),
+            Poll::Pending
+        );
+    }
+    assert_eq!(closed.waiting(), 1, "only the live wait is registered");
+    closed.retire(crate::streaming::Retirement::Sent);
+    assert_eq!(
+        live.as_mut().poll(&mut Context::from_waker(&live_waker)),
+        Poll::Ready(crate::streaming::Retirement::Sent)
+    );
+}

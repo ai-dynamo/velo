@@ -40,7 +40,7 @@ use super::tasks::StreamTasks;
 use crate::transports::MessageType;
 use crate::transports::address::WorkerAddressBuilder;
 use crate::transports::coalesce::{
-    Coalescable, WriterFailure, WriterObserver, run_coalescing_writer,
+    Coalescable, WriterExit, WriterFailure, WriterObserver, run_coalescing_writer,
 };
 use crate::transports::tcp::TcpFrameCodec;
 use crate::transports::tcp::framing::{DEFAULT_SHRINK_THRESHOLD, maybe_shrink_read_buffer};
@@ -58,8 +58,9 @@ use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use velo_ext::{PeerInfo, TransportKey, WorkerAddress, WorkerId};
 
+use crate::streaming::control::RetireGuard;
 use crate::streaming::sender::is_terminal_sentinel;
-use crate::streaming::transport::FrameTransport;
+use crate::streaming::transport::{FrameTransport, RetiringFrameTransport};
 
 /// Maximum time a registered (anchor, session) slot may sit unused before its
 /// slot is freed. After expiry, an arriving connection with that handshake is
@@ -376,15 +377,21 @@ async fn pump_frames(
 /// wire-compatible with an unmodified peer and why it adds no latency. The
 /// trick this path relies on is that the frames a forward pass emits
 /// back-to-back are already sitting in the channel by the time the pump wakes.
+///
+/// `retire` is the stream's retirement, when a sender asked for it: reported
+/// `Sent` once the terminal is on the socket, and dropped, as `Discarded`, on
+/// every other exit (the socket failed, the channel closed without a terminal,
+/// or the task was stopped with the transport).
 async fn egress_pump(
     mut stream: TcpStream,
     rx: flume::Receiver<Vec<u8>>,
     metrics: Option<Arc<crate::observability::VeloMetrics>>,
+    retire: Option<RetireGuard>,
 ) {
     // No cancellation token: this pump stops when the channel closes, when a
     // terminal sentinel goes out, or when the socket fails. Each frame is
     // wrapped as it comes off the channel — see `EgressFrame`.
-    run_coalescing_writer(
+    let exit = run_coalescing_writer(
         &mut stream,
         &rx,
         EgressFrame,
@@ -393,8 +400,15 @@ async fn egress_pump(
     )
     .await;
 
-    if let Err(e) = stream.flush().await {
+    let flushed = stream.flush().await;
+    if let Err(e) = &flushed {
         tracing::debug!("TCP streaming flush on close: {}", e);
+    }
+    if let Some(retire) = retire
+        && exit == WriterExit::Terminal
+        && flushed.is_ok()
+    {
+        retire.sent();
     }
     if let Err(e) = stream.shutdown().await {
         tracing::debug!("TCP streaming shutdown on close: {}", e);
@@ -518,6 +532,91 @@ fn configure_socket_buffers<'a>(sock: impl Into<socket2::SockRef<'a>>) {
     }
 }
 
+impl TcpFrameTransport {
+    /// Dial the peer, hand it the stream's identity, and start the egress
+    /// pump; `retire` goes to the pump.
+    fn connect_with(
+        &self,
+        peer: WorkerId,
+        anchor_id: u64,
+        session_id: u64,
+        retire: Option<RetireGuard>,
+    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
+        let peers = self.peers.clone();
+        let metrics = self.metrics.clone();
+        Box::pin(async move {
+            if self.tasks.is_stopped() {
+                return Err(anyhow!("TCP streaming transport shut down"));
+            }
+            let addr = *peers.get(&peer).ok_or_else(|| {
+                anyhow!(
+                    "TCP streaming: peer {} not registered (call register_peer first)",
+                    peer
+                )
+            })?;
+
+            // Bound the dial and handshake write so an unreachable / stalled
+            // peer surfaces as a fast `connect timed out` instead of hanging
+            // an attach for the full kernel SYN backoff or longer.
+            let mut stream = tokio::time::timeout(TOKEN_READ_TIMEOUT, TcpStream::connect(addr))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "TCP streaming: connect to peer {} ({}) timed out after {:?}",
+                        peer,
+                        addr,
+                        TOKEN_READ_TIMEOUT
+                    )
+                })??;
+            configure_socket(&stream);
+            configure_socket_buffers(&stream);
+            let mut handshake = [0u8; 16];
+            handshake[..8].copy_from_slice(&anchor_id.to_be_bytes());
+            handshake[8..].copy_from_slice(&session_id.to_be_bytes());
+            tokio::time::timeout(TOKEN_READ_TIMEOUT, stream.write_all(&handshake))
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "TCP streaming: handshake write to peer {} ({}) timed out after {:?}",
+                        peer,
+                        addr,
+                        TOKEN_READ_TIMEOUT
+                    )
+                })??;
+
+            let (tx, rx) = flume::bounded::<Vec<u8>>(4096);
+            let pump_metrics = metrics.get().cloned();
+
+            if !self
+                .tasks
+                .spawn(egress_pump(stream, rx, pump_metrics, retire))
+            {
+                return Err(anyhow!("TCP streaming transport shut down"));
+            }
+
+            Ok(tx)
+        })
+    }
+}
+
+impl RetiringFrameTransport for TcpFrameTransport {
+    fn connect_retiring(
+        &self,
+        peer: WorkerId,
+        anchor_id: u64,
+        session_id: u64,
+        closed: crate::streaming::control::SenderClosed,
+    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
+        self.connect_with(peer, anchor_id, session_id, Some(RetireGuard::new(closed)))
+    }
+
+    /// The codec's frame limit. `EgressFrame` carries no header, so an item
+    /// at this size is exactly what the codec still encodes.
+    fn item_limit(&self) -> Option<usize> {
+        Some(crate::streaming::transport::MAX_ITEM_BYTES)
+    }
+}
+
 impl FrameTransport for TcpFrameTransport {
     fn key(&self) -> TransportKey {
         self.key.clone()
@@ -603,57 +702,7 @@ impl FrameTransport for TcpFrameTransport {
         anchor_id: u64,
         session_id: u64,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
-        let peers = self.peers.clone();
-        let metrics = self.metrics.clone();
-        Box::pin(async move {
-            if self.tasks.is_stopped() {
-                return Err(anyhow!("TCP streaming transport shut down"));
-            }
-            let addr = *peers.get(&peer).ok_or_else(|| {
-                anyhow!(
-                    "TCP streaming: peer {} not registered (call register_peer first)",
-                    peer
-                )
-            })?;
-
-            // Bound the dial and handshake write so an unreachable / stalled
-            // peer surfaces as a fast `connect timed out` instead of hanging
-            // an attach for the full kernel SYN backoff or longer.
-            let mut stream = tokio::time::timeout(TOKEN_READ_TIMEOUT, TcpStream::connect(addr))
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "TCP streaming: connect to peer {} ({}) timed out after {:?}",
-                        peer,
-                        addr,
-                        TOKEN_READ_TIMEOUT
-                    )
-                })??;
-            configure_socket(&stream);
-            configure_socket_buffers(&stream);
-            let mut handshake = [0u8; 16];
-            handshake[..8].copy_from_slice(&anchor_id.to_be_bytes());
-            handshake[8..].copy_from_slice(&session_id.to_be_bytes());
-            tokio::time::timeout(TOKEN_READ_TIMEOUT, stream.write_all(&handshake))
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "TCP streaming: handshake write to peer {} ({}) timed out after {:?}",
-                        peer,
-                        addr,
-                        TOKEN_READ_TIMEOUT
-                    )
-                })??;
-
-            let (tx, rx) = flume::bounded::<Vec<u8>>(4096);
-            let pump_metrics = metrics.get().cloned();
-
-            if !self.tasks.spawn(egress_pump(stream, rx, pump_metrics)) {
-                return Err(anyhow!("TCP streaming transport shut down"));
-            }
-
-            Ok(tx)
-        })
+        self.connect_with(peer, anchor_id, session_id, None)
     }
 }
 
@@ -874,5 +923,99 @@ mod tests {
         for h in handles {
             h.await.unwrap();
         }
+    }
+
+    /// A peer that is only a listener: the kernel completes the handshake and
+    /// takes what its buffers hold, and then the pump blocks. Registered under
+    /// `client`'s key, the way a real peer's address is.
+    fn raw_peer(
+        client: &TcpFrameTransport,
+        listener: &std::net::TcpListener,
+    ) -> (WorkerId, PeerInfo) {
+        let addr = listener.local_addr().unwrap();
+        let endpoints = resolve_advertise_endpoints(addr, &InterfaceFilter::default()).unwrap();
+        let encoded = rmp_serde::to_vec(&endpoints).unwrap();
+        let mut builder = WorkerAddressBuilder::new();
+        builder.add_entry(client.key().as_str(), encoded).unwrap();
+        fresh_peer(builder.build().unwrap())
+    }
+
+    fn item(len: usize) -> Vec<u8> {
+        rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(vec![0u8; len])).unwrap()
+    }
+
+    fn retired(
+        closed: &crate::streaming::control::SenderClosed,
+    ) -> impl std::future::Future<Output = crate::streaming::Retirement> + '_ {
+        crate::streaming::Retired::new(closed.clone())
+    }
+
+    /// The pump reports the stream's retirement: `Discarded` when the socket
+    /// goes before the terminal is written, `Sent` once the terminal is on
+    /// the socket. While the peer does not read, the terminal waits behind
+    /// the frames the kernel cannot take, and the stream is not retired. A
+    /// sender that reported as it queued the terminal would say `Sent` here,
+    /// with the terminal still on this node.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_pump_retires_the_stream_once_it_wrote_the_terminal() {
+        use crate::streaming::Retirement;
+        use futures::FutureExt;
+        // Well past what loopback buffers hold on any OS, so the pump blocks
+        // with the terminal still queued behind it.
+        const FRAMES: usize = 64;
+        const PAYLOAD: usize = 1 << 20;
+        let client = TcpFrameTransport::default_bound().await.unwrap();
+
+        // The peer closes first.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (peer, info) = raw_peer(&client, &listener);
+        client.register(&info).unwrap();
+        let closed = crate::streaming::control::SenderClosed::default();
+        let tx = client
+            .connect_retiring(peer, 1, 1, closed.clone())
+            .await
+            .unwrap();
+        for _ in 0..FRAMES {
+            tx.send_async(item(PAYLOAD)).await.unwrap();
+        }
+        tx.send_async(crate::streaming::sender::cached_finalized().clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            retired(&closed).now_or_never(),
+            None,
+            "the terminal is queued behind frames the peer has not taken"
+        );
+        drop(listener);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), retired(&closed)).await,
+            Ok(Retirement::Discarded)
+        );
+
+        // The peer reads everything.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (peer, info) = raw_peer(&client, &listener);
+        client.register(&info).unwrap();
+        let drained = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            std::io::copy(&mut socket, &mut std::io::sink()).unwrap_or(0)
+        });
+        let closed = crate::streaming::control::SenderClosed::default();
+        let tx = client
+            .connect_retiring(peer, 2, 2, closed.clone())
+            .await
+            .unwrap();
+        for _ in 0..FRAMES {
+            tx.send_async(item(PAYLOAD)).await.unwrap();
+        }
+        tx.send_async(crate::streaming::sender::cached_finalized().clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), retired(&closed)).await,
+            Ok(Retirement::Sent)
+        );
+        drop(tx);
+        assert!(drained.join().unwrap() > (FRAMES * PAYLOAD) as u64);
     }
 }

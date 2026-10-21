@@ -32,6 +32,7 @@ use super::listener::TcpListener;
 use super::writer::TcpWriterObserver;
 use crate::transports::coalesce::{EgressMetrics, run_coalescing_writer};
 use crate::transports::ingress::{DialedReaderContext, run_dialed_reader};
+use crate::transports::teardown_grace::{TEARDOWN_FLUSH_GRACE, TeardownStop};
 
 mod builder;
 pub use builder::TcpTransportBuilder;
@@ -83,6 +84,9 @@ pub struct TcpTransport {
     listener: Mutex<Option<std::net::TcpListener>>,
     // The accept loop, so `closed()` can wait until its socket is gone.
     listener_tasks: tokio_util::task::TaskTracker,
+    // Whether a stop is teardown, the one deadline for what the writers still
+    // hold then, and the writers themselves, so `closed()` can wait for them.
+    teardown: Arc<TeardownStop>,
 
     // Cached local interfaces for endpoint selection
     local_interfaces: OnceLock<Vec<InterfaceEndpoint>>,
@@ -183,6 +187,7 @@ impl TcpTransport {
         listener: Option<std::net::TcpListener>,
         numa_hint: Option<u32>,
     ) -> Self {
+        let cancel_token = CancellationToken::new();
         Self {
             key,
             bind_addr,
@@ -191,12 +196,13 @@ impl TcpTransport {
             connections: Arc::new(DashMap::new()),
             lanes: NonZeroU16::MIN,
             runtime: OnceLock::new(),
-            cancel_token: CancellationToken::new(),
+            cancel_token: cancel_token.clone(),
             shutdown_state: OnceLock::new(),
             channel_capacity,
             connect_timeout,
             listener: Mutex::new(listener),
             listener_tasks: tokio_util::task::TaskTracker::new(),
+            teardown: Arc::new(TeardownStop::new(cancel_token, TEARDOWN_FLUSH_GRACE)),
             local_interfaces: OnceLock::new(),
             numa_hint,
             metrics: OnceLock::new(),
@@ -291,6 +297,12 @@ impl TcpTransport {
         rt: &tokio::runtime::Handle,
     ) -> Result<ConnectionHandle> {
         let (instance_id, lane) = key;
+        // After teardown a connection could only dial to be stopped, and a
+        // frame it admitted would ride the teardown deadline meant for the
+        // frames admitted before it. Refuse it, so the send fails at once.
+        if self.cancel_token.is_cancelled() {
+            anyhow::bail!("transport shut down");
+        }
         let addr = *self
             .peers
             .get(&instance_id)
@@ -325,6 +337,8 @@ impl TcpTransport {
         WriterTaskContext {
             connections: Arc::clone(&self.connections),
             cancel_token: cancel,
+            teardown: Arc::clone(&self.teardown),
+            writing: self.teardown.writer(),
             connect_timeout: self.connect_timeout,
             reader_ctx: self.dialed_ctx.get().cloned(),
             metrics: self.metrics.get().cloned(),
@@ -585,22 +599,48 @@ impl Transport for TcpTransport {
     fn shutdown(&self) {
         info!("Shutting down TCP transport");
 
+        // Refuse what still waits in each admission gate, before the writers
+        // start teardown: the grace covers only what is already in a writer's
+        // channel. Left alone, a gate's driver went on admitting its queue
+        // during teardown, and a frame it admitted after the writer stopped
+        // was failed at once, after its sender was told it was admitted.
+        // The gates are collected first: a refusal runs the sender's error
+        // hook on this thread, and a hook may call back into this map (to
+        // unregister the peer), which would wait on a shard this iterator
+        // holds.
+        let gates: Vec<_> = self
+            .connections
+            .iter()
+            .map(|connection| connection.gate.clone())
+            .collect();
+        for gate in gates {
+            gate.fail_all(AdmissionError::ChannelClosed);
+        }
+
         // Cancel the teardown token (Phase 3) to stop the listener and connection handlers
         if let Some(state) = self.shutdown_state.get() {
             state.teardown_token().cancel();
         }
-        self.cancel_token.cancel();
+        // Cancels `cancel_token` (the teardown's token) and fixes the deadline.
+        self.teardown.begin();
 
-        // Clear connections
+        // Clear connections. Their writers write what they already queued,
+        // until the teardown deadline; `closed()` waits for that.
         self.connections.clear();
         self.update_connection_gauge();
     }
 
+    /// Wait for the connection writers to write what teardown kept (the
+    /// teardown grace, 1 s unless the builder set it, plus 0.5 s), then for
+    /// the accept loop to close its socket (LISTENER_CLOSE_WAIT: 1 s).
     fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
         Box::pin(async move {
             if !self.cancel_token.is_cancelled() {
                 return;
             }
+            self.teardown
+                .wait_for_writers(&format!("TCP transport on {}", self.bind_addr))
+                .await;
             // `shutdown()` cancelled teardown, so the accept loop is exiting.
             // Wait for it, so no peer can connect once this returns.
             self.listener_tasks.close();
@@ -682,6 +722,11 @@ struct WriterTaskContext {
     connections: Arc<DashMap<LaneKey, ConnectionHandle>>,
     /// The connection's token: shutdown and unregister both cancel it.
     cancel_token: CancellationToken,
+    /// Whether a stop is teardown, which finishes the dial and writes what
+    /// is queued first, and the deadline for that.
+    teardown: Arc<TeardownStop>,
+    /// Held while the writer can still write, so `closed()` can wait for it.
+    writing: tokio_util::task::task_tracker::TaskTrackerToken,
     connect_timeout: Duration,
     reader_ctx: Option<DialedReaderContext>,
     metrics: Option<std::sync::Arc<dyn velo_ext::TransportObservability>>,
@@ -703,6 +748,8 @@ async fn connection_writer_task(
     ctx: WriterTaskContext,
 ) -> Result<()> {
     let result = connection_writer_inner(addr, key, &rx, &ctx).await;
+    // Nothing more reaches the socket: what is still queued fails below.
+    drop(ctx.writing);
     let reason = match &result {
         Ok(()) => "Connection closed".to_string(),
         Err(error) => {
@@ -739,14 +786,19 @@ async fn retire_connection(
 }
 
 /// Connect to `addr` and set up the socket before its first write, or `None`
-/// when the transport is cancelled first.
+/// when the connection is stopped first.
+///
+/// Teardown does not end a dial at once: the frames queued behind it were
+/// admitted, so the dial runs on until the teardown deadline, as the writes
+/// after it do. A stop that is only the connection's ends it now.
 async fn dial(addr: SocketAddr, ctx: &WriterTaskContext) -> Result<Option<TcpStream>> {
-    let stream = tokio::select! {
-        _ = ctx.cancel_token.cancelled() => return Ok(None),
-        res = tokio::time::timeout(ctx.connect_timeout, TcpStream::connect(addr)) => {
-            res.context("connect timeout")?.context("connect failed")?
-        },
+    let connect = tokio::time::timeout(ctx.connect_timeout, TcpStream::connect(addr));
+    let Some(connected) = ctx.teardown.until_stopped(&ctx.cancel_token, connect).await else {
+        return Ok(None);
     };
+    let stream = connected
+        .context("connect timeout")?
+        .context("connect failed")?;
 
     if let Err(e) = stream.set_nodelay(true) {
         warn!("Failed to set TCP_NODELAY: {}", e);
@@ -820,6 +872,7 @@ async fn connection_writer_inner(
             lane,
             addr,
             egress: metrics.map(EgressMetrics::new),
+            teardown: Arc::clone(&ctx.teardown),
         },
     )
     .await;

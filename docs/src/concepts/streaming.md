@@ -42,6 +42,34 @@ The consumer can request graceful stop with `anchor.controller().request_stop()`
 
 The consumer can cancel the stream with `anchor.cancel()` or a cloned `StreamController`. Cancel triggers both producer tokens and ends delivery. Dropping the consumer also cancels. Stop and cancel made before attach or ticket open are retained; the producer observes them when it opens, even if it sends no data. Transport failure remains a stream error.
 
+## Know when the output has left
+
+`finalize` returns before the stream's output leaves the producer's node. Under the messenger mux, records wait on the producer for the consumer's credit, and a slow consumer can hold them there for as long as it does not read. A producer that shuts its node down in that time cuts the stream short.
+
+`sender.retired()` returns a future. The future resolves once velo on the producer's node has handed on all of the stream's output; the table below says what that means on each path. It resolves after `finalize`, `detach`, or drop. Get the future before any of the three, because each one consumes the sender.
+
+```rust,ignore
+let retired = sender.retired();
+sender.finalize()?;
+match retired.await {
+    Retirement::Sent => {}      // Handed on; see the table and the staged-item exception below.
+    Retirement::Discarded => {} // Output was thrown away before it left this node.
+    _ => {}                     // `Retirement` is not exhaustive.
+}
+```
+
+`Retirement::Sent` means that velo handed the terminal (`Finalized`, `Detached`, or `Dropped`) on behind every record before it. It is a statement about the producer's node, not about the consumer: it does not say that the consumer received anything, and what "handed on" means depends on the path of the stream:
+
+| Path | `Sent` means |
+|---|---|
+| Messenger mux | The transport admitted the batch that carries the terminal: it is in the connection writer's queue, or on its way there. At graceful shutdown, TCP and UDS write the frames that they admitted, until their teardown grace has passed (1 second unless the builder set it); QUIC fails the frames that are still queued ([known limitation](../appendix/limitations.md#quic-discards-queued-frames-at-teardown)); what another messenger transport does with them at teardown is its own (see [Shutdown](shutdown.md)). One exception: an item larger than the eager budget is staged on the producer until the consumer pulls it, so `Sent` can resolve while the producer still holds it ([known limitation](../appendix/limitations.md#sent-while-a-staged-item-is-still-held)). |
+| Same worker | The terminal is in the anchor's channel. |
+| Per-stream transport (TCP, gRPC) | The stream's own pump wrote the terminal to the socket (TCP), or the server took the whole request stream (gRPC). `Discarded` if the write failed, the connection ended first, or the gRPC server did not take the whole stream, including after 20 seconds without an answer from it. On both, an item whose encoded frame is larger than 16 MiB (`MAX_ITEM_BYTES`, the TCP streaming codec's frame limit) fails at `send` with `SendError::ItemTooLarge` and nothing leaves the producer; the gRPC server decodes with the same limit, so a frame the producer lets through is never one the server refuses. The same holds for an `MpscStreamSender` on these transports. A gRPC server from before velo 0.21 ends the call cleanly even when its consumer left, so against one a producer reads `Sent` for frames nobody took ([known limitation](../appendix/limitations.md#a-grpc-server-from-before-velo-021-answers-sent-for-frames-nobody-took)). This holds when the `Velo` builder installed the transport; a frame transport from outside velo, or an `AnchorManager` built by hand, reports as the terminal enters the egress channel ([known limitation](../appendix/limitations.md#a-hand-built-anchormanager-reports-a-per-stream-sent-at-enqueue)). |
+
+`Retirement::Discarded` means that the output was thrown away before velo handed it on. Over the messenger mux: the consumer cancelled or dropped its anchor, the consumer's process went away, the transport refused the batch, or the producer's node shut down while it held the output. On the same worker: the consumer dropped its anchor, so the terminal had no channel to enter; a cancel through a `StreamController` while the anchor lives leaves the terminal in the anchor's channel, which is `Sent`. On a per-stream transport: the pump's write failed, the connection ended first, or the gRPC server did not take the stream; a per-stream TCP pump cannot see a consumer that left before it writes ([known limitation](../appendix/limitations.md#per-stream-tcp-cannot-see-a-consumer-that-dropped-its-anchor)). A task or batch that dies with the terminal also gives `Discarded`, so the future does not wait forever.
+
+The future shares the state that the sender already keeps for the stream. A sender can hand out any number of them, and each one wakes. A stream that nobody asks about pays one compare-exchange when it retires. [Batched streaming](batched-streaming.md#retirement) shows how the mux reports it, and what it costs.
+
 ## Byte items
 
 Some streams carry items that the application has already serialized, such as response chunks. For these, use `Bytes` as the item type, send with `send_bytes`, and read with `next_bytes`. Inside a hand-written `Stream`, use `poll_next_bytes`.

@@ -5,9 +5,13 @@
 //! the routes by which a consumer stops or cancels one.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::task::{Context, Poll, Waker};
+
+use parking_lot::Mutex;
 
 use super::{StreamCancelHandle, StreamCancelRequest};
+use crate::streaming::sender::Retirement;
 
 /// Whether a sender is cancelled, readable on every send without a lock.
 ///
@@ -19,18 +23,193 @@ use super::{StreamCancelHandle, StreamCancelRequest};
 /// that task runs, and only while the runtime that built the sender is alive.
 /// Until then a send that finds channel space is accepted, up to the free
 /// capacity of the channel.
+///
+/// It is also where the stream's retirement is recorded: the sender and its
+/// transport slot already share this allocation, so
+/// [`StreamSender::retired`](crate::streaming::StreamSender::retired) costs a
+/// stream nothing until the stream ends.
 #[derive(Clone, Debug, Default)]
-pub struct SenderClosed(Arc<AtomicBool>);
+pub struct SenderClosed(Arc<SenderState>);
+
+/// The state behind [`SenderClosed`]: one allocation per stream, made when the
+/// stream opens.
+#[derive(Debug, Default)]
+struct SenderState {
+    closed: AtomicBool,
+    /// The retirement outcome in the low bits ([`SENT`] or [`DISCARDED`], or
+    /// none yet), and [`WATCHED`] once a [`Retired`] future has registered a
+    /// waker. The first outcome stands.
+    ///
+    /// [`Retired`]: crate::streaming::Retired
+    retirement: AtomicU8,
+    /// One waker per [`Retired`] future of this stream that waits. A sender
+    /// can hand out any number of them, so one stored waker is not enough: the
+    /// last registration would replace the others, and a waiter that gave up
+    /// would strand the rest. Each future keeps its own entry, replaces its
+    /// waker when polled from another task, and removes the entry when it is
+    /// dropped, so an abandoned wait leaves nothing behind. Touched only by a
+    /// poll, a drop, and the retirement of a watched stream, never on the item
+    /// path.
+    ///
+    /// [`Retired`]: crate::streaming::Retired
+    wakers: Mutex<Wakers>,
+}
+
+#[derive(Debug, Default)]
+struct Wakers {
+    next: u64,
+    waiting: Vec<(u64, Waker)>,
+}
+
+const SENT: u8 = 1;
+const DISCARDED: u8 = 2;
+const OUTCOME: u8 = SENT | DISCARDED;
+/// Set by a waiting [`Retired`](crate::streaming::Retired). Without it,
+/// retirement skips the waker, so a stream nobody watches pays one
+/// uncontended compare-exchange when it ends.
+const WATCHED: u8 = 4;
+
+fn outcome(state: u8) -> Option<Retirement> {
+    match state & OUTCOME {
+        SENT => Some(Retirement::Sent),
+        DISCARDED => Some(Retirement::Discarded),
+        _ => None,
+    }
+}
 
 impl SenderClosed {
     /// Mark the sender cancelled.
     pub fn close(&self) {
-        self.0.store(true, Ordering::Release);
+        self.0.closed.store(true, Ordering::Release);
     }
 
     /// Whether the sender is cancelled.
     pub fn is_closed(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.closed.load(Ordering::Acquire)
+    }
+
+    /// Record how the stream's output left this node, and wake a waiting
+    /// [`Retired`](crate::streaming::Retired). The first outcome stands, so a
+    /// later report of the same stream changes nothing.
+    pub(crate) fn retire(&self, outcome: Retirement) {
+        let code = match outcome {
+            Retirement::Sent => SENT,
+            Retirement::Discarded => DISCARDED,
+        };
+        let state = &self.0.retirement;
+        // Expect no watcher first: that is the common case, and it costs one
+        // compare-exchange. A failure that shows only `WATCHED` retries once
+        // with it.
+        let mut current = 0;
+        loop {
+            match state.compare_exchange(
+                current,
+                current | code,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    if current & WATCHED != 0 {
+                        // Taken under the lock a poll registers under, so a
+                        // waker registered before the mark is in the list by
+                        // the time the mark is seen. Woken outside it.
+                        let wakers = std::mem::take(&mut self.0.wakers.lock().waiting);
+                        for (_, waker) in wakers {
+                            waker.wake();
+                        }
+                    }
+                    return;
+                }
+                Err(actual) if actual & OUTCOME == 0 => current = actual,
+                Err(_) => return,
+            }
+        }
+    }
+
+    /// Wakers registered and not yet woken.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.0.wakers.lock().waiting.len()
+    }
+
+    /// Remove the waker a dropped [`Retired`](crate::streaming::Retired)
+    /// registered, if retirement has not taken it already.
+    pub(crate) fn unregister_retired(&self, id: u64) {
+        let mut wakers = self.0.wakers.lock();
+        if let Some(index) = wakers.waiting.iter().position(|(entry, _)| *entry == id) {
+            wakers.waiting.swap_remove(index);
+        }
+    }
+
+    /// Poll the stream's retirement for [`Retired`](crate::streaming::Retired).
+    ///
+    /// `registration` is the future's own entry in the waker list: `None`
+    /// until its first pending poll.
+    pub(crate) fn poll_retired(
+        &self,
+        cx: &mut Context<'_>,
+        registration: &mut Option<u64>,
+    ) -> Poll<Retirement> {
+        let state = &self.0.retirement;
+        if let Some(outcome) = outcome(state.load(Ordering::Acquire)) {
+            return Poll::Ready(outcome);
+        }
+        // Register before marking, under the lock: a `retire` that sees the
+        // mark takes the lock after this and finds the waker, and one that
+        // came first shows in what `fetch_or` returns.
+        let mut wakers = self.0.wakers.lock();
+        let entry =
+            registration.and_then(|id| wakers.waiting.iter_mut().find(|(entry, _)| *entry == id));
+        match entry {
+            Some((_, waker)) => {
+                if !waker.will_wake(cx.waker()) {
+                    *waker = cx.waker().clone();
+                }
+            }
+            None => {
+                let id = *registration.get_or_insert_with(|| {
+                    wakers.next += 1;
+                    wakers.next
+                });
+                wakers.waiting.push((id, cx.waker().clone()));
+            }
+        }
+        drop(wakers);
+        match outcome(state.fetch_or(WATCHED, Ordering::AcqRel)) {
+            Some(outcome) => Poll::Ready(outcome),
+            None => Poll::Pending,
+        }
+    }
+}
+
+/// Reports a stream [`Discarded`](Retirement::Discarded) when dropped, unless
+/// [`sent`](Self::sent) consumed it first.
+///
+/// Whatever holds a stream's terminal on its way out holds one of these: the
+/// task that waits for channel space, the batch that carries the terminal, the
+/// task that watches a rendezvous admission. When that holder dies with the
+/// terminal (an aborted task, a batch thrown away), the stream still retires,
+/// so a [`Retired`](crate::streaming::Retired) never waits forever.
+pub(crate) struct RetireGuard(Option<SenderClosed>);
+
+impl RetireGuard {
+    pub(crate) fn new(closed: SenderClosed) -> Self {
+        Self(Some(closed))
+    }
+
+    /// The terminal left: report the stream sent.
+    pub(crate) fn sent(mut self) {
+        if let Some(closed) = self.0.take() {
+            closed.retire(Retirement::Sent);
+        }
+    }
+}
+
+impl Drop for RetireGuard {
+    fn drop(&mut self) {
+        if let Some(closed) = self.0.take() {
+            closed.retire(Retirement::Discarded);
+        }
     }
 }
 

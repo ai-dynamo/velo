@@ -20,7 +20,9 @@
 //! 3. **Drop** — abnormal exit, sends `Dropped` sentinel.
 //!
 //! The heartbeat background task is cancelled in all three paths before the
-//! terminal sentinel is sent.
+//! terminal sentinel is sent. [`retired`](StreamSender::retired) tells the
+//! producer when, after any of the three, velo on its node has handed on all
+//! of the stream's output.
 //!
 //! None of the three blocks the calling thread on a full channel. `send_terminal`
 //! is where that is arranged, and why it has to be.
@@ -52,6 +54,24 @@ pub(crate) struct StreamSenderCancelInfo {
     /// The flag the registry entry's cancel sets. Passed in, not looked up:
     /// a cancel that arrives before the sender is built removes the entry.
     pub closed: crate::streaming::control::SenderClosed,
+    /// Who reports the stream's retirement once the terminal is in `tx`.
+    pub retires_on: RetiresOn,
+    /// The largest encoded item the stream's transport carries, when it has
+    /// a limit the producer should meet before the frame leaves.
+    pub item_limit: Option<usize>,
+}
+
+/// Who reports a stream's retirement when its terminal is handed to the
+/// sender's channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RetiresOn {
+    /// The channel is the last thing velo on this node hands the terminal to
+    /// (the anchor on the same worker, or a frame transport that cannot say
+    /// when a frame leaves): `send_terminal` reports `Sent` as it queues it.
+    Queue,
+    /// What is behind the channel reports: the mux slot once the terminal's
+    /// batch is admitted, a per-stream pump once it wrote the terminal.
+    Transport,
 }
 
 // ---------------------------------------------------------------------------
@@ -133,6 +153,92 @@ pub(crate) fn is_terminal_sentinel(bytes: &[u8]) -> bool {
     )
 }
 
+/// How a stream's output left this node. See [`StreamSender::retired`].
+///
+/// Not exhaustive: a later velo may add an outcome, for instance for the
+/// staged item that `Sent` does not cover today (see [`Sent`](Self::Sent)).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Retirement {
+    /// The terminal (`Finalized`, `Detached` or `Dropped`) was handed on
+    /// behind every record before it. Over the messenger mux, the batch that
+    /// carries the terminal was admitted by the transport. One exception: an
+    /// item larger than the eager budget (the stager's threshold,
+    /// `RendezvousStager::with_threshold`, 256 KiB by default, or less on a
+    /// transport with a smaller frame limit) is staged on
+    /// this node until the consumer pulls it, so `Sent` can resolve while
+    /// this node still holds it; the "Known limitations" appendix of the book says
+    /// what that means for a shutdown. On the same worker, the terminal is in
+    /// the anchor's channel. On a per-stream
+    /// transport of this crate that the `Velo` builder installed, the
+    /// stream's own pump wrote the terminal to the socket (TCP), or the
+    /// server took the whole stream (gRPC); on a frame transport from outside
+    /// velo, or under an `AnchorManager` built by hand, the terminal is in
+    /// the stream's egress channel.
+    ///
+    /// It says nothing about the consumer: not that it received anything.
+    /// Over gRPC, a server from before velo 0.21 ends the call cleanly even
+    /// when its consumer left, so a producer reads `Sent` for frames nobody
+    /// took; and a server that never ends the call gives `Discarded` after
+    /// 20 seconds.
+    Sent,
+    /// The stream's output was thrown away before it was handed on. Over the
+    /// messenger mux: the consumer cancelled or dropped its anchor, the
+    /// consumer's process went away, the transport refused the batch, or this
+    /// node shut down. On the same worker: the consumer dropped its anchor,
+    /// so the terminal had no channel to enter; a cancel through a
+    /// `StreamController` while the anchor lives leaves the terminal in the
+    /// anchor's channel, which is `Sent`. On a per-stream transport of this
+    /// crate: the pump's write failed, the connection ended first, or the
+    /// gRPC server did not take the stream. A per-stream TCP pump cannot see
+    /// a consumer that left before it writes, so there `Sent` stands
+    /// (the "Known limitations" appendix of the book).
+    Discarded,
+}
+
+/// A future that resolves once velo on this node has handed on all of a
+/// stream's output. Made by [`StreamSender::retired`].
+///
+/// It holds no part of the stream, so it can outlive the sender, and polling
+/// it after it resolved gives the same answer again. A sender can hand out
+/// any number of them, and each one wakes.
+#[must_use = "a future does nothing unless polled"]
+#[derive(Debug)]
+pub struct Retired {
+    closed: crate::streaming::control::SenderClosed,
+    /// This future's entry in the stream's waker list, once it has waited.
+    registration: Option<u64>,
+}
+
+impl Retired {
+    pub(crate) fn new(closed: crate::streaming::control::SenderClosed) -> Self {
+        Self {
+            closed,
+            registration: None,
+        }
+    }
+}
+
+impl Drop for Retired {
+    fn drop(&mut self) {
+        if let Some(id) = self.registration {
+            self.closed.unregister_retired(id);
+        }
+    }
+}
+
+impl std::future::Future for Retired {
+    type Output = Retirement;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Retirement> {
+        let this = self.get_mut();
+        this.closed.poll_retired(cx, &mut this.registration)
+    }
+}
+
 /// Typed sender for pushing frames through the streaming channel.
 ///
 /// Holds a [`flume::Sender<Vec<u8>>`] for serialized frame bytes, a
@@ -169,6 +275,11 @@ pub struct StreamSender<T> {
     /// attach never negotiated one. See
     /// [`negotiated_transport`](StreamSender::negotiated_transport).
     negotiated_transport: Option<velo_ext::TransportKey>,
+    /// Who reports the stream's retirement once the terminal is in `tx`.
+    retires_on: RetiresOn,
+    /// The largest encoded item the transport carries in one frame, if it
+    /// has such a limit: refused at `send`, so it never reaches the wire.
+    item_limit: Option<usize>,
     /// The runtime the sender was made on. A terminal that meets a full
     /// channel on a thread with no runtime waits in a task here.
     runtime: tokio::runtime::Handle,
@@ -214,6 +325,8 @@ impl<T: Serialize> StreamSender<T> {
             sender_stream_id,
             sender_registry,
             closed,
+            retires_on,
+            item_limit,
         } = cancel;
         let stop_token = sender_registry
             .senders
@@ -259,6 +372,8 @@ impl<T: Serialize> StreamSender<T> {
             local_registry: negotiated_transport.is_none().then_some(registry),
             cancel_token,
             closed,
+            retires_on,
+            item_limit,
             sender_stream_id,
             sender_registry,
             metrics,
@@ -321,6 +436,9 @@ impl<T: Serialize> StreamSender<T> {
     /// # Errors
     ///
     /// - [`SendError::SerializationError`] if `rmp_serde::to_vec` fails.
+    /// - [`SendError::ItemTooLarge`] if the encoded item is larger than the
+    ///   stream's transport carries in one frame (per-stream TCP and gRPC:
+    ///   16 MiB); nothing is sent, and the stream stays open.
     /// - [`SendError::ChannelClosed`] if the receiver has been dropped or the
     ///   stream has been cancelled. A cancel through `SenderEntry::cancel` is
     ///   seen at once; a direct cancel of [`Self::cancellation_token`] once
@@ -387,7 +505,8 @@ impl<T: Serialize> StreamSender<T> {
         self.sent_terminal = true;
         // Clean up sender registry entry before returning
         self.sender_registry.senders.remove(&self.sender_stream_id);
-        send_terminal(&self.runtime, &self.tx, bytes, || {})
+        let retire = self.retires_on_channel();
+        send_terminal(&self.runtime, &self.tx, bytes, retire, || {})
     }
 
     /// Detach the sender from the anchor by sending a `Detached` sentinel.
@@ -416,7 +535,8 @@ impl<T: Serialize> StreamSender<T> {
         let (worker_id, local_id) = self.handle.unpack();
         let sender_stream_id = self.sender_stream_id;
         let runtime = self.runtime.clone();
-        send_terminal(&self.runtime, &self.tx, bytes, move || {
+        let retire = self.retires_on_channel();
+        send_terminal(&self.runtime, &self.tx, bytes, retire, move || {
             // The fast path runs this on the caller's thread, which may have
             // no runtime; the unattached timeout must still be armed.
             let _runtime = crate::streaming::tasks::enter_if_outside_runtime(&runtime);
@@ -437,10 +557,58 @@ impl<T: Serialize> StreamSender<T> {
 }
 
 impl<T> StreamSender<T> {
+    /// A future that resolves once velo on this node has handed on all of
+    /// this stream's output, however the sender ends:
+    /// [`finalize`](Self::finalize), [`detach`](Self::detach), or drop.
+    ///
+    /// [`Retirement::Sent`] means the terminal was handed on behind every
+    /// record before it; [`Retirement::Discarded`] means the output was thrown
+    /// away. What "handed on" means depends on the transport the stream
+    /// crosses; see [`Retirement::Sent`].
+    ///
+    /// A producer that must not cut its consumer short waits on this before it
+    /// shuts its node down. A finalized stream's output is not gone when
+    /// `finalize` returns: under the messenger mux, records wait for the
+    /// consumer's credit, and a slow consumer can hold them for as long as it
+    /// does not read.
+    ///
+    /// It shares the state the sender already keeps per stream; the first
+    /// poll stores the waiter's waker, and a stream nobody asks about pays one
+    /// compare-exchange when it retires. Ask for it before `finalize` or
+    /// `detach`, which consume the sender.
+    pub fn retired(&self) -> Retired {
+        Retired::new(self.closed.clone())
+    }
+
+    /// Who reports this stream's retirement, for tests of the wiring.
+    #[cfg(test)]
+    pub(crate) fn retires_on(&self) -> RetiresOn {
+        self.retires_on
+    }
+
+    /// The flag `send_terminal` reports this stream's retirement through, when
+    /// the channel is the last thing velo on this node hands the terminal to.
+    /// `None` when what is behind the channel reports instead (see
+    /// [`RetiresOn`]).
+    fn retires_on_channel(&self) -> Option<&crate::streaming::control::SenderClosed> {
+        (self.retires_on == RetiresOn::Queue).then_some(&self.closed)
+    }
+
     /// Queue one encoded `Item` frame. [`send`](Self::send) and
     /// [`send_bytes`](StreamSender::send_bytes) share it, so they agree on
     /// backpressure, cancel, and a closed channel.
     async fn send_item_frame(&self, bytes: Vec<u8>) -> Result<(), SendError> {
+        // Refused here rather than by the transport's encoder, so the
+        // producer learns at once and the stream stays open. One branch per
+        // item; `None` on the mux and on the same worker.
+        if let Some(limit) = self.item_limit
+            && bytes.len() > limit
+        {
+            return Err(SendError::ItemTooLarge {
+                len: bytes.len(),
+                limit,
+            });
+        }
         // Try non-blocking first so we can record producer-side backpressure
         // before falling through to the awaited send. The connect-side channel
         // is 4096 deep on the per-stream path and C+1 deep under the mux.
@@ -534,22 +702,38 @@ fn send_terminal(
     runtime: &tokio::runtime::Handle,
     tx: &flume::Sender<Vec<u8>>,
     bytes: Vec<u8>,
+    retire: Option<&crate::streaming::control::SenderClosed>,
     on_delivered: impl FnOnce() + Send + 'static,
 ) -> Result<(), SendError> {
+    use crate::streaming::control::RetireGuard;
     let bytes = match tx.try_send(bytes) {
         Ok(()) => {
             on_delivered();
+            if let Some(closed) = retire {
+                closed.retire(Retirement::Sent);
+            }
             return Ok(());
         }
-        Err(flume::TrySendError::Disconnected(_)) => return Err(SendError::ChannelClosed),
+        Err(flume::TrySendError::Disconnected(_)) => {
+            if let Some(closed) = retire {
+                closed.retire(Retirement::Discarded);
+            }
+            return Err(SendError::ChannelClosed);
+        }
         Err(flume::TrySendError::Full(bytes)) => bytes,
     };
 
     let runtime = tokio::runtime::Handle::try_current().unwrap_or_else(|_| runtime.clone());
     let tx = tx.clone();
+    // A guard, not a flag: a task dropped with its runtime still retires the
+    // stream, as Discarded.
+    let retire = retire.cloned().map(RetireGuard::new);
     runtime.spawn(async move {
         if tx.send_async(bytes).await.is_ok() {
             on_delivered();
+            if let Some(retire) = retire {
+                retire.sent();
+            }
         }
     });
     Ok(())
@@ -570,7 +754,8 @@ impl<T> Drop for StreamSender<T> {
             // Never blocks — see `send_terminal`. A `Drop` that parks a runtime
             // worker is the one thing this path may not do. Errors ignored: the
             // channel may already be closed if the receiver was dropped first.
-            let _ = send_terminal(&self.runtime, &self.tx, bytes, || {});
+            let retire = self.retires_on_channel();
+            let _ = send_terminal(&self.runtime, &self.tx, bytes, retire, || {});
         }
     }
 }
@@ -675,6 +860,8 @@ mod tests {
                 sender_stream_id: 1,
                 sender_registry,
                 closed: Default::default(),
+                retires_on: crate::streaming::sender::RetiresOn::Queue,
+                item_limit: None,
             },
             Duration::from_secs(5),
             None,
@@ -714,6 +901,8 @@ mod tests {
                 sender_stream_id,
                 sender_registry: sender_registry.clone(),
                 closed,
+                retires_on: crate::streaming::sender::RetiresOn::Queue,
+                item_limit: None,
             },
             Duration::from_secs(5),
             None,
@@ -963,6 +1152,8 @@ mod tests {
                 sender_stream_id: 1,
                 sender_registry,
                 closed: Default::default(),
+                retires_on: crate::streaming::sender::RetiresOn::Queue,
+                item_limit: None,
             },
             Duration::from_secs(5),
             None,
@@ -1006,6 +1197,8 @@ mod tests {
                 sender_stream_id: 1,
                 sender_registry,
                 closed: Default::default(),
+                retires_on: crate::streaming::sender::RetiresOn::Queue,
+                item_limit: None,
             },
             Duration::from_secs(5),
             None,

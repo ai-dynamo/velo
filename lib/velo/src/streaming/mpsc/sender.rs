@@ -65,6 +65,9 @@ pub struct MpscStreamSender<T> {
     cancel_token: CancellationToken,
     /// Checked per record instead of the token, which takes a lock.
     closed: crate::streaming::control::SenderClosed,
+    /// The largest encoded item the transport carries in one frame, if it
+    /// has such a limit: refused at `send`, so it never reaches the wire.
+    item_limit: Option<usize>,
     sender_stream_id: u64,
     sender_registry: Arc<crate::streaming::control::SenderRegistry>,
     metrics: Option<Arc<crate::observability::VeloMetrics>>,
@@ -102,6 +105,10 @@ impl<T: Serialize> MpscStreamSender<T> {
             sender_stream_id,
             sender_registry,
             closed,
+            // An MPSC sender has no `retired()`; the report goes to a flag
+            // nobody polls.
+            retires_on: _,
+            item_limit,
         } = cancel;
         let heartbeat_cancel = cancel_token.child_token();
 
@@ -149,6 +156,7 @@ impl<T: Serialize> MpscStreamSender<T> {
             mpsc_registry,
             cancel_token,
             closed,
+            item_limit,
             sender_stream_id,
             sender_registry,
             metrics,
@@ -188,17 +196,30 @@ impl<T: Serialize> MpscStreamSender<T> {
     ///
     /// # Errors
     ///
-    /// Returns [`SendError::ChannelClosed`] if the receiver has been dropped or
-    /// the stream has been cancelled. A cancel through `SenderEntry::cancel` is
-    /// seen at once; a direct cancel of [`Self::cancellation_token`] once the
-    /// sender's heartbeat task has run, which needs the runtime that built the
-    /// sender to be alive.
+    /// - [`SendError::ItemTooLarge`] if the encoded item is larger than the
+    ///   stream's transport carries in one frame (per-stream TCP and gRPC:
+    ///   16 MiB); nothing is sent, and the stream stays open.
+    /// - [`SendError::ChannelClosed`] if the receiver has been dropped or the
+    ///   stream has been cancelled. A cancel through `SenderEntry::cancel` is
+    ///   seen at once; a direct cancel of [`Self::cancellation_token`] once
+    ///   the sender's heartbeat task has run, which needs the runtime that
+    ///   built the sender to be alive.
     pub async fn send(&self, item: T) -> Result<(), SendError> {
         if self.closed.is_closed() {
             return Err(SendError::ChannelClosed);
         }
         let bytes = rmp_serde::to_vec(&StreamFrame::Item(item))
             .map_err(|e| SendError::SerializationError(e.to_string()))?;
+        // The same refusal as the SPSC sender's: the producer learns at once,
+        // and the stream stays open.
+        if let Some(limit) = self.item_limit
+            && bytes.len() > limit
+        {
+            return Err(SendError::ItemTooLarge {
+                len: bytes.len(),
+                limit,
+            });
+        }
         // try_send first so producer-side backpressure ticks before the
         // awaited send. Mirrors SPSC StreamSender::send.
         match &self.channel {
@@ -424,6 +445,8 @@ mod tests {
                 sender_stream_id: 1,
                 sender_registry: Arc::new(crate::streaming::control::SenderRegistry::default()),
                 closed: Default::default(),
+                retires_on: crate::streaming::sender::RetiresOn::Queue,
+                item_limit: None,
             },
             heartbeat,
             None,
