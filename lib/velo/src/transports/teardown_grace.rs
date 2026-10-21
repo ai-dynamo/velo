@@ -98,9 +98,12 @@ impl TeardownStop {
         self.writers.token()
     }
 
-    /// For the transport's `shutdown`, after it cancelled the token: fix the
-    /// deadline, so every writer's teardown ends at the same time.
+    /// For the transport's `shutdown`: cancel the transport's token, then fix
+    /// the deadline, so every writer's teardown ends at the same time. Both in
+    /// one call: a deadline asked for before the cancel would be `None`, and
+    /// the first writer to ask after it would fix it instead.
     pub(crate) fn begin(&self) {
+        self.token.cancel();
         self.deadline();
         self.writers.close();
     }

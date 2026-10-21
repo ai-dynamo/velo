@@ -131,7 +131,7 @@ protocol.
 **What happens.** At teardown, a TCP or UDS writer keeps writing for the
 transport's teardown grace (`teardown_flush_grace` on the builders, 1 s by
 default), but only the frames already in its channel: at most
-`channel_capacity` per connection. A frame that still waits in the connection's admission gate when teardown starts is refused, and a send after teardown fails at once. Over the messenger mux, a refused batch retires its streams as `Discarded`.
+`channel_capacity` per connection. A frame that waits in the connection's admission gate when teardown starts is refused, and a send after teardown fails at once. A send that races the start of teardown can still be admitted and then fail; closing that needs a terminal state on the admission gate in `velo-ext`. Over the messenger mux, a refused batch retires its streams as `Discarded`.
 
 **When.** The close step of `graceful_shutdown`.
 

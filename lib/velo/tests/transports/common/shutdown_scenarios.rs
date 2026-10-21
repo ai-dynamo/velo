@@ -593,7 +593,9 @@ where
 ///
 /// More frames than the channel holds, and teardown right after them, so most
 /// still wait in the gate. One frame may be in the driver's hands already when
-/// the gate fails, and it may still land; nothing else may.
+/// the gate fails, and it may still land; nothing else queued before teardown
+/// may. A send that races `shutdown()` itself can still take the gate's fresh
+/// epoch; closing that needs a terminal state on `AdmissionGate`.
 pub async fn teardown_admits_nothing_from_the_gate<C: ShutdownTestClient>()
 where
     C::Transport: 'static,

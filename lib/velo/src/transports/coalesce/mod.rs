@@ -38,8 +38,9 @@
 //! if it did not reach the wire, and **none** if it did. The caller's own
 //! post-loop drain (e.g. `connection_writer_task`) covers items still sitting
 //! in the channel, but it cannot see an item this loop is holding — so the
-//! three paths that hold one (a mandatory flush failing, a rejected encode, a
-//! failed direct write) report it themselves.
+//! four paths that hold one (a mandatory flush failing, a rejected encode, a
+//! failed direct write, and an item taken after the teardown deadline) report
+//! it themselves.
 //!
 //! There is exactly **one** retention model. Staging an item copies its bytes
 //! into the batch buffer and converts what is left into a

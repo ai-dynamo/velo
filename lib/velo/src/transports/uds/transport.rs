@@ -572,7 +572,7 @@ impl Transport for UdsTransport {
         if let Some(state) = self.shutdown_state.get() {
             state.teardown_token().cancel();
         }
-        self.cancel_token.cancel();
+        // Cancels `cancel_token` (the teardown's token) and fixes the deadline.
         self.teardown.begin();
 
         // Clear connections. Their writers write what they already queued,
