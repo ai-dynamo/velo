@@ -1011,7 +1011,8 @@ pub struct AnchorManager {
     pub transport_registry:
         Arc<HashMap<String, Arc<dyn crate::streaming::transport::FrameTransport>>>,
 
-    /// Default inactivity timeout for newly created anchors.
+    /// Default inactivity timeout for newly created SPSC anchors. MPSC
+    /// anchors do not inherit it; see [`crate::streaming::mpsc::MpscAnchorConfig`].
     /// When set, `create_anchor` spawns a timeout task that auto-removes the
     /// anchor if no sender attaches within this duration. Per-anchor overrides
     /// are supported via [`AnchorConfig::unattached_timeout`] +
@@ -2675,9 +2676,9 @@ impl AnchorManager {
         let (frame_tx, frame_rx) = flume::bounded::<(u64, Vec<u8>)>(capacity);
         let cancel_token = CancellationToken::new();
 
-        let unattached_timeout = config
-            .unattached_timeout
-            .or(self.default_unattached_timeout);
+        // Not `default_unattached_timeout`: that is a renewable reservation
+        // lifetime for SPSC anchors, and renewal cannot reach an MPSC anchor.
+        let unattached_timeout = config.unattached_timeout;
         let heartbeat_interval = config
             .heartbeat_interval
             .unwrap_or(self.default_heartbeat_interval);
@@ -5026,5 +5027,34 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(3600)).await;
         mgr.renew_reservations(&[reservation]).await.expect("renew");
         assert!(mgr.registry.contains_key(&anchor.handle().unpack().1));
+    }
+
+    /// An MPSC anchor takes its unattached timeout from its own config only.
+    /// The manager default (120 s under `Velo`) is a reservation lifetime for
+    /// SPSC anchors, and renewal cannot reach an MPSC anchor; inheriting it
+    /// reaped a fan-in anchor two minutes after its last sender left, with no
+    /// way for the holder to keep it.
+    #[tokio::test(start_paused = true)]
+    async fn an_mpsc_anchor_does_not_inherit_the_unattached_default() {
+        let mgr = AnchorManagerBuilder::default()
+            .worker_id(velo_ext::WorkerId::from_u64(42))
+            .transport(
+                Arc::new(MockTransport) as Arc<dyn crate::streaming::transport::FrameTransport>
+            )
+            .default_unattached_timeout(Duration::from_secs(1))
+            .build()
+            .expect("manager");
+        let inherited = mgr.create_mpsc_anchor::<u32>();
+        let own =
+            mgr.create_mpsc_anchor_with_config::<u32>(crate::streaming::mpsc::MpscAnchorConfig {
+                unattached_timeout: Some(Duration::from_secs(2)),
+                ..Default::default()
+            });
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            mgr.mpsc_registry
+                .contains_key(&inherited.handle().unpack().1)
+        );
+        assert!(!mgr.mpsc_registry.contains_key(&own.handle().unpack().1));
     }
 }

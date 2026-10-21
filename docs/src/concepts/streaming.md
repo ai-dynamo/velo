@@ -82,7 +82,7 @@ Why separate methods: `next` cannot skip serde for `Bytes` alone. Rust has no sp
 
 ## Many producers (MPSC)
 
-`create_mpsc_anchor` makes an anchor that accepts many producers. Each producer gets a `SenderId` when it attaches, and each frame carries the `SenderId` of its producer. `Detached` and `Dropped` from one producer do not end the stream. The consumer ends the stream: it cancels, drops the anchor, or lets the unattached timeout fire after all producers leave. A producer cannot finalize an MPSC anchor.
+`create_mpsc_anchor` makes an anchor that accepts many producers. Each producer gets a `SenderId` when it attaches, and each frame carries the `SenderId` of its producer. `Detached` and `Dropped` from one producer do not end the stream. The consumer ends the stream: it cancels, drops the anchor, or lets its unattached timeout (`MpscAnchorConfig::unattached_timeout`, none by default) fire after all producers leave. A producer cannot finalize an MPSC anchor.
 
 ## How frames travel
 
@@ -133,7 +133,7 @@ Ticket senders support `stop_token()` and `cancellation_token()` through messeng
 
 ## Reservation renewal
 
-`VeloBuilder::reservation_config` sets the default unattached lifetime (120 seconds) and prepared-slot lifetime (180 seconds). Per-anchor `AnchorConfig::unattached_timeout` overrides the ordinary lifetime.
+`VeloBuilder::reservation_config` sets the default unattached lifetime (120 seconds) and prepared-slot lifetime (180 seconds). Per-anchor `AnchorConfig::unattached_timeout` overrides the ordinary lifetime. These defaults apply to SPSC anchors only. An MPSC anchor has an unattached timeout only when `MpscAnchorConfig::unattached_timeout` sets one, and renewal does not extend it.
 
 Capture `AnchorReservation::new(handle, ticket.as_ref())` when a request takes responsibility for a reply. Keep the reservation while that request waits or executes before attachment. Periodically pass held reservations to `AnchorManager::renew_reservations`. The call groups them by owner and sends at most 256 entries per remote batch. It does not attach a producer. The application owns the collection, renewal cadence, and call deadline. Velo does not schedule renewal. Choose a cadence shorter than the reservation lifetime.
 
