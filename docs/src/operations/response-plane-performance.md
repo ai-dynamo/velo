@@ -121,19 +121,23 @@ Before the fixes above, these symbols appeared only in velo's profile, as a shar
 
 Removed, measured on the rig rather than in a profile: each bind used to spawn one task that slept for the 60-second accept window, and a claim did not cancel it. A frontend at about 2,000 requests per second held 146,000 live tokio tasks against about 25,000 on the QUIC plane. The accept window is now a deadline in one queue that the credit sweep drains, so a bind owns no task and a window closes up to one sweep interval late. The test `a_finished_zero_rtt_stream_leaves_no_task_behind` holds the task count to its baseline after streams end.
 
-Removed, measured with `anchor_setup_bench`: each SPSC anchor used to spawn one task for its unattached timeout. Attach cancelled the task, but each stream still paid one spawn and one exit, and each unattached anchor held one task. An unattached deadline is now an entry in one queue per manager, and one task sweeps that queue. The sweep wakes at the earliest entry, so a timeout fires at its deadline, as before. The table below has the median of three interleaved runs on one aarch64 host with 20 cores (10 Cortex-X925, 10 Cortex-A725), with 8 tokio threads, 64 tasks and 1.28M lifecycles.
+Removed, measured with `anchor_setup_bench`: each SPSC anchor used to spawn one task for its unattached timeout. Attach cancelled the task, but each stream still paid one spawn and one exit, and each unattached anchor held one task. An unattached deadline is now an entry in one queue per manager, and one task sweeps that queue. The sweep wakes at the earliest entry, so a timeout fires at its deadline, as before. The host is one aarch64 machine with 20 cores (10 Cortex-X925, 10 Cortex-A725). The unattached rows are the median of three interleaved runs at 8 tokio threads. The lifecycle rows are the median of five interleaved runs of 16M lifecycles (3.84M at 2 threads), 64 tasks. Such a run lasts about 10 s, so the sweep pops entries for all but its first second. CPU is the user and system time of the process, divided by the lifecycles.
 
 | Measure | Task per anchor | Deadline queue |
 |---|---|---|
 | Tasks held by 200,000 unattached anchors | 200,000 | 1 |
 | RSS added by 200,000 unattached anchors | 276.6 MiB | 168.5 MiB |
 | Create time of an unattached anchor | 1,217 ns | 708 ns |
-| Lifecycles per second | 1.37M | 1.62M |
-| Lifecycle p50 / p99 / p99.9 | 4.74 / 12.11 / 21.98 µs | 3.81 / 10.72 / 21.25 µs |
+| Lifecycles per second, 2 / 8 / 16 threads | 0.74M / 1.45M / 1.56M | 0.87M / 1.62M / 2.15M |
+| CPU per lifecycle, 8 threads | 9.2 µs | 7.5 µs |
+| Lifecycle p50 / p99 / p99.9, 8 threads | 4.37 / 12.05 / 22.62 µs | 3.97 / 10.42 / 18.14 µs |
+| Lifecycle p99 / p99.9, 16 threads | 39.9 / 261 µs | 25.9 / 167 µs |
+
+At 2 threads the p99.99 ranges overlap: 127 to 251 µs with a task per anchor, and 133 to 216 µs with the queue. A run of 1.28M lifecycles ends before any entry comes due, so it measures only the push; the 16M run includes the sweep.
 
 The queue does not remove an entry when its anchor attaches or ends. The sweep drops the entry when it comes due. A new entry comes due within 1 s, and a requeued entry within 60 s, so the queue holds about stream rate × 1 s of stale entries, at 24 bytes each. An entry queued at the deadline of its anchor stayed for the full timeout instead: 120 s by default, and 30 years for `Duration::MAX`.
 
-Rejected: one lock for the whole queue. Every create takes a lock on the queue. With one lock, the lifecycle p99.9 at 8 threads was 110 µs, against 22 µs with a task per anchor. Smaller pop batches and a pre-sized heap did not change it. With 1 or 2 threads, the single lock was faster than the task at every percentile, so the cost was contention. The queue now has 16 parts, each with its own lock, and the id of an anchor selects its part.
+Rejected: one lock for the whole queue. Every create takes a lock on the queue. With one lock, the lifecycle p99.9 at 8 threads was 110 µs, against 22 µs with a task per anchor. No entry came due inside that run, so the sweep did not cause the tail: creates waited on each other for the one lock. With 1 or 2 threads, the single lock was faster than the task at every percentile, so the cost was contention. The queue now has 16 parts, each with its own lock, and the id of an anchor selects its part.
 
 The tests `unattached_anchors_share_one_sweep_task` and `ended_anchors_leave_the_queue_within_the_first_look` hold the task count and the queue length. MPSC anchors still spawn one task for their unattached timeout.
 

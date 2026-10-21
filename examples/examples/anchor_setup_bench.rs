@@ -153,13 +153,14 @@ fn main() -> Result<()> {
         nanos.sort_unstable();
         let total = nanos.len();
         println!(
-            "lifecycle: {total} streams, {} tasks, {} threads: {:.0} streams/s, p50 {:.2} us, p99 {:.2} us, p99.9 {:.2} us",
+            "lifecycle: {total} streams, {} tasks, {} threads: {:.0} streams/s, p50 {:.2} us, p99 {:.2} us, p99.9 {:.2} us, p99.99 {:.2} us",
             args.tasks,
             args.threads,
             total as f64 / elapsed.as_secs_f64(),
             percentile(&nanos, 0.50),
             percentile(&nanos, 0.99),
             percentile(&nanos, 0.999),
+            percentile(&nanos, 0.9999),
         );
         Ok(())
     })

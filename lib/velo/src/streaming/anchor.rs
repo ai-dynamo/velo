@@ -385,6 +385,11 @@ impl AnchorDeadlineQueue {
         use dashmap::mapref::entry::Entry;
         loop {
             let due = shard.pop_due(now, ANCHOR_EXPIRE_BATCH);
+            // Nothing due in this shard: skip the requeue and its lock.
+            // After a burst, the requeue of its last chunk shrinks.
+            if due.is_empty() {
+                break;
+            }
             let more = due.len() == ANCHOR_EXPIRE_BATCH;
             let mut renewed = Vec::new();
             for local_id in due {
