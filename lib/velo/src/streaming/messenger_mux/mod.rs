@@ -180,9 +180,9 @@ pub(crate) struct MessengerMuxTransport {
     key: TransportKey,
 }
 
-/// State shared between the transport, its batchers and the ingress handler.
 type BindDeadline = std::cmp::Reverse<(tokio::time::Instant, (u64, u64))>;
 
+/// State shared between the transport, its batchers and the ingress handler.
 struct MuxCore {
     messenger: Arc<Messenger>,
     config: MuxConfig,
@@ -217,11 +217,14 @@ struct MuxCore {
     /// `bind` returns. Take-once: whoever collects it owns it, and the bind
     /// expiry that already exists drops any that was never collected.
     drains: DashMap<(u64, u64), Arc<ingress::DrainSignal>>,
-    /// One expiry entry per bind. Renewal changes the bind's deadline in its
-    /// shard; the sweep requeues that entry when its earlier deadline arrives.
-    /// A heap permits different configured lifetimes without scanning all binds.
+    /// One expiry entry per bind, earliest first. Renewal moves the deadline
+    /// stored with the bind, not this entry; when the entry comes due, the
+    /// sweep reads the stored deadline and queues the entry again if it moved.
+    /// A requeued entry lands behind newer binds, so this is a heap and not a
+    /// FIFO queue.
     bind_deadlines: std::sync::Mutex<std::collections::BinaryHeap<BindDeadline>>,
-    /// The prepared-slot lifetime in nanoseconds, saturating (584 years).
+    /// The accept window of every bind, attach or pre-bind, in nanoseconds,
+    /// saturating at 584 years.
     reservation_timeout_ns: AtomicU64,
     /// A barrier handed to every batcher this core spawns, installed by the
     /// tests that need one held mid-wake. See [`peer_batcher::test_hooks`].
@@ -581,15 +584,20 @@ impl MuxCore {
             }
             due
         };
+        let mut renewed = Vec::new();
         for (anchor_id, session_id) in due {
             if let Some(deadline) = self.ingress.expire_due(anchor_id, session_id, now) {
-                self.bind_deadlines
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .push(std::cmp::Reverse((deadline, (anchor_id, session_id))));
+                renewed.push(std::cmp::Reverse((deadline, (anchor_id, session_id))));
             } else {
                 self.drains.remove(&(anchor_id, session_id));
             }
+        }
+        // One lock for every requeue: binds take this lock too.
+        if !renewed.is_empty() {
+            self.bind_deadlines
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .extend(renewed);
         }
     }
 
@@ -755,9 +763,9 @@ impl MessengerMuxTransport {
     ///
     /// The accept window does the same thing when it expires, and stays as the
     /// backstop. This is for the owner that already knows: a pre-bound anchor
-    /// whose request died before its first token knows a minute earlier than
-    /// the timer does, and at the rate a frontend registers requests that
-    /// minute is thousands of leaked binds.
+    /// whose request died before its first token knows up to a whole window
+    /// earlier than the timer does, and at the rate a frontend registers
+    /// requests that window is thousands of leaked binds.
     ///
     /// Idempotent: a bind already claimed or already released is not there to
     /// remove, and removing nothing is the right answer for both.

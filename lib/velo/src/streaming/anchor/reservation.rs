@@ -1,18 +1,25 @@
 //! Reservation lifetimes before a producer opens its stream.
 
 use super::*;
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const DEFAULT_UNATTACHED_TIMEOUT: Duration = Duration::from_secs(120);
 pub(crate) const DEFAULT_PREBIND_TIMEOUT: Duration = Duration::from_secs(180);
+/// Most reservations in one `_anchor_renew` message. A wire limit: the handler
+/// refuses a larger batch, so a sender and its peer must agree on it.
+const RENEW_BATCH: usize = 256;
 
 /// Receiver lifetimes before a producer attaches.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
 pub struct ReservationConfig {
-    /// Ordinary anchors wait this long for attachment. Defaults to 120 seconds.
+    /// SPSC anchors wait this long for attachment. Defaults to 120 seconds.
+    /// `Duration::MAX` means they never time out.
     pub unattached_timeout: Duration,
-    /// Prepared slots wait this long for opening or renewal. Defaults to 180 seconds.
+    /// The accept window of every messenger-mux bind: a prepared slot waits
+    /// this long for its `OpenSlot` or its next renewal, and an ordinary attach
+    /// waits this long for its first batch. Defaults to 180 seconds.
     pub prebind_timeout: Duration,
 }
 impl Default for ReservationConfig {
@@ -30,8 +37,8 @@ impl ReservationConfig {
             "unattached timeout must be positive"
         );
         anyhow::ensure!(
-            self.prebind_timeout.as_millis() > 0,
-            "reservation timeout must be at least one millisecond"
+            !self.prebind_timeout.is_zero(),
+            "prebind timeout must be positive"
         );
         Ok(())
     }
@@ -95,13 +102,14 @@ impl AnchorManager {
         for (worker, reservations) in peers {
             let messenger = Arc::clone(messenger);
             calls.push(async move {
-                for batch in reservations.chunks(256) {
+                for batch in reservations.chunks(RENEW_BATCH) {
                     messenger
                         .typed_unary_streaming::<()>("_anchor_renew")
                         .payload(batch)?
                         .worker(worker)
                         .send()
-                        .await?;
+                        .await
+                        .with_context(|| format!("renew reservations on {worker}"))?;
                 }
                 Ok::<_, anyhow::Error>(())
             });
@@ -158,8 +166,8 @@ pub(crate) fn renewal_handler(
             let manager = manager.clone();
             async move {
                 anyhow::ensure!(
-                    cx.input.len() <= 256,
-                    "reservation renewal batch exceeds 256 entries"
+                    cx.input.len() <= RENEW_BATCH,
+                    "reservation renewal batch exceeds {RENEW_BATCH} entries"
                 );
                 if let Some(manager) = manager.upgrade() {
                     manager.renew_reservations_local(&cx.input);
@@ -186,7 +194,7 @@ mod tests {
         config.unattached_timeout = Duration::from_millis(1);
         config.prebind_timeout = Duration::ZERO;
         assert!(config.validate().is_err());
-        config.prebind_timeout = Duration::from_millis(1);
+        config.prebind_timeout = Duration::from_micros(500);
         assert!(config.validate().is_ok());
     }
 }

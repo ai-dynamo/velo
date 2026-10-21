@@ -133,10 +133,19 @@ Ticket senders support `stop_token()` and `cancellation_token()` through messeng
 
 ## Reservation renewal
 
-`VeloBuilder::reservation_config` sets the default unattached lifetime (120 seconds) and prepared-slot lifetime (180 seconds). Per-anchor `AnchorConfig::unattached_timeout` overrides the ordinary lifetime. These defaults apply to SPSC anchors only. An MPSC anchor has an unattached timeout only when `MpscAnchorConfig::unattached_timeout` sets one, and renewal does not extend it.
+`VeloBuilder::reservation_config` sets the default unattached lifetime (120 seconds) and the accept window of the messenger mux (180 seconds). The accept window applies to every mux bind: a prepared slot and an ordinary attach. Per-anchor `AnchorConfig::unattached_timeout` overrides the ordinary lifetime. To make anchors wait for a sender with no limit, set `unattached_timeout` to `Duration::MAX`.
+
+`ReservationConfig` is `#[non_exhaustive]`, so start from the default and change its fields:
+
+```rust,ignore
+let mut reservations = ReservationConfig::default();
+reservations.prebind_timeout = Duration::from_secs(600);
+let velo = Velo::builder().reservation_config(reservations).build().await?;
+```
+ These defaults apply to SPSC anchors only. An MPSC anchor has an unattached timeout only when `MpscAnchorConfig::unattached_timeout` sets one, and renewal does not extend it.
 
 Capture `AnchorReservation::new(handle, ticket.as_ref())` when a request takes responsibility for a reply. Keep the reservation while that request waits or executes before attachment. Periodically pass held reservations to `AnchorManager::renew_reservations`. The call groups them by owner and sends at most 256 entries per remote batch. It does not attach a producer. The application owns the collection, renewal cadence, and call deadline. Velo does not schedule renewal. Choose a cadence shorter than the reservation lifetime.
 
-Renewal extends only a live, unattached reservation. Attached, expired, cancelled, and replaced reservations are successful no-ops, including attachment races. Renewal cannot revive an expired stream. A transport failure returns an error. Successful delivery does not prove that a reservation still exists.
+Renewal extends only a live, unattached reservation. Attached, expired, cancelled, and replaced reservations are successful no-ops, including attachment races. Renewal cannot revive an expired stream. A transport failure returns an error. A peer that runs an older Velo has no `_anchor_renew` handler, so renewal to it returns an error too. Successful delivery does not prove that a reservation still exists.
 
-Release the held reservation after downstream acceptance, attachment, cancellation, or failure. Renewal does not extend an application request deadline or replace producer heartbeats. A prepared ticket still identifies one slot generation; renewal does not make that ticket reusable after detach.
+Release the held reservation after downstream acceptance, attachment, cancellation, or failure. The accept window is the only limit on an unclaimed bind. A renewal loop that outlives its request holds the bind, its buffer, and its count on a mux lane until the loop stops. Renewal does not extend an application request deadline or replace producer heartbeats. A prepared ticket still identifies one slot generation; renewal does not make that ticket reusable after detach.

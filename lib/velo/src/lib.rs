@@ -473,9 +473,9 @@ impl VeloBuilder {
             !self.mux_only || self.stream_config.is_none(),
             "mux_only cannot be combined with stream_config or stream_bind_addr"
         );
+        self.reservation_config.validate()?;
         // Read the override once at build so this instance keeps the same
         // transport offers for every attach.
-        self.reservation_config.validate()?;
         let config = resolve_mux_config(
             self.mux_config.unwrap_or_default(),
             messenger_mux_disabled_by_env(),

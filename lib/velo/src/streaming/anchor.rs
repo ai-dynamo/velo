@@ -105,8 +105,8 @@ pub enum AttachError {
 #[derive(Debug, Clone, Default)]
 pub struct AnchorConfig {
     /// How long an unattached anchor may live before being auto-removed.
-    /// `Some(None)` is not expressible — pass `None` to inherit the manager
-    /// default (which itself may be `None` to disable the timeout entirely).
+    /// `None` inherits the manager default (120 s under [`crate::Velo`]).
+    /// `Some(Duration::MAX)` means the anchor never times out.
     pub unattached_timeout: Option<Duration>,
 
     /// The heartbeat cadence the attached sender must emit at, and the
@@ -211,7 +211,7 @@ pub(crate) struct AnchorEntry {
 ///
 /// - **Unclaimed** — release the bind. The configured accept window would collect it
 ///   eventually and stays as the backstop, but a request that dies before its
-///   first token knows a minute sooner than that timer does.
+///   first token knows sooner than that timer does.
 /// - **Claimed** — tell the peer to abandon its egress slot. Without this a
 ///   producer that is not sending never learns its consumer is gone: the
 ///   ingress fault carrying that news rides on the next record to arrive, and
@@ -1239,7 +1239,8 @@ impl AnchorManager {
         }
     }
 
-    /// Convenience constructor with no default timeout.
+    /// Convenience constructor with the builder defaults: a 120 s unattached
+    /// timeout and a 5 s heartbeat interval.
     ///
     /// Equivalent to `AnchorManagerBuilder::default().worker_id(id).transport(t).build()`.
     pub fn new(
@@ -1358,22 +1359,34 @@ impl AnchorManager {
         };
         let tc_clone = tc.clone();
         rt.spawn(async move {
+            // Renewal moves `AnchorEntry::expires`, not this task's timer, so
+            // on waking the task re-reads it and sleeps again if it moved.
             let mut deadline = reservation::deadline_after(timeout);
             loop {
                 tokio::select! {
                     _ = tc_clone.cancelled() => break,
                     _ = tokio::time::sleep_until(deadline) => {
                         use dashmap::mapref::entry::Entry;
-                        let Entry::Occupied(entry) = registry.entry(local_id) else { break; };
-                        if tc_clone.is_cancelled() || entry.get().attachment || entry.get().prebind.is_some() { break; }
-                        if let Some(next) = entry.get().expires
-                            && next > tokio::time::Instant::now() { deadline = next; continue; }
+                        let Entry::Occupied(entry) = registry.entry(local_id) else {
+                            break;
+                        };
+                        let anchor = entry.get();
+                        // Attach and pre-bind pause this timer; a stale wake
+                        // after either must not remove the anchor.
+                        if tc_clone.is_cancelled() || anchor.attachment || anchor.prebind.is_some() {
+                            break;
+                        }
+                        if let Some(next) = anchor.expires
+                            && next > tokio::time::Instant::now()
+                        {
+                            deadline = next;
+                            continue;
+                        }
                         entry.remove().cancel_token.cancel();
                         break;
                     }
                 }
             }
-
         });
         tc
     }
@@ -1636,7 +1649,7 @@ impl AnchorManager {
         let Some((ticket, frame_tx, heartbeat_interval, prebound, feed, replaced)) = prepared
         else {
             // Nothing took ownership of the bind, so give it straight back
-            // rather than leaving the accept window to find it in a minute.
+            // rather than leaving the accept window to find it.
             mux.release_bind(local_id, routing_session_id);
             tracing::debug!(
                 %handle,
@@ -2557,7 +2570,7 @@ impl AnchorManager {
                     // on another worker. This one is on ours and writes
                     // straight into the anchor's channel, so that slot has no
                     // sender and never will: releasing it here is what keeps
-                    // the accept window from holding a bind for a minute that
+                    // the accept window from holding a bind for its whole span that
                     // nothing can claim.
                     //
                     // The guard above is a best-effort read: `prebind_is_claimed`
@@ -3929,7 +3942,7 @@ mod tests {
     async fn test_set_timeout_starts_timeout_on_no_default() {
         tokio::time::pause();
 
-        // Manager with NO default timeout
+        // Every anchor below sets its own timeout.
         let mgr = make_manager();
         let stream = mgr.create_anchor::<u32>();
         let (_, local_id) = stream.handle().unpack();
