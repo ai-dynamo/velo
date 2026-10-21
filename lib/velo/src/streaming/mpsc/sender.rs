@@ -122,9 +122,7 @@ impl<T: Serialize> MpscStreamSender<T> {
         let hb_cancel = heartbeat_cancel.clone();
         let hb_channel = channel.clone();
         let hb_sender_id = sender_id.0;
-        let hb_closed = crate::streaming::control::CloseOnCancel::new(&cancel_token, &closed);
         tokio::spawn(async move {
-            let _close = hb_closed;
             // First tick one period out. Waiting for an immediate first
             // tick would delay seeing a cancelled token by a timer turn.
             let mut interval = tokio::time::interval_at(
@@ -172,10 +170,13 @@ impl<T: Serialize> MpscStreamSender<T> {
         self.sender_id
     }
 
-    /// Return a cloneable cancellation token that fires when the consumer
-    /// cancels the stream (`MpscStreamController::cancel`).
+    /// Return a cancellation token that fires when the consumer cancels the
+    /// stream (`MpscStreamController::cancel`).
+    ///
+    /// The token only observes the stream: cancelling it does not stop the
+    /// sender. To end the stream, finalize, detach, or drop the sender.
     pub fn cancellation_token(&self) -> CancellationToken {
-        self.cancel_token.clone()
+        self.cancel_token.child_token()
     }
 
     /// Await `send`, giving up when the consumer cancels the stream.
@@ -437,6 +438,7 @@ mod tests {
     async fn cancellation_stops_heartbeats_while_the_sender_is_retained() {
         let (tx, rx) = flume::bounded(16);
         let cancel_token = CancellationToken::new();
+        let closed = crate::streaming::control::SenderClosed::default();
         let heartbeat = Duration::from_secs(5);
         let sender = MpscStreamSender::<u32>::new(
             SenderId(1),
@@ -447,7 +449,7 @@ mod tests {
                 cancel_token: cancel_token.clone(),
                 sender_stream_id: 1,
                 sender_registry: Arc::new(crate::streaming::control::SenderRegistry::default()),
-                closed: Default::default(),
+                closed: closed.clone(),
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
                 deadline_queue: None,
@@ -456,15 +458,13 @@ mod tests {
             None,
         );
         assert_eq!(rx.recv_async().await.unwrap(), *cached_heartbeat());
-        cancel_token.cancel();
-        // A direct token cancel reaches the per-record flag once the heartbeat
-        // task runs. Bounded, not one hop, so the runtime flavour does not matter.
-        for _ in 0..1000 {
-            if sender.closed.is_closed() {
-                break;
-            }
-            tokio::task::yield_now().await;
+        // What `SenderEntry::cancel` does: the flag first, then the token.
+        crate::streaming::control::SenderEntry {
+            cancel_token: cancel_token.clone(),
+            stop_token: cancel_token.child_token(),
+            closed,
         }
+        .cancel();
         assert!(matches!(
             sender.send(42).await,
             Err(SendError::ChannelClosed)

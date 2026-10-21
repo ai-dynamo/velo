@@ -346,9 +346,7 @@ impl<T: Serialize> StreamSender<T> {
         // Spawn heartbeat background task
         let cancel = heartbeat_cancel.clone();
         let tx_clone = tx.clone();
-        let hb_closed = crate::streaming::control::CloseOnCancel::new(&cancel_token, &closed);
         tokio::spawn(async move {
-            let _close = hb_closed;
             // First tick one period out. Waiting for an immediate first
             // tick would delay seeing a cancelled token by a timer turn.
             let mut interval = tokio::time::interval_at(
@@ -427,8 +425,11 @@ impl<T: Serialize> StreamSender<T> {
     /// ```
     ///
     /// Also fires for ticket opens, including an idle producer whose slot closes.
+    ///
+    /// The token only observes the stream: cancelling it does not stop the
+    /// sender. To end the stream, finalize, detach, or drop the sender.
     pub fn cancellation_token(&self) -> CancellationToken {
-        self.cancel_token.clone()
+        self.cancel_token.child_token()
     }
 
     /// Fires when the consumer requests graceful stop or cancels the stream.
@@ -851,6 +852,13 @@ mod tests {
     }
 
     /// Create a test sender with a bounded(256) channel and a dummy handle.
+    /// Cancel the stream as `SenderEntry::cancel` does: the per-record flag
+    /// first, then the token.
+    fn cancel_stream<T>(sender: &StreamSender<T>) {
+        sender.closed.close();
+        sender.cancel_token.cancel();
+    }
+
     fn make_sender() -> (StreamSender<u32>, flume::Receiver<Vec<u8>>) {
         make_sender_of()
     }
@@ -1260,6 +1268,39 @@ mod tests {
         );
     }
 
+    /// The token from `cancellation_token` only observes the stream. A
+    /// caller that cancels it does not stop the sender: only the consumer, a
+    /// registry cancel, or shutdown cancels a stream.
+    ///
+    /// Before, a direct cancel of this token closed the sender, so a task per
+    /// sender had to watch the token to set the flag that `send` checks per
+    /// record. Checking the token itself per record takes its mutex. With an
+    /// observe-only token, every cancel goes through `SenderEntry::cancel`,
+    /// which sets the flag first, and no task needs to watch.
+    #[tokio::test]
+    async fn cancelling_the_observer_token_does_not_stop_the_sender() {
+        let (tx, rx) = flume::bounded::<Vec<u8>>(256);
+        let handle = StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 1);
+        let (sender, registry) = make_sender_with_registry(tx, handle, 7);
+        let observer = sender.cancellation_token();
+        observer.cancel();
+        tokio::task::yield_now().await;
+        sender.send(42).await.expect("the stream is not cancelled");
+        assert_eq!(rx.len(), 1);
+        assert!(!sender.cancellation_token().is_cancelled());
+
+        let watching = sender.cancellation_token();
+        registry.cancel(7);
+        assert!(
+            watching.is_cancelled(),
+            "a registry cancel fires the observer"
+        );
+        assert!(matches!(
+            sender.send(43).await,
+            Err(SendError::ChannelClosed)
+        ));
+    }
+
     // -----------------------------------------------------------------------
     // Test 10: cancellation_token() returns a cloneable token
     // -----------------------------------------------------------------------
@@ -1270,19 +1311,12 @@ mod tests {
         rt.block_on(async {
             let (sender, _rx) = make_sender();
             let token = sender.cancellation_token();
-            // Token should not be cancelled yet
             assert!(!token.is_cancelled(), "token should not start cancelled");
-            // Cancelling the token externally should be reflected
-            token.cancel();
+            cancel_stream(&sender);
+            assert!(token.is_cancelled(), "a stream cancel fires the token");
             assert!(
-                token.is_cancelled(),
-                "token should be cancelled after cancel()"
-            );
-            // A clone should also be cancelled
-            let clone = sender.cancellation_token();
-            assert!(
-                clone.is_cancelled(),
-                "cloned token should reflect cancellation"
+                sender.cancellation_token().is_cancelled(),
+                "a token taken after the cancel is cancelled too"
             );
             drop(sender);
         });
@@ -1313,8 +1347,7 @@ mod tests {
     }
 
     /// The registry cancel needs no task: it sets the flag itself. So it
-    /// still stops a sender whose building runtime is gone, when a direct
-    /// token cancel no longer can (no heartbeat task is left to see it).
+    /// still stops a sender whose building runtime is gone.
     #[test]
     fn registry_cancel_works_after_the_senders_runtime_is_gone() {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -1333,33 +1366,6 @@ mod tests {
         ));
     }
 
-    /// A token cancelled directly, not through the registry, reaches the
-    /// per-record flag from the heartbeat task, once the cancelling task
-    /// yields and the heartbeat task runs.
-    /// Checking the token itself per record would take its mutex every time.
-    #[tokio::test]
-    async fn test_send_after_cancel() {
-        let (sender, rx) = make_sender();
-        sender.cancellation_token().cancel();
-        // Bounded, not one hop: on a multi-thread runtime the heartbeat task
-        // may run on another worker.
-        for _ in 0..1000 {
-            if sender.closed.is_closed() {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(matches!(
-            sender.send(42).await,
-            Err(SendError::ChannelClosed)
-        ));
-        assert!(matches!(
-            sender.send_err("late error").await,
-            Err(SendError::ChannelClosed)
-        ));
-        assert!(rx.is_empty());
-    }
-
     #[tokio::test]
     async fn cancellation_wakes_item_and_error_sends_on_a_full_channel() {
         let (sender, rx) = make_sender();
@@ -1372,7 +1378,7 @@ mod tests {
         assert!(futures::poll!(&mut item).is_pending());
         assert!(futures::poll!(&mut error).is_pending());
 
-        sender.cancellation_token().cancel();
+        cancel_stream(&sender);
         let (item, error) =
             tokio::time::timeout(Duration::from_secs(1), async { (item.await, error.await) })
                 .await
@@ -1402,7 +1408,7 @@ mod tests {
         let blocked = sender.send_bytes(b"late");
         tokio::pin!(blocked);
         assert!(futures::poll!(&mut blocked).is_pending());
-        sender.cancellation_token().cancel();
+        cancel_stream(&sender);
         let blocked = tokio::time::timeout(Duration::from_secs(1), blocked)
             .await
             .expect("a blocked send_bytes did not wake after cancellation");

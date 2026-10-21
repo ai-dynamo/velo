@@ -213,39 +213,6 @@ impl Drop for RetireGuard {
     }
 }
 
-/// Held by a sender's heartbeat task, which ends when the sender's token is
-/// cancelled. A token cancelled other than through [`SenderEntry::cancel`]
-/// reaches the per-record check here. A drop guard, so a cancel that came
-/// before the task was dropped with its runtime still sets the flag. A direct
-/// cancel after that runtime is gone has no task to see it, and `send` keeps
-/// accepting records; [`SenderEntry::cancel`] still works then.
-pub(crate) struct CloseOnCancel {
-    token: tokio_util::sync::CancellationToken,
-    closed: SenderClosed,
-}
-
-impl CloseOnCancel {
-    /// Built with the sender. A token already cancelled by then closes the
-    /// flag at once: no task needs to run for it.
-    pub(crate) fn new(token: &tokio_util::sync::CancellationToken, closed: &SenderClosed) -> Self {
-        if token.is_cancelled() {
-            closed.close();
-        }
-        Self {
-            token: token.clone(),
-            closed: closed.clone(),
-        }
-    }
-}
-
-impl Drop for CloseOnCancel {
-    fn drop(&mut self) {
-        if self.token.is_cancelled() {
-            self.closed.close();
-        }
-    }
-}
-
 /// A single slot in the sender-side registry, representing an active [`crate::streaming::sender::StreamSender`].
 ///
 /// Stored per active stream. The `_stream_cancel` handler removes the entry
