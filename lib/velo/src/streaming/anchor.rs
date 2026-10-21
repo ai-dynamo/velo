@@ -1351,7 +1351,8 @@ impl AnchorManager {
         )
     }
 
-    /// Spawn a background task that removes the anchor after `timeout` elapses.
+    /// Spawn a background task that removes the anchor once `expires`, or the
+    /// later deadline a renewal stored in `AnchorEntry::expires`, has passed.
     ///
     /// Returns a [`CancellationToken`] that cancels the task when triggered
     /// (e.g. on attach, or when `set_timeout(None)` is called). The returned

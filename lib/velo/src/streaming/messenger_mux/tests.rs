@@ -3100,3 +3100,80 @@ async fn a_ticket_reservation_renews_the_anchor_after_its_prebind_is_released() 
     drop(anchor);
     node.mux.shutdown().await;
 }
+
+/// A released bind's expiry entry leaves the queue within the recheck horizon,
+/// whatever the accept window.
+///
+/// The queue does not remove an entry when its bind is claimed or released;
+/// the sweep drops it when it comes due. Queued at the bind's own deadline, an
+/// entry for a `Duration::MAX` window came due in 30 years, so every claimed
+/// or released bind grew the queue for the life of the process.
+#[tokio::test]
+async fn a_released_bind_leaves_the_queue_within_the_recheck_horizon() {
+    tokio::time::pause();
+    let node = prebinding_node_with_window(test_config(), None, Duration::MAX).await;
+    let released = node.manager.create_anchor::<u32>();
+    node.manager
+        .prebind_anchor(released.handle())
+        .expect("ticket");
+    let held = node.manager.create_anchor::<u32>();
+    node.manager.prebind_anchor(held.handle()).expect("ticket");
+    drop(released);
+    eventually(|| node.mux.pending_binds() == 1).await;
+    assert_eq!(node.mux.core.bind_deadlines.lock().unwrap().len(), 2);
+
+    tokio::time::advance(super::BIND_RECHECK + Duration::from_secs(1)).await;
+    node.mux.core.expire_binds(tokio::time::Instant::now());
+    assert_eq!(
+        node.mux.core.bind_deadlines.lock().unwrap().len(),
+        1,
+        "the released bind's entry is gone; the held one is queued again"
+    );
+    assert_eq!(node.mux.pending_binds(), 1, "the held bind is still open");
+    drop(held);
+    node.mux.shutdown().await;
+}
+
+/// The sweep sizes the queue after it requeues the binds that are still open.
+///
+/// It decided on the shrink first. A sweep that found thousands of held binds
+/// due at once saw a nearly empty queue, gave the capacity back, and then grew
+/// it again to requeue them: one shrink and one grow under the lock every bind
+/// takes, each `BIND_RECHECK` for as long as the binds were held.
+#[tokio::test]
+async fn the_sweep_does_not_shrink_the_queue_it_is_about_to_refill() {
+    const HELD: u64 = 9_000;
+    tokio::time::pause();
+    let node = prebinding_node_with_window(test_config(), None, Duration::MAX).await;
+    let core = &node.mux.core;
+    let due = tokio::time::Instant::now() + Duration::from_secs(1);
+    let capacity = {
+        let mut deadlines = core.bind_deadlines.lock().unwrap();
+        deadlines.reserve(16_384);
+        for anchor in 1..=HELD {
+            let (tx, _rx) = flume::bounded(1);
+            core.ingress.register_bind(
+                anchor,
+                1,
+                tx,
+                Arc::new(ingress::DrainSignal::new(core.drain_tx.clone())),
+                LaneReservation::uncounted(LaneIndex::ZERO),
+                crate::streaming::deadline::deadline_after(Duration::MAX),
+            );
+            deadlines.push(std::cmp::Reverse((due, (anchor, 1))));
+        }
+        deadlines.capacity()
+    };
+    tokio::time::advance(Duration::from_secs(2)).await;
+    core.expire_binds(tokio::time::Instant::now());
+    let (len, after) = {
+        let deadlines = core.bind_deadlines.lock().unwrap();
+        (deadlines.len(), deadlines.capacity())
+    };
+    assert_eq!(len, HELD as usize, "every held bind is queued again");
+    assert_eq!(
+        after, capacity,
+        "the queue kept its capacity instead of shrinking and growing back"
+    );
+    node.mux.shutdown().await;
+}
