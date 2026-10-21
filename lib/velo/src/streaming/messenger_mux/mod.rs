@@ -221,7 +221,9 @@ struct MuxCore {
     /// stored with the bind, not this entry; when the entry comes due, the
     /// sweep reads the stored deadline and queues the entry again if it moved.
     /// A requeued entry lands behind newer binds, so this is a heap and not a
-    /// FIFO queue.
+    /// FIFO queue. A bind claimed or released early leaves its entry here, and
+    /// that entry costs a failed lookup when it comes due; that is cheaper than
+    /// finding and removing it on the claim path.
     bind_deadlines: std::sync::Mutex<std::collections::BinaryHeap<BindDeadline>>,
     /// The accept window of every bind, attach or pre-bind
     /// (`ReservationConfig::prebind_timeout`).
