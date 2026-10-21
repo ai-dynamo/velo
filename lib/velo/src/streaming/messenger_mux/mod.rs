@@ -580,15 +580,11 @@ impl MuxCore {
             while deadlines.peek().is_some_and(|entry| entry.0.0 <= now) {
                 due.push(deadlines.pop().expect("due entry").0.1);
             }
-            // A burst of binds leaves the queue's capacity behind it. Give it
-            // back only once the queue is nearly empty: the shrink copies what
-            // is left while holding the lock every bind takes, so shrinking a
-            // queue still tens of thousands deep would stall new streams.
-            if deadlines.len() <= 1024 && deadlines.capacity() > 8192 {
-                deadlines.shrink_to(2048);
-            }
             due
         };
+        if due.is_empty() {
+            return;
+        }
         let mut renewed = Vec::new();
         for (anchor_id, session_id) in due {
             if let Some(deadline) = self.ingress.expire_due(anchor_id, session_id, now) {
@@ -599,11 +595,18 @@ impl MuxCore {
             }
         }
         // One lock for every requeue: binds take this lock too.
-        if !renewed.is_empty() {
-            self.bind_deadlines
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .extend(renewed);
+        let mut deadlines = self
+            .bind_deadlines
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        deadlines.extend(renewed);
+        // A burst of binds leaves the queue's capacity behind it. Give it back
+        // only once the queue is nearly empty: the shrink copies what is left
+        // while holding the lock every bind takes, so shrinking a queue still
+        // tens of thousands deep would stall new streams. Decided after the
+        // requeue, so a sweep never shrinks a queue it is about to refill.
+        if deadlines.len() <= 1024 && deadlines.capacity() > 8192 {
+            deadlines.shrink_to(2048);
         }
     }
 
