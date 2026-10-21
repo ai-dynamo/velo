@@ -48,8 +48,9 @@ A file that is not compiled (docs, CI, scripts) has no tier. Check for
 - `lib/velo/src/messenger/common/messages.rs`: `encode_active_message`.
 - `lib/velo/src/transports.rs`: `VeloBackend::send_message_on_lane`,
   `instrument_transport_error_handler`, `finalize_send_outcome`.
-- `lib/velo/src/transports/{tcp,uds,quic}/transport.rs`:
-  `send_message_on_lane`, `admit`.
+- `lib/velo/src/transports/{tcp,quic}/transport.rs`:
+  `send_message_on_lane`, `admit`. `transports/uds/transport.rs`:
+  `send_message`, `admit`.
 - `lib/velo-ext/src/admission.rs`: `AdmissionGate::send`. The fast path is
   one lock plus `try_send`. A full channel takes a `Ticket` and may spawn
   `drive`.
@@ -128,8 +129,10 @@ A file that is not compiled (docs, CI, scripts) has no tier. Check for
   → the sender task; its own `route_frame`.
 - ZMQ, `transports/zmq/transport.rs`: `send_message` → the `run_sender`
   thread. Inbound: `transports/zmq/listener.rs`.
-- UCX, `transports/ucx/transport.rs`: `send_message`, `admit` → the command
-  ring → `transports/ucx/worker.rs`: `Doorbell::ring`, `run_loop`,
+- UCX, `transports/ucx/transport.rs`: `send_message`, `admit` →
+  `AdmissionGate` → a per-peer forwarder task (spawned in
+  `get_or_create_connection`; a hop per send when it is parked) → the
+  command ring → `transports/ucx/worker.rs`: `Doorbell::ring`, `run_loop`,
   `drain_ring`, `handle_cmd`, `post_am`. These run on the progress thread
   (`UcxConfig::spin_us`).
 - Rendezvous and large payloads (`rendezvous/**`, `transports/ucx/rma.rs`,

@@ -41,7 +41,8 @@ Set `HEAD_SHA=$(git rev-parse <head>)`. Set `BASE_SHA` to
 `..` range.
 
 **Audit mode.** `HEAD_SHA=$(git rev-parse HEAD)`. `AUDIT_PATH` is the
-argument. There is no base.
+argument, plus its module root file (`<AUDIT_PATH>.rs`) when there is one.
+There is no base.
 
 `$SCRATCH` is the session's scratchpad directory, or a fresh `mktemp -d`
 when there is none. `$S` is `$SCRATCH/perf-review`.
@@ -162,8 +163,14 @@ at most 3. Drop a finder whose families cannot apply. Each finder:
 
 **In audit mode**, the same finders ask "what does this code pay now?".
 When the T1 and T2 code under `AUDIT_PATH` spans more than 3 subsystems,
-shard by subsystem instead: one finder per shard, all families, at most 5
-finders. If 5 is not enough, ask the user to narrow the path.
+shard by subsystem instead: one finder per shard, all families, at most 4
+finders. If 4 is not enough, ask the user to narrow the path. Give shared
+code (the coalescer, framing, ingress) to one shard. Before Stage 2, merge
+the candidates that several shards found. A cost outside `AUDIT_PATH` goes
+under "Related, out of scope".
+
+In audit mode every finding is an opportunity, so it has `impact`, not
+`severity`, and no `delta`.
 
 Each finding is thermonuclear's `{file, line, claim, why-it-breaks,
 severity}`, plus these fields. `severity` is for regressions only; an
@@ -197,11 +204,13 @@ chain of the code the pin guards, `delta` quotes the test change, and
 
 Start one verifier for each finder that returned anything (in inline mode,
 one verifier). In parallel, start one more verifier that checks every
-candidate the finder rated major or above, from scratch, without the
-first verdict. This second verifier runs in inline mode too. If the two disagree, the lower severity stands. That is at
-most 4 verifiers per round. When every candidate can only be minor (a
-constant T2 cost, or inferred evidence only), skip this stage and report
-them as minor and unverified.
+candidate the finder rated major or above (in audit mode, high impact),
+from scratch, without the first verdict. This second verifier runs in
+inline mode too. If the two disagree, the lower rating stands. Use at most
+4 verifiers per round in every mode; with more finders, give each
+verifier the candidates of several. When every candidate can only be
+minor (a constant T2 cost, or inferred evidence only), skip this stage and
+report them as minor and unverified.
 
 Each verifier reads the real code, not the finder's summary, and answers
 these questions in order. The first "no" decides.
@@ -279,10 +288,10 @@ confirmed regressions, and tell them what is already found. Opportunities
 do not start a round. A new finding needs a fix of its own; a sub-point of
 an existing finding is not new. Stage 1 is round 1.
 
-Skip this stage in inline mode, unless a verifier named a missed
-candidate (then verify that one). Skip it also when the only confirmed
-regression is fixed by reverting the diff. Stop when a round confirms
-nothing new, or after 3 rounds.
+Skip this stage in audit mode. Skip it in inline mode, unless a verifier
+named a missed candidate (then verify that one). Skip it also when the
+only confirmed regression is fixed by reverting the diff. Stop when a
+round confirms nothing new, or after 3 rounds.
 
 ## Stage 4: measure (only when triggered)
 
@@ -337,12 +346,18 @@ markdown with these sections:
    sections the diff makes false, worktrees removed, `git status`, and
    any check that was not independent.
 
+In audit mode the report has no Regressions or Claims sections. Give the
+high and medium opportunities in full (at most 15), and the low ones in
+one line each.
+
 Do not apply fixes. The caller decides what to fix, and then reruns the
 review.
 
 ## Calibration
 
 - Finders: sonnet. Verifiers and any judgment call: opus.
+- Cost: an inline review is 1 or 2 agents per round. A review with
+  finders, or an audit, is at most 8 agents in all.
 - Silence is a valid outcome. Most changes on a hot path add no cost. "0
   confirmed regressions" with the refuted list is a pass.
 - Never call a clone, a `Box` or a `match` expensive without a chain and an

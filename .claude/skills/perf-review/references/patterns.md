@@ -9,7 +9,7 @@ A finding without one says "unquantified".
 | R | Cost | Source |
 |---|---|---|
 | R1 | A cross-thread wake of a parked task: about 2.4 µs (216 ns on a pinned `current_thread` runtime) | rdma-design.md, "Where the per-message time goes" |
-| R2 | A UCX ring push: about 100 ns. `ucp_worker_signal`: 1 to 3 µs | rdma-design.md, "The UCX transport"; `UcxConfig::spin_us` doc |
+| R2 | A UCX ring push: about 100 ns. `ucp_worker_signal`: 1 to 3 µs. A design estimate, never measured | rdma-design.md, "The UCX transport"; `UcxConfig::spin_us` doc |
 | R3 | `CancellationToken::is_cancelled`: 8.7 ns (it locks the token node). A plain atomic flag: 0.3 ns | `streaming/control/registry.rs` (`SenderClosed`); guides/migrate-dispatch-and-cancellation.md |
 | R4 | Polling `cancelled()`: about 20 ns (two mutex round trips). Built per frame on the node-wide token, it adds and removes a waiter under one `Notify` lock that every connection shares: about 5% of frontend CPU | the comment in `create_message_handler`; the `connection_teardown` doc |
 | R5 | `Weak::upgrade` under contention: 86 to 94 ns. An `Arc` clone: 30 to 39 ns | commit 442223c message |
@@ -29,6 +29,8 @@ A finding without one says "unquantified".
 | R19 | `CancellationToken::is_cancelled` on the delivery path, per record: 0.43% of 72 cores | response-plane-performance.md, the symbol table in "Where velo's extra CPU goes" |
 | R20 | Coalescing, as counts: a burst of 20,001 frames left in 21 writes (952:1); two writes per large frame instead of three took `sendto` from 6,644 to 4,476 over 1,100 frames | concepts/batched-streaming.md, "Per-stream coalescing cannot reach the forward-pass shape"; rdma-design.md, "Three writes per large frame" |
 | R21 | Moving one pinned `Sleep` to a later deadline on every record: +48 instructions per record and no lock on tokio 1.54 (`extend_expiration` is a CAS). It is not R7 | measured in this skill's evaluation: `perf stat -e instructions:u`, 16 `reader_pump`s x 200,000 records, 10 interleaved reps per arm, dev box (directional) |
+| R22 | One uncontended mutex acquire (`CancellationToken::is_cancelled`): about 8 ns alone, about 6 ns in a loop with real work (aarch64, pinned) | the comment in `create_message_handler` |
+| R23 | `memcpy`, memory touched first (B200): 0.05 µs at 4 KiB, 4.6 µs at 256 KiB, 27.5 to 35.8 µs at 1 MiB, 486 to 494 µs at 8 MiB | rdma-design.md, "Measurements behind it" |
 
 The repo has no number for a prometheus `with_label_values` lookup, a
 `tokio::spawn`, a `DashMap` shard lock, a small-frame write syscall, or a
