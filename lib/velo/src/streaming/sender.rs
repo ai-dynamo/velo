@@ -204,7 +204,28 @@ pub enum Retirement {
 /// any number of them, and each one wakes.
 #[must_use = "a future does nothing unless polled"]
 #[derive(Debug)]
-pub struct Retired(crate::streaming::control::SenderClosed);
+pub struct Retired {
+    closed: crate::streaming::control::SenderClosed,
+    /// This future's entry in the stream's waker list, once it has waited.
+    registration: Option<u64>,
+}
+
+impl Retired {
+    pub(crate) fn new(closed: crate::streaming::control::SenderClosed) -> Self {
+        Self {
+            closed,
+            registration: None,
+        }
+    }
+}
+
+impl Drop for Retired {
+    fn drop(&mut self) {
+        if let Some(id) = self.registration {
+            self.closed.unregister_retired(id);
+        }
+    }
+}
 
 impl std::future::Future for Retired {
     type Output = Retirement;
@@ -213,7 +234,8 @@ impl std::future::Future for Retired {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Retirement> {
-        self.0.poll_retired(cx)
+        let this = self.get_mut();
+        this.closed.poll_retired(cx, &mut this.registration)
     }
 }
 
@@ -555,7 +577,7 @@ impl<T> StreamSender<T> {
     /// compare-exchange when it retires. Ask for it before `finalize` or
     /// `detach`, which consume the sender.
     pub fn retired(&self) -> Retired {
-        Retired(self.closed.clone())
+        Retired::new(self.closed.clone())
     }
 
     /// Who reports this stream's retirement, for tests of the wiring.

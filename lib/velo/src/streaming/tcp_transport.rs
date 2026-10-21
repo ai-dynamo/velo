@@ -947,7 +947,7 @@ mod tests {
     fn retired(
         closed: &crate::streaming::control::SenderClosed,
     ) -> impl std::future::Future<Output = crate::streaming::Retirement> + '_ {
-        std::future::poll_fn(move |cx| closed.poll_retired(cx))
+        crate::streaming::Retired::new(closed.clone())
     }
 
     /// The pump reports the stream's retirement: `Discarded` when the socket

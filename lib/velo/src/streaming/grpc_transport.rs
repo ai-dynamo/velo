@@ -1060,7 +1060,7 @@ mod tests {
         tx.send_async(crate::streaming::sender::cached_finalized().clone())
             .await
             .unwrap();
-        let retired = std::future::poll_fn(|cx| closed.poll_retired(cx));
+        let retired = crate::streaming::Retired::new(closed.clone());
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(5), retired).await,
             Ok(crate::streaming::Retirement::Discarded)

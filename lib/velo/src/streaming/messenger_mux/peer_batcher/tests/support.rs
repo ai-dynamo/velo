@@ -439,7 +439,7 @@ pub(super) fn watched_lifecycle() -> (
 pub(super) fn retired(
     closed: &crate::streaming::control::SenderClosed,
 ) -> impl std::future::Future<Output = crate::streaming::Retirement> + '_ {
-    std::future::poll_fn(move |cx| closed.poll_retired(cx))
+    crate::streaming::Retired::new(closed.clone())
 }
 
 pub(super) fn item(n: u32) -> Vec<u8> {

@@ -2232,10 +2232,18 @@ fn retirement_wakes_every_waiting_future() {
     let closed = SenderClosed::default();
     for w in &wakers {
         let mut cx = Context::from_waker(w);
-        assert_eq!(closed.poll_retired(&mut cx), Poll::Pending);
-        // The same task polling again registers once.
-        assert_eq!(closed.poll_retired(&mut cx), Poll::Pending);
+        let mut registration = None;
+        assert_eq!(
+            closed.poll_retired(&mut cx, &mut registration),
+            Poll::Pending
+        );
+        // The same future polling again keeps its one entry.
+        assert_eq!(
+            closed.poll_retired(&mut cx, &mut registration),
+            Poll::Pending
+        );
     }
+    assert_eq!(closed.waiting(), 3);
     // The last waiter gives up: its future goes, its waker stays registered.
     drop(wakers);
 
@@ -2251,14 +2259,54 @@ fn retirement_wakes_every_waiting_future() {
     let again = waker(counters[0].clone());
     let mut cx = Context::from_waker(&again);
     assert_eq!(
-        closed.poll_retired(&mut cx),
+        closed.poll_retired(&mut cx, &mut None),
         Poll::Ready(crate::streaming::Retirement::Sent)
     );
     // A later report changes nothing, and wakes nobody.
     closed.retire(crate::streaming::Retirement::Discarded);
     assert_eq!(
-        closed.poll_retired(&mut cx),
+        closed.poll_retired(&mut cx, &mut None),
         Poll::Ready(crate::streaming::Retirement::Sent)
     );
     assert_eq!(counters[0].0.load(Ordering::SeqCst), 1);
+}
+
+/// A `Retired` future that is dropped before the stream retires takes its
+/// waker with it.
+///
+/// Each one registered its task's waker and left it behind. A long-lived
+/// stream whose retirement was awaited under a timeout, from a new task each
+/// time, kept one waker per abandoned wait, and with it each task's
+/// allocation, until the stream retired; retirement then woke all of them.
+#[test]
+fn a_dropped_retired_future_takes_its_waker_with_it() {
+    use futures::task::{ArcWake, waker};
+    use std::future::Future;
+    use std::task::{Context, Poll};
+
+    struct Task;
+    impl ArcWake for Task {
+        fn wake_by_ref(_: &Arc<Self>) {}
+    }
+    let closed = SenderClosed::default();
+    let live_waker = waker(Arc::new(Task));
+    let mut live = Box::pin(crate::streaming::Retired::new(closed.clone()));
+    assert_eq!(
+        live.as_mut().poll(&mut Context::from_waker(&live_waker)),
+        Poll::Pending
+    );
+    for _ in 0..8 {
+        let task = waker(Arc::new(Task));
+        let mut abandoned = Box::pin(crate::streaming::Retired::new(closed.clone()));
+        assert_eq!(
+            abandoned.as_mut().poll(&mut Context::from_waker(&task)),
+            Poll::Pending
+        );
+    }
+    assert_eq!(closed.waiting(), 1, "only the live wait is registered");
+    closed.retire(crate::streaming::Retirement::Sent);
+    assert_eq!(
+        live.as_mut().poll(&mut Context::from_waker(&live_waker)),
+        Poll::Ready(crate::streaming::Retirement::Sent)
+    );
 }

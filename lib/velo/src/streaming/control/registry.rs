@@ -42,14 +42,23 @@ struct SenderState {
     ///
     /// [`Retired`]: crate::streaming::Retired
     retirement: AtomicU8,
-    /// One waker per task that waits on a [`Retired`] future of this stream.
-    /// A sender can hand out any number of them, so one stored waker is not
-    /// enough: the last registration would replace the others, and a waiter
-    /// that gave up would strand the rest. Touched only by a poll and by the
-    /// retirement of a watched stream, never on the item path.
+    /// One waker per [`Retired`] future of this stream that waits. A sender
+    /// can hand out any number of them, so one stored waker is not enough: the
+    /// last registration would replace the others, and a waiter that gave up
+    /// would strand the rest. Each future keeps its own entry, replaces its
+    /// waker when polled from another task, and removes the entry when it is
+    /// dropped, so an abandoned wait leaves nothing behind. Touched only by a
+    /// poll, a drop, and the retirement of a watched stream, never on the item
+    /// path.
     ///
     /// [`Retired`]: crate::streaming::Retired
-    wakers: Mutex<Vec<Waker>>,
+    wakers: Mutex<Wakers>,
+}
+
+#[derive(Debug, Default)]
+struct Wakers {
+    next: u64,
+    waiting: Vec<(u64, Waker)>,
 }
 
 const SENT: u8 = 1;
@@ -104,8 +113,8 @@ impl SenderClosed {
                         // Taken under the lock a poll registers under, so a
                         // waker registered before the mark is in the list by
                         // the time the mark is seen. Woken outside it.
-                        let wakers = std::mem::take(&mut *self.0.wakers.lock());
-                        for waker in wakers {
+                        let wakers = std::mem::take(&mut self.0.wakers.lock().waiting);
+                        for (_, waker) in wakers {
                             waker.wake();
                         }
                     }
@@ -117,8 +126,30 @@ impl SenderClosed {
         }
     }
 
+    /// Wakers registered and not yet woken.
+    #[cfg(test)]
+    pub(crate) fn waiting(&self) -> usize {
+        self.0.wakers.lock().waiting.len()
+    }
+
+    /// Remove the waker a dropped [`Retired`](crate::streaming::Retired)
+    /// registered, if retirement has not taken it already.
+    pub(crate) fn unregister_retired(&self, id: u64) {
+        let mut wakers = self.0.wakers.lock();
+        if let Some(index) = wakers.waiting.iter().position(|(entry, _)| *entry == id) {
+            wakers.waiting.swap_remove(index);
+        }
+    }
+
     /// Poll the stream's retirement for [`Retired`](crate::streaming::Retired).
-    pub(crate) fn poll_retired(&self, cx: &mut Context<'_>) -> Poll<Retirement> {
+    ///
+    /// `registration` is the future's own entry in the waker list: `None`
+    /// until its first pending poll.
+    pub(crate) fn poll_retired(
+        &self,
+        cx: &mut Context<'_>,
+        registration: &mut Option<u64>,
+    ) -> Poll<Retirement> {
         let state = &self.0.retirement;
         if let Some(outcome) = outcome(state.load(Ordering::Acquire)) {
             return Poll::Ready(outcome);
@@ -127,9 +158,23 @@ impl SenderClosed {
         // mark takes the lock after this and finds the waker, and one that
         // came first shows in what `fetch_or` returns.
         let mut wakers = self.0.wakers.lock();
-        if !wakers.iter().any(|waker| waker.will_wake(cx.waker())) {
-            wakers.push(cx.waker().clone());
+        let entry =
+            registration.and_then(|id| wakers.waiting.iter_mut().find(|(entry, _)| *entry == id));
+        match entry {
+            Some((_, waker)) => {
+                if !waker.will_wake(cx.waker()) {
+                    *waker = cx.waker().clone();
+                }
+            }
+            None => {
+                let id = *registration.get_or_insert_with(|| {
+                    wakers.next += 1;
+                    wakers.next
+                });
+                wakers.waiting.push((id, cx.waker().clone()));
+            }
         }
+        drop(wakers);
         match outcome(state.fetch_or(WATCHED, Ordering::AcqRel)) {
             Some(outcome) => Poll::Ready(outcome),
             None => Poll::Pending,
