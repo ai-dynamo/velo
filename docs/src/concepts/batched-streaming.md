@@ -348,6 +348,16 @@ Measured with the `stream_lifecycle` example ([Benchmarking](../operations/bench
 
 Awaiting `retired()` costs about 600 instructions per stream here, under 0.5 percent; the acknowledgement costs about 38,000, 30 percent, and a round trip. A stream that nobody watches pays one compare-exchange when it retires; this run has no build without retirement, so it does not measure that.
 
+A second run compares a build without retirement. It ran on an idle Linux host (20 Arm cores: Cortex-X925 and Cortex-A725), release build, with the same harness and defaults. Hardware counters are not readable there, so the figure is the process's CPU time (user and system) divided by the streams, median of fifteen runs, with the builds and modes interleaved. The build without retirement is the same harness on the commit before retirement, with the `retired` mode left out.
+
+| Path and mode | Without retirement | With retirement | Producer holds the stream after `finalize`, p50 / p99 |
+|---|---|---|---|
+| Mux, `plain` | 40.6 µs (38.4 to 42.9) | 39.7 µs (38.0 to 42.7) | — |
+| Mux, `retired` awaited | — | 43.0 µs (42.1 to 43.7) | 277 µs / 654 µs |
+| Per-stream TCP, `plain` | 269.0 µs (254.5 to 270.9) | 269.1 µs (250.0 to 272.5) | — |
+
+A stream that nobody watches costs the same with and without retirement, on both paths: the medians differ by less than the spread of the runs. Throughput is the same too (86,000 and 87,500 streams per second on the mux; 15,160 and 15,146 per stream). Awaiting `retired()` costs about 3 µs of CPU per stream on this host.
+
 ## Heartbeats
 
 Each `StreamSender` runs a heartbeat task. The task ticks at the heartbeat interval that the consumer advertised and calls `try_send` with a `StreamFrame::Heartbeat` into the sender's channel. On a full channel the heartbeat is dropped. Under the mux, a heartbeat is an ordinary `Data` record. It spends data credit and shares the peer's queues with data.

@@ -21,8 +21,8 @@
 //!
 //! The heartbeat background task is cancelled in all three paths before the
 //! terminal sentinel is sent. [`retired`](StreamSender::retired) tells the
-//! producer when, after any of the three, velo on its node holds none of the
-//! stream's output.
+//! producer when, after any of the three, velo on its node has handed on all
+//! of the stream's output.
 //!
 //! None of the three blocks the calling thread on a full channel. `send_terminal`
 //! is where that is arranged, and why it has to be.

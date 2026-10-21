@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! `StreamSender::retired`: when velo on the producer holds none of a
+//! `StreamSender::retired`: when velo on the producer has handed on all of a
 //! stream's output, over real nodes.
 //!
 //! A finished stream's output is not gone when `finalize` returns. Under the

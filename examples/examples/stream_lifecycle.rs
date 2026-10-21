@@ -13,7 +13,7 @@
 //! - `plain`: nothing. It moves on at once, and velo may still hold the
 //!   stream's output.
 //! - `retired`: it awaits `StreamSender::retired()`, which resolves once velo
-//!   on the producer holds none of the stream's output.
+//!   on the producer has handed on all of the stream's output.
 //! - `ack`: the consumer sends one active message after it reads `Finalized`,
 //!   and the producer waits for it. This is what an application builds when
 //!   velo gives no signal: one more message per stream, and a table of waiters
