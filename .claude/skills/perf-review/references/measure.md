@@ -168,11 +168,14 @@ for each operation.
 - Run each arm at N, 4N and 16N operations, at the same concurrency.
   Record the peak RSS of each run (`/usr/bin/time -f %M`, in KiB).
   Growth per operation is (RSS at 4N - RSS at N) / 3N. With a constant
-  number of live operations, it is about zero in a correct arm.
+  number of live operations, it is about zero in a correct arm. The 16N
+  run checks that the growth holds: (RSS at 16N - RSS at 4N) / 12N must
+  match it. If it is larger, the growth speeds up with N; report both.
 - Growth is not yet a leak. Before you call it one, rule out the two
   other causes, after the run and a settle of a few seconds:
-  - **A backlog of tasks.** Read `num_alive_tasks()`. Tasks of operations
-    that already ended, still alive, are a backlog: a loop that never
+  - **A backlog of tasks.** Read `num_alive_tasks()` before the workload
+    and again after it. Tasks above that baseline, of operations that
+    already ended, are a backlog: a loop that never
     returns `Pending` (flume and same-worker paths are not under tokio's
     coop budget) cannot let them run. Their peak memory is real, and it
     grows with N for as long as the loop runs. Count the tasks spawned

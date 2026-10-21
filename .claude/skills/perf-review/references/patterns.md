@@ -198,7 +198,9 @@ that pins it now.
   once. RSS growth alone is not proof: rule out a task backlog (P13) and
   allocator retention first (measure.md, section 6). Pin: run N
   operations, then assert that each registry and queue is empty again,
-  and that `num_alive_tasks()` is back to its baseline after a yield.
+  that `num_alive_tasks()` is back to its baseline after a yield, and
+  that each `Arc` or buffer an operation held is released (a `Weak` to it
+  no longer upgrades, or the buffer is back to its baseline length).
 
 ## Pinning idioms (for the `pin` field)
 
