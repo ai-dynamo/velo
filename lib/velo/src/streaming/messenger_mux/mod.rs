@@ -574,6 +574,11 @@ impl MuxCore {
     fn expire_binds(&self, now: tokio::time::Instant) {
         loop {
             let due = self.bind_deadlines.pop_due(now, EXPIRE_BATCH);
+            // Nothing due: most ticks. The requeue would only take the lock
+            // again; after a burst, the requeue of its last chunk shrinks.
+            if due.is_empty() {
+                return;
+            }
             let more = due.len() == EXPIRE_BATCH;
             let mut renewed = Vec::new();
             for (anchor_id, session_id) in due {
