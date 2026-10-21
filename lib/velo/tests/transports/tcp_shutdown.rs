@@ -124,12 +124,16 @@ fn shutdown_lets_an_error_handler_call_back_into_the_transport() {
     });
     let pending = runtime.block_on(async {
         let (adapter, _streams) = make_channels();
-        a.start(
-            InstanceId::new_v4(),
-            adapter,
-            tokio::runtime::Handle::current(),
+        tokio::time::timeout(
+            common::OUTER_TEST_TIMEOUT,
+            a.start(
+                InstanceId::new_v4(),
+                adapter,
+                tokio::runtime::Handle::current(),
+            ),
         )
         .await
+        .expect("start timed out")
         .unwrap();
         a.register(PeerInfo::new(b_id, b.address())).unwrap();
         let mut pending = 0;

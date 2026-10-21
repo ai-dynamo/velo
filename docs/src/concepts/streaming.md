@@ -46,7 +46,7 @@ The consumer can cancel the stream with `anchor.cancel()` or a cloned `StreamCon
 
 `finalize` returns before the stream's output leaves the producer's node. Under the messenger mux, records wait on the producer for the consumer's credit, and a slow consumer can hold them there for as long as it does not read. A producer that shuts its node down in that time cuts the stream short.
 
-`sender.retired()` returns a future. The future resolves once velo on the producer's node has handed on all of the stream's output; the table below says what that means on each path. It resolves after `finalize`, `detach`, or drop. Get the future before `finalize` or `detach`, because they consume the sender.
+`sender.retired()` returns a future. The future resolves once velo on the producer's node has handed on all of the stream's output; the table below says what that means on each path. It resolves after `finalize`, `detach`, or drop. Get the future before any of the three, because each one consumes the sender.
 
 ```rust,ignore
 let retired = sender.retired();
