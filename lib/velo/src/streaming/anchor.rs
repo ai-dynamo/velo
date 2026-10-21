@@ -5814,4 +5814,48 @@ mod tests {
             );
         });
     }
+
+    /// Attach and leave cycles of one MPSC anchor leave one queue entry, not
+    /// one per last-sender departure.
+    ///
+    /// Each departure of the last sender queued a new entry, and the sweep
+    /// requeued every copy until the deadline: 5 cycles left 6 entries.
+    #[tokio::test(start_paused = true)]
+    async fn rearming_an_mpsc_anchor_keeps_one_queue_entry() {
+        let mgr = queue_manager(DEFAULT_UNATTACHED_TIMEOUT);
+        let anchor =
+            mgr.create_mpsc_anchor_with_config::<u32>(mpsc_config(DEFAULT_UNATTACHED_TIMEOUT));
+        for _ in 0..5 {
+            let sender = mgr
+                .attach_mpsc_stream_anchor::<u32>(anchor.handle())
+                .await
+                .expect("attach");
+            sender.detach().await.expect("detach");
+        }
+        assert_eq!(mgr.mpsc_deadlines.len(), 1);
+    }
+
+    /// An MPSC anchor whose queue entry the sweep dropped, because a sender
+    /// was attached then, is still reaped after the last sender leaves.
+    ///
+    /// This guards the dedup: a departure must queue a new entry when the
+    /// recorded one is in the past, or nothing looks at the anchor again.
+    #[tokio::test(start_paused = true)]
+    async fn an_mpsc_departure_after_the_entry_was_dropped_still_reaps() {
+        let mgr = queue_manager(DEFAULT_UNATTACHED_TIMEOUT);
+        let anchor = mgr.create_mpsc_anchor_with_config::<u32>(mpsc_config(Duration::from_secs(2)));
+        let id = anchor.handle().unpack().1;
+        let sender = mgr
+            .attach_mpsc_stream_anchor::<u32>(anchor.handle())
+            .await
+            .expect("attach");
+        tokio::time::sleep(ANCHOR_FIRST_LOOK + Duration::from_millis(500)).await;
+        assert_eq!(mgr.mpsc_deadlines.len(), 0, "the sweep dropped the entry");
+        sender.detach().await.expect("detach");
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !mgr.mpsc_registry.contains_key(&id),
+            "the MPSC anchor must be reaped at its timeout"
+        );
+    }
 }

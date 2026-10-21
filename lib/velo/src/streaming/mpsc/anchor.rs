@@ -329,7 +329,9 @@ pub(crate) fn remove_sender_slot(
         // shard lock, and the sweep reads `expires` and `queued` after this
         // guard is gone.
         let entry = &mut *entry;
-        entry.queued = Some(entry.deadlines.push(registry, expires, local_id));
+        entry
+            .deadlines
+            .arm(registry, &mut entry.queued, expires, local_id);
     }
     Some(slot)
 }
