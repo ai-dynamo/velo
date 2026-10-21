@@ -3717,8 +3717,9 @@ mod tests {
     #[test]
     fn test_detached_arm_off_runtime_does_not_panic() {
         // The `Detached` arm's `released.is_some()` branch re-arms the
-        // unattached timeout, which can start the deadline sweep, but `poll_next` runs under whatever executor the *consumer*
-        // chose -- `StreamAnchor`'s inner stream is a plain
+        // unattached timeout, which can start the deadline sweep, but
+        // `poll_next` runs under whatever executor the *consumer* chose --
+        // `StreamAnchor`'s inner stream is a plain
         // `flume::r#async::RecvStream`, executor-agnostic, with no tokio
         // requirement documented anywhere on the consumer side. A bare
         // `tokio::spawn` reachable from here therefore panics mid-poll on a
@@ -5750,8 +5751,15 @@ mod tests {
             .expect("attach");
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(mgr.mpsc_registry.contains_key(&id), "a sender is attached");
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let before = metrics.num_alive_tasks();
         sender.detach().await.expect("detach");
         tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            metrics.num_alive_tasks(),
+            before,
+            "the re-arm at the last detach spawns no task"
+        );
         assert!(
             mgr.mpsc_registry.contains_key(&id),
             "the timeout restarted at detach"

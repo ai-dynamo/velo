@@ -324,8 +324,7 @@ pub(crate) fn remove_sender_slot(
         entry.expires = Some(expires);
         // Under the shard lock. That is safe: the push takes only a queue
         // shard lock, and the sweep reads `expires` after this guard is gone.
-        let deadlines = Arc::clone(&entry.deadlines);
-        deadlines.push(registry, expires, local_id);
+        entry.deadlines.push(registry, expires, local_id);
     }
     Some(slot)
 }
