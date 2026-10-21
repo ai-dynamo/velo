@@ -89,6 +89,11 @@ from `REVIEW_ROOT/.claude/`.
 
 ## Stage 0: classify (no agents)
 
+**In audit mode**, there is no diff, so skip steps 1 to 4 and step 6. Tier
+the functions under `AUDIT_PATH` with hot-paths.md (`HOT_FILES` is the
+list of files with T1 or T2 code), run step 5 over those files, then go
+to Stage 1.
+
 1. Run `git diff --stat $REVIEW_RANGE`. Tier each changed line, not the
    function around it, with hot-paths.md. A file that is not compiled
    (docs, CI, scripts) has no tier; check `include_str!` first.
@@ -128,9 +133,6 @@ If nothing is T1 or T2 and nothing was flagged, report "No hot path
 touched" with the files and their tiers, plus the Scope and Housekeeping
 sections of Stage 5, and stop. That is a pass.
 
-In audit mode: list the T1 and T2 functions under `AUDIT_PATH` from
-hot-paths.md, then plan the shards (Stage 1).
-
 ## Stage 1: find (sonnet)
 
 | Finder | Pattern families (patterns.md) |
@@ -169,9 +171,6 @@ code (the coalescer, framing, ingress) to one shard. Before Stage 2, merge
 the candidates that several shards found. A cost outside `AUDIT_PATH` goes
 under "Related, out of scope".
 
-In audit mode every finding is an opportunity, so it has `impact`, not
-`severity`, and no `delta`.
-
 Each finding is thermonuclear's `{file, line, claim, why-it-breaks,
 severity}`, plus these fields. `severity` is for regressions only; an
 opportunity has `impact` instead.
@@ -194,7 +193,8 @@ impact:    opportunities only: high | medium | low
 ```
 
 `why-it-breaks` gives the chain, the mechanism and the cost in one
-paragraph. No chain, no finding.
+paragraph. No chain, no finding. In audit mode every finding is an
+opportunity, so it has `impact`, not `severity`, and no `delta`.
 
 For a P24 finding (a pin weakened, removed or bypassed), `chain` is the
 chain of the code the pin guards, `delta` quotes the test change, and
@@ -207,9 +207,9 @@ one verifier). In parallel, start one more verifier that checks every
 candidate the finder rated major or above (in audit mode, high impact),
 from scratch, without the first verdict. This second verifier runs in
 inline mode too, unless a Stage 0 count already proves the candidate. If
-the two disagree, the lower rating stands. Use at most
-4 verifiers per round in every mode; with more finders, give each
-verifier the candidates of several. When every candidate can only be
+the two disagree, the lower rating stands. Use at most 4 verifiers per
+round in every mode; with more finders, give each verifier the
+candidates of several. When every candidate can only be
 minor (a constant T2 cost, or inferred evidence only), skip this stage and
 report them as minor and unverified.
 

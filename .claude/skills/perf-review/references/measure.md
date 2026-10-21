@@ -83,6 +83,7 @@ directory can run each other's code with no warning. This gave false pin
 results in this skill's own evaluation.
 
 ```shell
+set -euo pipefail   # a failed build must stop here, before `cp`
 S="$SCRATCH/perf-review"
 # REVIEW_ROOT ($S/root) is the head arm. Add the base arm:
 git worktree add --detach "$S/base" "$BASE_SHA"
@@ -98,6 +99,8 @@ strings "$S/bin/root/<harness>" | grep -c "$S/root/"   # > 0
 strings "$S/bin/root/<harness>" | grep -c "$S/base/"   # 0
 ```
 
+- If a build fails, stop. A seeded target directory still holds an old
+  binary, and timing it measures the wrong code.
 - A test run in Stage 0 step 6 uses the same layout: `CARGO_TARGET_DIR`
   is `$S/target-root` for `REVIEW_ROOT`, and `$S/target-base` for a base
   rerun. Check that the build log shows `Compiling velo (<that tree>)`.

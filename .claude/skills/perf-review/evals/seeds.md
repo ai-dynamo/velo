@@ -17,7 +17,7 @@ worktree, never in the repo root.
 SCR="$SCRATCH/perf-eval"; BASE=$(git rev-parse HEAD)
 git worktree add --detach "$SCR/S3" "$BASE"
 # Apply the seed edit to files under $SCR/S3/ only.
-git -C "$SCR/S3" commit -qam "perf-review eval seed S3 (never push)"
+git -C "$SCR/S3" commit -qam wip     # a neutral message; see below
 SEED=$(git -C "$SCR/S3" rev-parse HEAD)
 # From the repo root: perf-review $BASE..$SEED
 # (this also tests REVIEW_ROOT, because HEAD is not the seed)
@@ -28,8 +28,8 @@ git status --short; git worktree list     # clean; only the main tree
 A detached commit makes no branch. Once its worktree is gone, nothing
 refers to it, and `git gc` removes it.
 
-Set the seed commit's message to "wip". A message that says "eval seed"
-tells the reviewer to look for something.
+The seed commit's message is "wip" on purpose. A message that says "eval
+seed" tells the reviewer to look for something.
 
 ## Run several at once
 
@@ -78,5 +78,5 @@ tells the reviewer to look for something.
 
 - Run thermonuclear-review on S4: its dimension 9 must fire and confirm
   the blocker.
-- On N1, stop after the Stage 1 plan: dimension 9 must be dropped. This
-  skips the heavy Stage 0 test suite of thermonuclear-review.
+- On N1, run Stage 0, then stop after the Stage 1 plan: dimension 9 must
+  be dropped. This avoids the Stage 1 fan-out but does not skip Stage 0.
