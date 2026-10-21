@@ -115,6 +115,8 @@ bash scripts/build-book.sh                # needs mdbook, mdbook-mermaid, mdbook
 
 The `zmq` feature needs `cmake`. The `ucx` feature needs the `libibverbs-dev` and `librdmacm-dev` headers. See [Testing](docs/src/development/testing.md).
 
+A change on a hot path also needs a test that counts its cost. See [Review for performance](docs/src/development/performance-review.md).
+
 On macOS the whole workspace builds with `--all-features`, but the `ucx` transport is Linux only. See [Platforms](docs/src/guides/getting-started.md#platforms).
 
 ## Contributing
