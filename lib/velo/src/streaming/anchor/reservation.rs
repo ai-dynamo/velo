@@ -69,6 +69,8 @@ impl AnchorReservation {
 impl AnchorManager {
     /// Renew held reservations, grouped by owner in batches of at most 256.
     /// Attached, cancelled, expired, or replaced reservations are no-ops.
+    /// A ticket reservation whose pre-bind was released renews the anchor's
+    /// unattached timer.
     /// The caller schedules renewal and bounds the call with its own deadline.
     /// Only transport failures return an error; successful delivery does not
     /// prove that a reservation still exists.
@@ -134,7 +136,11 @@ impl AnchorManager {
                         mux.renew_reservation(bind.anchor_id, session);
                     }
                 }
-                (None, None) => {
+                // No pre-bind: the anchor waits on its unattached timer. A
+                // ticket whose pre-bind a refusal or a detach released still
+                // stands for the holder's open request, so it renews the
+                // timer too.
+                (_, None) => {
                     if let Some(timeout) = entry.unattached_timeout
                         && let Some(expires) = entry.expires.as_mut()
                     {

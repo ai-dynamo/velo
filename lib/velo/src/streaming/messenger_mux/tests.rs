@@ -3053,3 +3053,50 @@ async fn an_oversized_reservation_lifetime_does_not_panic() {
     assert_eq!(node.manager.active_anchor_count(), 1);
     node.mux.shutdown().await;
 }
+
+/// A ticket reservation keeps its anchor after the pre-bind is released.
+///
+/// A refused adoption (or a detach) gives the pre-bind back and resumes the
+/// anchor's unattached timer. The holder's request is still open and the
+/// anchor still waits for a sender, so renewing with the ticket must extend
+/// that timer; a no-op here let the anchor expire under a holder whose every
+/// renewal returned `Ok`.
+#[tokio::test]
+async fn a_ticket_reservation_renews_the_anchor_after_its_prebind_is_released() {
+    const UNATTACHED: Duration = Duration::from_secs(2);
+    let node = prebinding_node(test_config(), Some(UNATTACHED)).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let (_, local_id) = handle.unpack();
+    let ticket = node.manager.prebind_anchor(handle).expect("ticket");
+    let reservation = crate::streaming::AnchorReservation::new(handle, Some(&ticket));
+    let request = crate::streaming::control::AnchorAttachRequest {
+        handle,
+        session_id: 1,
+        stream_cancel_handle: crate::streaming::control::StreamCancelHandle::pack(
+            WorkerId::from_u64(7),
+            1,
+        ),
+        supported_transport_keys: vec![velo_ext::TransportKey::new(
+            crate::streaming::tcp_transport::TCP_STREAM_KEY,
+        )],
+        lane_key: None,
+    };
+    assert!(matches!(
+        node.manager.adopt_prebind(local_id, &request),
+        crate::streaming::anchor::PrebindAdoption::Refused(_)
+    ));
+    tokio::time::pause();
+    for _ in 0..8 {
+        tokio::time::sleep(UNATTACHED / 2).await;
+        node.manager.renew_reservations_local(&[reservation]);
+        assert!(
+            node.manager.registry.contains_key(&local_id),
+            "renewal with the ticket keeps the anchor"
+        );
+    }
+    tokio::time::sleep(UNATTACHED * 2).await;
+    assert!(!node.manager.registry.contains_key(&local_id));
+    drop(anchor);
+    node.mux.shutdown().await;
+}

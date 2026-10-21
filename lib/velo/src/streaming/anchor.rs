@@ -4963,6 +4963,11 @@ mod tests {
     /// built without the builder's `messenger` field attaches remotely, so it
     /// must renew remotely too; otherwise every renewal fails with "remote
     /// renewal requires a messenger" and the held reservation expires anyway.
+    ///
+    /// It reads the stored deadline rather than racing the real clock: that
+    /// renewal keeps an anchor alive is proven under paused time by
+    /// `ordinary_reservation_renews_until_released`, and end to end by the
+    /// zero-RTT integration suite.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_renewal_uses_the_registered_messenger_and_extends_the_lifetime() {
         let consumer = crate::messenger::Messenger::builder()
@@ -4977,9 +4982,7 @@ mod tests {
             .unwrap();
         consumer.register_peer(producer.peer_info()).unwrap();
         producer.register_peer(consumer.peer_info()).unwrap();
-        // Wide enough that a loaded runner cannot stall one renewal round
-        // trip past the lifetime: each must land within 1.5 s of the last.
-        let lifetime = Duration::from_secs(2);
+        let lifetime = Duration::from_secs(60);
         let receiver = Arc::new(
             AnchorManagerBuilder::default()
                 .worker_id(consumer.instance_id().worker_id())
@@ -5012,27 +5015,14 @@ mod tests {
         let anchor = receiver.create_anchor::<u32>();
         let id = anchor.handle().unpack().1;
         let reservation = AnchorReservation::new(anchor.handle(), None);
-        // Two lifetimes of renewal at a quarter-lifetime cadence.
-        for _ in 0..8 {
-            tokio::time::sleep(lifetime / 4).await;
-            sender
-                .renew_reservations(&[reservation])
-                .await
-                .expect("remote renewal");
-        }
-        assert!(
-            receiver.registry.contains_key(&id),
-            "renewal held the anchor past two lifetimes"
-        );
-        // Once renewal stops, the ordinary timer reaps it.
-        let deadline = tokio::time::Instant::now() + lifetime * 5;
-        while receiver.registry.contains_key(&id) {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "anchor outlived its last renewal"
-            );
-            tokio::time::sleep(lifetime / 10).await;
-        }
+        let expires = || receiver.registry.get(&id).unwrap().expires.unwrap();
+        let before = expires();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        sender
+            .renew_reservations(&[reservation])
+            .await
+            .expect("remote renewal");
+        assert!(expires() > before, "the remote renewal moved the deadline");
         drop(anchor);
     }
 

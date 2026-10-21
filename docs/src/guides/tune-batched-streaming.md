@@ -85,7 +85,7 @@ If you want batching with a time limit, use `FlushPolicy::Auto(AutoFlush { on_ad
 
 ## Settings reference
 
-All settings are fields of `MuxConfig`. Always build it with `..Default::default()` so that a new field does not break your code.
+The settings below are fields of `MuxConfig`. Always build it with `..Default::default()` so that a new field does not break your code. The accept window of each bind is not a `MuxConfig` field: `ReservationConfig::prebind_timeout` sets it (180 seconds by default).
 
 | Field | Default | What it controls |
 |---|---|---|
