@@ -312,6 +312,7 @@ pub struct VeloBuilder {
     inner: MessengerBuilder,
     stream_config: Option<StreamConfig>,
     mux_config: Option<crate::streaming::MuxConfig>,
+    reservation_config: crate::streaming::ReservationConfig,
     mux_only: bool,
     metrics: Option<Arc<VeloMetrics>>,
     /// The concrete UCX transport, kept beside the type-erased one so the
@@ -326,12 +327,19 @@ pub struct VeloBuilder {
 }
 
 impl VeloBuilder {
+    /// Configure anchor waiting lifetimes.
+    pub fn reservation_config(mut self, config: crate::streaming::ReservationConfig) -> Self {
+        self.reservation_config = config;
+        self
+    }
+
     /// Create a new empty builder.
     pub fn new() -> Self {
         Self {
             inner: MessengerBuilder::new(),
             stream_config: None,
             mux_config: None,
+            reservation_config: Default::default(),
             mux_only: false,
             metrics: None,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -465,6 +473,7 @@ impl VeloBuilder {
             !self.mux_only || self.stream_config.is_none(),
             "mux_only cannot be combined with stream_config or stream_bind_addr"
         );
+        self.reservation_config.validate()?;
         // Read the override once at build so this instance keeps the same
         // transport offers for every attach.
         let config = resolve_mux_config(
@@ -479,6 +488,7 @@ impl VeloBuilder {
                 Arc::clone(&messenger),
                 config,
                 self.metrics.clone(),
+                self.reservation_config.prebind_timeout,
             )?;
             Some(mux)
         } else {
@@ -540,6 +550,7 @@ impl VeloBuilder {
 
         let anchor_manager = Arc::new(
             crate::streaming::AnchorManagerBuilder::default()
+                .default_unattached_timeout(self.reservation_config.unattached_timeout)
                 .worker_id(worker_id)
                 .transport(Arc::clone(&stream_transport))
                 .transport_registry(Arc::new(registry))

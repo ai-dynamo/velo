@@ -304,7 +304,9 @@ impl MessengerMuxTransport {
     #[cfg(all(test, feature = "quic"))]
     pub(crate) fn expire_all_binds(&self) {
         self.core.expire_binds(
-            tokio::time::Instant::now() + super::ACCEPT_TIMEOUT + std::time::Duration::from_secs(1),
+            tokio::time::Instant::now()
+                + self.core.accept_window
+                + std::time::Duration::from_secs(1),
         );
     }
 

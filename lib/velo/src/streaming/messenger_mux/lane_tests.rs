@@ -859,7 +859,7 @@ async fn an_unkeyed_attach_choice_takes_no_ingress_table_lock() {
 /// pre-bound while the handler bound) are races: the mux bind does not await,
 /// so another thread must land in between. The bind hook plays that thread
 /// and removes the anchor. Left to the accept window, the bind would count on
-/// its lane for 60 s and skew every unkeyed choice for that peer meanwhile.
+/// its lane for the whole accept window and skew every unkeyed choice for that peer meanwhile.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attach_that_fails_after_its_bind_gives_its_lane_back() {
     let (consumer, producer) = pair(4, 4).await;

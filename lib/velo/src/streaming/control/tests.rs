@@ -173,6 +173,7 @@ async fn stream_watchdog_unclaimed_bind_reap_increments_counter() {
             active_pump_token: None,
             attachment: true,
             timeout_cancel: None,
+            expires: None,
             unattached_timeout: None,
             heartbeat_interval: std::time::Duration::from_secs(5),
             stream_cancel_handle: None,
@@ -818,6 +819,7 @@ fn make_pump_test_infra() -> (
             active_pump_token: None,
             attachment: true,
             timeout_cancel: None,
+            expires: None,
             unattached_timeout: None,
             heartbeat_interval: Duration::from_secs(5),
             stream_cancel_handle: None,
@@ -905,6 +907,7 @@ fn make_watchdog_test_infra(
             active_pump_token: None,
             attachment,
             timeout_cancel: None,
+            expires: None,
             unattached_timeout: None,
             heartbeat_interval: heartbeat_deadline,
             stream_cancel_handle: None,
@@ -1056,7 +1059,7 @@ async fn test_watchdog_reaps_an_unclaimed_prebind_when_its_bind_is_reclaimed() {
 /// from already returned (see `WatchdogContext::prebound`). Before gating on
 /// `prebound` instead, this pump silently stopped counting heartbeat misses
 /// for the same window, so a sender that attached and then died before its
-/// first frame went undetected until the mux's 60 s accept-window timer
+/// first frame went undetected until the mux's configured accept-window timer
 /// reclaimed the bind, instead of the configured
 /// `DETECTION_MULTIPLIER * heartbeat_interval`.
 #[tokio::test]
@@ -1089,8 +1092,9 @@ async fn test_watchdog_reaps_an_ordinary_attach_with_unclaimed_mux_drain_after_m
 /// attach whose peer died before its first `OpenSlot`) relying solely on the
 /// heartbeat watchdog to reap it. That race is not always won: the watchdog
 /// restarts counting from whenever this arm's caller stopped exempting it,
-/// while the accept window is a fixed 60 s from bind creation, so at
-/// `heartbeat_interval >= 20 s` the window always closes first -- and, before
+/// while the accept window is a fixed span from bind creation, so when
+/// `DETECTION_MULTIPLIER * heartbeat_interval` is longer than that span (a
+/// 60 s interval against the 180 s default) the window always closes first -- and, before
 /// this fix, closing first left the registry entry behind forever, with the
 /// consumer's `StreamAnchor` wedged on `Poll::Pending`.
 #[tokio::test]
@@ -1488,6 +1492,7 @@ async fn reader_pump_does_not_count_a_blocked_forward_as_heartbeat_silence() {
             active_pump_token: None,
             attachment: true,
             timeout_cancel: None,
+            expires: None,
             unattached_timeout: None,
             heartbeat_interval: deadline,
             stream_cancel_handle: None,
@@ -1695,6 +1700,7 @@ async fn test_child_token_reattach_pump_survives() {
             active_pump_token: Some(child1.clone()),
             attachment: true,
             timeout_cancel: None,
+            expires: None,
             unattached_timeout: None,
             heartbeat_interval: Duration::from_secs(5),
             stream_cancel_handle: None,

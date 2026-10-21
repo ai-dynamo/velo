@@ -26,6 +26,7 @@
 
 pub mod anchor;
 pub mod control;
+pub(crate) mod deadline;
 pub mod frame;
 #[cfg(feature = "grpc")]
 pub mod grpc_transport;
@@ -47,7 +48,8 @@ pub mod tcp_transport;
 pub mod transport;
 
 pub use anchor::{
-    AnchorConfig, AnchorManager, AnchorManagerBuilder, AttachError, StreamAnchor, StreamController,
+    AnchorConfig, AnchorManager, AnchorManagerBuilder, AnchorReservation, AttachError,
+    ReservationConfig, StreamAnchor, StreamController,
 };
 pub use frame::{SendError, StreamError, StreamFrame};
 #[cfg(feature = "grpc")]
