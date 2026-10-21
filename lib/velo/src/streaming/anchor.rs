@@ -1231,6 +1231,10 @@ pub struct AnchorManager {
     /// The unattached deadlines of this manager's SPSC anchors.
     #[builder(setter(skip), default)]
     pub(crate) deadline_queue: SweepOwner<DashMap<u64, AnchorEntry>>,
+
+    /// The heartbeats of this manager's remote senders.
+    #[builder(setter(skip), default)]
+    pub(crate) heartbeats: crate::streaming::heartbeat::ManagerHeartbeats,
 }
 
 impl AnchorManagerBuilder {
@@ -1382,6 +1386,7 @@ impl AnchorManager {
 
     pub(crate) fn stop(&self) {
         self.deadline_queue.stop();
+        self.heartbeats.stop();
         self.prepare_stop();
         if let Some(mux) = self.mux.get() {
             mux.stop();
@@ -1390,6 +1395,7 @@ impl AnchorManager {
 
     pub(crate) async fn shutdown(&self) {
         self.deadline_queue.stop();
+        self.heartbeats.stop();
         self.prepare_stop();
         if let Some(mux) = self.mux.get() {
             mux.shutdown().await;
@@ -2577,6 +2583,7 @@ impl AnchorManager {
                 retires_on,
                 item_limit,
                 deadline_queue: Some(self.deadline_queue.clone()),
+                heartbeats: Some(self.heartbeats.handle()),
             },
             Duration::from_millis(ticket.heartbeat_interval_ms),
             self.metrics.clone(),
@@ -2787,6 +2794,7 @@ impl AnchorManager {
                             retires_on: crate::streaming::sender::RetiresOn::Queue,
                             item_limit: None,
                             deadline_queue: Some(self.deadline_queue.clone()),
+                            heartbeats: Some(self.heartbeats.handle()),
                         },
                         heartbeat_interval,
                         self.metrics.clone(),
@@ -2973,6 +2981,7 @@ impl AnchorManager {
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
                 deadline_queue: Some(self.deadline_queue.clone()),
+                heartbeats: Some(self.heartbeats.handle()),
             },
             heartbeat_interval,
             self.metrics.clone(),
@@ -3099,6 +3108,7 @@ impl AnchorManager {
                         retires_on,
                         item_limit,
                         deadline_queue: Some(self.deadline_queue.clone()),
+                        heartbeats: Some(self.heartbeats.handle()),
                     },
                     Duration::from_millis(heartbeat_interval_ms),
                     self.metrics.clone(),
@@ -5101,7 +5111,7 @@ mod tests {
             .expect("local attach should succeed");
 
         // Drain the consumer-side stream concurrently so the bounded channel
-        // doesn't block the sender's heartbeat task.
+        // doesn't block the sender.
         let collected: Arc<DashMap<usize, crate::streaming::frame::StreamFrame<u32>>> =
             Arc::new(DashMap::new());
         let collected_clone = collected.clone();

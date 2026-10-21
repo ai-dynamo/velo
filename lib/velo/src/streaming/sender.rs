@@ -5,7 +5,7 @@
 //!
 //! `StreamSender` is the primary write-side abstraction for the streaming protocol.
 //! It serializes typed items into [`StreamFrame`] via `rmp_serde`, pushes them through
-//! a [`flume::Sender<Vec<u8>>`], manages a background heartbeat task, and guarantees
+//! a [`flume::Sender<Vec<u8>>`], registers for heartbeats when the stream is remote, and guarantees
 //! a [`StreamFrame::Dropped`] sentinel on abnormal exit via `impl Drop`.
 //! A `StreamSender<Bytes>` can also send bytes that are already serialized with
 //! [`send_bytes`](StreamSender::send_bytes), which writes the same frame without serde.
@@ -19,8 +19,8 @@
 //! 2. **[`detach(self)`](StreamSender::detach)** — clean detach, sends `Detached` sentinel, returns handle for re-attach.
 //! 3. **Drop** — abnormal exit, sends `Dropped` sentinel.
 //!
-//! The heartbeat background task is cancelled in all three paths before the
-//! terminal sentinel is sent. [`retired`](StreamSender::retired) tells the
+//! The sender's heartbeats stop in all three paths before the terminal
+//! sentinel is sent. [`retired`](StreamSender::retired) tells the
 //! producer when, after any of the three, velo on its node has handed on all
 //! of the stream's output.
 //!
@@ -63,6 +63,9 @@ pub(crate) struct StreamSenderCancelInfo {
     /// worker. `detach` queues the re-armed deadline here. `None` for a
     /// sender with no local anchor to re-arm.
     pub deadline_queue: Option<Arc<crate::streaming::anchor::AnchorDeadlineQueue>>,
+    /// The manager's heartbeats. A remote sender registers here; a
+    /// same-worker sender does not, because nothing reads its beats.
+    pub heartbeats: Option<crate::streaming::heartbeat::HeartbeatHandle>,
 }
 
 /// Who reports a stream's retirement when its terminal is handed to the
@@ -246,8 +249,8 @@ impl std::future::Future for Retired {
 /// Typed sender for pushing frames through the streaming channel.
 ///
 /// Holds a [`flume::Sender<Vec<u8>>`] for serialized frame bytes, a
-/// [`StreamAnchorHandle`] identifying the anchor, a [`CancellationToken`]
-/// to stop the background heartbeat task, and a reference to the anchor
+/// [`StreamAnchorHandle`] identifying the anchor, its heartbeat registration
+/// when the stream is remote, and a reference to the anchor
 /// registry so that [`detach`](StreamSender::detach) can clear the attachment
 /// flag once its sentinel is in the channel.
 ///
@@ -258,7 +261,9 @@ impl std::future::Future for Retired {
 pub struct StreamSender<T> {
     tx: flume::Sender<Vec<u8>>,
     handle: StreamAnchorHandle,
-    heartbeat_cancel: CancellationToken,
+    /// The sender's heartbeat registration, if it beats. Dropped before the
+    /// terminal is sent, so no beat follows the terminal.
+    beat: Option<crate::streaming::heartbeat::BeatGuard>,
     sent_terminal: bool,
     /// Registry reference for clearing the attachment flag on detach.
     local_registry: Option<Arc<DashMap<u64, AnchorEntry>>>,
@@ -303,11 +308,15 @@ impl<T> std::fmt::Debug for StreamSender<T> {
 }
 
 impl<T: Serialize> StreamSender<T> {
-    /// Create a new `StreamSender` and spawn the background heartbeat task.
+    /// Create a new `StreamSender`, registered for heartbeats when the stream
+    /// is remote.
     ///
-    /// The heartbeat task emits [`StreamFrame::Heartbeat`] at `heartbeat_interval`
-    /// via non-blocking `try_send`. It is cancelled when the sender is finalized,
-    /// detached, or dropped. `heartbeat_interval` is negotiated by the consumer
+    /// The manager's heartbeat sweep puts a [`StreamFrame::Heartbeat`] into
+    /// the channel every `heartbeat_interval`, with a non-blocking `try_send`,
+    /// until the sender is finalized, detached, or dropped. A same-worker
+    /// stream has no watchdog, and its consumer drops heartbeats, so a sender
+    /// with no negotiated transport does not register. `heartbeat_interval`
+    /// is negotiated by the consumer
     /// via [`crate::streaming::control::AnchorAttachResponse::Ok::heartbeat_interval_ms`]
     /// — both sides must agree so the consumer's watchdog deadline matches.
     ///
@@ -335,44 +344,22 @@ impl<T: Serialize> StreamSender<T> {
             retires_on,
             item_limit,
             deadline_queue,
+            heartbeats,
         } = cancel;
         let stop_token = sender_registry
             .senders
             .get(&sender_stream_id)
             .map(|entry| entry.stop_token.clone())
             .unwrap_or_else(|| cancel_token.child_token());
-        let heartbeat_cancel = cancel_token.child_token();
-
-        // Spawn heartbeat background task
-        let cancel = heartbeat_cancel.clone();
-        let tx_clone = tx.clone();
-        tokio::spawn(async move {
-            // First tick one period out. Waiting for an immediate first
-            // tick would delay seeing a cancelled token by a timer turn.
-            let mut interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + heartbeat_interval,
-                heartbeat_interval,
-            );
-
-            loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => break,
-                    _ = interval.tick() => {
-                        // Use cached heartbeat bytes — avoids rmp_serde::to_vec per tick.
-                        let bytes = cached_heartbeat().clone();
-                        // Non-blocking try_send: if the channel is full we silently
-                        // drop the heartbeat rather than stalling the sender.
-                        let _ = tx_clone.try_send(bytes);
-                    }
-                }
-            }
-        });
+        let beat = heartbeats
+            .filter(|_| negotiated_transport.is_some())
+            .map(|heartbeats| heartbeats.register(tx.clone(), heartbeat_interval, closed.clone()));
 
         Self {
             tx,
             handle,
             runtime: tokio::runtime::Handle::current(),
-            heartbeat_cancel,
+            beat,
             stop_token,
             sent_terminal: false,
             local_registry: negotiated_transport.is_none().then_some(registry),
@@ -450,10 +437,8 @@ impl<T: Serialize> StreamSender<T> {
     ///   stream's transport carries in one frame (per-stream TCP and gRPC:
     ///   16 MiB); nothing is sent, and the stream stays open.
     /// - [`SendError::ChannelClosed`] if the receiver has been dropped or the
-    ///   stream has been cancelled. A cancel through `SenderEntry::cancel` is
-    ///   seen at once; a direct cancel of [`Self::cancellation_token`] once
-    ///   the sender's heartbeat task has run, which needs the runtime that
-    ///   built the sender to be alive.
+    ///   stream has been cancelled. A cancel is seen at once: it sets the
+    ///   flag that this checks before the stream token fires.
     pub async fn send(&self, item: T) -> Result<(), SendError> {
         if self.closed.is_closed() {
             return Err(SendError::ChannelClosed);
@@ -498,7 +483,7 @@ impl<T: Serialize> StreamSender<T> {
 
     /// Permanently close the stream by sending a `Finalized` sentinel.
     ///
-    /// Cancels the heartbeat task, hands `StreamFrame::Finalized` to the channel
+    /// Stops the heartbeats, hands `StreamFrame::Finalized` to the channel
     /// through `send_terminal`, and consumes `self`. The subsequent `Drop` will
     /// see `sent_terminal = true` and skip the `Dropped` sentinel.
     ///
@@ -510,7 +495,7 @@ impl<T: Serialize> StreamSender<T> {
     ///
     /// - [`SendError::ChannelClosed`] if the receiver has already been dropped.
     pub fn finalize(mut self) -> Result<(), SendError> {
-        self.heartbeat_cancel.cancel();
+        self.beat = None;
         let bytes = cached_finalized().clone();
         self.sent_terminal = true;
         // Clean up sender registry entry before returning
@@ -521,7 +506,7 @@ impl<T: Serialize> StreamSender<T> {
 
     /// Detach the sender from the anchor by sending a `Detached` sentinel.
     ///
-    /// Cancels the heartbeat task, hands `StreamFrame::Detached` to the channel
+    /// Stops the heartbeats, hands `StreamFrame::Detached` to the channel
     /// through `send_terminal`, clears the attachment flag in the registry (so a
     /// new sender can attach), and returns the [`StreamAnchorHandle`] for
     /// re-attachment. The subsequent `Drop` will see `sent_terminal = true` and
@@ -538,7 +523,7 @@ impl<T: Serialize> StreamSender<T> {
     ///
     /// - [`SendError::ChannelClosed`] if the receiver has already been dropped.
     pub fn detach(mut self) -> Result<StreamAnchorHandle, SendError> {
-        self.heartbeat_cancel.cancel();
+        self.beat = None;
         let bytes = cached_detached().clone();
         self.sent_terminal = true;
         let registry = self.local_registry.clone();
@@ -761,7 +746,7 @@ impl<T> Drop for StreamSender<T> {
         // This is idempotent: if finalize/detach already removed it, this is a no-op.
         self.sender_registry.senders.remove(&self.sender_stream_id);
         if !self.sent_terminal {
-            self.heartbeat_cancel.cancel();
+            self.beat = None;
             let bytes = cached_dropped().clone();
             // Never blocks — see `send_terminal`. A `Drop` that parks a runtime
             // worker is the one thing this path may not do. Errors ignored: the
@@ -882,6 +867,7 @@ mod tests {
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
                 deadline_queue: None,
+                heartbeats: None,
             },
             Duration::from_secs(5),
             None,
@@ -924,6 +910,7 @@ mod tests {
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
                 deadline_queue: None,
+                heartbeats: None,
             },
             Duration::from_secs(5),
             None,
@@ -1002,21 +989,40 @@ mod tests {
         rmp_serde::from_slice(bytes).expect("deserialize StreamFrame")
     }
 
-    // -----------------------------------------------------------------------
-    // Test 1: StreamSender::new() spawns a heartbeat task
-    // -----------------------------------------------------------------------
+    /// A sender on `negotiated_transport`, registered with `heartbeats`.
+    fn make_beating_sender(
+        heartbeats: &crate::streaming::heartbeat::ManagerHeartbeats,
+        negotiated_transport: Option<velo_ext::TransportKey>,
+    ) -> (StreamSender<u32>, flume::Receiver<Vec<u8>>) {
+        let (tx, rx) = flume::bounded::<Vec<u8>>(256);
+        let sender = StreamSender::new(
+            tx,
+            StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 1),
+            empty_registry(),
+            StreamSenderCancelInfo {
+                cancel_token: tokio_util::sync::CancellationToken::new(),
+                sender_stream_id: 1,
+                sender_registry: std::sync::Arc::default(),
+                closed: Default::default(),
+                retires_on: crate::streaming::sender::RetiresOn::Queue,
+                item_limit: None,
+                deadline_queue: None,
+                heartbeats: Some(heartbeats.handle()),
+            },
+            Duration::from_secs(5),
+            None,
+            negotiated_transport,
+        );
+        (sender, rx)
+    }
 
-    #[tokio::test]
+    /// A remote sender beats every interval until it finishes.
+    #[tokio::test(start_paused = true)]
     async fn test_heartbeat_emits() {
-        tokio::time::pause();
-
-        let (sender, rx) = make_sender();
-
-        // Advance time past one heartbeat interval (5 seconds).
-        // Use sleep rather than advance+yield so the interval task gets polled.
+        let heartbeats = crate::streaming::heartbeat::ManagerHeartbeats::default();
+        let (sender, rx) =
+            make_beating_sender(&heartbeats, Some(velo_ext::TransportKey::new("tcp")));
         tokio::time::sleep(Duration::from_secs(6)).await;
-
-        // Should have received at least one heartbeat
         let bytes = rx.try_recv().expect("should receive heartbeat frame");
         let frame: StreamFrame<u32> = decode(&bytes);
         assert!(
@@ -1024,7 +1030,20 @@ mod tests {
             "expected Heartbeat, got {:?}",
             frame
         );
+        sender.finalize().unwrap();
+        assert_eq!(heartbeats.handle().registered(), 0);
+    }
 
+    /// A same-worker sender does not beat: its consumer drops heartbeats and
+    /// no watchdog reads them, so a beat would only take a slot in the
+    /// anchor's channel.
+    #[tokio::test(start_paused = true)]
+    async fn a_same_worker_sender_does_not_beat() {
+        let heartbeats = crate::streaming::heartbeat::ManagerHeartbeats::default();
+        let (sender, rx) = make_beating_sender(&heartbeats, None);
+        assert_eq!(heartbeats.handle().registered(), 0);
+        tokio::time::sleep(Duration::from_secs(16)).await;
+        assert!(rx.is_empty(), "no beat reached the channel");
         drop(sender);
     }
 
@@ -1176,6 +1195,7 @@ mod tests {
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
                 deadline_queue: None,
+                heartbeats: None,
             },
             Duration::from_secs(5),
             None,
@@ -1222,6 +1242,7 @@ mod tests {
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
                 deadline_queue: None,
+                heartbeats: None,
             },
             Duration::from_secs(5),
             None,
@@ -1241,17 +1262,14 @@ mod tests {
         drop(sender);
     }
 
-    // -----------------------------------------------------------------------
-    // Test 9: heartbeat task stops after cancel (CancellationToken)
-    // -----------------------------------------------------------------------
-
+    /// A finalized sender beats no more.
     #[tokio::test]
     async fn test_heartbeat_stops_after_cancel() {
         tokio::time::pause();
 
-        let (sender, rx) = make_sender();
-
-        // Finalize cancels the heartbeat
+        let heartbeats = crate::streaming::heartbeat::ManagerHeartbeats::default();
+        let (sender, rx) =
+            make_beating_sender(&heartbeats, Some(velo_ext::TransportKey::new("tcp")));
         sender.finalize().expect("finalize should succeed");
 
         // Drain any frames already sent

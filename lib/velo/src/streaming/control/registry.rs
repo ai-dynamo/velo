@@ -18,11 +18,8 @@ use crate::streaming::sender::Retirement;
 /// `CancellationToken::is_cancelled` locks a mutex (tokio-util 0.7.18 and
 /// 0.7.19): 8.7 ns per call against 0.3 ns for this load, paid on every
 /// record. [`SenderEntry::cancel`] sets the flag before it cancels the token,
-/// so a send after it fails at once. A token cancelled any other way sets the
-/// flag from the sender's heartbeat task, once the cancelling task yields and
-/// that task runs, and only while the runtime that built the sender is alive.
-/// Until then a send that finds channel space is accepted, up to the free
-/// capacity of the channel.
+/// so a send after it fails at once. Nothing else cancels the stream token:
+/// the token a sender hands out is a child that only observes it.
 ///
 /// It is also where the stream's retirement is recorded: the sender and its
 /// transport slot already share this allocation, so

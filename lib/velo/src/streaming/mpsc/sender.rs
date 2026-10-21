@@ -22,17 +22,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::streaming::frame::{SendError, StreamFrame};
 use crate::streaming::handle::StreamAnchorHandle;
-use crate::streaming::sender::{
-    StreamSenderCancelInfo, cached_detached, cached_dropped, cached_heartbeat,
-};
+use crate::streaming::sender::{StreamSenderCancelInfo, cached_detached, cached_dropped};
 
 use super::anchor::MpscAnchorEntry;
 use super::types::SenderId;
 
 /// Local vs. remote frame delivery channel.
 ///
-/// Cloneable because the heartbeat background task holds its own clone and
-/// the main sender keeps another for per-item `send()` calls.
+/// Cloneable because a detach that meets a full channel finishes in a task.
 #[derive(Clone)]
 pub(crate) enum SenderChannel {
     /// Same-worker write path: push `(sender_id, bytes)` directly into the
@@ -46,8 +43,8 @@ pub(crate) enum SenderChannel {
 
 /// Typed sender for an MPSC anchor.
 ///
-/// Holds one of two channels ([`SenderChannel`]) plus the usual heartbeat
-/// task and cancellation token. Created by
+/// Holds one of two channels ([`SenderChannel`]), a heartbeat registration
+/// when the channel is remote, and a cancellation token. Created by
 /// [`crate::AnchorManager::attach_mpsc_stream_anchor`] (local) or by the
 /// `_mpsc_anchor_attach` handler round-trip (remote).
 ///
@@ -58,7 +55,9 @@ pub struct MpscStreamSender<T> {
     sender_id: SenderId,
     channel: SenderChannel,
     handle: StreamAnchorHandle,
-    heartbeat_cancel: CancellationToken,
+    /// The heartbeat registration of a remote sender. Dropped before the
+    /// terminal is sent, so no beat follows the terminal.
+    beat: Option<crate::streaming::heartbeat::BeatGuard>,
     runtime: tokio::runtime::Handle,
     sent_terminal: bool,
     mpsc_registry: Arc<DashMap<u64, MpscAnchorEntry>>,
@@ -85,7 +84,9 @@ impl<T> std::fmt::Debug for MpscStreamSender<T> {
 }
 
 impl<T: Serialize> MpscStreamSender<T> {
-    /// Construct a new MPSC sender and spawn its heartbeat task.
+    /// Construct a new MPSC sender, registered for heartbeats when its
+    /// channel is remote. A local sender writes into the anchor's channel,
+    /// where nothing watches for beats.
     ///
     /// All arguments except `cancel` are distinct because bundling them
     /// further would obscure the local/remote dispatch. `cancel` is the same
@@ -112,46 +113,20 @@ impl<T: Serialize> MpscStreamSender<T> {
             // MPSC anchors keep their own per-anchor timeout task; the SPSC
             // shared deadline queue does not track them.
             deadline_queue: _,
+            heartbeats,
         } = cancel;
-        let heartbeat_cancel = cancel_token.child_token();
-
-        // Heartbeat task — skip first immediate tick, then emit cached
-        // heartbeat bytes via non-blocking `try_send`. Matches the SPSC
-        // heartbeat shape in sender.rs:158-177 but dispatches on the channel
-        // enum.
-        let hb_cancel = heartbeat_cancel.clone();
-        let hb_channel = channel.clone();
-        let hb_sender_id = sender_id.0;
-        tokio::spawn(async move {
-            // First tick one period out. Waiting for an immediate first
-            // tick would delay seeing a cancelled token by a timer turn.
-            let mut interval = tokio::time::interval_at(
-                tokio::time::Instant::now() + heartbeat_interval,
-                heartbeat_interval,
-            );
-            loop {
-                tokio::select! {
-                    _ = hb_cancel.cancelled() => break,
-                    _ = interval.tick() => {
-                        let bytes = cached_heartbeat().clone();
-                        match &hb_channel {
-                            SenderChannel::Local(tx) => {
-                                let _ = tx.try_send((hb_sender_id, bytes));
-                            }
-                            SenderChannel::Remote(tx) => {
-                                let _ = tx.try_send(bytes);
-                            }
-                        }
-                    }
-                }
+        let beat = match (&channel, heartbeats) {
+            (SenderChannel::Remote(tx), Some(heartbeats)) => {
+                Some(heartbeats.register(tx.clone(), heartbeat_interval, closed.clone()))
             }
-        });
+            _ => None,
+        };
 
         Self {
             sender_id,
             channel,
             handle,
-            heartbeat_cancel,
+            beat,
             runtime: tokio::runtime::Handle::current(),
             sent_terminal: false,
             mpsc_registry,
@@ -204,10 +179,8 @@ impl<T: Serialize> MpscStreamSender<T> {
     ///   stream's transport carries in one frame (per-stream TCP and gRPC:
     ///   16 MiB); nothing is sent, and the stream stays open.
     /// - [`SendError::ChannelClosed`] if the receiver has been dropped or the
-    ///   stream has been cancelled. A cancel through `SenderEntry::cancel` is
-    ///   seen at once; a direct cancel of [`Self::cancellation_token`] once
-    ///   the sender's heartbeat task has run, which needs the runtime that
-    ///   built the sender to be alive.
+    ///   stream has been cancelled. A cancel is seen at once: it sets the
+    ///   flag that this checks before the stream token fires.
     pub async fn send(&self, item: T) -> Result<(), SendError> {
         if self.closed.is_closed() {
             return Err(SendError::ChannelClosed);
@@ -255,10 +228,8 @@ impl<T: Serialize> MpscStreamSender<T> {
     /// # Errors
     ///
     /// Returns [`SendError::ChannelClosed`] if the receiver has been dropped or
-    /// the stream has been cancelled. A cancel through `SenderEntry::cancel` is
-    /// seen at once; a direct cancel of [`Self::cancellation_token`] once the
-    /// sender's heartbeat task has run, which needs the runtime that built the
-    /// sender to be alive.
+    /// the stream has been cancelled. A cancel is seen at once: it sets the
+    /// flag that this checks before the stream token fires.
     pub async fn send_err(&self, msg: impl ToString) -> Result<(), SendError> {
         if self.closed.is_closed() {
             return Err(SendError::ChannelClosed);
@@ -289,7 +260,7 @@ impl<T: Serialize> MpscStreamSender<T> {
     /// on the caller's runtime (the sender's own when the caller has none).
     /// Consumer cancellation stops a detach that is waiting for channel space.
     pub async fn detach(mut self) -> Result<StreamAnchorHandle, SendError> {
-        self.heartbeat_cancel.cancel();
+        self.beat = None;
         let cleanup = self.cleanup_guard();
         self.sent_terminal = true;
         if self.cancel_token.is_cancelled() {
@@ -394,7 +365,7 @@ impl<T> Drop for MpscStreamSender<T> {
     fn drop(&mut self) {
         if !self.sent_terminal {
             let _cleanup = self.cleanup_guard();
-            self.heartbeat_cancel.cancel();
+            self.beat = None;
             let bytes = cached_dropped().clone();
             match &self.channel {
                 SenderChannel::Local(tx) => {
@@ -439,6 +410,7 @@ mod tests {
         let (tx, rx) = flume::bounded(16);
         let cancel_token = CancellationToken::new();
         let closed = crate::streaming::control::SenderClosed::default();
+        let heartbeats = crate::streaming::heartbeat::ManagerHeartbeats::default();
         let heartbeat = Duration::from_secs(5);
         let sender = MpscStreamSender::<u32>::new(
             SenderId(1),
@@ -453,11 +425,15 @@ mod tests {
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
                 deadline_queue: None,
+                heartbeats: Some(heartbeats.handle()),
             },
             heartbeat,
             None,
         );
-        assert_eq!(rx.recv_async().await.unwrap(), *cached_heartbeat());
+        assert_eq!(
+            rx.recv_async().await.unwrap(),
+            *crate::streaming::sender::cached_heartbeat()
+        );
         // What `SenderEntry::cancel` does: the flag first, then the token.
         crate::streaming::control::SenderEntry {
             cancel_token: cancel_token.clone(),
