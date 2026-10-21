@@ -461,11 +461,8 @@ pub(crate) fn mpsc_anchor_attach_handler(
                         };
                         entry.senders.insert(sender_id, slot);
 
-                        // Cancel unattached timeout now that we have a sender again.
-                        if let Some(ref tc) = entry.timeout_cancel {
-                            tc.cancel();
-                        }
-                        entry.timeout_cancel = None;
+                        // Pause the unattached timeout now that we have a sender again.
+                        entry.expires = None;
 
                         (entry.frame_tx.clone(), pump_cancel, sender_id)
                     }
@@ -575,9 +572,6 @@ pub(crate) fn mpsc_anchor_cancel_handler(
 
                 if let Some((_, entry)) = manager.mpsc_registry.remove(&local_id) {
                     entry.cancel_token.cancel();
-                    if let Some(ref tc) = entry.timeout_cancel {
-                        tc.cancel();
-                    }
                     super::anchor::cancel_all_senders(
                         &entry,
                         ctx.msg.instance_id().worker_id(),

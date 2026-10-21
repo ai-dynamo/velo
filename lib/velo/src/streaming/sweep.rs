@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use dashmap::DashMap;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -269,6 +270,65 @@ impl<T: SweepTarget> DeadlineSweep<T> {
                         break;
                     }
                     tokio::task::yield_now().await;
+                }
+            }
+        }
+    }
+}
+
+/// What a sweep does with a due key, decided from the state of its entry.
+pub(crate) enum Due {
+    /// Nothing waits on the deadline (a sender is attached, or there is no
+    /// timeout): forget the queue entry.
+    Drop,
+    /// A renewal moved the deadline past now: look again then.
+    Requeue(Instant),
+    /// The deadline has passed: remove the entry.
+    Expire,
+}
+
+impl Due {
+    /// The verdict for an entry that waits on `expires`.
+    pub(crate) fn at(expires: Option<Instant>, now: Instant) -> Self {
+        match expires {
+            Some(deadline) if deadline > now => Self::Requeue(deadline),
+            Some(_) => Self::Expire,
+            None => Self::Drop,
+        }
+    }
+}
+
+/// Act on the due keys of a registry whose entries expire.
+///
+/// A read lock decides each key: most belong to entries that a sender took
+/// or that ended, and a write lock per key would contend with attach and
+/// detach. Only an expiry takes the write lock, and decides again under it,
+/// because a renewal or an attach can land between the two. The removed
+/// entry goes to `expire` after its shard lock is released.
+pub(crate) fn expire_due<V>(
+    registry: &DashMap<u64, V>,
+    due: Vec<u64>,
+    now: Instant,
+    renewed: &mut Vec<(Instant, u64)>,
+    decide: impl Fn(&V, Instant) -> Due,
+    expire: impl Fn(V),
+) {
+    use dashmap::mapref::entry::Entry;
+    for key in due {
+        let Some(verdict) = registry.get(&key).map(|entry| decide(&entry, now)) else {
+            continue; // already removed
+        };
+        match verdict {
+            Due::Drop => {}
+            Due::Requeue(deadline) => renewed.push((deadline, key)),
+            Due::Expire => {
+                let Entry::Occupied(entry) = registry.entry(key) else {
+                    continue;
+                };
+                match decide(entry.get(), now) {
+                    Due::Expire => expire(entry.remove()),
+                    Due::Requeue(deadline) => renewed.push((deadline, key)),
+                    Due::Drop => {}
                 }
             }
         }

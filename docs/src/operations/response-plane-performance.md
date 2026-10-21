@@ -139,7 +139,7 @@ The queue does not remove an entry when its anchor attaches or ends. The sweep d
 
 Rejected: one lock for the whole queue. Every create takes a lock on the queue. With one lock, the lifecycle p99.9 at 8 threads was 110 µs, against 22 µs with a task per anchor. No entry came due inside that run, so the sweep did not cause the tail: creates waited on each other for the one lock. With 1 or 2 threads, the single lock was faster than the task at every percentile, so the cost was contention. The queue now has 16 parts, each with its own lock, and the id of an anchor selects its part.
 
-The tests `unattached_anchors_share_one_sweep_task` and `ended_anchors_leave_the_queue_within_the_first_look` hold the task count and the queue length. MPSC anchors still spawn one task for their unattached timeout.
+The tests `unattached_anchors_share_one_sweep_task` and `ended_anchors_leave_the_queue_within_the_first_look` hold the task count and the queue length. MPSC anchors use a second queue of the same kind, and `mpsc_anchors_share_one_sweep_task` holds its task count.
 
 Removed, measured with `anchor_setup_bench` and `stream_lifecycle`: each SPSC and MPSC sender spawned one heartbeat task that lived as long as its stream. Now one task per `AnchorManager` beats every remote sender, from the same kind of queue. A sender on the anchor's own worker does not beat at all, because no watchdog reads its beats. Same host and settings as above, median of three interleaved runs, against the deadline queue alone:
 
