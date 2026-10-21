@@ -16,8 +16,8 @@
 //!   cancellations are no-ops.
 
 mod reservation;
-pub(crate) use reservation::deadline_after;
 pub use reservation::{AnchorReservation, ReservationConfig};
+pub(crate) use reservation::{DEFAULT_PREBIND_TIMEOUT, DEFAULT_UNATTACHED_TIMEOUT, deadline_after};
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -1017,7 +1017,10 @@ pub struct AnchorManager {
     /// anchor if no sender attaches within this duration. Per-anchor overrides
     /// are supported via [`AnchorConfig::unattached_timeout`] +
     /// [`AnchorManager::create_anchor_with_config`].
-    #[builder(default = "Some(Duration::from_secs(120))", setter(into, strip_option))]
+    #[builder(
+        default = "Some(DEFAULT_UNATTACHED_TIMEOUT)",
+        setter(into, strip_option)
+    )]
     pub default_unattached_timeout: Option<Duration>,
 
     /// Default heartbeat cadence negotiated with senders attached to anchors
@@ -2069,9 +2072,10 @@ impl AnchorManager {
         };
 
         messenger.register_streaming_handler(anchor_attach_handler(manager.clone()))?;
+        // Everything but the attaches serves a stream already open, or a
+        // reservation already made, so the drain gate lets it through; an
+        // attach opens a new stream.
         messenger.register_drain_exempt_handler(reservation::renewal_handler(manager.clone()))?;
-        // Everything but the attaches serves a stream already open, so the
-        // drain gate lets it through; an attach opens a new stream.
         messenger.register_drain_exempt_handler(anchor_detach_handler(manager.clone()))?;
         messenger.register_drain_exempt_handler(anchor_finalize_handler(manager.clone()))?;
         messenger.register_drain_exempt_handler(anchor_cancel_handler(manager.clone()))?;

@@ -3,6 +3,9 @@
 use super::*;
 use serde::{Deserialize, Serialize};
 
+pub(crate) const DEFAULT_UNATTACHED_TIMEOUT: Duration = Duration::from_secs(120);
+pub(crate) const DEFAULT_PREBIND_TIMEOUT: Duration = Duration::from_secs(180);
+
 /// Receiver lifetimes before a producer attaches.
 #[derive(Debug, Clone, Copy)]
 #[non_exhaustive]
@@ -15,8 +18,8 @@ pub struct ReservationConfig {
 impl Default for ReservationConfig {
     fn default() -> Self {
         Self {
-            unattached_timeout: Duration::from_secs(120),
-            prebind_timeout: Duration::from_secs(180),
+            unattached_timeout: DEFAULT_UNATTACHED_TIMEOUT,
+            prebind_timeout: DEFAULT_PREBIND_TIMEOUT,
         }
     }
 }

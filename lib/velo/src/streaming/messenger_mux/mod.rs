@@ -147,9 +147,6 @@ pub(crate) use self::lane_choice::LaneReservation;
 /// re-deriving the one value negotiation is keyed on.
 pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
 
-/// Default wait for a producer to claim a reserved mux slot.
-const ACCEPT_TIMEOUT: Duration = Duration::from_secs(180);
-
 /// Attempts `connect` makes before giving up on a batcher that keeps retiring
 /// underneath it. Two is already generous — losing the race twice requires two
 /// eviction sweeps inside one attach.
@@ -343,7 +340,9 @@ impl MessengerMuxTransport {
             drain_rx,
             drains: DashMap::new(),
             bind_deadlines: std::sync::Mutex::default(),
-            reservation_timeout_ns: AtomicU64::new(ACCEPT_TIMEOUT.as_nanos() as u64),
+            reservation_timeout_ns: AtomicU64::new(
+                crate::streaming::anchor::DEFAULT_PREBIND_TIMEOUT.as_nanos() as u64,
+            ),
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -734,8 +733,8 @@ impl MessengerMuxTransport {
     /// to ask.
     ///
     /// Nothing about the resulting bind is special. A peer's `OpenSlot` claims
-    /// it by the same `(anchor_id, session_id)` lookup, the accept window runs
-    /// the same 60 s, and [`release_bind`](Self::release_bind) is what an owner
+    /// it by the same `(anchor_id, session_id)` lookup, the accept window is
+    /// the same configured lifetime, and [`release_bind`](Self::release_bind) is what an owner
     /// that gives up before then calls.
     pub(crate) fn bind_on_lane(
         &self,

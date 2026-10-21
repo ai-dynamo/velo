@@ -733,8 +733,8 @@ async fn live_slots_returns_to_zero_when_the_producers_go_away() {
 /// Dropping the transports themselves has to reach zero too, and promptly.
 ///
 /// The failure this guards against is a strong reference held across `bind`'s
-/// 60-second accept window: the transport would keep every slot, batcher task
-/// and ingress entry alive for a minute after its last owner let go, and the
+/// accept window: the transport would keep every slot, batcher task
+/// and ingress entry alive for the whole window after its last owner let go, and the
 /// gauge would come back only when the timers did.
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_the_transports_tears_every_slot_down_promptly() {
@@ -1510,7 +1510,7 @@ async fn prebinding_node(
 ///
 /// Zero-RTT setup binds a slot at request registration, so a request that dies
 /// before its first token — a client that hangs up, a prompt that is refused —
-/// leaves one behind. [`ACCEPT_TIMEOUT`] would collect it eventually and stays
+/// leaves one behind. The accept window would collect it eventually and stays
 /// as the backstop, but at the rate a frontend registers requests, a minute of
 /// leaked bind, drain signal and stream watchdog per abandoned one is not a
 /// reclamation policy.
@@ -1923,7 +1923,7 @@ async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot(
 /// End-to-end version of the reap-on-reclaim fix (`control::reap_unclaimed`,
 /// run by the stream watchdog or the consumer), driven through the real
 /// `AnchorManager` / mux stack rather than a synthetic fixture: at a heartbeat interval the watchdog alone cannot
-/// beat the 60 s accept window with (`>= 20 s` -- `DETECTION_MULTIPLIER`
+/// beat the 60 s accept window this test sets with (`>= 20 s` -- `DETECTION_MULTIPLIER`
 /// is 3, so the watchdog's earliest fire from a fresh window is `3 *
 /// heartbeat`), an adopted pre-bind whose sender never delivers its
 /// `OpenSlot` must still be reaped once the accept window closes, and the
@@ -1931,7 +1931,7 @@ async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot(
 /// forever.
 ///
 /// The sibling above uses a 50 ms heartbeat, so its watchdog always wins the
-/// race against the 60 s window and this path never runs there -- this test
+/// race against the accept window and this path never runs there -- this test
 /// is the one that actually exercises the accept window as the reaper.
 #[tokio::test]
 async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window() {
@@ -1968,7 +1968,7 @@ async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window
     );
 
     // The watchdog alone would not fire until 25 s * (0 + DETECTION_MULTIPLIER)
-    // = 75 s from adoption -- after the fixed 60 s accept window, not before.
+    // = 75 s from adoption -- after the 60 s accept window set above, not before.
     // Advance well past both so whichever fires first has already run.
     tokio::time::sleep(Duration::from_secs(65)).await;
 
@@ -2009,7 +2009,10 @@ async fn an_unclaimed_prebind_closes_at_its_accept_window_and_not_before() {
         .prebind_anchor(handle)
         .expect("a mux is installed, so a ticket is minted");
 
-    tokio::time::sleep(ACCEPT_TIMEOUT - Duration::from_millis(500)).await;
+    tokio::time::sleep(
+        crate::streaming::anchor::DEFAULT_PREBIND_TIMEOUT - Duration::from_millis(500),
+    )
+    .await;
     assert!(
         node.manager.registry.contains_key(&local_id),
         "the accept window has not closed yet, so the pre-bound anchor must still be registered"
@@ -2850,7 +2853,7 @@ async fn a_stale_detached_spares_a_prebind_installed_mid_poll() {
 
 /// Dropping an anchor before any sender opened its slot gives the bind back.
 ///
-/// The bind would otherwise wait out the 60 s accept window, one per request
+/// The bind would otherwise wait out the accept window, one per request
 /// a frontend abandoned before its worker got to it.
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_an_anchor_before_its_sender_opens_releases_the_bind() {
@@ -2937,7 +2940,7 @@ async fn reservation_renewal_extends_one_deadline_without_reallocating_slots() {
 }
 
 #[tokio::test]
-async fn stale_reservation_does_not_renew_a_replacement_binding() {
+async fn a_reservation_for_another_session_does_not_renew_the_bind() {
     tokio::time::pause();
     let node = prebinding_node(test_config(), None).await;
     node.mux.set_reservation_timeout(Duration::from_secs(3));
