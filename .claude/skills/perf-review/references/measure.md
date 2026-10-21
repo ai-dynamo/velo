@@ -100,6 +100,12 @@ done
 grep -qaF "$S/root/" "$S/bin/root/<harness>"   # must match, or stop here
 if grep -qaF "$S/base/" "$S/bin/root/<harness>"; then
   echo "head binary was built from the base tree" >&2; exit 1
+else
+  status=$?
+  if [ "$status" -ne 1 ]; then
+    echo "failed to validate head binary provenance" >&2
+    exit "$status"
+  fi
 fi
 ```
 
