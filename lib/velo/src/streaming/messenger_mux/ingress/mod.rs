@@ -350,11 +350,12 @@ impl IngressRegistry {
         frame_tx: flume::Sender<Vec<u8>>,
         drain: Arc<DrainSignal>,
         lane: LaneReservation,
+        expires: tokio::time::Instant,
     ) {
         self.binds.insert(
             (anchor_id, session_id),
             BindEntry {
-                expires: tokio::time::Instant::now() + super::ACCEPT_TIMEOUT,
+                expires,
                 frame_tx,
                 drain,
                 lane,
@@ -366,7 +367,7 @@ impl IngressRegistry {
         if let Some(mut bind) = self.binds.get_mut(&(anchor, session)) {
             let now = tokio::time::Instant::now();
             if bind.expires > now {
-                bind.expires = now + timeout;
+                bind.expires = crate::streaming::anchor::deadline_after(timeout);
             }
         }
     }

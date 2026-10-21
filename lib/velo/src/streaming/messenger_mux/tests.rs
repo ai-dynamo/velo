@@ -2958,3 +2958,50 @@ async fn stale_reservation_does_not_renew_a_replacement_binding() {
     assert_eq!(node.manager.active_anchor_count(), 0);
     node.mux.shutdown().await;
 }
+
+/// A prepared-slot lifetime keeps its full precision. Stored in whole
+/// milliseconds, 1.5 ms became 1 ms, so a bind expired before the lifetime the
+/// caller configured, and a renewal cadence that fit the configured lifetime
+/// arrived too late.
+#[tokio::test]
+async fn a_sub_millisecond_reservation_lifetime_is_not_truncated() {
+    tokio::time::pause();
+    let node = prebinding_node(test_config(), None).await;
+    node.mux
+        .set_reservation_timeout(Duration::from_micros(1500));
+    let anchor = node.manager.create_anchor::<u32>();
+    node.manager
+        .prebind_anchor(anchor.handle())
+        .expect("ticket");
+    tokio::time::advance(Duration::from_micros(1200)).await;
+    node.mux.core.expire_binds(tokio::time::Instant::now());
+    tokio::task::yield_now().await;
+    assert_eq!(
+        node.manager.active_anchor_count(),
+        1,
+        "1.2 ms into a 1.5 ms lifetime the bind is still live"
+    );
+    node.mux.shutdown().await;
+}
+
+/// A huge prepared-slot lifetime means "never" and must not panic on
+/// `Instant + Duration` overflow, at bind or at renewal.
+#[tokio::test]
+async fn an_oversized_reservation_lifetime_does_not_panic() {
+    tokio::time::pause();
+    let node = prebinding_node(test_config(), None).await;
+    node.mux.set_reservation_timeout(Duration::MAX);
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let ticket = node.manager.prebind_anchor(handle).expect("ticket");
+    node.manager
+        .renew_reservations_local(&[crate::streaming::AnchorReservation::new(
+            handle,
+            Some(&ticket),
+        )]);
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    node.mux.core.expire_binds(tokio::time::Instant::now());
+    tokio::task::yield_now().await;
+    assert_eq!(node.manager.active_anchor_count(), 1);
+    node.mux.shutdown().await;
+}

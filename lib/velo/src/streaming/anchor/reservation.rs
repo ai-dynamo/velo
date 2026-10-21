@@ -34,6 +34,17 @@ impl ReservationConfig {
     }
 }
 
+/// `now + lifetime`, saturating 30 years out as `tokio::time::sleep` does.
+///
+/// `Instant + Duration` panics on overflow, and a caller that passes
+/// `Duration::MAX` as a timeout means "never".
+pub(crate) fn deadline_after(lifetime: Duration) -> tokio::time::Instant {
+    const FAR_FUTURE: Duration = Duration::from_secs(86_400 * 365 * 30);
+    let now = tokio::time::Instant::now();
+    now.checked_add(lifetime)
+        .unwrap_or_else(|| now + FAR_FUTURE)
+}
+
 /// A handle and, for prepared streams, the generation of its reserved slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct AnchorReservation {
@@ -72,7 +83,8 @@ impl AnchorManager {
                 peers.entry(worker).or_default().push(*reservation);
             }
         }
-        let Some(messenger) = self.messenger.as_ref() else {
+        // The messenger `register_handlers` installed, as the attach paths use.
+        let Some(messenger) = self.messenger_lock.get().or(self.messenger.as_ref()) else {
             anyhow::ensure!(peers.is_empty(), "remote renewal requires a messenger");
             return Ok(());
         };
@@ -125,7 +137,7 @@ impl AnchorManager {
                         (entry.expires, entry.unattached_timeout)
                         && expires > now
                     {
-                        entry.expires = Some(now + timeout);
+                        entry.expires = Some(deadline_after(timeout));
                     }
                 }
                 _ => {}

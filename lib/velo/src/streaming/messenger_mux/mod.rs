@@ -224,7 +224,8 @@ struct MuxCore {
     /// shard; the sweep requeues that entry when its earlier deadline arrives.
     /// A heap permits different configured lifetimes without scanning all binds.
     bind_deadlines: std::sync::Mutex<std::collections::BinaryHeap<BindDeadline>>,
-    reservation_timeout_ms: AtomicU64,
+    /// The prepared-slot lifetime in nanoseconds, saturating (584 years).
+    reservation_timeout_ns: AtomicU64,
     /// A barrier handed to every batcher this core spawns, installed by the
     /// tests that need one held mid-wake. See [`peer_batcher::test_hooks`].
     #[cfg(test)]
@@ -241,18 +242,16 @@ struct MuxCore {
 
 impl MessengerMuxTransport {
     pub(crate) fn set_reservation_timeout(&self, timeout: Duration) {
-        self.core.reservation_timeout_ms.store(
-            timeout.as_millis().min(u64::MAX as u128) as u64,
+        self.core.reservation_timeout_ns.store(
+            u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
     }
 
     pub(crate) fn renew_reservation(&self, anchor: u64, session: u64) {
-        self.core.ingress.renew_bind(
-            anchor,
-            session,
-            Duration::from_millis(self.core.reservation_timeout_ms.load(Ordering::Relaxed)),
-        );
+        self.core
+            .ingress
+            .renew_bind(anchor, session, self.core.reservation_timeout());
     }
 
     /// Ask the sender of a claimed slot to stop, through the batcher of the
@@ -344,7 +343,7 @@ impl MessengerMuxTransport {
             drain_rx,
             drains: DashMap::new(),
             bind_deadlines: std::sync::Mutex::default(),
-            reservation_timeout_ms: AtomicU64::new(180_000),
+            reservation_timeout_ns: AtomicU64::new(ACCEPT_TIMEOUT.as_nanos() as u64),
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -386,6 +385,10 @@ impl MessengerMuxTransport {
 }
 
 impl MuxCore {
+    fn reservation_timeout(&self) -> Duration {
+        Duration::from_nanos(self.reservation_timeout_ns.load(Ordering::Relaxed))
+    }
+
     /// Hand one decoded batch to the ingress lane and act on what it produced.
     ///
     /// Everything the batch produced goes back through the batcher for the
@@ -645,8 +648,11 @@ fn open_bind(
     let drain = Arc::new(ingress::DrainSignal::new(core.drain_tx.clone()));
     core.drains
         .insert((anchor_id, session_id), Arc::clone(&drain));
+    // One deadline, stored with the bind and queued below. Renewal moves the
+    // stored one; the queued one only says when to look again.
+    let expires = crate::streaming::anchor::deadline_after(core.reservation_timeout());
     core.ingress
-        .register_bind(anchor_id, session_id, frame_tx, drain, lane);
+        .register_bind(anchor_id, session_id, frame_tx, drain, lane, expires);
 
     // Close the race with shutdown between the initial check and registration.
     if core.tasks.is_stopped() {
@@ -658,18 +664,10 @@ fn open_bind(
     // A deadline, not a task: the sweep expires it (`MuxCore::expire_binds`).
     // Nothing here may pin the core either, which a task holding a strong
     // handle would, for the full window after the last owner dropped it.
-    // The clock is read under the lock, so pushes land in deadline order.
-    let mut deadlines = core
-        .bind_deadlines
+    core.bind_deadlines
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let timeout = Duration::from_millis(core.reservation_timeout_ms.load(Ordering::Relaxed));
-    core.ingress.renew_bind(anchor_id, session_id, timeout);
-    deadlines.push(std::cmp::Reverse((
-        tokio::time::Instant::now() + timeout,
-        (anchor_id, session_id),
-    )));
-    drop(deadlines);
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(std::cmp::Reverse((expires, (anchor_id, session_id))));
 
     Ok(frame_rx)
 }

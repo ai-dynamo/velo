@@ -16,6 +16,7 @@
 //!   cancellations are no-ops.
 
 mod reservation;
+pub(crate) use reservation::deadline_after;
 pub use reservation::{AnchorReservation, ReservationConfig};
 
 use std::collections::HashMap;
@@ -318,7 +319,7 @@ impl AnchorEntry {
             && self.prebind.is_none()
             && let Some(duration) = self.unattached_timeout
         {
-            self.expires = Some(tokio::time::Instant::now() + duration);
+            self.expires = Some(reservation::deadline_after(duration));
             self.timeout_cancel = Some(AnchorManager::spawn_timeout_task(
                 Arc::clone(registry),
                 local_id,
@@ -1299,7 +1300,7 @@ impl AnchorManager {
             active_pump_token: None,
             attachment: false,
             timeout_cancel,
-            expires: unattached_timeout.map(|duration| tokio::time::Instant::now() + duration),
+            expires: unattached_timeout.map(reservation::deadline_after),
             unattached_timeout,
             heartbeat_interval,
             stream_cancel_handle: None, // populated on attach
@@ -1353,7 +1354,7 @@ impl AnchorManager {
         };
         let tc_clone = tc.clone();
         rt.spawn(async move {
-            let mut deadline = tokio::time::Instant::now() + timeout;
+            let mut deadline = reservation::deadline_after(timeout);
             loop {
                 tokio::select! {
                     _ = tc_clone.cancelled() => break,
@@ -4931,5 +4932,99 @@ mod tests {
             );
             drop(anchor);
         }
+    }
+
+    /// Remote renewal must reach the peer through the messenger that
+    /// `register_handlers` installs, the one the attach paths use. A manager
+    /// built without the builder's `messenger` field attaches remotely, so it
+    /// must renew remotely too; otherwise every renewal fails with "remote
+    /// renewal requires a messenger" and the held reservation expires anyway.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remote_renewal_uses_the_registered_messenger_and_extends_the_lifetime() {
+        let consumer = crate::messenger::Messenger::builder()
+            .add_transport(tcp_messenger_transport())
+            .build()
+            .await
+            .unwrap();
+        let producer = crate::messenger::Messenger::builder()
+            .add_transport(tcp_messenger_transport())
+            .build()
+            .await
+            .unwrap();
+        consumer.register_peer(producer.peer_info()).unwrap();
+        producer.register_peer(consumer.peer_info()).unwrap();
+        let lifetime = Duration::from_millis(600);
+        let receiver = Arc::new(
+            AnchorManagerBuilder::default()
+                .worker_id(consumer.instance_id().worker_id())
+                .transport(
+                    Arc::new(MockTransport) as Arc<dyn crate::streaming::transport::FrameTransport>
+                )
+                .default_unattached_timeout(lifetime)
+                .build()
+                .unwrap(),
+        );
+        let sender = Arc::new(
+            AnchorManagerBuilder::default()
+                .worker_id(producer.instance_id().worker_id())
+                .transport(
+                    Arc::new(MockTransport) as Arc<dyn crate::streaming::transport::FrameTransport>
+                )
+                .build()
+                .unwrap(),
+        );
+        receiver.register_handlers(consumer.clone()).unwrap();
+        sender.register_handlers(producer.clone()).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            producer.wait_for_handler(consumer.instance_id(), "_anchor_renew"),
+        )
+        .await
+        .expect("bounded handler wait")
+        .expect("renew handler advertised");
+
+        let anchor = receiver.create_anchor::<u32>();
+        let id = anchor.handle().unpack().1;
+        let reservation = AnchorReservation::new(anchor.handle(), None);
+        // Four lifetimes of renewal at a quarter-lifetime cadence.
+        for _ in 0..16 {
+            tokio::time::sleep(lifetime / 4).await;
+            sender
+                .renew_reservations(&[reservation])
+                .await
+                .expect("remote renewal");
+        }
+        assert!(
+            receiver.registry.contains_key(&id),
+            "renewal held the anchor past four lifetimes"
+        );
+        // Once renewal stops, the ordinary timer reaps it.
+        let deadline = tokio::time::Instant::now() + lifetime * 5;
+        while receiver.registry.contains_key(&id) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "anchor outlived its last renewal"
+            );
+            tokio::time::sleep(lifetime / 10).await;
+        }
+        drop(anchor);
+    }
+
+    /// A caller that passes a huge timeout to mean "never" must not panic:
+    /// `Instant + Duration::MAX` overflows. `tokio::time::sleep` saturates such
+    /// a deadline, and the renewable deadlines must do the same.
+    #[tokio::test(start_paused = true)]
+    async fn an_oversized_unattached_timeout_does_not_panic() {
+        let mgr = make_manager();
+        let anchor = mgr.create_anchor_with_config::<u32>(AnchorConfig {
+            unattached_timeout: Some(Duration::MAX),
+            ..Default::default()
+        });
+        let reservation = AnchorReservation::new(anchor.handle(), None);
+        mgr.renew_reservations(&[reservation]).await.expect("renew");
+        anchor.set_timeout(Some(Duration::MAX));
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        mgr.renew_reservations(&[reservation]).await.expect("renew");
+        assert!(mgr.registry.contains_key(&anchor.handle().unpack().1));
     }
 }
