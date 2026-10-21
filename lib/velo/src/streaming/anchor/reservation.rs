@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Reservation lifetimes before a producer opens its stream.
 
 use super::*;
@@ -42,17 +45,6 @@ impl ReservationConfig {
         );
         Ok(())
     }
-}
-
-/// `now + lifetime`, saturating 30 years out as `tokio::time::sleep` does.
-///
-/// `Instant + Duration` panics on overflow, and a caller that passes
-/// `Duration::MAX` as a timeout means "never".
-pub(crate) fn deadline_after(lifetime: Duration) -> tokio::time::Instant {
-    const FAR_FUTURE: Duration = Duration::from_secs(86_400 * 365 * 30);
-    let now = tokio::time::Instant::now();
-    now.checked_add(lifetime)
-        .unwrap_or_else(|| now + FAR_FUTURE)
 }
 
 /// A handle and, for prepared streams, the generation of its reserved slot.
@@ -143,12 +135,10 @@ impl AnchorManager {
                     }
                 }
                 (None, None) => {
-                    let now = tokio::time::Instant::now();
-                    if let (Some(expires), Some(timeout)) =
-                        (entry.expires, entry.unattached_timeout)
-                        && expires > now
+                    if let Some(timeout) = entry.unattached_timeout
+                        && let Some(expires) = entry.expires.as_mut()
                     {
-                        entry.expires = Some(deadline_after(timeout));
+                        crate::streaming::deadline::renew_if_live(expires, timeout);
                     }
                 }
                 _ => {}

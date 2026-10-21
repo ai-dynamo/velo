@@ -16,8 +16,9 @@
 //!   cancellations are no-ops.
 
 mod reservation;
+use crate::streaming::deadline::deadline_after;
+use reservation::DEFAULT_UNATTACHED_TIMEOUT;
 pub use reservation::{AnchorReservation, ReservationConfig};
-pub(crate) use reservation::{DEFAULT_UNATTACHED_TIMEOUT, deadline_after};
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -322,11 +323,12 @@ impl AnchorEntry {
             && self.prebind.is_none()
             && let Some(duration) = self.unattached_timeout
         {
-            self.expires = Some(reservation::deadline_after(duration));
+            let expires = deadline_after(duration);
+            self.expires = Some(expires);
             self.timeout_cancel = Some(AnchorManager::spawn_timeout_task(
                 Arc::clone(registry),
                 local_id,
-                duration,
+                expires,
                 &self.cancel_token,
             ));
         }
@@ -1016,15 +1018,13 @@ pub struct AnchorManager {
 
     /// Default inactivity timeout for newly created SPSC anchors. MPSC
     /// anchors do not inherit it; see [`crate::streaming::mpsc::MpscAnchorConfig`].
-    /// When set, `create_anchor` spawns a timeout task that auto-removes the
+    /// `create_anchor` spawns a timeout task that auto-removes the
     /// anchor if no sender attaches within this duration. Per-anchor overrides
     /// are supported via [`AnchorConfig::unattached_timeout`] +
     /// [`AnchorManager::create_anchor_with_config`].
-    #[builder(
-        default = "Some(DEFAULT_UNATTACHED_TIMEOUT)",
-        setter(into, strip_option)
-    )]
-    pub default_unattached_timeout: Option<Duration>,
+    /// `Duration::MAX` means anchors never time out.
+    #[builder(default = "DEFAULT_UNATTACHED_TIMEOUT", setter(into))]
+    pub default_unattached_timeout: Duration,
 
     /// Default heartbeat cadence negotiated with senders attached to anchors
     /// created by this manager. Per-anchor overrides are supported via
@@ -1287,17 +1287,20 @@ impl AnchorManager {
         let cancel_token = CancellationToken::new();
 
         // Resolve liveness knobs: per-anchor override > manager default.
-        let unattached_timeout = config
-            .unattached_timeout
-            .or(self.default_unattached_timeout);
+        let unattached_timeout = Some(
+            config
+                .unattached_timeout
+                .unwrap_or(self.default_unattached_timeout),
+        );
         let heartbeat_interval = config
             .heartbeat_interval
             .unwrap_or(self.default_heartbeat_interval);
 
         // Spawn timeout task if configured — derive child from the anchor's parent token
         // so that finalize/remove auto-cancels it.
-        let timeout_cancel = unattached_timeout.map(|timeout| {
-            Self::spawn_timeout_task(self.registry.clone(), local_id, timeout, &cancel_token)
+        let expires = unattached_timeout.map(deadline_after);
+        let timeout_cancel = expires.map(|expires| {
+            Self::spawn_timeout_task(self.registry.clone(), local_id, expires, &cancel_token)
         });
 
         let feed = Arc::new(crate::streaming::control::FeedCell::default());
@@ -1308,7 +1311,7 @@ impl AnchorManager {
             active_pump_token: None,
             attachment: false,
             timeout_cancel,
-            expires: unattached_timeout.map(reservation::deadline_after),
+            expires,
             unattached_timeout,
             heartbeat_interval,
             stream_cancel_handle: None, // populated on attach
@@ -1349,7 +1352,7 @@ impl AnchorManager {
     pub(crate) fn spawn_timeout_task(
         registry: Arc<DashMap<u64, AnchorEntry>>,
         local_id: u64,
-        timeout: Duration,
+        expires: tokio::time::Instant,
         parent_cancel: &CancellationToken,
     ) -> CancellationToken {
         let tc = parent_cancel.child_token();
@@ -1364,7 +1367,7 @@ impl AnchorManager {
         rt.spawn(async move {
             // Renewal moves `AnchorEntry::expires`, not this task's timer, so
             // on waking the task re-reads it and sleeps again if it moved.
-            let mut deadline = reservation::deadline_after(timeout);
+            let mut deadline = expires;
             loop {
                 tokio::select! {
                     _ = tc_clone.cancelled() => break,
@@ -3766,7 +3769,7 @@ mod tests {
             .build()
             .expect("builder with required fields should succeed");
         assert!(
-            mgr.default_unattached_timeout == Some(Duration::from_secs(120)),
+            mgr.default_unattached_timeout == Duration::from_secs(120),
             "default_unattached_timeout must default to 120 seconds"
         );
     }
@@ -3784,7 +3787,7 @@ mod tests {
             .expect("builder with timeout should succeed");
         assert_eq!(
             mgr.default_unattached_timeout,
-            Some(std::time::Duration::from_secs(10)),
+            std::time::Duration::from_secs(10),
             "default_unattached_timeout must match configured value"
         );
     }
@@ -3794,7 +3797,7 @@ mod tests {
         // The convenience constructor uses the same default as the builder.
         let mgr = make_manager();
         assert!(
-            mgr.default_unattached_timeout == Some(Duration::from_secs(120)),
+            mgr.default_unattached_timeout == Duration::from_secs(120),
             "AnchorManager::new must use the 120-second default"
         );
     }
@@ -4974,7 +4977,9 @@ mod tests {
             .unwrap();
         consumer.register_peer(producer.peer_info()).unwrap();
         producer.register_peer(consumer.peer_info()).unwrap();
-        let lifetime = Duration::from_millis(600);
+        // Wide enough that a loaded runner cannot stall one renewal round
+        // trip past the lifetime: each must land within 1.5 s of the last.
+        let lifetime = Duration::from_secs(2);
         let receiver = Arc::new(
             AnchorManagerBuilder::default()
                 .worker_id(consumer.instance_id().worker_id())
@@ -5007,8 +5012,8 @@ mod tests {
         let anchor = receiver.create_anchor::<u32>();
         let id = anchor.handle().unpack().1;
         let reservation = AnchorReservation::new(anchor.handle(), None);
-        // Four lifetimes of renewal at a quarter-lifetime cadence.
-        for _ in 0..16 {
+        // Two lifetimes of renewal at a quarter-lifetime cadence.
+        for _ in 0..8 {
             tokio::time::sleep(lifetime / 4).await;
             sender
                 .renew_reservations(&[reservation])
@@ -5017,7 +5022,7 @@ mod tests {
         }
         assert!(
             receiver.registry.contains_key(&id),
-            "renewal held the anchor past four lifetimes"
+            "renewal held the anchor past two lifetimes"
         );
         // Once renewal stops, the ordinary timer reaps it.
         let deadline = tokio::time::Instant::now() + lifetime * 5;

@@ -368,10 +368,7 @@ impl IngressRegistry {
 
     pub(crate) fn renew_bind(&self, anchor: u64, session: u64, timeout: std::time::Duration) {
         if let Some(mut bind) = self.binds.get_mut(&(anchor, session)) {
-            let now = tokio::time::Instant::now();
-            if bind.expires > now {
-                bind.expires = crate::streaming::anchor::deadline_after(timeout);
-            }
+            crate::streaming::deadline::renew_if_live(&mut bind.expires, timeout);
         }
     }
 

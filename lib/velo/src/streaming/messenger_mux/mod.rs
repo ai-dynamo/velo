@@ -645,7 +645,7 @@ fn open_bind(
         .insert((anchor_id, session_id), Arc::clone(&drain));
     // One deadline, stored with the bind and queued below. Renewal moves the
     // stored one; the queued one only says when to look again.
-    let expires = crate::streaming::anchor::deadline_after(core.accept_window);
+    let expires = crate::streaming::deadline::deadline_after(core.accept_window);
     core.ingress
         .register_bind(anchor_id, session_id, frame_tx, drain, lane, expires);
 

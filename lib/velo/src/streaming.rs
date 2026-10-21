@@ -26,6 +26,7 @@
 
 pub mod anchor;
 pub mod control;
+pub(crate) mod deadline;
 pub mod frame;
 #[cfg(feature = "grpc")]
 pub mod grpc_transport;

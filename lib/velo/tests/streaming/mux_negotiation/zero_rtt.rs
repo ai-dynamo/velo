@@ -1021,7 +1021,7 @@ async fn a_finished_zero_rtt_stream_leaves_no_task_behind() {
     }
     drop(anchors);
 
-    // Far inside the 60 s window: a per-bind timer still holds its task here.
+    // Far inside the 180 s window: a per-bind timer still holds its task here.
     let settled = tokio::time::timeout(Duration::from_secs(2), async {
         while alive() > base + STREAMS / 20 {
             tokio::time::sleep(Duration::from_millis(50)).await;
