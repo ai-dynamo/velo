@@ -270,8 +270,12 @@ pub struct StreamSender<T> {
     /// The manager's unattached deadlines. Paired with `local_registry` on
     /// the same-worker detach path.
     deadline_queue: Option<Arc<crate::streaming::anchor::AnchorDeadlineQueue>>,
-    /// User-facing cancellation signal: fires when _stream_cancel is received.
+    /// The stream token: fires when _stream_cancel is received. Only
+    /// `SenderEntry::cancel` cancels it.
     cancel_token: CancellationToken,
+    /// A child of `cancel_token`, handed out by `cancellation_token`. A
+    /// caller that cancels it cancels only the observer.
+    observer: CancellationToken,
     /// Checked per record instead of the token, which takes a lock.
     closed: crate::streaming::control::SenderClosed,
     stop_token: CancellationToken,
@@ -364,6 +368,7 @@ impl<T: Serialize> StreamSender<T> {
             sent_terminal: false,
             local_registry: negotiated_transport.is_none().then_some(registry),
             deadline_queue,
+            observer: cancel_token.child_token(),
             cancel_token,
             closed,
             retires_on,
@@ -414,9 +419,11 @@ impl<T: Serialize> StreamSender<T> {
     /// Also fires for ticket opens, including an idle producer whose slot closes.
     ///
     /// The token only observes the stream: cancelling it does not stop the
-    /// sender. To end the stream, finalize, detach, or drop the sender.
+    /// sender. To end the stream, finalize, detach, or drop the sender. Every
+    /// call returns a clone of one observer token, made with the sender, so a
+    /// call costs a clone.
     pub fn cancellation_token(&self) -> CancellationToken {
-        self.cancel_token.child_token()
+        self.observer.clone()
     }
 
     /// Fires when the consumer requests graceful stop or cancels the stream.
@@ -1300,28 +1307,29 @@ mod tests {
         let (tx, rx) = flume::bounded::<Vec<u8>>(256);
         let handle = StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 1);
         let (sender, registry) = make_sender_with_registry(tx, handle, 7);
-        let observer = sender.cancellation_token();
-        observer.cancel();
+        sender.cancellation_token().cancel();
         tokio::task::yield_now().await;
         sender.send(42).await.expect("the stream is not cancelled");
         assert_eq!(rx.len(), 1);
-        assert!(!sender.cancellation_token().is_cancelled());
-
-        let watching = sender.cancellation_token();
         registry.cancel(7);
-        assert!(
-            watching.is_cancelled(),
-            "a registry cancel fires the observer"
-        );
         assert!(matches!(
             sender.send(43).await,
             Err(SendError::ChannelClosed)
         ));
     }
 
-    // -----------------------------------------------------------------------
-    // Test 10: cancellation_token() returns a cloneable token
-    // -----------------------------------------------------------------------
+    /// A registry cancel fires the observer token, whenever it was taken.
+    #[tokio::test]
+    async fn a_registry_cancel_fires_the_observer_token() {
+        let (tx, _rx) = flume::bounded::<Vec<u8>>(256);
+        let handle = StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 1);
+        let (sender, registry) = make_sender_with_registry(tx, handle, 7);
+        let early = sender.cancellation_token();
+        assert!(!early.is_cancelled());
+        registry.cancel(7);
+        assert!(early.is_cancelled());
+        assert!(sender.cancellation_token().is_cancelled());
+    }
 
     #[test]
     fn test_cancellation_token() {

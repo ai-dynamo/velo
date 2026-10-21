@@ -62,6 +62,9 @@ pub struct MpscStreamSender<T> {
     sent_terminal: bool,
     mpsc_registry: Arc<DashMap<u64, MpscAnchorEntry>>,
     cancel_token: CancellationToken,
+    /// A child of `cancel_token`, handed out by `cancellation_token`. A
+    /// caller that cancels it cancels only the observer.
+    observer: CancellationToken,
     /// Checked per record instead of the token, which takes a lock.
     closed: crate::streaming::control::SenderClosed,
     /// The largest encoded item the transport carries in one frame, if it
@@ -130,6 +133,7 @@ impl<T: Serialize> MpscStreamSender<T> {
             runtime: tokio::runtime::Handle::current(),
             sent_terminal: false,
             mpsc_registry,
+            observer: cancel_token.child_token(),
             cancel_token,
             closed,
             item_limit,
@@ -149,9 +153,11 @@ impl<T: Serialize> MpscStreamSender<T> {
     /// stream (`MpscStreamController::cancel`).
     ///
     /// The token only observes the stream: cancelling it does not stop the
-    /// sender. To end the stream, finalize, detach, or drop the sender.
+    /// sender. To end the stream, finalize, detach, or drop the sender. Every
+    /// call returns a clone of one observer token, made with the sender, so a
+    /// call costs a clone.
     pub fn cancellation_token(&self) -> CancellationToken {
-        self.cancel_token.child_token()
+        self.observer.clone()
     }
 
     /// Await `send`, giving up when the consumer cancels the stream.
