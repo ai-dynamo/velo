@@ -115,7 +115,7 @@ mod test_support;
 mod tests;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
@@ -223,9 +223,9 @@ struct MuxCore {
     /// A requeued entry lands behind newer binds, so this is a heap and not a
     /// FIFO queue.
     bind_deadlines: std::sync::Mutex<std::collections::BinaryHeap<BindDeadline>>,
-    /// The accept window of every bind, attach or pre-bind, in nanoseconds,
-    /// saturating at 584 years.
-    reservation_timeout_ns: AtomicU64,
+    /// The accept window of every bind, attach or pre-bind
+    /// (`ReservationConfig::prebind_timeout`).
+    accept_window: Duration,
     /// A barrier handed to every batcher this core spawns, installed by the
     /// tests that need one held mid-wake. See [`peer_batcher::test_hooks`].
     #[cfg(test)]
@@ -241,17 +241,10 @@ struct MuxCore {
 }
 
 impl MessengerMuxTransport {
-    pub(crate) fn set_reservation_timeout(&self, timeout: Duration) {
-        self.core.reservation_timeout_ns.store(
-            u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX),
-            Ordering::Relaxed,
-        );
-    }
-
     pub(crate) fn renew_reservation(&self, anchor: u64, session: u64) {
         self.core
             .ingress
-            .renew_bind(anchor, session, self.core.reservation_timeout());
+            .renew_bind(anchor, session, self.core.accept_window);
     }
 
     /// Ask the sender of a claimed slot to stop, through the batcher of the
@@ -312,6 +305,7 @@ impl MessengerMuxTransport {
         messenger: Arc<Messenger>,
         config: MuxConfig,
         metrics: Option<Arc<VeloMetrics>>,
+        accept_window: Duration,
     ) -> Result<Arc<Self>> {
         let limits = NegotiatedLimits::from_wire(config.initial_credit, config.slot_byte_budget)
             .map_err(|error| anyhow!("messenger mux: {error}"))?;
@@ -343,9 +337,7 @@ impl MessengerMuxTransport {
             drain_rx,
             drains: DashMap::new(),
             bind_deadlines: std::sync::Mutex::default(),
-            reservation_timeout_ns: AtomicU64::new(
-                crate::streaming::anchor::DEFAULT_PREBIND_TIMEOUT.as_nanos() as u64,
-            ),
+            accept_window,
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
             #[cfg(test)]
@@ -387,10 +379,6 @@ impl MessengerMuxTransport {
 }
 
 impl MuxCore {
-    fn reservation_timeout(&self) -> Duration {
-        Duration::from_nanos(self.reservation_timeout_ns.load(Ordering::Relaxed))
-    }
-
     /// Hand one decoded batch to the ingress lane and act on what it produced.
     ///
     /// Everything the batch produced goes back through the batcher for the
@@ -657,7 +645,7 @@ fn open_bind(
         .insert((anchor_id, session_id), Arc::clone(&drain));
     // One deadline, stored with the bind and queued below. Renewal moves the
     // stored one; the queued one only says when to look again.
-    let expires = crate::streaming::anchor::deadline_after(core.reservation_timeout());
+    let expires = crate::streaming::anchor::deadline_after(core.accept_window);
     core.ingress
         .register_bind(anchor_id, session_id, frame_tx, drain, lane, expires);
 

@@ -75,6 +75,9 @@ pub(crate) const MAX_INGRESS_SLOTS_PER_PEER: usize = 1 << 16;
 
 /// A `bind()` waiting for the `OpenSlot` that will claim it.
 struct BindEntry {
+    /// When the accept window closes. This is the deadline that counts:
+    /// renewal moves it, and the entry in `MuxCore::bind_deadlines` only says
+    /// when the sweep reads it again.
     expires: tokio::time::Instant,
     /// The mux-owned `C + 1` buffer whose receiver went to the anchor.
     frame_tx: flume::Sender<Vec<u8>>,

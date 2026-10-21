@@ -305,7 +305,7 @@ impl MessengerMuxTransport {
     pub(crate) fn expire_all_binds(&self) {
         self.core.expire_binds(
             tokio::time::Instant::now()
-                + self.core.reservation_timeout()
+                + self.core.accept_window
                 + std::time::Duration::from_secs(1),
         );
     }

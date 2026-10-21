@@ -133,7 +133,7 @@ Ticket senders support `stop_token()` and `cancellation_token()` through messeng
 
 ## Reservation renewal
 
-`VeloBuilder::reservation_config` sets the default unattached lifetime (120 seconds) and the accept window of the messenger mux (180 seconds). The accept window applies to every mux bind: a prepared slot and an ordinary attach. Per-anchor `AnchorConfig::unattached_timeout` overrides the ordinary lifetime. To make anchors wait for a sender with no limit, set `unattached_timeout` to `Duration::MAX`.
+`VeloBuilder::reservation_config` sets the default unattached lifetime (120 seconds) and the accept window of the messenger mux (180 seconds). The accept window applies to every mux bind: a prepared slot and an ordinary attach. Per-anchor `AnchorConfig::unattached_timeout` overrides the ordinary lifetime. The unattached default applies to SPSC anchors only. An MPSC anchor has an unattached timeout only when `MpscAnchorConfig::unattached_timeout` sets one, and renewal does not extend it. To make anchors wait for a sender with no limit, set `unattached_timeout` to `Duration::MAX`.
 
 `ReservationConfig` is `#[non_exhaustive]`, so start from the default and change its fields:
 
@@ -142,7 +142,6 @@ let mut reservations = ReservationConfig::default();
 reservations.prebind_timeout = Duration::from_secs(600);
 let velo = Velo::builder().reservation_config(reservations).build().await?;
 ```
- These defaults apply to SPSC anchors only. An MPSC anchor has an unattached timeout only when `MpscAnchorConfig::unattached_timeout` sets one, and renewal does not extend it.
 
 Capture `AnchorReservation::new(handle, ticket.as_ref())` when a request takes responsibility for a reply. Keep the reservation while that request waits or executes before attachment. Periodically pass held reservations to `AnchorManager::renew_reservations`. The call groups them by owner and sends at most 256 entries per remote batch. It does not attach a producer. The application owns the collection, renewal cadence, and call deadline. Velo does not schedule renewal. Choose a cadence shorter than the reservation lifetime.
 

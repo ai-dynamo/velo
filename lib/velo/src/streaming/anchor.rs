@@ -17,7 +17,7 @@
 
 mod reservation;
 pub use reservation::{AnchorReservation, ReservationConfig};
-pub(crate) use reservation::{DEFAULT_PREBIND_TIMEOUT, DEFAULT_UNATTACHED_TIMEOUT, deadline_after};
+pub(crate) use reservation::{DEFAULT_UNATTACHED_TIMEOUT, deadline_after};
 
 use std::collections::HashMap;
 use std::pin::Pin;
@@ -164,6 +164,9 @@ pub(crate) struct AnchorEntry {
     /// Cancels the inactivity timeout task when a sender attaches.
     /// `None` if no timeout is configured for this anchor.
     pub timeout_cancel: Option<CancellationToken>,
+    /// When the unattached anchor expires. This is the deadline that counts:
+    /// renewal moves it, and the timeout task only wakes at its own deadline
+    /// to read this one and sleep again if it moved.
     pub(crate) expires: Option<tokio::time::Instant>,
 
     /// The configured unattached timeout for this anchor. Stored so that

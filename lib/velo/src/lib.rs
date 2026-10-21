@@ -488,8 +488,8 @@ impl VeloBuilder {
                 Arc::clone(&messenger),
                 config,
                 self.metrics.clone(),
+                self.reservation_config.prebind_timeout,
             )?;
-            mux.set_reservation_timeout(self.reservation_config.prebind_timeout);
             Some(mux)
         } else {
             None

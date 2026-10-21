@@ -83,11 +83,16 @@ async fn mux_pair(config: MuxConfig) -> Pair {
         Arc::clone(&m_consumer),
         config.clone(),
         Some(Arc::clone(&metrics)),
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .expect("consumer mux");
-    let producer =
-        MessengerMuxTransport::new(Arc::clone(&m_producer), config, Some(Arc::clone(&metrics)))
-            .expect("producer mux");
+    let producer = MessengerMuxTransport::new(
+        Arc::clone(&m_producer),
+        config,
+        Some(Arc::clone(&metrics)),
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("producer mux");
     let consumer_worker = m_consumer.instance_id().worker_id();
     let producer_worker = m_producer.instance_id().worker_id();
     Pair {
@@ -260,6 +265,7 @@ fn aborting_a_retiring_batchers_final_flush_stops_the_mux() {
                 ..MuxConfig::default()
             },
             None,
+            crate::streaming::ReservationConfig::default().prebind_timeout,
         )
         .unwrap();
         let hooks = Arc::new(TestHooks::default());
@@ -316,7 +322,13 @@ async fn a_batcher_dropped_by_stop_sending_leaves_slots_to_shutdown() {
     messenger
         .register_peer(velo_ext::PeerInfo::new(peer, stalling_address()))
         .unwrap();
-    let mux = MessengerMuxTransport::new(messenger, MuxConfig::default(), None).unwrap();
+    let mux = MessengerMuxTransport::new(
+        messenger,
+        MuxConfig::default(),
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .unwrap();
     let hooks = Arc::new(TestHooks::default());
     assert!(mux.core.hooks.set(hooks.clone()).is_ok());
     let receiver = mux.bind(1, 1).await.unwrap();
@@ -534,6 +546,7 @@ async fn a_zero_sweep_interval_is_refused_when_the_mux_is_built() {
             ..MuxConfig::default()
         },
         None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .err()
     .expect("a zero sweep interval cannot tick, so the build must say so");
@@ -549,6 +562,7 @@ async fn a_zero_sweep_interval_is_refused_when_the_mux_is_built() {
             ..MuxConfig::default()
         },
         None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .expect("the same messenger takes a mux with a positive interval");
 }
@@ -805,10 +819,20 @@ async fn a_remote_stream_preserves_send_order_under_a_slow_consumer() {
     let consumer_worker = m_consumer.instance_id().worker_id();
     let producer_worker = m_producer.instance_id().worker_id();
 
-    let mux_consumer =
-        MessengerMuxTransport::new(Arc::clone(&m_consumer), test_config(), None).expect("mux a");
-    let mux_producer =
-        MessengerMuxTransport::new(Arc::clone(&m_producer), test_config(), None).expect("mux b");
+    let mux_consumer = MessengerMuxTransport::new(
+        Arc::clone(&m_consumer),
+        test_config(),
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("mux a");
+    let mux_producer = MessengerMuxTransport::new(
+        Arc::clone(&m_producer),
+        test_config(),
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("mux b");
 
     let am_consumer = Arc::new(
         AnchorManagerBuilder::default()
@@ -933,6 +957,7 @@ async fn one_flush_reaches_every_peer_batcher() {
         Arc::clone(&producer_messenger),
         config.clone(),
         Some(Arc::clone(&metrics)),
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .expect("producer mux");
 
@@ -940,8 +965,13 @@ async fn one_flush_reaches_every_peer_batcher() {
     let mut senders = Vec::new();
     let mut consumer_muxes = Vec::new();
     for (peer, messenger) in consumers.iter().enumerate() {
-        let mux = MessengerMuxTransport::new(Arc::clone(messenger), config.clone(), None)
-            .expect("consumer mux");
+        let mux = MessengerMuxTransport::new(
+            Arc::clone(messenger),
+            config.clone(),
+            None,
+            crate::streaming::ReservationConfig::default().prebind_timeout,
+        )
+        .expect("consumer mux");
         let worker = messenger.instance_id().worker_id();
         for slot in 0..SLOTS_PER_PEER {
             let id = (peer as u64 + 1) * 100 + slot;
@@ -1046,10 +1076,16 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
         Arc::clone(&consumer_messenger),
         config.clone(),
         Some(Arc::clone(&consumer_metrics)),
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .expect("consumer mux");
-    let producer = MessengerMuxTransport::new(Arc::clone(&producer_messenger), config, None)
-        .expect("producer mux");
+    let producer = MessengerMuxTransport::new(
+        Arc::clone(&producer_messenger),
+        config,
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("producer mux");
 
     let rx = consumer.bind(1, 1).await.expect("bind");
     let tx = producer
@@ -1484,12 +1520,27 @@ async fn prebinding_node(
     config: MuxConfig,
     unattached_timeout: Option<Duration>,
 ) -> PrebindingNode {
+    prebinding_node_with_window(
+        config,
+        unattached_timeout,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .await
+}
+
+/// [`prebinding_node`] with the mux's accept window set.
+async fn prebinding_node_with_window(
+    config: MuxConfig,
+    unattached_timeout: Option<Duration>,
+    accept_window: Duration,
+) -> PrebindingNode {
     let messenger = Messenger::builder()
         .add_transport(tcp_transport())
         .build()
         .await
         .expect("messenger");
-    let mux = MessengerMuxTransport::new(Arc::clone(&messenger), config, None).expect("mux");
+    let mux = MessengerMuxTransport::new(Arc::clone(&messenger), config, None, accept_window)
+        .expect("mux");
     let mut builder = AnchorManagerBuilder::default()
         .worker_id(messenger.instance_id().worker_id())
         .transport(Arc::clone(&mux) as Arc<dyn crate::streaming::transport::FrameTransport>);
@@ -1937,8 +1988,7 @@ async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot(
 async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window() {
     tokio::time::pause();
     let heartbeat = Duration::from_secs(25);
-    let node = prebinding_node(test_config(), None).await;
-    node.mux.set_reservation_timeout(Duration::from_secs(60));
+    let node = prebinding_node_with_window(test_config(), None, Duration::from_secs(60)).await;
     let mut anchor = node.manager.create_anchor_with_config::<u32>(AnchorConfig {
         heartbeat_interval: Some(heartbeat),
         ..Default::default()
@@ -2010,7 +2060,7 @@ async fn an_unclaimed_prebind_closes_at_its_accept_window_and_not_before() {
         .expect("a mux is installed, so a ticket is minted");
 
     tokio::time::sleep(
-        crate::streaming::anchor::DEFAULT_PREBIND_TIMEOUT - Duration::from_millis(500),
+        crate::streaming::ReservationConfig::default().prebind_timeout - Duration::from_millis(500),
     )
     .await;
     assert!(
@@ -2919,8 +2969,7 @@ async fn a_removed_anchor_withdraws_its_feed() {
 #[tokio::test]
 async fn reservation_renewal_extends_one_deadline_without_reallocating_slots() {
     tokio::time::pause();
-    let node = prebinding_node(test_config(), None).await;
-    node.mux.set_reservation_timeout(Duration::from_secs(3));
+    let node = prebinding_node_with_window(test_config(), None, Duration::from_secs(3)).await;
     let anchor = node.manager.create_anchor::<u32>();
     let handle = anchor.handle();
     let ticket = node.manager.prebind_anchor(handle).expect("ticket");
@@ -2942,8 +2991,7 @@ async fn reservation_renewal_extends_one_deadline_without_reallocating_slots() {
 #[tokio::test]
 async fn a_reservation_for_another_session_does_not_renew_the_bind() {
     tokio::time::pause();
-    let node = prebinding_node(test_config(), None).await;
-    node.mux.set_reservation_timeout(Duration::from_secs(3));
+    let node = prebinding_node_with_window(test_config(), None, Duration::from_secs(3)).await;
     let anchor = node.manager.create_anchor::<u32>();
     let handle = anchor.handle();
     let ticket = node.manager.prebind_anchor(handle).expect("ticket");
@@ -2969,9 +3017,7 @@ async fn a_reservation_for_another_session_does_not_renew_the_bind() {
 #[tokio::test]
 async fn a_sub_millisecond_reservation_lifetime_is_not_truncated() {
     tokio::time::pause();
-    let node = prebinding_node(test_config(), None).await;
-    node.mux
-        .set_reservation_timeout(Duration::from_micros(1500));
+    let node = prebinding_node_with_window(test_config(), None, Duration::from_micros(1500)).await;
     let anchor = node.manager.create_anchor::<u32>();
     node.manager
         .prebind_anchor(anchor.handle())
@@ -2992,8 +3038,7 @@ async fn a_sub_millisecond_reservation_lifetime_is_not_truncated() {
 #[tokio::test]
 async fn an_oversized_reservation_lifetime_does_not_panic() {
     tokio::time::pause();
-    let node = prebinding_node(test_config(), None).await;
-    node.mux.set_reservation_timeout(Duration::MAX);
+    let node = prebinding_node_with_window(test_config(), None, Duration::MAX).await;
     let anchor = node.manager.create_anchor::<u32>();
     let handle = anchor.handle();
     let ticket = node.manager.prebind_anchor(handle).expect("ticket");
