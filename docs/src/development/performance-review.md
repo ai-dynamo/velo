@@ -118,10 +118,12 @@ fails. See rule 11 in [Measurement rules](../operations/benchmarking.md#measurem
 5. **Call a difference real only when the ranges do not overlap.** Report
    latency beside throughput.
 6. **Check the memory kept per operation.** Run each arm at N and at 4N
-   operations, and divide the RSS difference by 3N. A leak passes every
-   count and every timing: no extra allocation per operation, and no
-   extra time. It shows only as memory that grows with the operations
-   that ended.
+   operations, and divide the RSS difference by 3N. Growth is not yet a
+   leak. Tasks of streams that ended can pile up in a loop that never
+   yields, and glibc keeps freed pages. Read `num_alive_tasks()` and RSS
+   after `malloc_trim(0)` before you call it a leak. In
+   `anchor_setup_bench`, two tasks per stream grew RSS to 24 GB at 16M
+   lifecycles, and `malloc_trim(0)` gave it all back.
 7. **Label the result.** A number from a shared or dev machine is
    directional. A number for this book needs an exclusive node and the
    [Measurement rules](../operations/benchmarking.md#measurement-rules).

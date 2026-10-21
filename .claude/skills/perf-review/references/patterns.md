@@ -193,11 +193,12 @@ that pins it now.
 - **P25. State kept after an operation ends.** Memory that grows with the
   operations that ended, not with the ones that are live: a map entry, a
   queue entry, an `Arc` or a buffer that nothing removes when a stream,
-  request or connection ends. Cost: RSS without bound; about 1 KiB for
-  each finished stream in the anchor lifecycle (measure.md, section 6).
-  An allocation count per operation does not see it, because the
-  allocation is made once. Pin: run N operations, then assert that each
-  registry and queue is empty again; measure.md, section 6, for RSS.
+  request or connection ends. Cost: RSS without bound. An allocation
+  count per operation does not see it, because the allocation is made
+  once. RSS growth alone is not proof: rule out a task backlog (P13) and
+  allocator retention first (measure.md, section 6). Pin: run N
+  operations, then assert that each registry and queue is empty again,
+  and that `num_alive_tasks()` is back to its baseline after a yield.
 
 ## Pinning idioms (for the `pin` field)
 
