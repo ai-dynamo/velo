@@ -418,7 +418,6 @@ mod tests {
             cancel_token: CancellationToken::new(),
             active_pump_token: None,
             attachment: false,
-            timeout_cancel: None,
             expires: None,
             unattached_timeout: None,
             heartbeat_interval: std::time::Duration::from_secs(5),
@@ -509,7 +508,7 @@ mod tests {
             registry: Arc::new(dashmap::DashMap::new()),
             mpsc_registry: Arc::new(dashmap::DashMap::new()),
             metrics: None,
-            deadline_queue: None,
+            deadline_queue: crate::streaming::anchor::AnchorDeadlineQueue::new(),
         };
         ctx.registry.insert(1, entry());
 

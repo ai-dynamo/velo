@@ -59,10 +59,9 @@ pub(crate) struct StreamSenderCancelInfo {
     /// The largest encoded item the stream's transport carries, when it has
     /// a limit the producer should meet before the frame leaves.
     pub item_limit: Option<usize>,
-    /// The manager's shared deadline queue, when the unattached timeout is
-    /// tracked on it. `detach` pushes a deadline here instead of spawning a
-    /// per-anchor task, which is what lets a detach on a thread with no
-    /// runtime still arm the reaper.
+    /// The manager's unattached deadlines, for a sender on the anchor's own
+    /// worker. `detach` queues the re-armed deadline here. `None` for a
+    /// sender with no local anchor to re-arm.
     pub deadline_queue: Option<Arc<crate::streaming::anchor::AnchorDeadlineQueue>>,
 }
 
@@ -263,9 +262,8 @@ pub struct StreamSender<T> {
     sent_terminal: bool,
     /// Registry reference for clearing the attachment flag on detach.
     local_registry: Option<Arc<DashMap<u64, AnchorEntry>>>,
-    /// The manager's shared deadline queue, when the unattached timeout is
-    /// tracked on it. Paired with `local_registry` on the same-worker detach
-    /// path; `None` for a per-anchor-task manager.
+    /// The manager's unattached deadlines. Paired with `local_registry` on
+    /// the same-worker detach path.
     deadline_queue: Option<Arc<crate::streaming::anchor::AnchorDeadlineQueue>>,
     /// User-facing cancellation signal: fires when _stream_cancel is received.
     cancel_token: CancellationToken,
@@ -553,13 +551,14 @@ impl<T: Serialize> StreamSender<T> {
             // no runtime; the unattached timeout must still be armed.
             let _runtime = crate::streaming::tasks::enter_if_outside_runtime(&runtime);
             if let Some(registry) = registry
+                && let Some(queue) = deadline_queue
                 && let Some(mut entry) = registry.get_mut(&local_id)
                 && entry
                     .stream_cancel_handle
                     .is_some_and(|handle| handle.unpack() == (worker_id, sender_stream_id))
             {
                 entry.attachment = false;
-                entry.restart_unattached_timeout(&registry, local_id, deadline_queue.as_deref());
+                entry.restart_unattached_timeout(&registry, local_id, &queue);
             }
         })?;
         // Clean up sender registry entry

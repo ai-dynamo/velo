@@ -2970,7 +2970,6 @@ async fn a_removed_anchor_withdraws_its_feed() {
 /// is `None` while the anchor is pre-bound. See
 /// `anchor::tests::a_local_attach_clears_the_unattached_deadline`.
 #[tokio::test]
-#[ignore = "finding 9: prebind_anchor does not clear expires"]
 async fn a_prebind_clears_the_unattached_deadline() {
     tokio::time::pause();
     let node = prebinding_node(test_config(), Some(Duration::from_secs(120))).await;

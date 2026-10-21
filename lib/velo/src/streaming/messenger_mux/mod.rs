@@ -354,7 +354,7 @@ impl MessengerMuxTransport {
             drain_tx,
             drain_rx,
             drains: DashMap::new(),
-            bind_deadlines: DeadlineQueue::new(BIND_RECHECK),
+            bind_deadlines: DeadlineQueue::new(BIND_RECHECK, BIND_RECHECK),
             accept_window,
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),

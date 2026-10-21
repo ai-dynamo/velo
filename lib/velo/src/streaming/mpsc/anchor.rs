@@ -337,8 +337,7 @@ pub(crate) fn spawn_mpsc_timeout_task(
     let tc = parent_cancel.child_token();
     // The last sender can leave from a plain thread, or from a thread-local
     // destructor after tokio's own context is gone, where a bare
-    // `tokio::spawn` panics. The timer then does not fire, as for SPSC
-    // (`AnchorManager::spawn_timeout_task`).
+    // `tokio::spawn` panics. The timer then does not fire.
     let Ok(rt) = tokio::runtime::Handle::try_current() else {
         tracing::debug!(
             local_id,

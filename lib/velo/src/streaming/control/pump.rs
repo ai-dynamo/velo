@@ -269,7 +269,7 @@ pub(crate) async fn reader_pump(
                                 entry.restart_unattached_timeout(
                                     &registry,
                                     local_id,
-                                    deadline_queue.as_deref(),
+                                    &deadline_queue,
                                 );
                             }
                             break;
