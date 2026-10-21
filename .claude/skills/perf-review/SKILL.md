@@ -53,7 +53,10 @@ detached worktree at `HEAD_SHA`, made when first needed:
 `git worktree add --detach "$S/root" "$HEAD_SHA"`.
 
 Every agent prompt carries: the mode, `REVIEW_RANGE` or `AUDIT_PATH`,
-`BASE_SHA`, `HEAD_SHA`, `REVIEW_ROOT`, and the paths of the references.
+`BASE_SHA`, `HEAD_SHA`, `REVIEW_ROOT`, and the absolute paths of the
+references in this skill's own directory. `REVIEW_ROOT` may hold an older
+copy of this skill: agents read the references from the given paths, not
+from `REVIEW_ROOT/.claude/`.
 
 ## Ground rules (a violation invalidates the review)
 
@@ -150,7 +153,9 @@ at most 3. Drop a finder whose families cannot apply. Each finder:
   command is in patterns.md), and engages with any near its finding;
 - reports a **regression** when the diff added the cost, and an
   **opportunity** when the cost already exists in a touched function, or
-  one call away from it (its direct callers and callees). Before it
+  one call away from it (its direct callers and callees; for a trait impl
+  that a library drives, such as `Decoder::decode` under `Framed`, the
+  loop that drives the library counts as the caller). Before it
   reports an opportunity, it reads the not-a-lever list. The same pattern
   further away goes under "Related, out of scope" in the report, as one
   line.
@@ -193,7 +198,7 @@ chain of the code the pin guards, `delta` quotes the test change, and
 Start one verifier for each finder that returned anything (in inline mode,
 one verifier). In parallel, start one more verifier that checks every
 candidate the finder rated major or above, from scratch, without the
-first verdict. If the two disagree, the lower severity stands. That is at
+first verdict. This second verifier runs in inline mode too. If the two disagree, the lower severity stands. That is at
 most 4 verifiers per round. When every candidate can only be minor (a
 constant T2 cost, or inferred evidence only), skip this stage and report
 them as minor and unverified.
@@ -217,8 +222,10 @@ these questions in order. The first "no" decides.
    a lock-free CAS on tokio 1.54 (R21). For P24, judge the cost the pin
    guards against.
 4. **Size.** Cite an R-id, and compare with the budget in hot-paths.md.
-   Under 1% of the budget, with no lock, wake, syscall or timer, is minor
-   at most.
+   For a "new" pattern, under 1% of the budget with no lock, wake, syscall
+   or timer is minor at most. A match to a P-pattern or rule keeps the
+   severity below, because each one was measured large in its incident;
+   state the size anyway, so the reader sees when it is small.
 5. **Collision.** Would removing the cost break order, drain, credit, a
    SeqCst argument, or short-write safety? Does a comment at the site
    record a measured trade-off? A finding that ignores that comment is
@@ -280,7 +287,8 @@ nothing new, or after 3 rounds.
 ## Stage 4: measure (only when triggered)
 
 Measure when any of these holds:
-- `--measure` was given;
+- `--measure` was given (it still stops at the first evidence that
+  settles the question, unless the user asked for timing);
 - a major or blocker regression on a T1 path was confirmed by a verifier
   (not by a failing pin, which is already a count);
 - the diff claims a speedup.

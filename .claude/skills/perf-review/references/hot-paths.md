@@ -66,8 +66,9 @@ A file that is not compiled (docs, CI, scripts) has no tier. Check for
 - Connection loops: `TcpListener::handle_connection`
   (`transports/tcp/listener.rs`; `connection_teardown` runs once per
   connection), `handle_connection` (`transports/uds/listener.rs`),
-  `serve_stream` (`transports/quic/listener.rs`), `run_dialed_reader`
-  (`transports/ingress.rs`).
+  `serve_stream` (`transports/quic/listener.rs`). `run_dialed_reader`
+  (`transports/ingress.rs`) is T3: a dialed socket normally carries only
+  `ShuttingDown` replies.
 - `TcpFrameCodec::decode`, `maybe_shrink_read_buffer`
   (`transports/tcp/framing.rs`).
 - `route_frame`, `record_inbound_frame` (`transports/ingress.rs`).

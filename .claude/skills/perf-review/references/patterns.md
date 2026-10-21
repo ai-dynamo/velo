@@ -73,7 +73,9 @@ that pins it now.
   `to_owned` on header or payload bytes. Cost: an allocation plus a
   `memcpy` of O(size) (R6). Incident: the CLAUDE.md rule; the mux ingress
   copy. Pins: `body_range_indexes_the_payload_for_zero_copy_slicing`,
-  `get_pinned_returns_the_bytes_without_a_copy_out`.
+  `get_pinned_returns_the_bytes_without_a_copy_out`. The TCP codec has no
+  pin: `test_zero_copy_bytes_share_buffer` compares contents only, so a
+  copying `TcpFrameCodec::decode` passes CI.
 - **P2. A full decode to answer yes or no.** A serde decode per item only
   to classify it. Incident: 68f7d12 (`is_terminal_sentinel`). Pin:
   `classifying_an_item_does_not_allocate`.

@@ -22,7 +22,8 @@ into the book must follow docs/src/operations/benchmarking.md,
    question, or when the finding is about latency.
 
 When no example reaches the code, a scratch test or microbenchmark in the
-worktrees is fine. Report its result as ns or instructions per operation,
+worktrees is fine. Write it in `REVIEW_ROOT` only after every agent that
+reads it has finished. Report its result as ns or instructions per operation,
 and compare that with the budget in hot-paths.md, not as a percentage of
 the microbenchmark.
 
@@ -92,15 +93,16 @@ for arm in root base; do
   mkdir -p "$S/bin/$arm"
   cp "$S/target-$arm/release/examples/<harness>" "$S/bin/$arm/"
 done
-# Provenance: each binary names the source paths it was built from.
-strings "$S/bin/root/<harness>" | grep -c "$S/root/lib/velo/src"   # > 0
-strings "$S/bin/base/<harness>" | grep -c "$S/base/lib/velo/src"   # > 0
+# Provenance: each binary names the tree it was built from.
+strings "$S/bin/root/<harness>" | grep -c "$S/root/"   # > 0
+strings "$S/bin/root/<harness>" | grep -c "$S/base/"   # 0
 ```
 
 - A test run in Stage 0 step 6 uses the same layout: `CARGO_TARGET_DIR`
   is `$S/target-root` for `REVIEW_ROOT`, and `$S/target-base` for a base
-  rerun. Check that the build log shows `Compiling velo (<that tree>)`,
-  or check the binary with `strings` as above.
+  rerun. Check that the build log shows `Compiling velo (<that tree>)`.
+  A lib-test binary is built from relative source paths, so grep it for
+  the tree's root (`$S/root/`), not for `lib/velo/src`.
 - Each arm builds its dependencies once. To save that time, you may seed
   an arm's target directory with `cp -a` of a warm one. Then run
   `find "$S/<arm>" -name '*.rs' -exec touch {} +` before you build, so
@@ -116,9 +118,10 @@ strings "$S/bin/base/<harness>" | grep -c "$S/base/lib/velo/src"   # > 0
 
 ## 4. Run the arms interleaved
 
-- Record `nproc`, `uptime`, both SHAs and the exact flags (rule 9). If the
-  one-minute load is above about a tenth of the cores, the run is noisy:
-  prefer a count or instructions, and say so in the report.
+- Record `nproc`, `uptime`, both SHAs and the exact flags (rule 9). Start
+  timing only after your own builds finish and the load falls. If the
+  one-minute load is still above about a tenth of the cores, the run is
+  noisy: prefer a count or instructions, and say so in the report.
 - Pin both arms to the same cores with `taskset -c <list>`. On a CPU with
   two core types (`ls /sys/devices/ | grep cpu_`), use one type only.
   `perf stat` then prints one line per type (`cpu_core`, `cpu_atom`): sum
