@@ -138,8 +138,7 @@ type AnchorDeadline = std::cmp::Reverse<(tokio::time::Instant, u64)>;
 
 /// The shared deadline queue a [`AnchorManager`] sweeps on one task instead
 /// of spawning a per-anchor timeout task. `None` when the manager was built
-/// on no runtime (or for a per-anchor mode); anchors then fall back to a
-/// per-anchor task, exactly as before.
+/// on no runtime; anchors then fall back to a per-anchor task.
 pub(crate) struct AnchorDeadlineQueue {
     deadlines: std::sync::Mutex<BinaryHeap<AnchorDeadline>>,
     /// Signalled by `push` when the new entry is earlier than everything
@@ -1112,24 +1111,6 @@ impl StreamAnchor<Bytes> {
 // AnchorManager
 // ---------------------------------------------------------------------------
 
-/// How an unattached anchor's inactivity deadline is tracked.
-///
-/// Both modes enforce the same deadline ([`AnchorEntry::expires`]); they
-/// differ only in the wake mechanism, so the choice is a cost trade, not a
-/// behaviour change.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AnchorTimeoutMode {
-    /// One shared deadline queue swept by a single task per
-    /// [`AnchorManager`]. The default: a stream's setup no longer spawns a
-    /// timer task that lives until attach.
-    #[default]
-    Queue,
-    /// One `tokio` task per unattached anchor, the pre-queue behaviour. Kept
-    /// for the response-plane A/B that measures the per-anchor timer's cost;
-    /// not a supported long-term configuration.
-    TaskPerAnchor,
-}
-
 /// Central registry that creates and tracks streaming anchors.
 ///
 /// `worker_id` is stamped into every [`StreamAnchorHandle`] so that remote
@@ -1188,8 +1169,7 @@ pub struct AnchorManager {
     /// Default inactivity timeout for newly created SPSC anchors. MPSC
     /// anchors do not inherit it; see [`crate::streaming::mpsc::MpscAnchorConfig`].
     /// The anchor is auto-removed if no sender attaches within this duration:
-    /// the shared deadline queue reaps it, or a per-anchor task does under
-    /// [`AnchorTimeoutMode::TaskPerAnchor`]. Per-anchor overrides
+    /// the shared deadline queue reaps it. Per-anchor overrides
     /// are supported via [`AnchorConfig::unattached_timeout`] +
     /// [`AnchorManager::create_anchor_with_config`].
     /// `Duration::MAX` means anchors never time out.
@@ -1259,13 +1239,8 @@ pub struct AnchorManager {
     #[builder(setter(skip), default = "std::sync::OnceLock::new()")]
     mux: std::sync::OnceLock<Arc<crate::streaming::messenger_mux::MessengerMuxTransport>>,
 
-    /// How unattached-anchor deadlines are woken. See [`AnchorTimeoutMode`].
-    #[builder(default)]
-    pub(crate) timeout_mode: AnchorTimeoutMode,
-
-    /// The shared deadline queue, present iff `timeout_mode` is
-    /// [`AnchorTimeoutMode::Queue`] and the manager was built on a tokio
-    /// runtime. Built and swept in [`AnchorManagerBuilder::build`].
+    /// The shared deadline queue, present when the manager was built on a
+    /// tokio runtime. Built and swept in [`AnchorManagerBuilder::build`].
     #[builder(setter(skip), default)]
     pub(crate) deadline_queue: Option<Arc<AnchorDeadlineQueue>>,
 }
@@ -1274,17 +1249,7 @@ impl AnchorManagerBuilder {
     /// Build the [`AnchorManager`].
     pub fn build(self) -> Result<AnchorManager, AnchorManagerBuilderError> {
         let mut manager = self.build_inner()?;
-        // The shared queue is the default. `VELO_ANCHOR_TIMEOUT=task` selects
-        // the pre-queue per-anchor task so the response-plane A/B can measure
-        // the per-anchor timer's cost; that knob is removed with the mode.
-        if manager.timeout_mode == AnchorTimeoutMode::Queue
-            && std::env::var_os("VELO_ANCHOR_TIMEOUT").is_some_and(|v| v == "task")
-        {
-            manager.timeout_mode = AnchorTimeoutMode::TaskPerAnchor;
-        }
-        if manager.timeout_mode == AnchorTimeoutMode::Queue
-            && let Ok(rt) = tokio::runtime::Handle::try_current()
-        {
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
             let queue = AnchorDeadlineQueue::new();
             rt.spawn(AnchorManager::run_deadline_sweep(
                 Arc::clone(&queue),
@@ -1505,8 +1470,8 @@ impl AnchorManager {
         // Spawn timeout task if configured — derive child from the anchor's parent token
         // so that finalize/remove auto-cancels it.
         let expires = unattached_timeout.map(deadline_after);
-        // Queue mode pushes a wake hint after the entry is in the registry;
-        // task mode spawns the per-anchor timer here.
+        // With a queue, push a wake hint after the entry is in the registry.
+        // Without one (built on no runtime), spawn the per-anchor timer here.
         let timeout_cancel = match (&self.deadline_queue, expires) {
             (Some(_), _) | (None, None) => None,
             (None, Some(expires)) => Some(Self::spawn_timeout_task(
@@ -4170,7 +4135,7 @@ mod tests {
             .build()
             .expect("builder should succeed");
 
-        // Queue mode is the default; the shared queue, not a per-anchor task.
+        // Built on a runtime: the shared queue, not a per-anchor task.
         assert!(
             mgr.deadline_queue().is_some(),
             "queue mode must arm the shared sweep"
@@ -4196,48 +4161,6 @@ mod tests {
         assert!(
             !mgr.registry.contains_key(&local_id),
             "the sweep must remove the anchor once its deadline passes"
-        );
-    }
-
-    #[tokio::test]
-    async fn test_task_mode_keeps_per_anchor_task() {
-        tokio::time::pause();
-        // Safety: the test is single-threaded about this var; the sweep build
-        // reads it once. Scoped and restored below.
-        unsafe { std::env::set_var("VELO_ANCHOR_TIMEOUT", "task") };
-
-        let worker_id = velo_ext::WorkerId::from_u64(42);
-        let transport: Arc<dyn crate::streaming::transport::FrameTransport> =
-            Arc::new(MockTransport);
-        let mgr = AnchorManagerBuilder::default()
-            .worker_id(worker_id)
-            .transport(transport)
-            .default_unattached_timeout(std::time::Duration::from_secs(1))
-            .build()
-            .expect("builder should succeed");
-        unsafe { std::env::remove_var("VELO_ANCHOR_TIMEOUT") };
-
-        assert!(
-            mgr.deadline_queue().is_none(),
-            "task mode must not arm the shared sweep"
-        );
-
-        let anchor = mgr.create_anchor::<u32>();
-        let (_, local_id) = anchor.handle().unpack();
-        assert!(
-            mgr.registry
-                .get(&local_id)
-                .unwrap()
-                .timeout_cancel
-                .is_some(),
-            "task mode must spawn a per-anchor timeout task"
-        );
-
-        tokio::time::advance(std::time::Duration::from_secs(2)).await;
-        tokio::task::yield_now().await;
-        assert!(
-            !mgr.registry.contains_key(&local_id),
-            "the per-anchor task must remove the anchor once its deadline passes"
         );
     }
 

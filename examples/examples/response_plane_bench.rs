@@ -159,10 +159,8 @@ struct Args {
     #[arg(long, value_enum, default_value_t = TransportType::Tcp)]
     transport: TransportType,
 
-    /// Unattached-anchor timeout, in milliseconds. The response-plane A/B for
-    /// the shared deadline queue holds this small so the timer's cost is
-    /// exercisable at load; pair with `VELO_ANCHOR_TIMEOUT=task` to measure
-    /// the per-anchor timer against the shared queue.
+    /// Unattached-anchor timeout, in milliseconds. Hold it small to make
+    /// unattached timeouts fire at load.
     #[arg(long)]
     unattached_timeout_ms: Option<u64>,
 }
