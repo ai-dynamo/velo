@@ -48,3 +48,4 @@
 
 - [Glossary](appendix/glossary.md)
 - [Metrics reference](appendix/metrics.md)
+- [Known limitations](appendix/limitations.md)

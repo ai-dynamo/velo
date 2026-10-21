@@ -167,7 +167,7 @@ pub enum Retirement {
     /// `RendezvousStager::with_threshold`, 256 KiB by default, or less on a
     /// transport with a smaller frame limit) is staged on
     /// this node until the consumer pulls it, so `Sent` can resolve while
-    /// this node still holds it; `LIMITATIONS.md` in the repository says
+    /// this node still holds it; the "Known limitations" appendix of the book says
     /// what that means for a shutdown. On the same worker, the terminal is in
     /// the anchor's channel. On a per-stream
     /// transport of this crate that the `Velo` builder installed, the
@@ -192,7 +192,7 @@ pub enum Retirement {
     /// crate: the pump's write failed, the connection ended first, or the
     /// gRPC server did not take the stream. A per-stream TCP pump cannot see
     /// a consumer that left before it writes, so there `Sent` stands
-    /// (`LIMITATIONS.md` in the repository).
+    /// (the "Known limitations" appendix of the book).
     Discarded,
 }
 
