@@ -59,6 +59,10 @@ pub(crate) struct StreamSenderCancelInfo {
     /// The largest encoded item the stream's transport carries, when it has
     /// a limit the producer should meet before the frame leaves.
     pub item_limit: Option<usize>,
+    /// The manager's unattached deadlines, for a sender on the anchor's own
+    /// worker. `detach` queues the re-armed deadline here. `None` for a
+    /// sender with no local anchor to re-arm.
+    pub deadline_queue: Option<Arc<crate::streaming::anchor::AnchorDeadlineQueue>>,
 }
 
 /// Who reports a stream's retirement when its terminal is handed to the
@@ -258,6 +262,9 @@ pub struct StreamSender<T> {
     sent_terminal: bool,
     /// Registry reference for clearing the attachment flag on detach.
     local_registry: Option<Arc<DashMap<u64, AnchorEntry>>>,
+    /// The manager's unattached deadlines. Paired with `local_registry` on
+    /// the same-worker detach path.
+    deadline_queue: Option<Arc<crate::streaming::anchor::AnchorDeadlineQueue>>,
     /// User-facing cancellation signal: fires when _stream_cancel is received.
     cancel_token: CancellationToken,
     /// Checked per record instead of the token, which takes a lock.
@@ -327,6 +334,7 @@ impl<T: Serialize> StreamSender<T> {
             closed,
             retires_on,
             item_limit,
+            deadline_queue,
         } = cancel;
         let stop_token = sender_registry
             .senders
@@ -370,6 +378,7 @@ impl<T: Serialize> StreamSender<T> {
             stop_token,
             sent_terminal: false,
             local_registry: negotiated_transport.is_none().then_some(registry),
+            deadline_queue,
             cancel_token,
             closed,
             retires_on,
@@ -532,6 +541,7 @@ impl<T: Serialize> StreamSender<T> {
         let bytes = cached_detached().clone();
         self.sent_terminal = true;
         let registry = self.local_registry.clone();
+        let deadline_queue = self.deadline_queue.clone();
         let (worker_id, local_id) = self.handle.unpack();
         let sender_stream_id = self.sender_stream_id;
         let runtime = self.runtime.clone();
@@ -541,13 +551,14 @@ impl<T: Serialize> StreamSender<T> {
             // no runtime; the unattached timeout must still be armed.
             let _runtime = crate::streaming::tasks::enter_if_outside_runtime(&runtime);
             if let Some(registry) = registry
+                && let Some(queue) = deadline_queue
                 && let Some(mut entry) = registry.get_mut(&local_id)
                 && entry
                     .stream_cancel_handle
                     .is_some_and(|handle| handle.unpack() == (worker_id, sender_stream_id))
             {
                 entry.attachment = false;
-                entry.restart_unattached_timeout(&registry, local_id);
+                entry.restart_unattached_timeout(&registry, local_id, &queue);
             }
         })?;
         // Clean up sender registry entry
@@ -862,6 +873,7 @@ mod tests {
                 closed: Default::default(),
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
+                deadline_queue: None,
             },
             Duration::from_secs(5),
             None,
@@ -903,6 +915,7 @@ mod tests {
                 closed,
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
+                deadline_queue: None,
             },
             Duration::from_secs(5),
             None,
@@ -1154,6 +1167,7 @@ mod tests {
                 closed: Default::default(),
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
+                deadline_queue: None,
             },
             Duration::from_secs(5),
             None,
@@ -1199,6 +1213,7 @@ mod tests {
                 closed: Default::default(),
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
+                deadline_queue: None,
             },
             Duration::from_secs(5),
             None,

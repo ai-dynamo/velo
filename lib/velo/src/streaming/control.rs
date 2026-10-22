@@ -532,6 +532,7 @@ pub(crate) fn anchor_attach_handler(manager: Weak<AnchorManager>) -> crate::mess
 
                             // Mark as attached and store cancel handle for upstream cancel routing
                             entry.attachment = true;
+                            entry.pause_unattached_timeout();
                             entry.stream_cancel_handle = Some(req.stream_cancel_handle);
                             if entry.stop_requested {
                                 request_sender_stop(
@@ -686,11 +687,14 @@ pub(crate) fn anchor_detach_handler(manager: Weak<AnchorManager>) -> crate::mess
                         // genuinely unattached again.
                         let released = entry.prebind.take();
                         // Called under the `Entry::Occupied` guard held
-                        // above: safe now that `spawn_timeout_task` guards
-                        // its own `tokio::spawn` — the call never runs
-                        // synchronously and never touches this registry, so
-                        // there is nothing here for it to deadlock against.
-                        entry.restart_unattached_timeout(&manager.registry, local_id);
+                        // above. That is safe: the push takes only the queue
+                        // lock, and the sweep reads `expires` after this
+                        // guard is gone.
+                        entry.restart_unattached_timeout(
+                            &manager.registry,
+                            local_id,
+                            &manager.deadline_queue,
+                        );
                         // Take the child token (leaves None) so the next attach creates a fresh one,
                         // cancel it and withdraw the feed here, before the shard lock drops and
                         // before the `released_prebind` below is dropped. Retiring first is
@@ -791,7 +795,11 @@ pub(crate) fn anchor_abort_attach_handler(
                     let feed = entry.feed.current();
                     entry.retire_pump();
                     let prebind = entry.prebind.take();
-                    entry.restart_unattached_timeout(&manager.registry, local_id);
+                    entry.restart_unattached_timeout(
+                        &manager.registry,
+                        local_id,
+                        &manager.deadline_queue,
+                    );
                     (feed, prebind)
                 };
                 // Mux release enters other locks. Release the anchor guard first.

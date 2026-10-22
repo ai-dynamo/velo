@@ -1,6 +1,6 @@
 # Benchmarking
 
-Use this chapter to measure the streaming response plane. It describes the three in-repo harnesses, the external serving rig, and the measurement rules that earlier mistakes made necessary. [Response plane performance](response-plane-performance.md) has the results. To compare two commits on one machine, see [Review for performance](../development/performance-review.md#compare-two-commits-on-one-machine).
+Use this chapter to measure the streaming response plane. It describes the four in-repo harnesses, the external serving rig, and the measurement rules that earlier mistakes made necessary. [Response plane performance](response-plane-performance.md) has the results. To compare two commits on one machine, see [Review for performance](../development/performance-review.md#compare-two-commits-on-one-machine).
 
 ## Select the harness
 
@@ -9,6 +9,7 @@ Use this chapter to measure the streaming response plane. It describes the three
 | `batched_streaming` | Show that the mux batches, and compare flush policies. | Tokens per wire write, per engine and in total. |
 | `response_plane_bench` | Compare two configurations of velo under load, in one process. | TTFT and inter-token latency percentiles, requests per second, tokens per write, process CPU. |
 | `stream_lifecycle` | Measure what a producer pays to learn that a stream's output left its node. | Streams per second, active messages per stream from each side, how long the producer holds each stream after `finalize`. |
+| `anchor_setup_bench` | Measure the anchor path alone: create, attach on the same worker, finish. | Create time, tasks and RSS held by unattached anchors; streams per second and latency percentiles of a full anchor lifecycle. |
 | External serving rig | Compare velo with another response plane inside a real serving stack. | Client TTFT, ITL and end-to-end latency, throughput, frontend CPU per request, errors. |
 
 The first two in-repo harnesses model the same serving shape. Anchor hosts stand in for frontends and own one response stream per request. Engines run continuous batching: each forward pass puts exactly one token on each active request's stream. Request dispatch is an in-process channel. The response path is real: anchors live on different workers from the engines, so every attach and every token crosses a loopback TCP socket.
@@ -113,6 +114,26 @@ cargo build --release --example stream_lifecycle
 On Linux, use `perf stat -e instructions` instead of `/usr/bin/time -l`. [Batched streaming](../concepts/batched-streaming.md#retirement) has the results for the mux.
 
 On the per-stream path (`--path per-stream`), keep `--streams` to a few thousand and leave time between runs: each stream opens a connection, and the ephemeral ports run out. Provisional, on the same laptop and under the same conditions as the mux table, with `--streams 4000 --warmup 400`, the two modes interleaved, median of five: `plain` 525,586 instructions per stream (520,910 to 526,380) and `retired` 527,360 (526,161 to 529,770). The spreads overlap, so awaiting `retired()` costs nothing this run can resolve; the pump reports the retirement in both modes, and most of each figure is the connection each stream opens. The producer holds a stream for about 130 µs p50 and 500 µs p99 after `finalize` while it waits for the write. To be confirmed on dedicated hardware.
+
+## Run anchor_setup_bench
+
+Run all commands from the `examples/` directory. The harness has no network and no mux, so its numbers show the cost of the anchor path only. It runs two phases, each on its own runtime and manager:
+
+1. Create `--held` SPSC anchors and hold them unattached. The harness reports the create time of each anchor, and the tokio tasks and the RSS that they add.
+2. Run `--tasks` concurrent tasks. Each task runs `--streams` lifecycles: create an anchor, attach a sender on the same worker, finalize, and read the terminal. The harness reports streams per second and the p50, p99 and p99.9 of one lifecycle.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--threads` | 8 | Tokio worker threads. |
+| `--tasks` | 64 | Concurrent lifecycle tasks. |
+| `--streams` | 20,000 | Lifecycles in each task. |
+| `--held` | 200,000 | Unattached anchors in the first phase. |
+
+```bash
+cargo run --release --example anchor_setup_bench
+```
+
+To compare two builds, run each build three times or more, interleave the runs, and take the median. The tail of the lifecycle depends on the thread count: a lock that every create takes shows at 8 threads and not at 1 or 2. [Response plane performance](response-plane-performance.md) has the results for the unattached timeout.
 
 ## The external serving rig
 

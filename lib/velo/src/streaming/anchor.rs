@@ -16,7 +16,7 @@
 //!   cancellations are no-ops.
 
 mod reservation;
-use crate::streaming::deadline::deadline_after;
+use crate::streaming::deadline::{DeadlineQueue, deadline_after};
 use reservation::DEFAULT_UNATTACHED_TIMEOUT;
 pub use reservation::{AnchorReservation, ReservationConfig};
 
@@ -48,6 +48,8 @@ pub(crate) struct AnchorContext {
     pub registry: Arc<DashMap<u64, AnchorEntry>>,
     pub mpsc_registry: Arc<DashMap<u64, crate::streaming::mpsc::anchor::MpscAnchorEntry>>,
     pub metrics: Option<Arc<VeloMetrics>>,
+    /// The manager's unattached deadlines. A detach queues one here.
+    pub deadline_queue: Arc<AnchorDeadlineQueue>,
 }
 
 // ---------------------------------------------------------------------------
@@ -118,6 +120,350 @@ pub struct AnchorConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Anchor deadline queue
+// ---------------------------------------------------------------------------
+
+/// How long a new or re-armed anchor's entry waits before the sweep first
+/// looks at it.
+///
+/// Most anchors attach within milliseconds, so most entries are stale at the
+/// first look and leave the queue then. The queue therefore holds about
+/// stream rate x this many stale entries, 24 bytes each: 50k at 50k streams/s.
+/// Queued at the 120 s default timeout instead, it held 6M.
+pub(crate) const ANCHOR_FIRST_LOOK: Duration = Duration::from_secs(1);
+
+/// The longest a requeued entry waits before the sweep looks again.
+///
+/// An anchor still unattached at its first look is requeued at its deadline
+/// or this far ahead, whichever is first. A `Duration::MAX` anchor costs one
+/// requeue per recheck, and an anchor that attaches later leaves its entry
+/// within one recheck.
+pub(crate) const ANCHOR_RECHECK: Duration = Duration::from_secs(60);
+
+/// The most entries one hold of a shard lock pops. Every anchor create and
+/// detach takes a shard lock.
+const ANCHOR_EXPIRE_BATCH: usize = 4096;
+
+/// How many independently locked parts the deadline queue has. An anchor's
+/// entries always go to the part that its id selects.
+///
+/// Every anchor create takes a lock on the queue. With one lock, creates on
+/// different worker threads waited on each other: in `anchor_setup_bench`
+/// at 8 threads, the p99.9 of a create-attach-finish cycle was 110 us,
+/// against 25 us with a task per anchor. With 1 or 2 threads, the single
+/// lock was faster than the task at every percentile.
+const ANCHOR_QUEUE_SHARDS: usize = 16;
+
+/// What the sweep does with a due entry, decided from the anchor's state.
+enum Due {
+    /// The anchor is attached, pre-bound, or has no timeout, or the entry is
+    /// a stale copy: forget the entry.
+    Drop,
+    /// A renewal moved the deadline past now: look again then.
+    Requeue(tokio::time::Instant),
+    /// The deadline has passed: remove the anchor.
+    Expire,
+}
+
+impl Due {
+    /// Decide an entry queued `at`.
+    fn of(anchor: &AnchorEntry, at: tokio::time::Instant, now: tokio::time::Instant) -> Self {
+        // The anchor queued a later entry: that one does the work. Acting on
+        // both would requeue each, and the copies would pile up.
+        if anchor.queued != Some(at) {
+            return Self::Drop;
+        }
+        // Attach and pre-bind clear `expires`. The flags are checked too, so a
+        // stale wake never reaps a live stream even if a path sets one
+        // without the other.
+        if anchor.attachment || anchor.prebind.is_some() {
+            return Self::Drop;
+        }
+        match anchor.expires {
+            Some(deadline) if deadline > now => Self::Requeue(deadline),
+            Some(_) => Self::Expire,
+            None => Self::Drop,
+        }
+    }
+}
+
+/// The unattached deadlines of one [`AnchorManager`], swept by one task.
+///
+/// A queue entry only says when to look again. The deadline that counts is
+/// [`AnchorEntry::expires`]: renewal moves it, and attach or pre-bind clears
+/// it. An entry is never removed early; the sweep drops it when it comes due
+/// and finds nothing to expire.
+///
+/// The sweep starts on the first push that finds none running, on the
+/// runtime of that push. So a manager outlives the runtime it was built on:
+/// when that runtime drops the sweep, the next push from a live runtime
+/// starts a new one. A push from a thread with no runtime still queues its
+/// entry. The next push from a runtime thread starts the sweep, and it
+/// expires every due entry.
+pub(crate) struct AnchorDeadlineQueue {
+    shards: [DeadlineQueue<u64>; ANCHOR_QUEUE_SHARDS],
+    /// Signalled by `push` when the new entry is the earliest, so the sweep
+    /// retargets its wait.
+    earlier: tokio::sync::Notify,
+    /// Cancelled when the manager stops or drops. It ends the sweep, and no
+    /// sweep starts after it.
+    stopped: CancellationToken,
+    /// Whether a sweep task exists. Cleared by [`SweepAlive`] when that task
+    /// ends or is dropped.
+    sweep_alive: AtomicBool,
+}
+
+/// The manager's own handle on its deadline queue: when the manager drops,
+/// it stops the sweep and cancels the anchors still in the registry.
+///
+/// Anchors and senders hold the queue too, so the sweep cannot learn from the
+/// queue itself that the manager is gone. A field that acts on drop does
+/// this without a `Drop` impl on [`AnchorManager`], which would stop callers
+/// from moving its public fields out.
+pub(crate) struct ManagerDeadlines {
+    queue: Arc<AnchorDeadlineQueue>,
+    /// The manager's registry, set by [`AnchorManagerBuilder::build`].
+    registry: Option<Arc<DashMap<u64, AnchorEntry>>>,
+}
+
+impl Default for ManagerDeadlines {
+    fn default() -> Self {
+        Self {
+            queue: AnchorDeadlineQueue::new(),
+            registry: None,
+        }
+    }
+}
+
+impl std::ops::Deref for ManagerDeadlines {
+    type Target = Arc<AnchorDeadlineQueue>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.queue
+    }
+}
+
+impl Drop for ManagerDeadlines {
+    /// A `StreamAnchor` keeps the registry alive past the manager, and with
+    /// the sweep stopped nothing would reap its anchor. So cancel them all,
+    /// as `stop()` does. After `stop()`, which `Velo` calls, the registry is
+    /// already empty.
+    fn drop(&mut self) {
+        self.queue.stop();
+        let Some(registry) = self.registry.take() else {
+            return;
+        };
+        // Remove entries outside shard guards: their Drop may close a mux slot.
+        let ids: Vec<u64> = registry.iter().map(|entry| *entry.key()).collect();
+        for id in ids {
+            if let Some((_, entry)) = registry.remove(&id) {
+                entry.cancel_token.cancel();
+            }
+        }
+    }
+}
+
+/// Clears [`AnchorDeadlineQueue::sweep_alive`] when the sweep ends.
+///
+/// Built before the spawn and moved into the task, not created inside it: a
+/// runtime that is shutting down can drop a spawned task before its first
+/// poll. A guard made in the task body would then never exist, the flag would
+/// stay set, and no sweep would start again.
+struct SweepAlive(Arc<AnchorDeadlineQueue>);
+
+impl Drop for SweepAlive {
+    fn drop(&mut self) {
+        self.0.sweep_alive.store(false, Ordering::Release);
+    }
+}
+
+impl AnchorDeadlineQueue {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            shards: std::array::from_fn(|_| DeadlineQueue::new(ANCHOR_FIRST_LOOK, ANCHOR_RECHECK)),
+            earlier: tokio::sync::Notify::new(),
+            stopped: CancellationToken::new(),
+            sweep_alive: AtomicBool::new(false),
+        })
+    }
+
+    fn shard(&self, local_id: u64) -> &DeadlineQueue<u64> {
+        &self.shards[(local_id % ANCHOR_QUEUE_SHARDS as u64) as usize]
+    }
+
+    /// When the earliest entry of any shard comes due.
+    fn next_due(&self) -> Option<tokio::time::Instant> {
+        self.shards.iter().filter_map(DeadlineQueue::next_due).min()
+    }
+
+    /// How many entries are queued, stale ones included.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.shards.iter().map(|shard| shard.heap().len()).sum()
+    }
+
+    /// Whether a sweep task exists on this queue.
+    #[cfg(test)]
+    pub(crate) fn sweep_running(&self) -> bool {
+        self.sweep_alive.load(Ordering::Acquire)
+    }
+
+    /// End the sweep, and start no other.
+    pub(crate) fn stop(&self) {
+        self.stopped.cancel();
+    }
+
+    /// Queue a look at `local_id` by `deadline`, and start a sweep if none
+    /// runs.
+    ///
+    /// Callers hold the anchor's registry shard lock. That is safe: this
+    /// takes only a queue shard lock, and the sweep never holds a queue shard
+    /// lock while it takes a registry shard lock. A spawn does not run the
+    /// task in place.
+    ///
+    /// The sweep is woken when the entry is the earliest of its queue shard.
+    /// That is not always the earliest of the queue, and then the wake only
+    /// costs the sweep a fresh look at the shards.
+    ///
+    /// Returns when the entry comes due. The caller records it in
+    /// [`AnchorEntry::queued`], under the same registry lock.
+    pub(crate) fn push(
+        self: &Arc<Self>,
+        registry: &Arc<DashMap<u64, AnchorEntry>>,
+        deadline: tokio::time::Instant,
+        local_id: u64,
+    ) -> tokio::time::Instant {
+        let pushed = self.shard(local_id).push(deadline, local_id);
+        if pushed.earliest {
+            self.earlier.notify_one();
+        }
+        if !self.sweep_alive.load(Ordering::Acquire) {
+            self.start_sweep(registry);
+        }
+        pushed.at
+    }
+
+    #[cold]
+    fn start_sweep(self: &Arc<Self>, registry: &Arc<DashMap<u64, AnchorEntry>>) {
+        if self.stopped.is_cancelled() {
+            return;
+        }
+        // The consumer may poll on an executor that is not tokio. The entry
+        // stays queued for the next push that has a runtime.
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        if self
+            .sweep_alive
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        rt.spawn(Self::sweep(
+            SweepAlive(Arc::clone(self)),
+            Arc::downgrade(registry),
+        ));
+    }
+
+    /// Park until the earliest entry is due, expire what is due, repeat.
+    ///
+    /// Holds the registry weakly, so a parked sweep does not keep the anchors
+    /// of a dropped manager alive.
+    async fn sweep(alive: SweepAlive, registry: std::sync::Weak<DashMap<u64, AnchorEntry>>) {
+        let queue = &alive.0;
+        loop {
+            let next = queue.next_due();
+            tokio::select! {
+                biased;
+                () = queue.stopped.cancelled() => return,
+                // An earlier entry was pushed: retarget the wait.
+                () = queue.earlier.notified() => continue,
+                () = async {
+                    match next {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        // Empty: only a push, through `earlier`, wakes it.
+                        None => std::future::pending().await,
+                    }
+                } => {}
+            }
+            let Some(registry) = registry.upgrade() else {
+                return;
+            };
+            queue
+                .expire_due(&registry, tokio::time::Instant::now())
+                .await;
+        }
+    }
+
+    /// Pop the due entries of each queue shard in bounded batches, and act on
+    /// each entry.
+    ///
+    /// A read lock decides each entry: most belong to anchors that attached
+    /// or ended, and a write lock per entry would contend with attach and
+    /// detach. Only an expiry takes the write lock, and decides again under
+    /// it, because a renewal or an attach can land between the two. A queue
+    /// shard lock is never held while a registry shard lock is taken.
+    async fn expire_due(&self, registry: &DashMap<u64, AnchorEntry>, now: tokio::time::Instant) {
+        for shard in &self.shards {
+            Self::expire_due_in(shard, registry, now).await;
+        }
+    }
+
+    async fn expire_due_in(
+        shard: &DeadlineQueue<u64>,
+        registry: &DashMap<u64, AnchorEntry>,
+        now: tokio::time::Instant,
+    ) {
+        use dashmap::mapref::entry::Entry;
+        loop {
+            let due = shard.pop_due(now, ANCHOR_EXPIRE_BATCH);
+            // Nothing due in this shard: skip the requeue and its lock.
+            // After a burst, the requeue of its last chunk shrinks.
+            if due.is_empty() {
+                break;
+            }
+            let more = due.len() == ANCHOR_EXPIRE_BATCH;
+            let mut renewed = Vec::new();
+            for (at, local_id) in due {
+                let Some(due) = registry
+                    .get(&local_id)
+                    .map(|anchor| Due::of(&anchor, at, now))
+                else {
+                    continue; // already removed
+                };
+                if matches!(due, Due::Drop) {
+                    continue;
+                }
+                // A requeue records its new instant in the entry, and an
+                // expiry removes it, so both take the write lock and decide
+                // again: a renewal, attach or re-arm can land in between.
+                let Entry::Occupied(mut entry) = registry.entry(local_id) else {
+                    continue;
+                };
+                match Due::of(entry.get(), at, now) {
+                    Due::Expire => entry.remove().cancel_token.cancel(),
+                    Due::Requeue(deadline) => {
+                        let requeue_at = shard.requeue_at(now, deadline);
+                        entry.get_mut().queued = Some(requeue_at);
+                        renewed.push((requeue_at, local_id));
+                    }
+                    Due::Drop => {}
+                }
+            }
+            // Every requeued deadline is after `now`, so this loop never pops
+            // its own requeues. A requeued id goes back to the shard it came
+            // from, because the shard is a function of the id.
+            shard.requeue(now, renewed);
+            if !more {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // AnchorEntry
 // ---------------------------------------------------------------------------
 
@@ -162,16 +508,25 @@ pub(crate) struct AnchorEntry {
     /// held by the reader pump, or by `feed` for a mux bind, not here.
     pub attachment: bool,
 
-    /// Cancels the inactivity timeout task when a sender attaches.
-    /// `None` if no timeout is configured for this anchor.
-    pub timeout_cancel: Option<CancellationToken>,
     /// When the unattached anchor expires. This is the deadline that counts:
-    /// renewal moves it, and the timeout task only wakes at its own deadline
-    /// to read this one and sleep again if it moved.
+    /// renewal moves it, and the manager's [`AnchorDeadlineQueue`] only says
+    /// when to read it again. `None` while attached or pre-bound (the timer
+    /// is paused, see [`AnchorEntry::pause_unattached_timeout`]) and while the
+    /// anchor has no timeout (`unattached_timeout == None`).
     pub(crate) expires: Option<tokio::time::Instant>,
 
+    /// When this anchor's one live entry in the deadline queue comes due.
+    ///
+    /// The sweep drops a popped entry whose instant differs, as a stale copy.
+    /// A re-arm queues nothing while this is still ahead and not after the
+    /// new deadline: that entry reads `expires` when it comes due. Without
+    /// this, each detach queued one more entry, and the sweep kept requeuing
+    /// all of them. It may name a past instant after the sweep drops the
+    /// entry; the next re-arm then queues a new one.
+    pub(crate) queued: Option<tokio::time::Instant>,
+
     /// The configured unattached timeout for this anchor. Stored so that
-    /// `detach` can respawn the timeout task with the same duration.
+    /// `detach` can re-arm the deadline with the same duration.
     /// `None` means the anchor never auto-removes while unattached.
     pub unattached_timeout: Option<Duration>,
 
@@ -311,27 +666,38 @@ impl Drop for AnchorEntry {
 }
 
 impl AnchorEntry {
+    /// Arm the unattached deadline a full timeout from now, if the anchor is
+    /// unattached and has a timeout. Every path that leaves an anchor
+    /// unattached calls this: the queue entry of the earlier deadline may be
+    /// gone, and nothing else re-arms it.
     pub(crate) fn restart_unattached_timeout(
         &mut self,
         registry: &Arc<DashMap<u64, AnchorEntry>>,
         local_id: u64,
+        queue: &Arc<AnchorDeadlineQueue>,
     ) {
-        if let Some(previous) = self.timeout_cancel.take() {
-            previous.cancel();
-        }
         if !self.attachment
             && self.prebind.is_none()
             && let Some(duration) = self.unattached_timeout
         {
             let expires = deadline_after(duration);
             self.expires = Some(expires);
-            self.timeout_cancel = Some(AnchorManager::spawn_timeout_task(
-                Arc::clone(registry),
-                local_id,
-                expires,
-                &self.cancel_token,
-            ));
+            let live = self
+                .queued
+                .is_some_and(|at| tokio::time::Instant::now() < at && at <= expires);
+            if !live {
+                self.queued = Some(queue.push(registry, expires, local_id));
+            }
+        } else {
+            self.pause_unattached_timeout();
         }
+    }
+
+    /// Pause the unattached deadline: a sender is attached, or a slot is
+    /// pre-bound for one. The queue entry stays, and the sweep drops it when
+    /// it comes due.
+    pub(crate) fn pause_unattached_timeout(&mut self) {
+        self.expires = None;
     }
 
     /// Stop the pump or watchdog serving this anchor, and withdraw the direct
@@ -614,6 +980,9 @@ pub struct StreamAnchor<T> {
     local_id: u64,
     /// Arc clone of the AnchorManager's registry (for cancel).
     registry: Arc<DashMap<u64, AnchorEntry>>,
+    /// The manager's unattached deadlines; `set_timeout` and the detach
+    /// path queue one here.
+    deadline_queue: Arc<AnchorDeadlineQueue>,
     /// Shared cancel handle — also held by any [`StreamController`] clones.
     controller: StreamController,
     metrics: Option<Arc<VeloMetrics>>,
@@ -638,6 +1007,7 @@ impl<T> StreamAnchor<T> {
             registry,
             mpsc_registry: _,
             metrics,
+            deadline_queue,
         } = ctx;
         let inner = Arc::new(StreamControllerInner {
             worker_id: handle.unpack().0,
@@ -660,6 +1030,7 @@ impl<T> StreamAnchor<T> {
             terminated: false,
             local_id,
             registry,
+            deadline_queue,
             controller,
             metrics,
             #[cfg(test)]
@@ -786,18 +1157,16 @@ impl<T> StreamAnchor<T> {
     /// Configure or override the inactivity timeout for this anchor.
     ///
     /// - `Some(duration)`: anchor will be auto-removed if no sender attaches
-    ///   within `duration`. If the anchor is currently unattached, a new timeout
-    ///   task is spawned immediately (replacing any existing one).
-    /// - `None`: disable timeout for this anchor. Any running timeout task is
-    ///   cancelled.
+    ///   within `duration`. If the anchor is currently unattached, the
+    ///   deadline moves to `duration` from now.
+    /// - `None`: disable timeout for this anchor.
     ///
     /// If the anchor is currently attached, the new duration is stored and will
-    /// take effect on the next detach (no immediate spawn since the timer is
-    /// paused while attached).
+    /// take effect on the next detach (the timer is paused while attached).
     pub fn set_timeout(&self, timeout: Option<Duration>) {
         if let Some(mut entry) = self.registry.get_mut(&self.local_id) {
             entry.unattached_timeout = timeout;
-            entry.restart_unattached_timeout(&self.registry, self.local_id);
+            entry.restart_unattached_timeout(&self.registry, self.local_id, &self.deadline_queue);
         }
     }
 }
@@ -881,7 +1250,11 @@ impl<T> StreamAnchor<T> {
                                     }
                                     entry.attachment = false;
                                     let released = entry.prebind.take();
-                                    entry.restart_unattached_timeout(&self.registry, self.local_id);
+                                    entry.restart_unattached_timeout(
+                                        &self.registry,
+                                        self.local_id,
+                                        &self.deadline_queue,
+                                    );
                                     released
                                 })
                             });
@@ -1028,8 +1401,8 @@ pub struct AnchorManager {
 
     /// Default inactivity timeout for newly created SPSC anchors. MPSC
     /// anchors do not inherit it; see [`crate::streaming::mpsc::MpscAnchorConfig`].
-    /// `create_anchor` spawns a timeout task that auto-removes the
-    /// anchor if no sender attaches within this duration. Per-anchor overrides
+    /// The anchor is auto-removed if no sender attaches within this duration:
+    /// the shared deadline queue reaps it. Per-anchor overrides
     /// are supported via [`AnchorConfig::unattached_timeout`] +
     /// [`AnchorManager::create_anchor_with_config`].
     /// `Duration::MAX` means anchors never time out.
@@ -1098,12 +1471,17 @@ pub struct AnchorManager {
     /// crate-internal type, and a public setter naming it would leak it.
     #[builder(setter(skip), default = "std::sync::OnceLock::new()")]
     mux: std::sync::OnceLock<Arc<crate::streaming::messenger_mux::MessengerMuxTransport>>,
+
+    /// The unattached deadlines of this manager's SPSC anchors.
+    #[builder(setter(skip), default)]
+    pub(crate) deadline_queue: ManagerDeadlines,
 }
 
 impl AnchorManagerBuilder {
     /// Build the [`AnchorManager`].
     pub fn build(self) -> Result<AnchorManager, AnchorManagerBuilderError> {
-        let manager = self.build_inner()?;
+        let mut manager = self.build_inner()?;
+        manager.deadline_queue.registry = Some(Arc::clone(&manager.registry));
         if let Some(metrics) = manager.metrics.as_ref() {
             // Weak, so the metrics registry does not keep a dropped manager's
             // anchors alive; a dropped manager counts zero.
@@ -1247,6 +1625,7 @@ impl AnchorManager {
     }
 
     pub(crate) fn stop(&self) {
+        self.deadline_queue.stop();
         self.prepare_stop();
         if let Some(mux) = self.mux.get() {
             mux.stop();
@@ -1254,6 +1633,7 @@ impl AnchorManager {
     }
 
     pub(crate) async fn shutdown(&self) {
+        self.deadline_queue.stop();
         self.prepare_stop();
         if let Some(mux) = self.mux.get() {
             mux.shutdown().await;
@@ -1314,12 +1694,7 @@ impl AnchorManager {
             .heartbeat_interval
             .unwrap_or(self.default_heartbeat_interval);
 
-        // Spawn timeout task if configured — derive child from the anchor's parent token
-        // so that finalize/remove auto-cancels it.
         let expires = unattached_timeout.map(deadline_after);
-        let timeout_cancel = expires.map(|expires| {
-            Self::spawn_timeout_task(self.registry.clone(), local_id, expires, &cancel_token)
-        });
 
         let feed = Arc::new(crate::streaming::control::FeedCell::default());
         let entry = AnchorEntry {
@@ -1328,8 +1703,8 @@ impl AnchorManager {
             cancel_token,
             active_pump_token: None,
             attachment: false,
-            timeout_cancel,
             expires,
+            queued: None,
             unattached_timeout,
             heartbeat_interval,
             stream_cancel_handle: None, // populated on attach
@@ -1337,7 +1712,14 @@ impl AnchorManager {
             stop_requested: false,
         };
 
-        self.registry.insert(local_id, entry);
+        // Queue while holding the inserted entry: the sweep reads `expires`
+        // and `queued` from it, and must not see the queue entry before
+        // `queued` names it, or it drops that entry as stale.
+        let mut entry = self.registry.entry(local_id).insert(entry);
+        if let Some(deadline) = expires {
+            entry.queued = Some(self.deadline_queue.push(&self.registry, deadline, local_id));
+        }
+        drop(entry);
 
         let handle = StreamAnchorHandle::pack(self.worker_id, local_id);
         StreamAnchor::new(
@@ -1349,71 +1731,6 @@ impl AnchorManager {
             self.sender_registry.clone(),
             self.messenger.clone(),
         )
-    }
-
-    /// Spawn a background task that removes the anchor once `expires`, or the
-    /// later deadline a renewal stored in `AnchorEntry::expires`, has passed.
-    ///
-    /// Returns a [`CancellationToken`] that cancels the task when triggered
-    /// (e.g. on attach, or when `set_timeout(None)` is called). The returned
-    /// token is safe to store and cancel unconditionally even when no task
-    /// was actually spawned (see the guard below) — every reader of
-    /// `AnchorEntry::timeout_cancel` only ever calls `.cancel()` on it, which
-    /// is a no-op with nothing listening.
-    ///
-    /// Guarded by `Handle::try_current()` for the same reason
-    /// `close_claimed_slot` (`messenger_mux/mod.rs`) and `StreamController::cancel`
-    /// (below) are: this is reachable from `StreamAnchor::poll_next`'s `Detached`
-    /// arm, which runs under whatever executor the *consumer* chose, not
-    /// necessarily tokio. Degrading to "the timer never fires" is the same
-    /// trade those two make — the alternative is a bare `tokio::spawn` panic
-    /// in the middle of a consumer's poll.
-    pub(crate) fn spawn_timeout_task(
-        registry: Arc<DashMap<u64, AnchorEntry>>,
-        local_id: u64,
-        expires: tokio::time::Instant,
-        parent_cancel: &CancellationToken,
-    ) -> CancellationToken {
-        let tc = parent_cancel.child_token();
-        let Ok(rt) = tokio::runtime::Handle::try_current() else {
-            tracing::debug!(
-                local_id,
-                "anchor: no runtime to arm the unattached timeout on; it will not fire"
-            );
-            return tc;
-        };
-        let tc_clone = tc.clone();
-        rt.spawn(async move {
-            // Renewal moves `AnchorEntry::expires`, not this task's timer, so
-            // on waking the task re-reads it and sleeps again if it moved.
-            let mut deadline = expires;
-            loop {
-                tokio::select! {
-                    _ = tc_clone.cancelled() => break,
-                    _ = tokio::time::sleep_until(deadline) => {
-                        use dashmap::mapref::entry::Entry;
-                        let Entry::Occupied(entry) = registry.entry(local_id) else {
-                            break;
-                        };
-                        let anchor = entry.get();
-                        // Attach and pre-bind pause this timer; a stale wake
-                        // after either must not remove the anchor.
-                        if tc_clone.is_cancelled() || anchor.attachment || anchor.prebind.is_some() {
-                            break;
-                        }
-                        if let Some(next) = anchor.expires
-                            && next > tokio::time::Instant::now()
-                        {
-                            deadline = next;
-                            continue;
-                        }
-                        entry.remove().cancel_token.cancel();
-                        break;
-                    }
-                }
-            }
-        });
-        tc
     }
 
     /// Remove an anchor from the registry and return its entry (if present).
@@ -1625,9 +1942,7 @@ impl AnchorManager {
                         // A pre-bound anchor has a slot waiting for one, so the
                         // timer is measuring nothing and would remove a live
                         // stream. Attach pauses it for the same reason.
-                        if let Some(ref tc) = entry.timeout_cancel {
-                            tc.cancel();
-                        }
+                        entry.pause_unattached_timeout();
                         // Shared with the watchdog spawned below and cleared by
                         // `PreBind::adopt` the moment an attach hands this
                         // slot to a sender that used it instead of the
@@ -1804,12 +2119,14 @@ impl AnchorManager {
                     // dropped un-terminated (see `retire`'s doc above), and one
                     // the application is still holding is never dropped.
                     //
-                    // Called under the `Entry::Occupied` guard held above:
-                    // safe now that `spawn_timeout_task` guards its own
-                    // `tokio::spawn` — the call never runs synchronously and
-                    // never touches this registry, so there is nothing here
-                    // for it to deadlock against.
-                    entry.restart_unattached_timeout(&self.registry, local_id);
+                    // Called under the `Entry::Occupied` guard held above. That
+                    // is safe: the push takes only the queue lock, and the
+                    // sweep reads `expires` after this guard is gone.
+                    entry.restart_unattached_timeout(
+                        &self.registry,
+                        local_id,
+                        &self.deadline_queue,
+                    );
                     (
                         PrebindAdoption::Refused(format!(
                             "anchor {} was pre-bound on {key}, which this sender does not support",
@@ -1821,6 +2138,7 @@ impl AnchorManager {
                 Verdict::Adopt => {
                     let prebind = entry.prebind.take().expect("the verdict says it is there");
                     entry.attachment = true;
+                    entry.pause_unattached_timeout();
                     entry.stream_cancel_handle = Some(req.stream_cancel_handle);
                     if entry.stop_requested {
                         crate::streaming::control::request_sender_stop(
@@ -2043,6 +2361,7 @@ impl AnchorManager {
             registry: self.registry.clone(),
             mpsc_registry: self.mpsc_registry.clone(),
             metrics: self.metrics.clone(),
+            deadline_queue: self.deadline_queue.clone(),
         }
     }
 
@@ -2501,6 +2820,7 @@ impl AnchorManager {
                 closed: identity.entry.closed.clone(),
                 retires_on,
                 item_limit,
+                deadline_queue: Some(self.deadline_queue.clone()),
             },
             Duration::from_millis(ticket.heartbeat_interval_ms),
             self.metrics.clone(),
@@ -2626,10 +2946,7 @@ impl AnchorManager {
                     // pump or feed: it writes into `frame_tx` itself.
                     entry.attachment = true;
 
-                    // Cancel the timeout task while attached (pause timer)
-                    if let Some(ref tc) = entry.timeout_cancel {
-                        tc.cancel();
-                    }
+                    entry.pause_unattached_timeout();
 
                     // A pre-bound slot on this anchor was minted for a sender
                     // on another worker. This one is on ours and writes
@@ -2713,6 +3030,7 @@ impl AnchorManager {
                             closed,
                             retires_on: crate::streaming::sender::RetiresOn::Queue,
                             item_limit: None,
+                            deadline_queue: Some(self.deadline_queue.clone()),
                         },
                         heartbeat_interval,
                         self.metrics.clone(),
@@ -2898,6 +3216,7 @@ impl AnchorManager {
                 closed: identity.entry.closed.clone(),
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
                 item_limit: None,
+                deadline_queue: Some(self.deadline_queue.clone()),
             },
             heartbeat_interval,
             self.metrics.clone(),
@@ -3023,6 +3342,7 @@ impl AnchorManager {
                         closed: identity.entry.closed.clone(),
                         retires_on,
                         item_limit,
+                        deadline_queue: Some(self.deadline_queue.clone()),
                     },
                     Duration::from_millis(heartbeat_interval_ms),
                     self.metrics.clone(),
@@ -3173,33 +3493,40 @@ mod tests {
     /// The gauge counts each registry on its own.
     ///
     /// A `StreamAnchor` holds the SPSC registry and not the MPSC one, so the
-    /// manager can be gone while SPSC anchors still drain. A source that gave
-    /// up when either registry was gone would be pruned then, for good, and
-    /// the gauge would read zero with anchors alive.
+    /// SPSC registry can outlive the manager. A source that gave up when
+    /// either registry was gone would be pruned then, for good, and the gauge
+    /// would read zero with anchors alive. A dropped manager cancels its own
+    /// anchors, so the anchor that still counts here comes from a second
+    /// manager that shares the SPSC registry.
     #[tokio::test]
     async fn the_active_anchor_gauge_outlives_one_registry() {
         let registry = prometheus::Registry::new();
         let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
-        let mgr = AnchorManagerBuilder::default()
-            .worker_id(velo_ext::WorkerId::from_u64(1))
-            .transport(
-                Arc::new(MockTransport) as Arc<dyn crate::streaming::transport::FrameTransport>
-            )
-            .metrics(Some(metrics))
-            .build()
-            .unwrap();
+        let anchors: Arc<DashMap<u64, AnchorEntry>> = Arc::new(DashMap::new());
+        let builder = || {
+            AnchorManagerBuilder::default()
+                .worker_id(velo_ext::WorkerId::from_u64(1))
+                .transport(
+                    Arc::new(MockTransport) as Arc<dyn crate::streaming::transport::FrameTransport>
+                )
+                .registry(Arc::clone(&anchors))
+        };
+        let mgr = builder().metrics(Some(metrics)).build().unwrap();
         let gauge = || {
             crate::observability::test_helpers::MetricSnapshot::from_registry(&registry)
                 .gauge("velo_streaming_active_anchors", &[])
         };
         let spsc = mgr.create_anchor::<u32>();
         drop(mgr);
+        assert_eq!(gauge(), 0.0, "the dropped manager cancelled its anchor");
+        let other = builder().build().unwrap();
+        let other_anchor = other.create_anchor::<u32>();
         assert_eq!(
             gauge(),
             1.0,
-            "the MPSC registry went with the manager; the SPSC anchor still counts"
+            "the MPSC registry went with the manager; the SPSC registry still counts"
         );
-        drop(spsc);
+        drop((spsc, other_anchor, other));
         assert_eq!(gauge(), 0.0);
     }
 
@@ -3624,9 +3951,8 @@ mod tests {
         // `close_claimed_slot` and `StreamController::cancel` already guard
         // against for the same reason.
         //
-        // Setup needs a runtime of its own (`create_anchor_with_config`'s
-        // `spawn_timeout_task` call does too), so build one, use it, and
-        // drop it before polling on a bare `std::thread`.
+        // Setup needs a runtime of its own, so build one, use it, and drop it
+        // before polling on a bare `std::thread`.
         let setup_rt = tokio::runtime::Runtime::new().expect("build setup runtime");
         let (frame_tx, mut anchor) = setup_rt.block_on(async {
             let mgr = make_manager();
@@ -3901,6 +4227,373 @@ mod tests {
             !mgr.registry.contains_key(&local_id),
             "anchor must be removed after timeout expires"
         );
+    }
+
+    /// Unattached anchors spawn no task each: one sweep serves all of them.
+    ///
+    /// Each unattached anchor used to spawn a tokio task that lived until
+    /// attach, so stream setup paid one task spawn per stream. This counts
+    /// tasks, so it stays as the regression guard for that cost.
+    #[tokio::test(start_paused = true)]
+    async fn unattached_anchors_share_one_sweep_task() {
+        let mgr = queue_manager(Duration::from_secs(1));
+        let metrics = tokio::runtime::Handle::current().metrics();
+        let before = metrics.num_alive_tasks();
+        let anchors: Vec<_> = (0..100).map(|_| mgr.create_anchor::<u32>()).collect();
+        assert_eq!(
+            metrics.num_alive_tasks(),
+            before + 1,
+            "one sweep task for 100 anchors"
+        );
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for anchor in &anchors {
+            assert!(
+                !mgr.registry.contains_key(&anchor.handle().unpack().1),
+                "the sweep reaps every anchor at its deadline"
+            );
+        }
+    }
+
+    fn queue_manager(timeout: Duration) -> AnchorManager {
+        AnchorManagerBuilder::default()
+            .worker_id(velo_ext::WorkerId::from_u64(42))
+            .transport(
+                Arc::new(MockTransport) as Arc<dyn crate::streaming::transport::FrameTransport>
+            )
+            .default_unattached_timeout(timeout)
+            .build()
+            .expect("builder should succeed")
+    }
+
+    fn queue_of(mgr: &AnchorManager) -> Arc<AnchorDeadlineQueue> {
+        Arc::clone(&mgr.deadline_queue)
+    }
+
+    /// An attached anchor that never times out leaves the deadline queue
+    /// within the recheck horizon.
+    ///
+    /// `Duration::MAX` is the documented way to say "never time out". Its
+    /// entry was queued at the saturated deadline, 30 years out, and nothing
+    /// removes an entry before it comes due. So every such stream ever made
+    /// kept an entry in the heap for the life of the process.
+    #[tokio::test(start_paused = true)]
+    async fn an_attached_anchor_that_never_times_out_leaves_the_queue() {
+        let mgr = queue_manager(Duration::MAX);
+        let queue = queue_of(&mgr);
+        let anchor = mgr.create_anchor::<u32>();
+        let _sender = mgr
+            .attach_stream_anchor::<u32>(anchor.handle())
+            .await
+            .expect("attach");
+        assert_eq!(queue.len(), 1);
+        tokio::time::sleep(ANCHOR_RECHECK + Duration::from_secs(1)).await;
+        assert_eq!(
+            queue.len(),
+            0,
+            "the attached anchor's entry is dropped when it comes due"
+        );
+        assert!(mgr.registry.contains_key(&anchor.handle().unpack().1));
+    }
+
+    /// Control for the test above: an unattached anchor that never times out
+    /// stays registered, and keeps one entry however long it waits.
+    #[tokio::test(start_paused = true)]
+    async fn an_unattached_anchor_that_never_times_out_keeps_one_entry() {
+        let mgr = queue_manager(Duration::MAX);
+        let queue = queue_of(&mgr);
+        let anchor = mgr.create_anchor::<u32>();
+        tokio::time::sleep(Duration::from_secs(3600)).await;
+        assert!(mgr.registry.contains_key(&anchor.handle().unpack().1));
+        assert_eq!(queue.len(), 1);
+    }
+
+    /// The entries of anchors that ended leave the queue within the first
+    /// look, not at their full unattached timeout.
+    ///
+    /// Most streams attach within milliseconds and end soon after. Queued at
+    /// the 120 s default, the entry of each one stayed for 120 s, so the heap
+    /// held stream rate x 120 s entries: 6M at 50k streams/s. The per-anchor
+    /// task that the queue replaced exited on attach.
+    #[tokio::test(start_paused = true)]
+    async fn ended_anchors_leave_the_queue_within_the_first_look() {
+        const STREAMS: usize = 1000;
+        let mgr = queue_manager(DEFAULT_UNATTACHED_TIMEOUT);
+        let queue = queue_of(&mgr);
+        for _ in 0..STREAMS {
+            let anchor = mgr.create_anchor::<u32>();
+            let sender = mgr
+                .attach_stream_anchor::<u32>(anchor.handle())
+                .await
+                .expect("attach");
+            sender.finalize().expect("finalize");
+            drop(anchor);
+        }
+        assert_eq!(mgr.active_anchor_count(), 0);
+        assert_eq!(queue.len(), STREAMS);
+        tokio::time::sleep(ANCHOR_FIRST_LOOK + Duration::from_secs(1)).await;
+        assert_eq!(queue.len(), 0, "every ended anchor's entry is gone");
+    }
+
+    /// The deadline sweep exits when its manager drops.
+    ///
+    /// The sweep held the queue and parked on it until the next deadline, or
+    /// on the queue's `Notify` when the queue was empty. With the manager gone
+    /// nothing wakes it early, so the task and its queue lived as long as the
+    /// runtime, or until a deadline up to 30 years out.
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_sweep_exits_when_the_manager_drops() {
+        let mgr = queue_manager(DEFAULT_UNATTACHED_TIMEOUT);
+        let queue = queue_of(&mgr);
+        let anchor = mgr.create_anchor::<u32>();
+        tokio::task::yield_now().await;
+        assert!(queue.sweep_running());
+        drop(anchor);
+        drop(mgr);
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(!queue.sweep_running(), "the sweep outlived its manager");
+    }
+
+    /// A standalone manager that drops cancels the anchors still in its
+    /// registry.
+    ///
+    /// The manager's drop stops the sweep, but a `StreamAnchor` keeps the
+    /// registry alive. So an unattached anchor of a dropped manager stayed
+    /// in the registry forever: nothing swept it, and the per-anchor task
+    /// that the queue replaced was gone. `Velo` never hit this, because it
+    /// calls `stop()` first, and that empties the registry.
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_manager_cancels_its_unattached_anchors() {
+        let mgr = queue_manager(Duration::from_secs(1));
+        let registry = Arc::clone(&mgr.registry);
+        let anchor = mgr.create_anchor::<u32>();
+        let id = anchor.handle().unpack().1;
+        tokio::task::yield_now().await;
+        drop(mgr);
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !registry.contains_key(&id),
+            "the anchor outlived its dropped manager past its timeout"
+        );
+        drop(anchor);
+    }
+
+    /// Attach and detach cycles of one anchor leave one queue entry, not one
+    /// per detach.
+    ///
+    /// Each detach queued a new entry, and the sweep requeued every one of
+    /// them until the deadline: 5 cycles left 6 entries. A `Duration::MAX`
+    /// anchor that keeps re-attaching grew the queue without bound.
+    #[tokio::test(start_paused = true)]
+    async fn rearming_an_anchor_keeps_one_queue_entry() {
+        let mgr = queue_manager(DEFAULT_UNATTACHED_TIMEOUT);
+        let mut anchor = mgr.create_anchor::<u32>();
+        for _ in 0..5 {
+            let sender = mgr
+                .attach_stream_anchor::<u32>(anchor.handle())
+                .await
+                .expect("attach");
+            sender.detach().expect("detach");
+            assert!(matches!(
+                anchor.next().await,
+                Some(Ok(StreamFrame::Detached))
+            ));
+        }
+        assert_eq!(queue_of(&mgr).len(), 1);
+    }
+
+    /// An anchor whose queue entry the sweep already dropped, because the
+    /// anchor was attached then, is still reaped after a later detach.
+    ///
+    /// This guards the dedup: a detach must queue a new entry when the
+    /// anchor's recorded one is in the past, or nothing looks at the anchor
+    /// again.
+    #[tokio::test(start_paused = true)]
+    async fn a_detach_after_the_entry_was_dropped_still_reaps() {
+        let mgr = queue_manager(Duration::from_secs(2));
+        let mut anchor = mgr.create_anchor::<u32>();
+        let id = anchor.handle().unpack().1;
+        let sender = mgr
+            .attach_stream_anchor::<u32>(anchor.handle())
+            .await
+            .expect("attach");
+        tokio::time::sleep(ANCHOR_FIRST_LOOK + Duration::from_millis(500)).await;
+        assert_eq!(queue_of(&mgr).len(), 0, "the sweep dropped the entry");
+        sender.detach().expect("detach");
+        assert!(matches!(
+            anchor.next().await,
+            Some(Ok(StreamFrame::Detached))
+        ));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        assert!(
+            !mgr.registry.contains_key(&id),
+            "the detached anchor must be reaped at its timeout"
+        );
+    }
+
+    /// A renewal that moves the deadline makes the sweep requeue the anchor,
+    /// and the requeued entry counts: it is not dropped as a stale copy.
+    #[tokio::test(start_paused = true)]
+    async fn a_renewed_anchor_is_requeued_and_then_reaped() {
+        let mgr = queue_manager(Duration::from_secs(2));
+        let anchor = mgr.create_anchor::<u32>();
+        let id = anchor.handle().unpack().1;
+        let renew = || {
+            mgr.renew_reservations_local(&[crate::streaming::AnchorReservation::new(
+                anchor.handle(),
+                None,
+            )]);
+        };
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        renew(); // expires at 2.5 s; the 1 s first look requeues it
+        tokio::time::sleep(Duration::from_millis(1700)).await;
+        assert!(mgr.registry.contains_key(&id), "renewed past 2 s");
+        renew(); // at 2.2 s: expires at 4.2 s; the 2.5 s entry requeues it
+        tokio::time::sleep(Duration::from_millis(1700)).await;
+        assert!(mgr.registry.contains_key(&id), "renewed past 2.5 s");
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !mgr.registry.contains_key(&id),
+            "the renewed anchor must be reaped at its moved deadline"
+        );
+    }
+
+    /// `stop` ends the deadline sweep, as it ends the other stream tasks.
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_sweep_exits_on_stop() {
+        let mgr = queue_manager(DEFAULT_UNATTACHED_TIMEOUT);
+        let queue = queue_of(&mgr);
+        let _anchor = mgr.create_anchor::<u32>();
+        tokio::task::yield_now().await;
+        assert!(queue.sweep_running());
+        mgr.stop();
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert!(!queue.sweep_running(), "the sweep outlived stop");
+    }
+
+    /// A manager whose build runtime is gone still reaps the unattached
+    /// anchors that another runtime creates.
+    ///
+    /// The sweep ran on the runtime that was current at build, and died with
+    /// it. The queue stayed, so anchors kept queuing deadlines that nothing
+    /// swept. The per-anchor task that the queue replaced ran on the runtime
+    /// that was current at create.
+    ///
+    /// The setup anchor spawns a sweep that the setup runtime never polls.
+    /// The runtime drops it unpolled, and that must still clear the queue's
+    /// alive flag, or no sweep starts again.
+    #[test]
+    fn a_manager_reaps_after_its_build_runtime_is_gone() {
+        let setup = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("setup runtime");
+        let (mgr, setup_anchor) = setup.block_on(async {
+            let mgr = queue_manager(Duration::from_secs(1));
+            let anchor = mgr.create_anchor::<u32>();
+            (mgr, anchor)
+        });
+        assert!(mgr.deadline_queue.sweep_running());
+        drop(setup);
+        assert!(
+            !mgr.deadline_queue.sweep_running(),
+            "the dropped sweep cleared its flag"
+        );
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        rt.block_on(async {
+            let anchor = mgr.create_anchor::<u32>();
+            let id = anchor.handle().unpack().1;
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            assert!(
+                !mgr.registry.contains_key(&id),
+                "the unattached anchor must be reaped"
+            );
+            assert!(
+                !mgr.registry.contains_key(&setup_anchor.handle().unpack().1),
+                "the setup anchor is reaped by the new sweep"
+            );
+        });
+    }
+
+    /// A local attach pauses the unattached timer, and the entry says so:
+    /// `expires` is `None` while a sender is attached.
+    ///
+    /// The comments said that attach cleared it, but no attach path did. Only
+    /// the sweep's `attachment` check kept a stale wake from reaping a live
+    /// stream at its create-time deadline.
+    #[tokio::test(start_paused = true)]
+    async fn a_local_attach_clears_the_unattached_deadline() {
+        let mgr = queue_manager(DEFAULT_UNATTACHED_TIMEOUT);
+        let anchor = mgr.create_anchor::<u32>();
+        let id = anchor.handle().unpack().1;
+        assert!(mgr.registry.get(&id).unwrap().expires.is_some());
+        let _sender = mgr
+            .attach_stream_anchor::<u32>(anchor.handle())
+            .await
+            .expect("attach");
+        assert_eq!(mgr.registry.get(&id).unwrap().expires, None);
+    }
+
+    /// A remote attach pauses the unattached timer, and the entry says so.
+    /// See `a_local_attach_clears_the_unattached_deadline`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_remote_attach_clears_the_unattached_deadline() {
+        let consumer = crate::messenger::Messenger::builder()
+            .add_transport(tcp_messenger_transport())
+            .build()
+            .await
+            .unwrap();
+        let producer = crate::messenger::Messenger::builder()
+            .add_transport(tcp_messenger_transport())
+            .build()
+            .await
+            .unwrap();
+        consumer.register_peer(producer.peer_info()).unwrap();
+        producer.register_peer(consumer.peer_info()).unwrap();
+        let receiver = Arc::new(
+            AnchorManagerBuilder::default()
+                .worker_id(consumer.instance_id().worker_id())
+                .transport(
+                    Arc::new(MockTransport) as Arc<dyn crate::streaming::transport::FrameTransport>
+                )
+                .build()
+                .unwrap(),
+        );
+        let sender = Arc::new(
+            AnchorManagerBuilder::default()
+                .worker_id(producer.instance_id().worker_id())
+                .transport(
+                    Arc::new(MockTransport) as Arc<dyn crate::streaming::transport::FrameTransport>
+                )
+                .build()
+                .unwrap(),
+        );
+        receiver.register_handlers(consumer.clone()).unwrap();
+        sender.register_handlers(producer.clone()).unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            producer.wait_for_handler(consumer.instance_id(), "_anchor_attach"),
+        )
+        .await
+        .expect("bounded handler wait")
+        .expect("attach handler advertised");
+
+        let anchor = receiver.create_anchor::<u32>();
+        let id = anchor.handle().unpack().1;
+        assert!(receiver.registry.get(&id).unwrap().expires.is_some());
+        let _stream = tokio::time::timeout(
+            Duration::from_secs(10),
+            sender.attach_stream_anchor::<u32>(anchor.handle()),
+        )
+        .await
+        .expect("bounded attach")
+        .expect("remote attach");
+        let entry = receiver.registry.get(&id).unwrap();
+        assert!(entry.attachment);
+        assert_eq!(entry.expires, None);
     }
 
     #[tokio::test(start_paused = true)]
