@@ -30,6 +30,7 @@ use super::authority::{AbortOutcome, AuthorityError, RegistrationPermit};
 use super::error::HubError;
 use super::extension::{AnyPayload, AnyStaged, Committed, RegistrationView, Txn};
 use super::lifecycle::Job;
+use super::tls::ClientIdentity;
 use crate::protocol::{Credential, ErrorCode, RegisterRequest, RegisterResponse};
 use crate::store::{CredentialDigest, Incarnation, OpId, RegistrationRecord, Removal, StoreError};
 
@@ -37,6 +38,7 @@ use crate::store::{CredentialDigest, Incarnation, OpId, RegistrationRecord, Remo
 struct Request {
     peer: PeerInfo,
     presented: Option<Credential>,
+    client: Option<ClientIdentity>,
     raw: BTreeMap<String, serde_json::Value>,
     /// One slot per extension, in start order.
     payloads: Vec<Option<AnyPayload>>,
@@ -46,6 +48,7 @@ struct Request {
 pub(crate) async fn register(
     shared: Arc<Shared>,
     presented: Option<Credential>,
+    client: Option<ClientIdentity>,
     request: RegisterRequest,
 ) -> Result<RegisterResponse, HubError> {
     if !shared.admitting() {
@@ -64,7 +67,7 @@ pub(crate) async fn register(
     let answer = hub_task("registration", {
         let written = Arc::clone(&written);
         async move {
-            let request = decode(&shared, presented, request)?;
+            let request = decode(&shared, presented, client, request)?;
             transact(shared, request, written).await
         }
     })
@@ -113,6 +116,7 @@ async fn hub_task<T: Send + 'static>(
 fn decode(
     shared: &Shared,
     presented: Option<Credential>,
+    client: Option<ClientIdentity>,
     request: RegisterRequest,
 ) -> Result<Request, HubError> {
     let RegisterRequest { peer, extensions } = request;
@@ -159,6 +163,7 @@ fn decode(
     let view = RegistrationView {
         peer: &peer,
         extensions: &extensions,
+        client: client.as_ref(),
     };
     for (extension, payload) in shared.extensions.iter().zip(&payloads) {
         extension.admit(&view, payload.as_ref())?;
@@ -166,6 +171,7 @@ fn decode(
     Ok(Request {
         peer,
         presented,
+        client,
         raw: extensions,
         payloads,
     })
@@ -368,6 +374,7 @@ async fn transact(
     let Request {
         peer,
         presented,
+        client,
         raw,
         payloads,
     } = request;
@@ -406,6 +413,7 @@ async fn transact(
             epoch,
             previous,
             extensions: &raw,
+            client: client.as_ref(),
         };
         for (extension, payload) in shared.extensions.iter().zip(payloads) {
             let prepared =
@@ -492,6 +500,7 @@ async fn transact(
         epoch,
         previous,
         extensions: &raw,
+        client: client.as_ref(),
     };
     // Each slot is taken just before its commit, so if a commit panics the
     // values not yet committed are still in the transaction, and its Drop

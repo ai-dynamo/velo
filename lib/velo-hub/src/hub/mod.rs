@@ -41,6 +41,7 @@ mod lifecycle;
 mod registration;
 mod routes;
 mod services;
+mod tls;
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -65,6 +66,7 @@ pub use error::HubError;
 pub use extension::{Committed, Extension, IntoExtension, RegistrationView, Rejection, Txn};
 pub use graph::{Bundle, BundleInstaller, GraphError};
 pub use routes::{Authorized, HubJson, HubPath, credential_from_headers};
+pub use tls::{ClientCerts, ClientIdentity, HANDSHAKE_TIMEOUT, HubTls};
 
 use context::{Attached, Services};
 use extension::DynExtension;
@@ -139,9 +141,25 @@ pub struct HubBuilder {
     velo: Option<VeloBuilder>,
     bundles: Vec<PendingBundle>,
     direct: Vec<PendingExtension>,
+    public_tls: Option<HubTls>,
+    control_tls: Option<HubTls>,
 }
 
 impl HubBuilder {
+    /// Serve the public listener over TLS. Default: plain HTTP.
+    pub fn public_tls(mut self, tls: HubTls) -> Self {
+        self.public_tls = Some(tls);
+        self
+    }
+
+    /// Serve the control listener over TLS. Default: plain HTTP. Pass a
+    /// clone of the public listener's `HubTls` to use one certificate for
+    /// both.
+    pub fn control_tls(mut self, tls: HubTls) -> Self {
+        self.control_tls = Some(tls);
+        self
+    }
+
     /// The store. Default: an [`InMemoryStore`] with the config's TTL.
     pub fn store(mut self, store: Arc<dyn HubStore>) -> Self {
         self.store = Some(store);
@@ -189,6 +207,8 @@ impl HubBuilder {
             velo,
             bundles,
             mut direct,
+            public_tls,
+            control_tls,
         } = self;
         let server = config.server.clone();
 
@@ -227,6 +247,10 @@ impl HubBuilder {
             })?;
         let public_addr = public.local_addr().context("public listener address")?;
         let control_addr = control.local_addr().context("control listener address")?;
+        let public = tls::HubListener::new(public, public_tls.as_ref())
+            .context("TLS for the public listener")?;
+        let control = tls::HubListener::new(control, control_tls.as_ref())
+            .context("TLS for the control listener")?;
 
         let store: Arc<dyn HubStore> = store.unwrap_or_else(|| {
             Arc::new(
@@ -611,13 +635,18 @@ async fn join_within(handles: &mut [Option<JoinHandle<()>>], within: std::time::
 }
 
 fn spawn_server(
-    listener: TcpListener,
+    listener: tls::HubListener,
     router: axum::Router,
     cancel: CancellationToken,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let serve = axum::serve(listener, router)
-            .with_graceful_shutdown(async move { cancel.cancelled().await });
+        // Connect info carries the client identity, plain or TLS, so routes
+        // read it the same way on both.
+        let serve = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<tls::Connection>(),
+        )
+        .with_graceful_shutdown(async move { cancel.cancelled().await });
         if let Err(error) = serve.await {
             tracing::error!(%error, "hub listener failed");
         }
@@ -832,6 +861,8 @@ impl Hub {
             velo: None,
             bundles: Vec::new(),
             direct: Vec::new(),
+            public_tls: None,
+            control_tls: None,
         }
     }
 
