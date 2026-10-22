@@ -212,7 +212,7 @@ The pump stamps the frame time after the forward to the anchor channel completes
 
 The `select!` is `biased` toward the receive arm. `tokio::time::timeout`, which this replaced, always polled the receive first. An unbiased select can let a ready timer win over a ready frame, and report a real terminal as a watchdog `Dropped`. The messenger's ordered-lane router uses the same one-timer shape and the same bias.
 
-### Heartbeats: the consolidation that is specified, not built
+### Heartbeats: the consolidation that is partly built
 
 A per-stream heartbeat task does not detect a hung producer, because it runs on its own task. Under the mux, the health check of the batcher detects a dead peer on the sending side, and the mux learns of it through epoch death. On a node that only receives, a dead producer is still the stream watchdog's job. A connection that closes after admission is not reported to the mux, and the stream watchdog ends the slots that lost records with it. The other signal that a stream heartbeat carries is per-slot saturation. The design keeps the heartbeat per slot and makes it cheap:
 
@@ -220,7 +220,7 @@ A per-stream heartbeat task does not detect a hung producer, because it runs on 
 - **Phase alignment.** Each sender follows one peer-level tick (a `tokio::sync::watch` driven by one timer task) instead of its own `interval`. Heartbeats then coalesce into one batch instead of scattering across the interval.
 - **No per-sender task.** The batcher walks its live slots on each tick and emits `SlotHeartbeat` for the idle ones.
 
-N scattered heartbeats per interval become at most one batch, and N tasks become one. The receiver still sees a per-slot beat inside its per-slot deadline, so the stream watchdog and `DETECTION_MULTIPLIER` do not change. `SlotHeartbeat` must not join the reserved control class: a heartbeat dropped under saturation is the saturation signal. Today each sender still runs its own heartbeat task, and heartbeats travel as `Data` records.
+N scattered heartbeats per interval become at most one batch, and N tasks become one. The receiver still sees a per-slot beat inside its per-slot deadline, so the stream watchdog and `DETECTION_MULTIPLIER` do not change. `SlotHeartbeat` must not join the reserved control class: a heartbeat dropped under saturation is the saturation signal. The third point is built without the batcher: one task per `AnchorManager` beats every remote sender, so N senders use one task. Suppression and phase alignment are not built, and heartbeats still travel as `Data` records. A sender on the anchor's own worker does not beat, because no watchdog reads its beats.
 
 ## Why the mux surface is not in velo-ext
 

@@ -1,6 +1,6 @@
 ---
 name: thermonuclear-review
-description: Maximum-intensity multi-agent review of a velo diff/branch before it becomes a PR. Fans out repo-specific finder dimensions (correctness, concurrency, FFI/unsafe, wire-compat, semver boundary, shutdown contract), adversarially verifies every finding, loops until dry, then reports confirmed findings ranked by severity. Use after each implementation phase, or when the user says "thermonuclear review".
+description: Maximum-intensity multi-agent review of a velo diff/branch before it becomes a PR. Fans out repo-specific finder dimensions (correctness, concurrency, FFI/unsafe, wire-compat, semver boundary, shutdown contract, and performance when the diff touches a hot path), adversarially verifies every finding, loops until dry, then reports confirmed findings ranked by severity. Use after each implementation phase, or when the user says "thermonuclear review".
 ---
 
 # Thermonuclear Review
@@ -94,6 +94,19 @@ any that cannot apply to the diff, add ad-hoc ones the diff suggests:
 8. **test adequacy** — for each behavior the diff claims, is there a test that
    would fail if the behavior regressed? Deliberately break something small in
    your head and check a test catches it. Flag untested error paths.
+9. **performance** — only when the diff touches a hot path. Classify first
+   with Stage 0 of `.claude/skills/perf-review/SKILL.md` (a tier lookup in
+   `references/hot-paths.md`, no agents), and drop this dimension when
+   nothing is T1 or T2 and no measured default, perf-sensitive dependency
+   or pinning test changed. One finder, not perf-review's three: it reads
+   `references/hot-paths.md` and `references/patterns.md`, covers the
+   regression families of F1–F3 (regressions only, no opportunities), and
+   returns perf-review's extra fields (`pattern`, `tier`, `chain`, `delta`,
+   `mechanism`, `cost`, `evidence`, `pin`) beside the five below. Its
+   Stage-2 verifier applies perf-review's seven refutation questions and
+   its severity table. This review does not measure: a confirmed major or
+   blocker here, or a diff that claims a speedup, ends the report with
+   "run `perf-review $REVIEW_RANGE --measure`".
 
 Each finder returns findings as `{file, line, claim, why-it-breaks, severity}`.
 

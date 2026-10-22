@@ -129,6 +129,7 @@ use self::lane_choice::LaneLoad;
 use self::peer_batcher::{BatcherHandle, BatcherMap, OpenRejected, OpenSlotRequest};
 use crate::messenger::{Context, Handler, Messenger};
 use crate::observability::{MuxMetricsHandle, VeloMetrics};
+use crate::streaming::deadline::DeadlineQueue;
 use crate::streaming::transport::FrameTransport;
 
 pub use self::config::{AutoFlush, FlushPolicy, MuxConfig};
@@ -180,8 +181,6 @@ pub(crate) struct MessengerMuxTransport {
     key: TransportKey,
 }
 
-type BindDeadline = std::cmp::Reverse<(tokio::time::Instant, (u64, u64))>;
-
 /// The longest an expiry entry waits before the sweep looks at its bind.
 ///
 /// A claimed or released bind leaves its entry queued, and only the sweep
@@ -190,6 +189,11 @@ type BindDeadline = std::cmp::Reverse<(tokio::time::Instant, (u64, u64))>;
 /// the life of the process. Capped here, a stale entry goes within 60 s at any
 /// window. A bind still open past it costs one requeue per recheck.
 const BIND_RECHECK: Duration = Duration::from_secs(60);
+
+/// The most bind entries one hold of the queue's lock pops. Every bind takes
+/// that lock, so a sweep that popped a whole burst at once would stall new
+/// streams for as long as the burst took.
+const EXPIRE_BATCH: usize = 4096;
 
 /// State shared between the transport, its batchers and the ingress handler.
 struct MuxCore {
@@ -226,15 +230,12 @@ struct MuxCore {
     /// `bind` returns. Take-once: whoever collects it owns it, and the bind
     /// expiry that already exists drops any that was never collected.
     drains: DashMap<(u64, u64), Arc<ingress::DrainSignal>>,
-    /// One expiry entry per bind, earliest first. Renewal moves the deadline
-    /// stored with the bind, not this entry; when the entry comes due, the
-    /// sweep reads the stored deadline and queues the entry again if it moved.
-    /// A requeued entry lands behind newer binds, so this is a heap and not a
-    /// FIFO queue. A bind claimed or released early leaves its entry here, and
-    /// that entry costs a failed lookup when it comes due; that is cheaper than
-    /// finding and removing it on the claim path. No entry is queued more than
-    /// [`BIND_RECHECK`] ahead, so a stale one does not outlive that.
-    bind_deadlines: std::sync::Mutex<std::collections::BinaryHeap<BindDeadline>>,
+    /// One expiry entry per bind. Renewal moves the deadline stored with the
+    /// bind, not this entry; when the entry comes due, the sweep reads the
+    /// stored deadline and queues the entry again if it moved. A bind claimed
+    /// or released early leaves its entry here until it comes due, at most
+    /// [`BIND_RECHECK`] ahead.
+    bind_deadlines: DeadlineQueue<(u64, u64)>,
     /// The accept window of every bind, attach or pre-bind
     /// (`ReservationConfig::prebind_timeout`).
     accept_window: Duration,
@@ -353,7 +354,7 @@ impl MessengerMuxTransport {
             drain_tx,
             drain_rx,
             drains: DashMap::new(),
-            bind_deadlines: std::sync::Mutex::default(),
+            bind_deadlines: DeadlineQueue::new(BIND_RECHECK, BIND_RECHECK),
             accept_window,
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
@@ -571,42 +572,27 @@ impl MuxCore {
     /// Runs on the sweep tick, so a window closes up to one
     /// `credit_sweep_interval` late -- 200 ms on a 180 s window by default.
     fn expire_binds(&self, now: tokio::time::Instant) {
-        let due: Vec<(u64, u64)> = {
-            let mut deadlines = self
-                .bind_deadlines
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let mut due = Vec::new();
-            while deadlines.peek().is_some_and(|entry| entry.0.0 <= now) {
-                due.push(deadlines.pop().expect("due entry").0.1);
+        loop {
+            let due = self.bind_deadlines.pop_due(now, EXPIRE_BATCH);
+            // Nothing due: most ticks. The requeue would only take the lock
+            // again; after a burst, the requeue of its last chunk shrinks.
+            if due.is_empty() {
+                return;
             }
-            due
-        };
-        if due.is_empty() {
-            return;
-        }
-        let mut renewed = Vec::new();
-        for (anchor_id, session_id) in due {
-            if let Some(deadline) = self.ingress.expire_due(anchor_id, session_id, now) {
-                let recheck = deadline.min(now.checked_add(BIND_RECHECK).unwrap_or(deadline));
-                renewed.push(std::cmp::Reverse((recheck, (anchor_id, session_id))));
-            } else {
-                self.drains.remove(&(anchor_id, session_id));
+            let more = due.len() == EXPIRE_BATCH;
+            let mut renewed = Vec::new();
+            for (_, (anchor_id, session_id)) in due {
+                if let Some(deadline) = self.ingress.expire_due(anchor_id, session_id, now) {
+                    renewed.push((deadline, (anchor_id, session_id)));
+                } else {
+                    self.drains.remove(&(anchor_id, session_id));
+                }
             }
-        }
-        // One lock for every requeue: binds take this lock too.
-        let mut deadlines = self
-            .bind_deadlines
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        deadlines.extend(renewed);
-        // A burst of binds leaves the queue's capacity behind it. Give it back
-        // only once the queue is nearly empty: the shrink copies what is left
-        // while holding the lock every bind takes, so shrinking a queue still
-        // tens of thousands deep would stall new streams. Decided after the
-        // requeue, so a sweep never shrinks a queue it is about to refill.
-        if deadlines.len() <= 1024 && deadlines.capacity() > 8192 {
-            deadlines.shrink_to(2048);
+            // One lock for every requeue: binds take this lock too.
+            self.bind_deadlines.requeue(now, renewed);
+            if !more {
+                return;
+            }
         }
     }
 
@@ -681,13 +667,7 @@ fn open_bind(
     // A deadline, not a task: the sweep expires it (`MuxCore::expire_binds`).
     // Nothing here may pin the core either, which a task holding a strong
     // handle would, for the full window after the last owner dropped it.
-    core.bind_deadlines
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push(std::cmp::Reverse((
-            expires.min(crate::streaming::deadline::deadline_after(BIND_RECHECK)),
-            (anchor_id, session_id),
-        )));
+    core.bind_deadlines.push(expires, (anchor_id, session_id));
 
     Ok(frame_rx)
 }

@@ -158,6 +158,13 @@ struct Args {
     /// Messenger transport that carries the mux batches.
     #[arg(long, value_enum, default_value_t = TransportType::Tcp)]
     transport: TransportType,
+
+    /// Unattached-anchor timeout, in milliseconds. Hold it small so that
+    /// unattached deadlines come due during the run, but above the attach
+    /// latency: a request anchor that expires before its sender attaches
+    /// fails the run.
+    #[arg(long)]
+    unattached_timeout_ms: Option<u64>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -227,10 +234,15 @@ async fn node(args: &Args, mux_enabled: bool) -> Result<Arc<Node>> {
     // registry collide on collector names.
     let registry = Registry::new();
     let metrics = Arc::new(VeloMetrics::register(&registry)?);
-    let builder: VeloBuilder = Velo::builder()
+    let mut builder: VeloBuilder = Velo::builder()
         .add_transport(new_transport(args.transport, "response_plane_bench").await?)
         .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
         .metrics(metrics);
+    if let Some(ms) = args.unattached_timeout_ms {
+        let mut config = velo::streaming::ReservationConfig::default();
+        config.unattached_timeout = Duration::from_millis(ms);
+        builder = builder.reservation_config(config);
+    }
     let velo = builder
         .messenger_mux(MuxConfig {
             enabled: mux_enabled,

@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
+use crate::streaming::sweep::{DeadlineSweep, Due, Expiring, SweepTarget, expire_due};
 use dashmap::DashMap;
 use futures::Stream;
 use serde::de::DeserializeOwned;
@@ -56,12 +57,19 @@ pub(crate) struct MpscAnchorEntry {
     pub senders: HashMap<u64, MpscSenderSlot>,
     /// Monotonic sender-id allocator; starts at 1. Each attach increments it.
     pub next_sender_id: u64,
-    /// Stored duration used to respawn the unattached timeout after the
-    /// last sender departs.
+    /// Stored duration used to re-arm the unattached timeout after the last
+    /// sender departs.
     pub unattached_timeout: Option<Duration>,
-    /// Currently-armed timeout task cancel token. `None` while at least one
-    /// sender is attached.
-    pub timeout_cancel: Option<CancellationToken>,
+    /// When the anchor expires with no sender. `None` while at least one
+    /// sender is attached, and when there is no timeout. Renewal does not
+    /// reach an MPSC anchor, so this moves only when the last sender leaves.
+    pub expires: Option<tokio::time::Instant>,
+    /// When this anchor's live entry in the deadline queue comes due. The
+    /// sweep drops a popped entry whose instant differs, as a stale copy.
+    pub queued: Option<tokio::time::Instant>,
+    /// The manager's MPSC deadline queue, held here so that each path that
+    /// removes the last sender can re-arm the timeout.
+    pub deadlines: Arc<MpscDeadlines>,
     /// Negotiated heartbeat cadence echoed to each attaching sender.
     pub heartbeat_interval: Duration,
     /// Optional cap on concurrent attached senders.
@@ -114,9 +122,6 @@ impl MpscStreamController {
         };
 
         entry.cancel_token.cancel();
-        if let Some(ref tc) = entry.timeout_cancel {
-            tc.cancel();
-        }
         let _ = self.inner.cancel_wake.try_send(());
 
         cancel_all_senders(
@@ -304,8 +309,7 @@ pub(crate) fn cancel_all_senders(
 /// `pump_token`) or `None` if the slot was not present.
 ///
 /// If the entry goes to zero senders and has an `unattached_timeout`
-/// configured, a fresh timeout task is spawned inside the same critical
-/// section.
+/// configured, the timeout is re-armed inside the same critical section.
 ///
 /// Safe to call on a non-existent entry (no-op) and safe to call repeatedly
 /// for the same sender_id.
@@ -319,45 +323,56 @@ pub(crate) fn remove_sender_slot(
     if entry.senders.is_empty()
         && let Some(duration) = entry.unattached_timeout
     {
-        let parent = entry.cancel_token.clone();
-        let tc = spawn_mpsc_timeout_task(registry.clone(), local_id, duration, &parent);
-        entry.timeout_cancel = Some(tc);
+        let expires = crate::streaming::deadline::deadline_after(duration);
+        entry.expires = Some(expires);
+        // Under the shard lock. That is safe: the push takes only a queue
+        // shard lock, and the sweep reads `expires` and `queued` after this
+        // guard is gone.
+        let entry = &mut *entry;
+        entry
+            .deadlines
+            .arm(registry, &mut entry.queued, expires, local_id);
     }
     Some(slot)
 }
 
-/// Spawn a background task that removes the anchor after `timeout` elapses,
-/// cancelled by either explicit cancel or a new sender attaching.
-pub(crate) fn spawn_mpsc_timeout_task(
-    registry: Arc<DashMap<u64, MpscAnchorEntry>>,
-    local_id: u64,
-    timeout: Duration,
-    parent_cancel: &CancellationToken,
-) -> CancellationToken {
-    let tc = parent_cancel.child_token();
-    // The last sender can leave from a plain thread, or from a thread-local
-    // destructor after tokio's own context is gone, where a bare
-    // `tokio::spawn` panics. The timer then does not fire, as for SPSC
-    // (`AnchorManager::spawn_timeout_task`).
-    let Ok(rt) = tokio::runtime::Handle::try_current() else {
-        tracing::debug!(
-            local_id,
-            "mpsc anchor: no runtime to arm the unattached timeout on; it will not fire"
-        );
-        return tc;
-    };
-    let tc_clone = tc.clone();
-    rt.spawn(async move {
-        tokio::select! {
-            _ = tc_clone.cancelled() => {}
-            _ = tokio::time::sleep(timeout) => {
-                if let Some((_, entry)) = registry.remove(&local_id) {
-                    entry.cancel_token.cancel();
-                    // Dropping entry drops the stored frame_tx clone. Any remaining
-                    // sender clones keep the receiver alive until they're dropped.
-                }
-            }
+/// The unattached deadlines of one manager's MPSC anchors, swept by one
+/// task. See [`crate::streaming::anchor::AnchorDeadlineQueue`].
+pub(crate) type MpscDeadlines = DeadlineSweep<DashMap<u64, MpscAnchorEntry>>;
+
+impl Expiring for MpscAnchorEntry {
+    fn due(&self, now: tokio::time::Instant) -> Due {
+        if !self.senders.is_empty() {
+            return Due::Drop;
         }
-    });
-    tc
+        Due::at(self.expires, now)
+    }
+
+    fn queued(&self) -> Option<tokio::time::Instant> {
+        self.queued
+    }
+
+    fn set_queued(&mut self, at: tokio::time::Instant) {
+        self.queued = Some(at);
+    }
+
+    /// Dropping the entry drops its `frame_tx` clone. Remaining sender
+    /// clones keep the receiver alive until they drop.
+    fn expire(self) {
+        self.cancel_token.cancel();
+    }
+}
+
+impl SweepTarget for DashMap<u64, MpscAnchorEntry> {
+    const FIRST_LOOK: Duration = crate::streaming::anchor::ANCHOR_FIRST_LOOK;
+    const RECHECK: Duration = crate::streaming::anchor::ANCHOR_RECHECK;
+
+    fn on_due(
+        &self,
+        due: Vec<(tokio::time::Instant, u64)>,
+        now: tokio::time::Instant,
+        renewed: &mut Vec<(tokio::time::Instant, u64)>,
+    ) {
+        expire_due(self, due, now, renewed);
+    }
 }

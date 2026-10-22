@@ -70,6 +70,7 @@ CI links with `mold` (`RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=mold"`). 
 - **Write the test first.** A claim about a fault is proved by a test that fails for that fault. The same test then proves the fix.
 - **Prove the precondition. Do not wait for it.** A test that sleeps and hopes that a state is reached fails under load and under coverage instrumentation. Wait on an observable signal, such as a counter or a hook, that shows the state.
 - **Put the hard lessons in tests.** A comment does not stop a regression. A test does. The doc comment of the test can be long, because it carries the reason forward.
+- **Count a cost, not only a result.** A performance fault passes every functional test. Count the allocations, timer arms, tasks or writes of a hot path, and fail the test when the count grows. See [Review for performance](performance-review.md).
 - **Keep an ignored test honest.** If a failing test must land before its fix, mark it `#[ignore = "<finding>: <why it fails>"]`. An ignored test enforces nothing. Removing the ignore is the first step of the fix.
 
 ## Known flaky tests

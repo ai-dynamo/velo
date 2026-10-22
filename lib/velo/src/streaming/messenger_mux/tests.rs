@@ -2966,6 +2966,24 @@ async fn a_removed_anchor_withdraws_its_feed() {
     drop(anchor);
 }
 
+/// A pre-bind pauses the unattached timer, and the entry says so: `expires`
+/// is `None` while the anchor is pre-bound. See
+/// `anchor::tests::a_local_attach_clears_the_unattached_deadline`.
+#[tokio::test]
+async fn a_prebind_clears_the_unattached_deadline() {
+    tokio::time::pause();
+    let node = prebinding_node(test_config(), Some(Duration::from_secs(120))).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let id = anchor.handle().unpack().1;
+    assert!(node.manager.registry.get(&id).unwrap().expires.is_some());
+    node.manager
+        .prebind_anchor(anchor.handle())
+        .expect("ticket");
+    assert_eq!(node.manager.registry.get(&id).unwrap().expires, None);
+    drop(anchor);
+    node.mux.shutdown().await;
+}
+
 #[tokio::test]
 async fn reservation_renewal_extends_one_deadline_without_reallocating_slots() {
     tokio::time::pause();
@@ -2977,7 +2995,7 @@ async fn reservation_renewal_extends_one_deadline_without_reallocating_slots() {
     for _ in 0..5 {
         tokio::time::sleep(Duration::from_secs(2)).await;
         node.manager.renew_reservations_local(&[reservation]);
-        assert_eq!(node.mux.core.bind_deadlines.lock().unwrap().len(), 1);
+        assert_eq!(node.mux.core.bind_deadlines.heap().len(), 1);
         assert_eq!(node.manager.active_anchor_count(), 1);
     }
     tokio::time::sleep(Duration::from_secs(4)).await;
@@ -3120,12 +3138,12 @@ async fn a_released_bind_leaves_the_queue_within_the_recheck_horizon() {
     node.manager.prebind_anchor(held.handle()).expect("ticket");
     drop(released);
     eventually(|| node.mux.pending_binds() == 1).await;
-    assert_eq!(node.mux.core.bind_deadlines.lock().unwrap().len(), 2);
+    assert_eq!(node.mux.core.bind_deadlines.heap().len(), 2);
 
     tokio::time::advance(super::BIND_RECHECK + Duration::from_secs(1)).await;
     node.mux.core.expire_binds(tokio::time::Instant::now());
     assert_eq!(
-        node.mux.core.bind_deadlines.lock().unwrap().len(),
+        node.mux.core.bind_deadlines.heap().len(),
         1,
         "the released bind's entry is gone; the held one is queued again"
     );
@@ -3148,7 +3166,7 @@ async fn the_sweep_does_not_shrink_the_queue_it_is_about_to_refill() {
     let core = &node.mux.core;
     let due = tokio::time::Instant::now() + Duration::from_secs(1);
     let capacity = {
-        let mut deadlines = core.bind_deadlines.lock().unwrap();
+        let mut deadlines = core.bind_deadlines.heap();
         deadlines.reserve(16_384);
         for anchor in 1..=HELD {
             let (tx, _rx) = flume::bounded(1);
@@ -3167,7 +3185,7 @@ async fn the_sweep_does_not_shrink_the_queue_it_is_about_to_refill() {
     tokio::time::advance(Duration::from_secs(2)).await;
     core.expire_binds(tokio::time::Instant::now());
     let (len, after) = {
-        let deadlines = core.bind_deadlines.lock().unwrap();
+        let deadlines = core.bind_deadlines.heap();
         (deadlines.len(), deadlines.capacity())
     };
     assert_eq!(len, HELD as usize, "every held bind is queued again");
