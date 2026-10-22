@@ -3591,6 +3591,7 @@ dependencies = [
  "ring",
  "rmp-serde",
  "rustls",
+ "rustls-webpki",
  "serde",
  "serde_bytes",
  "serde_json",

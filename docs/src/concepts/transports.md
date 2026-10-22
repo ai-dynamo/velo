@@ -19,7 +19,7 @@ let node = Velo::builder()
 | gRPC | `grpc` (default) | HTTP/2 bidirectional stream | Reconnects with exponential backoff |
 | ZMQ | `zmq` | ZMQ DEALER/ROUTER | Reconnects and queues messages |
 | UCX | `ucx`, Linux only | UCX active messages over RDMA, TCP, or shared memory | Also carries RDMA rendezvous. See [Rendezvous and RDMA](rendezvous.md). |
-| QUIC | `quic` | QUIC over UDP, TLS 1.3 | Pinned self-signed certificate. Coalescing writer. See [QUIC](#quic). |
+| QUIC | `quic` | QUIC over UDP, TLS 1.3 | Pinned self-signed certificate, or certificates from a private CA with an authorization callback. Coalescing writer. See [QUIC](#quic). |
 
 The `http` feature exists, but the HTTP messenger transport is not built at this time.
 
@@ -115,7 +115,7 @@ graph LR
 - **One stream for each connection.** The dialer opens one bidirectional stream and writes velo frames on it with the TCP frame codec. One stream keeps the order of the messages on one connection, that is on one lane. Ordered handlers and batched streaming rely on that order. Several streams would remove head-of-line blocking after a packet loss, but they would also reorder the messages of one peer without the caller choosing it. Lanes (below) reorder only across lanes, and the caller picks the lane for each ordered flow.
 - **Shutdown waits for acknowledgement.** When a writer stops, even at teardown, it finishes its stream and waits up to 1 second for the peer to acknowledge what it wrote, and then closes its connection. A writer that is blocked because the peer stopped reading is closed by force at 2 seconds instead. The dial sockets close when every writer has finished, or at the latest after 2 seconds. A QUIC close discards unacknowledged data, which TCP would still deliver after a close. `Transport::closed()` waits for this, and `graceful_shutdown` waits for `closed()`, so a process can exit when `graceful_shutdown` returns.
 - **The reverse direction carries only drain echoes.** The listener writes a `ShuttingDown` frame back on the same stream when it refuses a request during drain. The dialer reads it with the same code as TCP.
-- **The certificate is pinned.** Each transport makes a self-signed certificate and puts its SHA-256 fingerprint in its `WorkerAddress` entry. A dialer accepts only that certificate and checks the TLS 1.3 handshake signature. A different listener on a reused port fails the handshake.
+- **The certificate is pinned by default.** Each transport makes a self-signed certificate and puts its SHA-256 fingerprint in its `WorkerAddress` entry. A dialer accepts only that certificate and checks the TLS 1.3 handshake signature. A different listener on a reused port fails the handshake. The listener does not authenticate the dialer. For authenticated peers, see [Authenticated QUIC](#authenticated-quic).
 - **Lanes are separate connections.** With `lanes(n)`, the dialer keeps up to `n` connections to each peer, one for each lane that it sends on, each from its own UDP socket. One QUIC connection does its packet and crypto work on one task, so it is bound to about one core. Lanes spread that work over more cores. `send_message` uses lane 0, so ordinary traffic keeps one ordered channel for each peer.
 - **Each server socket has its own port.** `server_endpoints(n)` binds `n` UDP sockets, each on its own port, and the `WorkerAddress` entry lists the ports. A dialer sends lane `k` to socket `(offset + k) % n`, where `offset` comes from the dialer's own certificate. So the lanes of one dialer land on different sockets, and the peers are spread over the sockets too. Each socket has its own quinn endpoint driver, receive queue and buffer ceiling. The lanes of a dialer are spread evenly, so a socket can carry two lanes: 8 lanes into 4 sockets moved as much as into 8. The default is 4. Each socket costs a port, a quinn endpoint and its buffers. A peer that does not list ports is dialed on its one advertised port for every lane.
 - **Dial sockets are separate.** Dials use their own sockets on ephemeral ports, one for each lane, so each lane has its own endpoint driver for its replies.
@@ -124,6 +124,30 @@ graph LR
 - **quinn 0.11.12 is the minimum.** It pulls quinn-proto 0.11.18. Older quinn-proto can fail an ordered, lossless stream of many small chunks with `too many gaps in stream buffer`.
 
 For the tuning settings and the measured cost against TCP, see [QUIC performance](../operations/quic-performance.md).
+
+### Authenticated QUIC
+
+`QuicTransportBuilder::tls(QuicTls)` replaces the pinned self-signed certificate with certificates from a private CA, such as ACM Private CA, SPIRE, or cert-manager. `QuicTls::new` takes the root certificates to trust, this transport's certificate chain, and its private key. Every transport both dials and listens, so each leaf certificate needs the `serverAuth` and the `clientAuth` extended key usages.
+
+```mermaid
+sequenceDiagram
+    participant D as Dialer
+    participant L as Listener
+    D->>L: TLS 1.3 handshake, both sides present a chain
+    Note over D,L: Each side verifies the other chain against its roots
+    Note over D: The dialer's authorizer decides on the listener
+    Note over L: The listener's authorizer decides on the dialer
+    D->>L: First frame, only after both decisions accept
+```
+
+- **Both ends verify the other.** The listener requires a client certificate. A dialer verifies the server chain against its roots and does not check a name, because every dialer presents the name `velo`. A peer is identified by its certificate.
+- **The application authorizes each connection.** A `QuicAuthorizer`, or a closure, gets the verified `PeerIdentity` and a `ConnectionOrigin`. The identity gives the leaf certificate, the chain, and the URI SANs, for example `spiffe://<deployment>/<class>/<cell>`. The origin is `Accepted`, or `Dialed` with the instance id and the lane. The decision is made for every connection, on every lane, in both directions. It is made after the handshake and before the transport reads or writes a frame on the connection. A refused connection is closed with the code `REFUSED` and dispatches nothing. A panic in the authorizer is a refusal.
+- **Why not `_hello`.** The messenger's `_hello` is not the first frame of every connection. System handlers skip it, and a connection that a peer dials back can begin with a response. So the check is on the connection.
+- **Rotation does not restart the transport.** `QuicTls::rotate` replaces the certificate and key, and `QuicTls::set_roots` replaces the roots. Keep a clone of the `QuicTls`, or get it with `QuicTransport::tls`. New handshakes use the new values, also to peers that were registered before the change. Connections that are open keep the identity that they authenticated with.
+- **No session resumption and no 0-RTT.** A resumed TLS session skips certificate verification and keeps the identity of the first session, so it would outlive a rotation. 0-RTT data would arrive before the client certificate is verified.
+- **A refusal by the listener can lose frames without a report.** In TLS 1.3 the client finishes its handshake, and can write, before the server verifies the client certificate. Frames that the dialer wrote on such a connection are lost, as with a peer that closes. The dialer logs a warning. A refusal by the dialer, or a server certificate that the dialer does not trust, fails the queued frames through their error handlers.
+- **All peers use the same mode.** A transport with the default pinned certificate has no client certificate, so it cannot dial a transport with `tls`.
+- **TCP is not covered.** The TCP transport has no TLS layer, so this does not come with the same code.
 
 ## Frame transports for streams
 
