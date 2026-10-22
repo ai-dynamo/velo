@@ -224,6 +224,10 @@ impl QuicTransportBuilder {
         let client_sockets = (0..self.lanes.get())
             .map(|_| bind_client_socket(bind_addr, self.udp_buffers))
             .collect::<Result<Vec<_>>>()?;
+        let dial_reaches_ipv4 = bind_addr.is_ipv4()
+            || socket2::SockRef::from(&client_sockets[0])
+                .only_v6()
+                .is_ok_and(|only_v6| !only_v6);
 
         let mut transport_config = quinn::TransportConfig::default();
         // One bidirectional stream per connection. Datagrams and
@@ -308,6 +312,7 @@ impl QuicTransportBuilder {
             lane_offset: super::lane_offset(&identity.fingerprint),
             local_interfaces: OnceLock::new(),
             numa_hint: self.numa_hint,
+            dial_reaches_ipv4,
             metrics: OnceLock::new(),
             dialed_ctx: OnceLock::new(),
         })

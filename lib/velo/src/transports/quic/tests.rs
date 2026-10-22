@@ -1601,3 +1601,50 @@ async fn a_peer_with_no_address_of_the_dial_sockets_family_is_refused() {
     ));
     assert!(transport.peers.get(&id).is_none());
 }
+
+/// An IPv6 dial socket on a host with `IPV6_V6ONLY` off reaches IPv4 peers
+/// through mapped addresses, so an IPv6 transport still sends to a peer
+/// that advertises IPv4 only. The family filter must not refuse it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dual_stack_dialer_reaches_an_ipv4_peer() {
+    let Ok(dialer) = QuicTransportBuilder::new()
+        .bind_addr("[::1]:0".parse().unwrap())
+        .build()
+    else {
+        eprintln!("no IPv6 loopback on this host; skipping");
+        return;
+    };
+    if !dialer.dial_reaches_ipv4 {
+        eprintln!("IPv6 sockets are IPv6-only on this host; skipping");
+        return;
+    }
+    let (adapter, _dialer_streams) = make_channels();
+    dialer
+        .start(
+            InstanceId::new_v4(),
+            adapter,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
+    let (server, server_streams, server_id) = started().await;
+    dialer
+        .register(PeerInfo::new(server_id, server.address()))
+        .expect("an IPv4 peer is reachable from a dual-stack dialer");
+    let errors = Arc::new(Errors::default());
+    let _ = dialer.send_message(
+        server_id,
+        Bytes::from_static(b"h"),
+        Bytes::from_static(b"mapped"),
+        MessageType::Event,
+        errors.clone(),
+    );
+    let (_, payload) = tokio::time::timeout(
+        Duration::from_secs(5),
+        server_streams.event_stream.recv_async(),
+    )
+    .await
+    .expect("the frame arrives over the mapped address")
+    .unwrap();
+    assert_eq!(&payload[..], b"mapped");
+}
