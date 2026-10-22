@@ -38,6 +38,20 @@ Extension routes are under `/v1/ext/{name}/`. An extension's `public_routes` go 
 | `POST /v1/instances/{id}/probe` | the hub sends a heartbeat to the instance over velo |
 | `GET /v1/peers/instance/{id}`, `GET /v1/peers/worker/{id}` | peer discovery |
 
+### TLS
+
+Each listener serves plain HTTP by default. `HubBuilder::public_tls` and `HubBuilder::control_tls` take a `HubTls`, so the two listeners can differ: for example, server TLS on the public listener and client certificates on the control listener. The library reads no files. The program passes DER certificates and keys (`velo_hub::pki_types`).
+
+- `HubTls::new(chain, key)` serves the chain and does not ask clients for a certificate.
+- `HubTls::client_certs(roots, mode)` asks for a client certificate and verifies it against `roots`. With `ClientCerts::Required`, a client without a certificate that verifies fails the handshake. With `ClientCerts::Optional`, a client can connect without a certificate, but a certificate that it presents must verify.
+- Routes read the verified certificate with the `ClientIdentity` extractor, which answers `unauthorized` without one, or with `Option<ClientIdentity>`. `ClientIdentity::uris` gives the URI SANs, for example `spiffe://<deployment>/<class>/<cell>`.
+- Registration hooks see it as `RegistrationView::client`, `Txn::client`, and `Committed::client`. An extension that admits only some identities refuses in `admit`.
+- `HubTls::rotate` replaces the certificate and `HubTls::set_client_roots` replaces the roots, without a restart. Keep a clone of the `HubTls`. New connections use the new values, and open connections keep theirs.
+- TLS 1.3 only, with no session resumption. A resumed session skips the client certificate check and keeps the first identity, so it would outlive a rotation.
+- Each handshake runs in its own task, under `HANDSHAKE_TIMEOUT` (10 s). A client that connects and sends nothing does not hold up the clients behind it.
+
+The client uses TLS through its HTTP client: build a `reqwest::Client` with TLS, and with a client certificate if the hub asks for one, and pass it to `HubClientBuilder::http_client` with `.scheme("https")`.
+
 A successful registration returns a credential and an epoch. The credential goes in the `x-velo-hub-credential` header of every mutation that the registration owns. Each registration gets a new credential and a new epoch, and the previous credential stops working. Every error that a core route answers is an `ErrorBody` with a stable `code`, also for a body or a path that the hub cannot parse, and for a route that does not exist. A client acts on the code: `busy` means retry, and `register_again` means register again without a credential. Extension routes get the same behavior when they use the `HubJson`, `HubPath`, and `Authorized` extractors and return `HubError`.
 
 ## Store

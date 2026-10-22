@@ -25,11 +25,14 @@ server = [
     "dep:dashmap",
     "dep:futures",
     "dep:parking_lot",
+    "dep:rustls",
     "dep:sha2",
     "dep:thiserror",
     "dep:tokio",
+    "dep:tokio-rustls",
     "dep:tokio-util",
     "dep:tracing",
+    "dep:webpki",
 ]
 # The hub client: registration, discovery and extension calls (reqwest).
 client = [
@@ -70,19 +73,28 @@ thiserror = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 tokio-util = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+# TLS on the listeners (`HubTls`), with the ring provider; nothing reads a
+# process-wide default provider. rustls-webpki reads client URI SANs
+# (`valid_uri_names` is in 0.103.8 and later).
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring"] }
+webpki = { package = "rustls-webpki", version = "0.103.8", optional = true, default-features = false, features = ["std"] }
 
 # etcd
 etcd-client = { workspace = true, optional = true }
 
 # client. No TLS by default: a caller that needs it enables it on reqwest and
-# passes its own client to `HubClientBuilder::http_client`.
+# passes its own client to `HubClientBuilder::http_client`. The server's TLS
+# (`HubTls`) is under `server`.
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream"], optional = true }
 
 [dev-dependencies]
 # `test-helpers` exposes `Velo::primary_transport_key`, which the hooks
 # suite reads to prove a failed registration leaves no velo peer behind.
 velo = { workspace = true, features = ["test-helpers"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-manual-roots"] }
+# Test certificates for the TLS suite.
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring"] }
 rmp-serde = { workspace = true }
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread", "time"] }
 tracing-subscriber = { workspace = true }
@@ -130,6 +142,11 @@ required-features = ["test-support", "client"]
 [[test]]
 name = "services_sync"
 path = "tests/services_sync.rs"
+required-features = ["test-support", "client"]
+
+[[test]]
+name = "tls"
+path = "tests/tls.rs"
 required-features = ["test-support", "client"]
 
 [[test]]

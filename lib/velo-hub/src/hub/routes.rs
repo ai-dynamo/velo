@@ -306,9 +306,10 @@ async fn list(State(shared): HubState) -> Json<ListInstancesResponse> {
 async fn register(
     State(shared): HubState,
     Presented(presented): Presented,
+    client: Option<super::tls::ClientIdentity>,
     HubJson(request): HubJson<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, HubError> {
-    registration::register(shared, presented, request)
+    registration::register(shared, presented, client, request)
         .await
         .map(Json)
 }
