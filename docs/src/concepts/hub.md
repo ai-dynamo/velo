@@ -49,7 +49,7 @@ Each listener serves plain HTTP by default. `HubBuilder::public_tls` and `HubBui
 - `HubTls::rotate` replaces the certificate and `HubTls::set_client_roots` replaces the roots, without a restart. Keep a clone of the `HubTls`. New connections use the new values, and open connections keep theirs.
 - TLS 1.3 only, with no session resumption. A resumed session skips the client certificate check and keeps the first identity, so it would outlive a rotation. ALPN offers HTTP/1.1 only, because the hub does not build HTTP/2 support.
 - Each handshake runs in its own task, under `HANDSHAKE_TIMEOUT` (10 s). A client that connects and sends nothing does not hold up the clients behind it.
-- At most 256 connections are in a handshake or wait for the server at one time. At that limit, the listener stops accepting, and the kernel backlog holds the next clients, as for a plain listener. So many clients that connect and send nothing can delay other clients, for up to `HANDSHAKE_TIMEOUT`, but they cannot use more memory or sockets than that.
+- At most 256 connections are in a handshake or wait for the server at one time. At that limit, the listener stops accepting, and the kernel backlog holds the next clients, as for a plain listener. So many clients that connect and send nothing can delay other clients, for up to `HANDSHAKE_TIMEOUT`. The hub holds at most 256 of their connections, and the kernel backlog holds the rest.
 - A TLS listener accepts only after the hub starts to serve. It owns its socket, so when `shutdown` returns, the port is free.
 
 The client uses TLS through its HTTP client: build a `reqwest::Client` with TLS, and with a client certificate if the hub asks for one, and pass it to `HubClientBuilder::http_client` with `.scheme("https")`.
