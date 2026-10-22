@@ -21,6 +21,16 @@ pub(crate) fn deadline_after(lifetime: Duration) -> Instant {
         .unwrap_or_else(|| now + FAR_FUTURE)
 }
 
+/// When [`DeadlineQueue::requeue`] at `now` queues an entry for `deadline`:
+/// at most `recheck` after `now`.
+///
+/// An owner that records the instant of its entry computes it here, so the
+/// instant it records is the one the queue holds.
+pub(crate) fn requeue_at(now: Instant, deadline: Instant, recheck: Duration) -> Instant {
+    now.checked_add(recheck)
+        .map_or(deadline, |cap| deadline.min(cap))
+}
+
 /// Move `expires` to a full `lifetime` from now, unless it already passed.
 ///
 /// A passed deadline stays passed: renewal never revives what expiry is about
@@ -100,13 +110,6 @@ impl<K: Ord> DeadlineQueue<K> {
         due
     }
 
-    /// When [`requeue`](Self::requeue) at `now` queues an entry for
-    /// `deadline`: at most `recheck` after `now`.
-    pub(crate) fn requeue_at(&self, now: Instant, deadline: Instant) -> Instant {
-        now.checked_add(self.recheck)
-            .map_or(deadline, |cap| deadline.min(cap))
-    }
-
     /// Queue every key in `renewed` again, each at most `recheck` after
     /// `now`, under one lock.
     ///
@@ -120,7 +123,7 @@ impl<K: Ord> DeadlineQueue<K> {
         heap.extend(
             renewed
                 .into_iter()
-                .map(|(deadline, key)| Reverse((self.requeue_at(now, deadline), key))),
+                .map(|(deadline, key)| Reverse((requeue_at(now, deadline, self.recheck), key))),
         );
         if heap.len() <= 1024 && heap.capacity() > 8192 {
             heap.shrink_to(2048);

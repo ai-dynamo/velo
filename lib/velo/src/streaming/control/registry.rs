@@ -18,11 +18,8 @@ use crate::streaming::sender::Retirement;
 /// `CancellationToken::is_cancelled` locks a mutex (tokio-util 0.7.18 and
 /// 0.7.19): 8.7 ns per call against 0.3 ns for this load, paid on every
 /// record. [`SenderEntry::cancel`] sets the flag before it cancels the token,
-/// so a send after it fails at once. A token cancelled any other way sets the
-/// flag from the sender's heartbeat task, once the cancelling task yields and
-/// that task runs, and only while the runtime that built the sender is alive.
-/// Until then a send that finds channel space is accepted, up to the free
-/// capacity of the channel.
+/// so a send after it fails at once. Nothing else cancels the stream token:
+/// the token a sender hands out is a child that only observes it.
 ///
 /// It is also where the stream's retirement is recorded: the sender and its
 /// transport slot already share this allocation, so
@@ -209,39 +206,6 @@ impl Drop for RetireGuard {
     fn drop(&mut self) {
         if let Some(closed) = self.0.take() {
             closed.retire(Retirement::Discarded);
-        }
-    }
-}
-
-/// Held by a sender's heartbeat task, which ends when the sender's token is
-/// cancelled. A token cancelled other than through [`SenderEntry::cancel`]
-/// reaches the per-record check here. A drop guard, so a cancel that came
-/// before the task was dropped with its runtime still sets the flag. A direct
-/// cancel after that runtime is gone has no task to see it, and `send` keeps
-/// accepting records; [`SenderEntry::cancel`] still works then.
-pub(crate) struct CloseOnCancel {
-    token: tokio_util::sync::CancellationToken,
-    closed: SenderClosed,
-}
-
-impl CloseOnCancel {
-    /// Built with the sender. A token already cancelled by then closes the
-    /// flag at once: no task needs to run for it.
-    pub(crate) fn new(token: &tokio_util::sync::CancellationToken, closed: &SenderClosed) -> Self {
-        if token.is_cancelled() {
-            closed.close();
-        }
-        Self {
-            token: token.clone(),
-            closed: closed.clone(),
-        }
-    }
-}
-
-impl Drop for CloseOnCancel {
-    fn drop(&mut self) {
-        if self.token.is_cancelled() {
-            self.closed.close();
         }
     }
 }
