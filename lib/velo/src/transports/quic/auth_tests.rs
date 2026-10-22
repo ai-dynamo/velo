@@ -800,3 +800,50 @@ mod velo_level {
         );
     }
 }
+
+/// Whether each direction's verifier accepts a leaf from `ca`.
+fn trusts(tls: &QuicTls, leaf: &CertificateDer<'_>) -> (bool, bool) {
+    use rustls::client::danger::ServerCertVerifier;
+    use rustls::server::danger::ClientCertVerifier;
+    let now = rustls::pki_types::UnixTime::now();
+    let name = rustls::pki_types::ServerName::try_from("velo").unwrap();
+    let outbound = super::RootsServerVerifier(tls.state.clone())
+        .verify_server_cert(leaf, &[], &name, &[], now)
+        .is_ok();
+    let inbound = super::CurrentClientVerifier(tls.state.clone())
+        .verify_client_cert(leaf, &[], now)
+        .is_ok();
+    (outbound, inbound)
+}
+
+/// Two `set_roots` calls at once leave both directions trusting the same
+/// roots. With the roots and the client verifier behind separate locks, the
+/// writes could interleave as A.roots, B.roots, B.verifier, A.verifier: the
+/// dialer then trusted B and the listener A, after both calls returned.
+#[test]
+fn concurrent_root_updates_leave_both_directions_agreeing() {
+    let a = Ca::new();
+    let b = Ca::new();
+    let leaf_a = a.leaf("spiffe://d/x/a").chain[0].clone();
+    let leaf_b = b.leaf("spiffe://d/x/b").chain[0].clone();
+    let tls = a.tls("spiffe://d/self/c1");
+    for round in 0..2000 {
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for root in [a.root(), b.root()] {
+                let (tls, barrier) = (&tls, &barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    tls.set_roots([root]).unwrap();
+                });
+            }
+        });
+        let (out_a, in_a) = trusts(&tls, &leaf_a);
+        let (out_b, in_b) = trusts(&tls, &leaf_b);
+        assert_eq!(
+            (out_a, out_b),
+            (in_a, in_b),
+            "round {round}: the dialer and the listener trust different roots"
+        );
+    }
+}

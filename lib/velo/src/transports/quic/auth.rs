@@ -141,14 +141,35 @@ pub struct QuicTls {
 struct TlsState {
     provider: Arc<CryptoProvider>,
     certified: RwLock<Arc<CertifiedKey>>,
-    roots: RwLock<Arc<RootCertStore>>,
-    client_verifier: RwLock<Arc<dyn ClientCertVerifier>>,
+    /// One lock for both directions: two `set_roots` calls at once must not
+    /// leave the dialer trusting one set and the listener another.
+    trust: RwLock<Arc<Trust>>,
+}
+
+/// The roots, and the client verifier built from them.
+struct Trust {
+    roots: Arc<RootCertStore>,
+    client_verifier: Arc<dyn ClientCertVerifier>,
+}
+
+impl Trust {
+    fn new(
+        roots: impl IntoIterator<Item = CertificateDer<'static>>,
+        provider: &Arc<CryptoProvider>,
+    ) -> Result<Arc<Self>> {
+        let roots = root_store(roots)?;
+        let client_verifier = client_verifier(&roots, provider)?;
+        Ok(Arc::new(Self {
+            roots,
+            client_verifier,
+        }))
+    }
 }
 
 impl fmt::Debug for TlsState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TlsState")
-            .field("roots", &self.roots.read().len())
+            .field("roots", &self.trust.read().roots.len())
             .finish_non_exhaustive()
     }
 }
@@ -172,15 +193,13 @@ impl QuicTls {
         key: PrivateKeyDer<'static>,
     ) -> Result<Self> {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let roots = root_store(roots)?;
+        let trust = Trust::new(roots, &provider)?;
         let certified = certified_key(chain, key, &provider)?;
-        let client_verifier = client_verifier(&roots, &provider)?;
         Ok(Self {
             state: Arc::new(TlsState {
                 provider,
                 certified: RwLock::new(certified),
-                roots: RwLock::new(roots),
-                client_verifier: RwLock::new(client_verifier),
+                trust: RwLock::new(trust),
             }),
             authorizer: None,
         })
@@ -211,13 +230,7 @@ impl QuicTls {
         &self,
         roots: impl IntoIterator<Item = CertificateDer<'static>>,
     ) -> Result<()> {
-        let roots = root_store(roots)?;
-        let verifier = client_verifier(&roots, &self.state.provider)?;
-        // Each lock is read on its own, so a handshake between the two
-        // writes can see new roots on one side and old on the other. Both
-        // are roots the caller trusted.
-        *self.state.roots.write() = roots;
-        *self.state.client_verifier.write() = verifier;
+        *self.state.trust.write() = Trust::new(roots, &self.state.provider)?;
         Ok(())
     }
 
@@ -382,8 +395,10 @@ impl ClientCertVerifier for CurrentClientVerifier {
         intermediates: &[CertificateDer<'_>],
         now: UnixTime,
     ) -> Result<ClientCertVerified, rustls::Error> {
-        let verifier = self.0.client_verifier.read().clone();
-        verifier.verify_client_cert(end_entity, intermediates, now)
+        let trust = self.0.trust.read().clone();
+        trust
+            .client_verifier
+            .verify_client_cert(end_entity, intermediates, now)
     }
 
     fn verify_tls12_signature(
@@ -438,10 +453,10 @@ impl ServerCertVerifier for RootsServerVerifier {
         now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
         let cert = ParsedCertificate::try_from(end_entity)?;
-        let roots = self.0.roots.read().clone();
+        let trust = self.0.trust.read().clone();
         verify_server_cert_signed_by_trust_anchor(
             &cert,
-            &roots,
+            &trust.roots,
             intermediates,
             now,
             self.0.provider.signature_verification_algorithms.all,

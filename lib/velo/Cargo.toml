@@ -28,7 +28,8 @@ zmq = ["dep:zmq"]
 # default feature is on — CI without RDMA packages exercises it over UCX_TLS=tcp,
 # but building still needs libibverbs-dev/librdmacm-dev headers).
 ucx = ["dep:ucx-rs", "dep:serde_bytes", "dep:offset-allocator"]
-# QUIC messenger transport (quinn, TLS 1.3 with a pinned self-signed certificate).
+# QUIC messenger transport (quinn, TLS 1.3 with a pinned self-signed certificate,
+# or certificates from a private CA).
 quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:ring", "dep:webpki"]
 
 # Discovery backends
@@ -106,7 +107,8 @@ rustls = { version = "0.23", optional = true, default-features = false, features
 rcgen = { version = "0.14", optional = true, default-features = false, features = ["crypto", "ring"] }
 ring = { version = "0.17", optional = true }
 # Reads the URI SANs of a verified QUIC peer certificate (feature `quic`).
-webpki = { package = "rustls-webpki", version = "0.103", optional = true, default-features = false, features = ["std"] }
+# 0.103.8 is the first release with `valid_uri_names`.
+webpki = { package = "rustls-webpki", version = "0.103.8", optional = true, default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.2", features = ["sched", "net"] }
