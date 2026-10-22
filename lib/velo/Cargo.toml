@@ -103,7 +103,7 @@ loom-rs = { version = "0.5.0", features = ["sim"], optional = true }
 # quinn-proto 0.11.18, whose stream assembler no longer fails ordered,
 # lossless streams with "too many gaps in stream buffer" (quinn-rs/quinn#2826).
 quinn = { version = "0.11.12", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
-rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.23", optional = true, default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.14", optional = true, default-features = false, features = ["crypto", "ring"] }
 ring = { version = "0.17", optional = true }
 # Reads the URI SANs of a verified QUIC peer certificate (feature `quic`).
