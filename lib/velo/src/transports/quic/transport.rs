@@ -405,8 +405,29 @@ impl Transport for QuicTransport {
         let local = self.local_interfaces.get_or_init(|| {
             resolve_advertise_endpoints(self.bind_addr, &InterfaceFilter::All).unwrap_or_default()
         });
-        let addr = select_best_endpoint(&info.endpoints, local, self.numa_hint)
-            .ok_or(TransportError::InvalidEndpoint)?;
+        // The dial sockets bind the family of `bind_addr` (see
+        // `bind_client_socket`), so only that family is reachable. A peer
+        // with none of it is refused here rather than failing every frame.
+        let reachable: Vec<InterfaceEndpoint> = info
+            .endpoints
+            .into_iter()
+            .filter(|ep| {
+                ep.socket_addr()
+                    .is_some_and(|addr| addr.is_ipv4() == self.bind_addr.is_ipv4())
+            })
+            .collect();
+        let addr = select_best_endpoint(&reachable, local, self.numa_hint).ok_or_else(|| {
+            error!(
+                "QUIC peer {} advertises no {} address, which this transport's dial sockets need",
+                peer_info.instance_id(),
+                if self.bind_addr.is_ipv4() {
+                    "IPv4"
+                } else {
+                    "IPv6"
+                }
+            );
+            TransportError::InvalidEndpoint
+        })?;
         let mut client_config = tls::pinned_client_config(info.fingerprint).map_err(|e| {
             error!("Failed to build the QUIC client config: {e:#}");
             TransportError::InvalidEndpoint

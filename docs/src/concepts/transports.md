@@ -37,7 +37,7 @@ By default, a transport advertises the address and port that it binds. If it bin
 
 A peer can reach a transport through a proxy, a NAT, or an overlay that maps another address and port to the bound socket. For this case, the TCP and QUIC builders have `advertise_addrs`. It advertises the given socket addresses, ports included, in place of the `interface_filter` result. The transport still listens on its bind address.
 
-A QUIC transport that uses `advertise_addrs` does not list its per-socket ports. A mapping covers one port, so every lane of a peer dials the advertised port. As a result, these lanes share one server socket.
+A QUIC transport that uses `advertise_addrs` does not list its per-socket ports. A mapping covers one port, so every lane of a peer dials the advertised port. As a result, these lanes share one server socket. A QUIC transport dials from sockets of the same address family as its bind address. So it dials only the advertised addresses of that family. It refuses to register a peer that advertises none.
 
 The per-stream TCP listener that `VeloBuilder` starts for streams does not use this setting. Behind a proxy, use `.mux_only()`, so that streams go through the messenger connections.
 

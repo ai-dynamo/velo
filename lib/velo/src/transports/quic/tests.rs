@@ -1556,3 +1556,48 @@ async fn retirement_reports_late_sends_and_preserves_successor() {
     assert_eq!(errors.0.lock().unwrap().len(), 2);
     assert!(connections.get(&key).unwrap().tx.same_channel(&next.tx));
 }
+
+/// A peer entry with exactly `endpoints`, and no per-socket ports.
+fn peer_advertising(endpoints: &[&str]) -> PeerInfo {
+    let addrs: Vec<std::net::SocketAddr> = endpoints.iter().map(|e| e.parse().unwrap()).collect();
+    let info = QuicEndpointInfo {
+        endpoints: crate::transports::utils::interfaces::advertised_endpoints(&addrs),
+        fingerprint: [0; 32],
+        ports: vec![],
+    };
+    let mut builder = WorkerAddressBuilder::new();
+    builder
+        .add_entry(velo_ext::TransportKey::from("quic"), info.encode().unwrap())
+        .unwrap();
+    PeerInfo::new(InstanceId::new_v4(), builder.build().unwrap())
+}
+
+/// The dial sockets take the family of the bind address, so a peer is
+/// dialed on an advertised address of that family. Without the filter, an
+/// IPv4 transport picked the first entry, an IPv6 one, and every frame to
+/// the peer failed with "invalid remote address".
+#[tokio::test]
+async fn a_peer_is_dialed_on_an_address_of_the_dial_sockets_family() {
+    let (transport, _streams, _) = started().await;
+    let peer = peer_advertising(&["[::1]:5000", "127.0.0.2:5001"]);
+    let id = peer.instance_id();
+    transport.register(peer).unwrap();
+    assert_eq!(
+        transport.peers.get(&id).unwrap().addr,
+        "127.0.0.2:5001".parse().unwrap()
+    );
+}
+
+/// A peer that advertises no address the dial sockets can reach is refused
+/// at registration, not registered and then failed on every frame.
+#[tokio::test]
+async fn a_peer_with_no_address_of_the_dial_sockets_family_is_refused() {
+    let (transport, _streams, _) = started().await;
+    let peer = peer_advertising(&["[::1]:5000"]);
+    let id = peer.instance_id();
+    assert!(matches!(
+        transport.register(peer),
+        Err(crate::transports::transport::TransportError::InvalidEndpoint)
+    ));
+    assert!(transport.peers.get(&id).is_none());
+}
