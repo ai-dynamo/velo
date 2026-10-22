@@ -16,6 +16,7 @@ use velo_ext::TransportKey;
 use crate::transports::tcp::framing::DEFAULT_SHRINK_THRESHOLD;
 use crate::transports::utils::interfaces::{InterfaceFilter, resolve_advertise_endpoints};
 
+use super::super::auth::QuicTls;
 use super::super::endpoint::{
     BufferSizes, QuicEndpointInfo, bind_client_socket, bind_server_sockets,
 };
@@ -43,6 +44,7 @@ pub struct QuicTransportBuilder {
     idle_timeout: Duration,
     shrink_threshold: usize,
     lanes: std::num::NonZeroU16,
+    tls: Option<QuicTls>,
 }
 
 impl QuicTransportBuilder {
@@ -66,6 +68,7 @@ impl QuicTransportBuilder {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             shrink_threshold: DEFAULT_SHRINK_THRESHOLD,
             lanes: std::num::NonZeroU16::MIN,
+            tls: None,
         }
     }
 
@@ -193,6 +196,18 @@ impl QuicTransportBuilder {
         self
     }
 
+    /// Authenticate peers with certificates from a private CA, in both
+    /// directions, instead of the default pinned self-signed certificate.
+    ///
+    /// The listener then requires a client certificate, so every peer must
+    /// use the same mode: a default transport cannot dial this one. Keep a
+    /// clone of `tls` to rotate the certificate or the roots later. See
+    /// [`QuicTls`].
+    pub fn tls(mut self, tls: QuicTls) -> Self {
+        self.tls = Some(tls);
+        self
+    }
+
     /// Bind the sockets, make the certificate, and build the transport.
     pub fn build(self) -> Result<QuicTransport> {
         let key = self.key.unwrap_or_else(|| TransportKey::from("quic"));
@@ -234,8 +249,38 @@ impl QuicTransportBuilder {
         }
         let transport_config = Arc::new(transport_config);
 
-        let identity = Identity::generate()?;
-        let crypto = tls::server_crypto(&identity)?;
+        // CA mode: the fingerprint names the first certificate only, and is
+        // not pinned; peers verify against the roots. The lane offset is
+        // random, because transports can share a certificate.
+        let (crypto, fingerprint, lane_offset, ca_client_config) = match &self.tls {
+            None => {
+                let identity = Identity::generate()?;
+                let crypto = tls::server_crypto(&identity)?;
+                let offset = super::lane_offset(&identity.fingerprint);
+                (crypto, identity.fingerprint, offset, None)
+            }
+            Some(quic_tls) => {
+                let crypto = quic_tls.server_crypto(tls::ALPN)?;
+                let mut client = quinn::ClientConfig::new(Arc::new(
+                    quinn::crypto::rustls::QuicClientConfig::try_from(
+                        quic_tls.client_crypto(tls::ALPN)?,
+                    )
+                    .context("failed to build the QUIC client TLS config")?,
+                ));
+                client.transport_config(transport_config.clone());
+                let offset = u16::from_le_bytes(
+                    uuid::Uuid::new_v4().as_bytes()[..2]
+                        .try_into()
+                        .expect("two bytes"),
+                );
+                (
+                    crypto,
+                    tls::fingerprint(&quic_tls.certificate()),
+                    offset,
+                    Some(client),
+                )
+            }
+        };
         let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
             quinn::crypto::rustls::QuicServerConfig::try_from(crypto)
                 .context("failed to build the QUIC server TLS config")?,
@@ -249,7 +294,7 @@ impl QuicTransportBuilder {
             .collect::<std::io::Result<Vec<u16>>>()?;
         let info = QuicEndpointInfo {
             endpoints,
-            fingerprint: identity.fingerprint,
+            fingerprint,
             ports,
         };
         let mut addr_builder = crate::transports::address::WorkerAddressBuilder::new();
@@ -260,7 +305,7 @@ impl QuicTransportBuilder {
             key,
             bind_addr,
             local_address,
-            fingerprint: identity.fingerprint,
+            fingerprint,
             shrink_threshold: self.shrink_threshold,
             peers: Arc::new(DashMap::new()),
             connections: Arc::new(DashMap::new()),
@@ -278,7 +323,9 @@ impl QuicTransportBuilder {
             server_endpoints: OnceLock::new(),
             client_endpoints: OnceLock::new(),
             lanes: self.lanes,
-            lane_offset: super::lane_offset(&identity.fingerprint),
+            lane_offset,
+            tls: self.tls,
+            ca_client_config,
             local_interfaces: OnceLock::new(),
             numa_hint: self.numa_hint,
             metrics: OnceLock::new(),

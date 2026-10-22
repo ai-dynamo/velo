@@ -14,6 +14,7 @@ use tracing::{debug, warn};
 
 use velo_ext::{MessageType, TransportAdapter, TransportErrorHandler};
 
+use super::auth::{ConnectionOrigin, QuicTls, REFUSED};
 use crate::observability::TransportRejection;
 use crate::transports::ingress::{Routed, route_frame};
 use crate::transports::tcp::TcpFrameCodec;
@@ -30,6 +31,8 @@ pub(super) struct AcceptContext {
     pub(super) teardown: CancellationToken,
     /// See `QuicTransportBuilder::shrink_threshold`.
     pub(super) shrink_threshold: usize,
+    /// CA mode: authorize each connection before its first stream.
+    pub(super) tls: Option<QuicTls>,
 }
 
 /// A QUIC receive stream that reads an orderly close as the end of the stream.
@@ -93,6 +96,14 @@ pub(super) async fn run_accept_loop(endpoint: quinn::Endpoint, ctx: AcceptContex
 /// Serve the streams that one peer opens on a connection.
 async fn serve_connection(connection: quinn::Connection, ctx: AcceptContext) {
     let peer = connection.remote_address();
+    // Before the first `accept_bi`: streams the peer opened wait unaccepted
+    // in quinn, so a refused connection routes no frame.
+    if let Some(tls) = &ctx.tls
+        && !tls.admit(&connection, ConnectionOrigin::Accepted { remote: peer })
+    {
+        connection.close(quinn::VarInt::from_u32(REFUSED), b"unauthorized");
+        return;
+    }
     loop {
         let stream = tokio::select! {
             biased;

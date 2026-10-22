@@ -28,6 +28,7 @@ use crate::transports::utils::interfaces::{
     InterfaceEndpoint, InterfaceFilter, resolve_advertise_endpoints, select_best_endpoint,
 };
 
+use super::auth::{ConnectionOrigin, QuicTls, REFUSED};
 use super::endpoint::QuicEndpointInfo;
 use super::listener::{AcceptContext, OrderlyEnd, run_accept_loop};
 use super::tls;
@@ -104,8 +105,15 @@ pub struct QuicTransport {
     lanes: std::num::NonZeroU16,
     /// This dialer's offset into a peer's server sockets. Taken from the
     /// certificate fingerprint, which is random per transport, so dialers
-    /// spread over a peer's sockets without coordinating.
+    /// spread over a peer's sockets without coordinating. Random in CA mode.
     lane_offset: u16,
+    /// CA mode: verify peers against roots and run the authorizer on every
+    /// connection. `None` pins self-signed certificates.
+    tls: Option<QuicTls>,
+    /// CA mode: the one dial config for every peer. It reads the current
+    /// certificate and roots on each handshake, so a rotation reaches peers
+    /// registered before it.
+    ca_client_config: Option<quinn::ClientConfig>,
 
     local_interfaces: OnceLock<Vec<InterfaceEndpoint>>,
     numa_hint: Option<u32>,
@@ -178,9 +186,17 @@ impl SendTask {
 }
 
 impl QuicTransport {
-    /// The SHA-256 fingerprint of this transport's certificate.
+    /// The SHA-256 fingerprint of this transport's certificate. In CA mode
+    /// (`QuicTransportBuilder::tls`), of the certificate it was built with;
+    /// peers do not pin it.
     pub fn fingerprint(&self) -> tls::Fingerprint {
         self.fingerprint
+    }
+
+    /// The CA-mode TLS handle, to rotate certificates or roots. `None` for
+    /// a transport with the default pinned certificate.
+    pub fn tls(&self) -> Option<&QuicTls> {
+        self.tls.as_ref()
     }
 
     fn reap_stale_connection(&self, key: LaneKey) {
@@ -281,6 +297,7 @@ impl QuicTransport {
                     connect_timeout: self.connect_timeout,
                     reader_ctx: self.dialed_ctx.get().cloned(),
                     metrics: self.metrics.get().cloned(),
+                    tls: self.tls.clone(),
                 },
             ),
             rt,
@@ -400,11 +417,17 @@ impl Transport for QuicTransport {
         });
         let addr = select_best_endpoint(&info.endpoints, local, self.numa_hint)
             .ok_or(TransportError::InvalidEndpoint)?;
-        let mut client_config = tls::pinned_client_config(info.fingerprint).map_err(|e| {
-            error!("Failed to build the QUIC client config: {e:#}");
-            TransportError::InvalidEndpoint
-        })?;
-        client_config.transport_config(self.transport_config.clone());
+        let client_config = match &self.ca_client_config {
+            Some(config) => config.clone(),
+            None => {
+                let mut config = tls::pinned_client_config(info.fingerprint).map_err(|e| {
+                    error!("Failed to build the QUIC client config: {e:#}");
+                    TransportError::InvalidEndpoint
+                })?;
+                config.transport_config(self.transport_config.clone());
+                config
+            }
+        };
 
         self.peers.insert(
             peer_info.instance_id(),
@@ -518,6 +541,7 @@ impl Transport for QuicTransport {
                 transport_key: self.key.as_str().to_string(),
                 metrics: self.metrics.get().cloned(),
                 shrink_threshold: self.shrink_threshold,
+                tls: self.tls.clone(),
             };
             for endpoint in &servers {
                 rt.spawn(run_accept_loop(endpoint.clone(), ctx.clone()));
@@ -666,6 +690,21 @@ impl Transport for QuicTransport {
                 .map_err(|_| HealthCheckError::ConnectionFailed)?;
             match tokio::time::timeout(timeout, connecting).await {
                 Ok(Ok(connection)) => {
+                    // A peer this transport would refuse to send to is not
+                    // healthy for it.
+                    if let Some(quic_tls) = &self.tls
+                        && !quic_tls.admit(
+                            &connection,
+                            ConnectionOrigin::Dialed {
+                                peer: instance_id,
+                                lane: 0,
+                                remote: addr,
+                            },
+                        )
+                    {
+                        connection.close(quinn::VarInt::from_u32(REFUSED), b"unauthorized");
+                        return Err(HealthCheckError::ConnectionFailed);
+                    }
                     connection.close(quinn::VarInt::from_u32(0), b"health check");
                     if connection_exists {
                         Ok(())
@@ -691,6 +730,8 @@ struct WriterTaskContext {
     connect_timeout: Duration,
     reader_ctx: Option<DialedReaderContext>,
     metrics: Option<Arc<dyn velo_ext::TransportObservability>>,
+    /// CA mode: authorize the peer before the first frame.
+    tls: Option<QuicTls>,
 }
 
 /// Dial, then write frames until the channel closes, a write fails, or the
@@ -706,7 +747,7 @@ async fn connection_writer_task(
     let addr = ctx.addr;
     let connections = Arc::clone(&ctx.connections);
     let metrics = ctx.metrics.clone();
-    if let Err(e) = connection_writer_inner(&peer_name, &rx, ctx).await {
+    if let Err(e) = connection_writer_inner(key, &peer_name, &rx, ctx).await {
         warn!("QUIC: connection to {peer_name} ({addr}) failed: {e:#}");
     }
 
@@ -735,6 +776,7 @@ async fn retire_connection(
 }
 
 async fn connection_writer_inner(
+    key: LaneKey,
     peer_name: &str,
     rx: &flume::Receiver<SendTask>,
     ctx: WriterTaskContext,
@@ -747,6 +789,7 @@ async fn connection_writer_inner(
         connect_timeout,
         reader_ctx,
         metrics,
+        tls,
         ..
     } = ctx;
 
@@ -759,6 +802,22 @@ async fn connection_writer_inner(
             res.context("connect timeout")?.context("QUIC handshake failed")?
         },
     };
+    // Before the stream, the reader and the first write: a refused peer gets
+    // no frame, and nothing it sends is routed. The queued frames fail
+    // through their error handlers when the writer retires.
+    if let Some(quic_tls) = &tls
+        && !quic_tls.admit(
+            &connection,
+            ConnectionOrigin::Dialed {
+                peer: key.0,
+                lane: key.1,
+                remote: addr,
+            },
+        )
+    {
+        connection.close(quinn::VarInt::from_u32(REFUSED), b"unauthorized");
+        anyhow::bail!("the authorizer refused the peer");
+    }
     let (mut send, recv) = connection
         .open_bi()
         .await
@@ -811,6 +870,14 @@ async fn connection_writer_inner(
         )
     };
     match connection.close_reason() {
+        Some(quinn::ConnectionError::ApplicationClosed(reason))
+            if reason.error_code == quinn::VarInt::from_u32(REFUSED) =>
+        {
+            warn!(
+                "QUIC: {peer_name} ({addr}) refused this transport's certificate; \
+                 frames written to it are lost"
+            );
+        }
         Some(quinn::ConnectionError::ApplicationClosed(reason)) => {
             debug!("QUIC connection to {peer_name} closed by peer: {reason}");
         }
