@@ -76,7 +76,7 @@ tracing = { workspace = true, optional = true }
 # TLS on the listeners (`HubTls`), with the ring provider; nothing reads a
 # process-wide default provider. rustls-webpki reads client URI SANs
 # (`valid_uri_names` is in 0.103.8 and later).
-rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.23", optional = true, default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26", optional = true, default-features = false, features = ["ring"] }
 webpki = { package = "rustls-webpki", version = "0.103.8", optional = true, default-features = false, features = ["std"] }
 

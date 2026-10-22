@@ -468,3 +468,115 @@ fn a_key_that_does_not_match_the_certificate_is_refused() {
         "set_client_roots without client_certs"
     );
 }
+
+/// Opens TLS only when it is told to start.
+struct SlowStart(tokio::sync::Semaphore);
+
+impl Extension for SlowStart {
+    const NAME: &'static str = "slow-start";
+    type Registration = ();
+    type Staged = ();
+
+    async fn start(&self, _ctx: &velo_hub::StartContext<'_>) -> anyhow::Result<()> {
+        let _ = self.0.acquire().await;
+        Ok(())
+    }
+
+    async fn prepare(&self, _txn: &Txn<'_>, _payload: Option<()>) -> Result<(), Rejection> {
+        Ok(())
+    }
+
+    fn commit(&self, _staged: (), _registration: &Committed<'_>) {}
+
+    fn on_removed(&self, _removal: Removal) {}
+}
+
+fn free_port() -> u16 {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A TLS listener takes no connection before the hub serves. Each one it
+/// took during a slow startup would hold a task and a socket until the hub
+/// served, with no bound: the kernel backlog is the only queue then.
+#[tokio::test]
+async fn no_tls_handshake_completes_before_the_hub_serves() {
+    let ca = Ca::new();
+    let gate = Arc::new(SlowStart(tokio::sync::Semaphore::new(0)));
+    let mut config = config();
+    config.server.public_port = free_port();
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], config.server.public_port));
+    let serving = tokio::spawn(
+        Hub::builder(config)
+            .extension(Arc::clone(&gate))
+            .public_tls(ca.hub_tls())
+            .serve(),
+    );
+    let client = connector(&ca, ca.client("spiffe://d/c/1"));
+    // Wait for the bind, then try a handshake while start() is held.
+    let early = async {
+        loop {
+            if let Ok(tcp) = tokio::net::TcpStream::connect(addr).await {
+                let name = ServerName::try_from("127.0.0.1").unwrap();
+                return client.connect(name, tcp).await;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_secs(1), early)
+            .await
+            .is_err(),
+        "a TLS handshake completed while the hub was still starting"
+    );
+    gate.0.add_permits(1);
+    let hub = serving.await.unwrap().unwrap();
+    assert!(handshake(addr, &client).await.is_ok());
+    hub.shutdown().await.unwrap();
+}
+
+/// The listener offers HTTP/1.1 only by ALPN: the hub does not build
+/// axum's HTTP/2 support, so offering `h2` broke clients that prefer it.
+#[tokio::test]
+async fn the_listener_negotiates_http_1_1() {
+    let ca = Ca::new();
+    let hub = builder().public_tls(ca.hub_tls()).serve().await.unwrap();
+    let mut config = rustls_client(&ca, None);
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    let tcp = tokio::net::TcpStream::connect(hub.public_addr())
+        .await
+        .unwrap();
+    let stream = tokio_rustls::TlsConnector::from(Arc::new(config))
+        .connect(ServerName::try_from("127.0.0.1").unwrap(), tcp)
+        .await
+        .unwrap();
+    assert_eq!(stream.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
+    hub.shutdown().await.unwrap();
+}
+
+/// When `shutdown` returns, the TLS listeners have closed their sockets,
+/// as the plain ones have: the ports bind again at once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_releases_the_tls_ports() {
+    let ca = Ca::new();
+    for round in 0..20 {
+        let tls = ca.hub_tls();
+        let hub = builder()
+            .public_tls(tls.clone())
+            .control_tls(tls)
+            .serve()
+            .await
+            .unwrap();
+        let (public, control) = (hub.public_addr(), hub.control_addr());
+        hub.shutdown().await.unwrap();
+        for addr in [public, control] {
+            assert!(
+                std::net::TcpListener::bind(addr).is_ok(),
+                "round {round}: {addr} is still bound after shutdown"
+            );
+        }
+    }
+}

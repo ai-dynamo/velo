@@ -13,7 +13,9 @@
 //!
 //! TLS handshakes run in their own tasks, each under
 //! [`HANDSHAKE_TIMEOUT`], so a slow or silent client cannot hold up
-//! `accept` for the clients behind it.
+//! `accept` for the clients behind it. At most `MAX_PENDING_TLS`
+//! connections wait in a handshake or for axum; past that the listener
+//! stops accepting.
 
 use std::convert::Infallible;
 use std::fmt;
@@ -208,8 +210,7 @@ impl HubTls {
         Ok(())
     }
 
-    /// The rustls config of a listener. TLS 1.3 only; HTTP/1.1 and HTTP/2
-    /// by ALPN. No session resumption: a resumed session skips client
+    /// The rustls config of a listener. TLS 1.3 only; HTTP/1.1 by ALPN. No session resumption: a resumed session skips client
     /// certificate verification and keeps the first identity, so it would
     /// outlive `rotate` and `set_client_roots`.
     fn server_config(&self) -> Result<Arc<rustls::ServerConfig>> {
@@ -220,7 +221,9 @@ impl HubTls {
             .with_cert_resolver(Arc::new(CurrentCert(self.state.clone())));
         config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
         config.send_tls13_tickets = 0;
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+        // HTTP/1.1 only: the hub does not build axum's HTTP/2 support, so a
+        // client that got `h2` would send a preface the server cannot read.
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
         Ok(Arc::new(config))
     }
 }
@@ -373,65 +376,124 @@ impl Connected<IncomingStream<'_, HubListener>> for Connection {
     }
 }
 
-type Accepted = (TlsStream<TcpStream>, Connection);
+/// Most TLS connections a listener holds before axum takes them: in their
+/// handshake, or done and waiting. At the limit it stops accepting, and the
+/// kernel backlog queues the rest, as for a plain listener.
+pub(crate) const MAX_PENDING_TLS: usize = 256;
+
+/// A finished handshake, with the slot it holds until axum takes it.
+type Ready = (
+    TlsStream<TcpStream>,
+    Connection,
+    tokio::sync::OwnedSemaphorePermit,
+);
 
 /// A hub listener: plain TCP, or TCP with TLS.
+///
+/// The TLS listener owns its socket and accepts only while axum asks for a
+/// connection, so it takes nothing before the hub serves, and its socket
+/// closes when `axum::serve` drops it at shutdown. Each handshake runs in a
+/// task of its own under [`HANDSHAKE_TIMEOUT`], so a client that sends
+/// nothing does not hold up the next one.
 pub(crate) enum HubListener {
     Plain(TcpListener),
-    Tls {
-        /// Connections whose handshake finished. The accept task stops
-        /// when this receiver is dropped, which `axum::serve` does when it
-        /// stops serving.
-        ready: mpsc::Receiver<Accepted>,
-    },
+    Tls(Box<TlsListener>),
+}
+
+pub(crate) struct TlsListener {
+    listener: TcpListener,
+    acceptor: TlsAcceptor,
+    /// One per connection in its handshake or waiting for axum.
+    slots: Arc<tokio::sync::Semaphore>,
+    ready_tx: mpsc::Sender<Ready>,
+    ready: mpsc::Receiver<Ready>,
 }
 
 impl HubListener {
-    /// Wrap `listener`, with TLS if `tls` is given.
+    /// Wrap `listener`, with TLS if `tls` is given. Accepts nothing yet.
     pub(crate) fn new(listener: TcpListener, tls: Option<&HubTls>) -> Result<Self> {
+        Self::with_limit(listener, tls, MAX_PENDING_TLS)
+    }
+
+    fn with_limit(listener: TcpListener, tls: Option<&HubTls>, limit: usize) -> Result<Self> {
         let Some(tls) = tls else {
             return Ok(Self::Plain(listener));
         };
-        let acceptor = TlsAcceptor::from(tls.server_config()?);
-        let (tx, ready) = mpsc::channel(64);
-        tokio::spawn(accept_tls(listener, acceptor, tx));
-        Ok(Self::Tls { ready })
+        // As many as there are slots, so a finished handshake never waits
+        // to send.
+        let (ready_tx, ready) = mpsc::channel(limit);
+        Ok(Self::Tls(Box::new(TlsListener {
+            listener,
+            acceptor: TlsAcceptor::from(tls.server_config()?),
+            slots: Arc::new(tokio::sync::Semaphore::new(limit)),
+            ready_tx,
+            ready,
+        })))
     }
 }
 
-/// Accept TCP connections and run each handshake in its own task.
-async fn accept_tls(listener: TcpListener, acceptor: TlsAcceptor, tx: mpsc::Sender<Accepted>) {
-    loop {
-        let (stream, remote) = tokio::select! {
-            _ = tx.closed() => return,
-            accepted = listener.accept() => match accepted {
-                Ok(accepted) => accepted,
-                Err(error) => {
-                    accept_error(&error).await;
-                    continue;
+impl TlsListener {
+    async fn accept(&mut self) -> (TlsStream<TcpStream>, Connection) {
+        let Self {
+            listener,
+            acceptor,
+            slots,
+            ready_tx,
+            ready,
+        } = self;
+        loop {
+            // Both arms are cancel-safe: a dropped slot future frees its
+            // permit, and `TcpListener::accept` loses no connection.
+            let accepted = tokio::select! {
+                biased;
+                done = ready.recv() => {
+                    let (stream, connection, _slot) =
+                        done.expect("the listener holds a sender");
+                    return (stream, connection);
                 }
-            },
-        };
-        let acceptor = acceptor.clone();
-        let tx = tx.clone();
-        tokio::spawn(async move {
-            let handshake = tokio::select! {
-                _ = tx.closed() => return,
-                handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)) => handshake,
+                accepted = async {
+                    let slot = Arc::clone(slots)
+                        .acquire_owned()
+                        .await
+                        .expect("the semaphore is never closed");
+                    (listener.accept().await, slot)
+                } => accepted,
             };
-            match handshake {
-                Ok(Ok(stream)) => {
-                    let identity = stream
-                        .get_ref()
-                        .1
-                        .peer_certificates()
-                        .and_then(ClientIdentity::from_chain);
-                    let _ = tx.send((stream, Connection { identity })).await;
+            match accepted {
+                (Ok((stream, _)), slot) => {
+                    tokio::spawn(handshake(stream, acceptor.clone(), ready_tx.clone(), slot));
                 }
-                Ok(Err(error)) => tracing::debug!(%remote, %error, "hub TLS handshake failed"),
-                Err(_) => tracing::debug!(%remote, "hub TLS handshake timed out"),
+                (Err(error), _) => accept_error(&error).await,
             }
-        });
+        }
+    }
+}
+
+/// One handshake, under [`HANDSHAKE_TIMEOUT`]. Ends early when the listener
+/// is dropped. Holds `slot` until axum takes the connection.
+async fn handshake(
+    stream: TcpStream,
+    acceptor: TlsAcceptor,
+    ready: mpsc::Sender<Ready>,
+    slot: tokio::sync::OwnedSemaphorePermit,
+) {
+    let remote = stream.peer_addr().ok();
+    let handshake = tokio::select! {
+        _ = ready.closed() => return,
+        handshake = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)) => handshake,
+    };
+    match handshake {
+        Ok(Ok(stream)) => {
+            let identity = stream
+                .get_ref()
+                .1
+                .peer_certificates()
+                .and_then(ClientIdentity::from_chain);
+            // Capacity equals the slots, and this holds one: never waits.
+            let _ = ready.try_send((stream, Connection { identity }, slot));
+        }
+        Ok(Err(error)) => tracing::debug!(?remote, %error, "hub TLS handshake failed"),
+        Err(_) => tracing::debug!(?remote, "hub TLS handshake timed out"),
     }
 }
 
@@ -461,12 +523,10 @@ impl axum::serve::Listener for HubListener {
                 let (stream, _) = axum::serve::Listener::accept(listener).await;
                 (Either::Left(stream), Connection { identity: None })
             }
-            Self::Tls { ready, .. } => match ready.recv().await {
-                Some((stream, connection)) => (Either::Right(stream), connection),
-                // The accept task holds the sender until this receiver is
-                // dropped, so the channel cannot close while it is read.
-                None => std::future::pending().await,
-            },
+            Self::Tls(tls) => {
+                let (stream, connection) = tls.accept().await;
+                (Either::Right(stream), connection)
+            }
         }
     }
 
@@ -474,5 +534,151 @@ impl axum::serve::Listener for HubListener {
     /// itself.
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
         Ok(Connection { identity: None })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A self-signed certificate for 127.0.0.1, enough to build a listener.
+    fn hub_tls() -> HubTls {
+        let certified = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        HubTls::new(
+            vec![certified.cert.der().clone()],
+            PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into()),
+        )
+        .unwrap()
+    }
+
+    /// `axum::serve` drops its listener when it stops. The TLS listener's
+    /// socket must close with it, before any other task runs: the hub's
+    /// shutdown joins the server task and then returns, and a socket held by
+    /// a detached task outlived it (for up to a second after an accept
+    /// error, while that task slept).
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_a_tls_listener_closes_its_socket_at_once() {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let listener = HubListener::new(tcp, Some(&hub_tls())).unwrap();
+        tokio::task::yield_now().await;
+        drop(listener);
+        assert!(
+            std::net::TcpListener::bind(addr).is_ok(),
+            "the TLS listener's socket outlived the listener"
+        );
+    }
+
+    /// A client that trusts any certificate, to finish handshakes.
+    fn client() -> tokio_rustls::TlsConnector {
+        #[derive(Debug)]
+        struct Any;
+        impl rustls::client::danger::ServerCertVerifier for Any {
+            fn verify_server_cert(
+                &self,
+                _: &CertificateDer<'_>,
+                _: &[CertificateDer<'_>],
+                _: &rustls::pki_types::ServerName<'_>,
+                _: &[u8],
+                _: UnixTime,
+            ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _: &[u8],
+                _: &CertificateDer<'_>,
+                _: &DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _: &[u8],
+                _: &CertificateDer<'_>,
+                _: &DigitallySignedStruct,
+            ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error>
+            {
+                Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
+            }
+        }
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Any))
+        .with_no_client_auth();
+        tokio_rustls::TlsConnector::from(Arc::new(config))
+    }
+
+    async fn connect(
+        addr: std::net::SocketAddr,
+    ) -> std::io::Result<tokio_rustls::client::TlsStream<TcpStream>> {
+        let tcp = TcpStream::connect(addr).await?;
+        client()
+            .connect(
+                rustls::pki_types::ServerName::try_from("127.0.0.1").unwrap(),
+                tcp,
+            )
+            .await
+    }
+
+    /// Connections in a handshake or waiting for axum are bounded. With a
+    /// limit of 2, two clients that connect and send nothing hold both slots,
+    /// so the listener accepts no third connection, and a real client waits
+    /// in the kernel backlog. When one silent client leaves, its slot frees,
+    /// and the real client gets through. Without the bound, every accepted
+    /// socket held a task of its own, with no limit.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pending_tls_connections_are_bounded() {
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        let HubListener::Tls(mut listener) =
+            HubListener::with_limit(tcp, Some(&hub_tls()), 2).unwrap()
+        else {
+            panic!("a TLS listener");
+        };
+        let slots = Arc::clone(&listener.slots);
+        // axum's loop: take every connection that is ready.
+        let (taken_tx, taken) = mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await;
+                let _ = taken_tx.send(stream);
+            }
+        });
+        let silent_a = TcpStream::connect(addr).await.unwrap();
+        let _silent_b = TcpStream::connect(addr).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while slots.available_permits() > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the silent clients take both slots");
+
+        let real = tokio::spawn(connect(addr));
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            !real.is_finished(),
+            "a handshake finished while two silent clients held every slot"
+        );
+        drop(silent_a);
+        tokio::time::timeout(Duration::from_secs(5), real)
+            .await
+            .expect("the real client gets a slot once a silent one leaves")
+            .unwrap()
+            .unwrap();
+        let mut taken = taken;
+        assert!(taken.recv().await.is_some(), "axum got the real connection");
+        server.abort();
     }
 }
