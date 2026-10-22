@@ -158,7 +158,43 @@ fi
 - Report latency beside throughput (rule 10).
 - Label every number "directional: dev box, <n> cores, load <x>".
 
-## 6. Clean up
+## 6. Check memory kept per operation
+
+Memory that grows with the operations that ended, not with the ones still
+live, passes every check above. Check it when the diff touches setup or
+teardown (a stream open or close, a connection, a slot), or keeps state
+for each operation.
+
+- Run each arm at N, 4N and 16N operations, at the same concurrency.
+  Record the peak RSS of each run (`/usr/bin/time -f %M`, in KiB).
+  Growth per operation is (RSS at 4N - RSS at N) / 3N. With a constant
+  number of live operations, it is about zero in a correct arm. The 16N
+  run checks that the growth holds: (RSS at 16N - RSS at 4N) / 12N must
+  match it. If it is larger, the growth speeds up with N; report both.
+- Growth is not yet a leak. Before you call it one, rule out the two
+  other causes, after the run and a settle of a few seconds:
+  - **A backlog of tasks.** Read `num_alive_tasks()` before the workload
+    and again after it. Tasks above that baseline, of operations that
+    already ended, are a backlog: a loop that never
+    returns `Pending` (flume and same-worker paths are not under tokio's
+    coop budget) cannot let them run. Their peak memory is real, and it
+    grows with N for as long as the loop runs. Count the tasks spawned
+    per operation; P13 is the cause.
+  - **Allocator retention.** Call `libc::malloc_trim(0)` in the harness
+    and read RSS again. If it falls back, the memory was freed; glibc
+    kept the pages.
+  - Only memory that is still allocated after both is a leak (P25).
+- Read the harness's own counters too: for `anchor_setup_bench`,
+  `active_anchor_count()` and the length of the sender registry.
+
+Example: `anchor_setup_bench` (64 tasks, 8 threads) on a base with two
+tasks per stream grew about 1.5 KiB per finished stream, to 24 GB at 16M
+lifecycles. It was not a leak: in a run of 512k lifecycles, `malloc_trim(0)`
+after the run took RSS from 777 MiB to 6 MiB. The cause was a backlog of the two tasks per
+stream, which the non-yielding loop could not let exit. With no task per
+stream, 2M lifecycles peaked at 74 MiB instead of about 3 GB.
+
+## 7. Clean up
 
 ```shell
 git worktree remove --force "$S/base"

@@ -190,6 +190,17 @@ that pins it now.
   `allocations_in` closure narrowed, or new code that does the same work
   without calling the `note_*` seam. A blocker unless a measurement comes
   with it.
+- **P25. State kept after an operation ends.** Memory that grows with the
+  operations that ended, not with the ones that are live: a map entry, a
+  queue entry, an `Arc` or a buffer that nothing removes when a stream,
+  request or connection ends. Cost: RSS without bound. An allocation
+  count per operation does not see it, because the allocation is made
+  once. RSS growth alone is not proof: rule out a task backlog (P13) and
+  allocator retention first (measure.md, section 6). Pin: run N
+  operations, then assert that each registry and queue is empty again,
+  that `num_alive_tasks()` is back to its baseline after a yield, and
+  that each `Arc` or buffer an operation held is released (a `Weak` to it
+  no longer upgrades, or the buffer is back to its baseline length).
 
 ## Pinning idioms (for the `pin` field)
 
