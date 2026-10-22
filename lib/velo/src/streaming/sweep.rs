@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
+use dashmap::DashMap;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
@@ -199,6 +200,29 @@ impl<T: SweepTarget> DeadlineSweep<T> {
         requeue_at(now, deadline, T::RECHECK)
     }
 
+    /// Arm `key` to come due by `expires`, for a target that keeps one live
+    /// entry per key and records its instant in `queued`.
+    ///
+    /// Queues nothing while the live entry is still ahead and not after
+    /// `expires`: that entry reads the new deadline from the target when it
+    /// comes due. Otherwise queues a new entry and records it. Without this,
+    /// each re-arm queued one more entry, and the sweep requeued every copy.
+    ///
+    /// The caller holds the target lock that guards `queued`, so the sweep
+    /// cannot pop the new entry before `queued` names it.
+    pub(crate) fn arm(
+        self: &Arc<Self>,
+        target: &Arc<T>,
+        queued: &mut Option<Instant>,
+        expires: Instant,
+        key: u64,
+    ) {
+        let live = queued.is_some_and(|at| Instant::now() < at && at <= expires);
+        if !live {
+            *queued = Some(self.push(target, expires, key));
+        }
+    }
+
     #[cold]
     fn start(self: &Arc<Self>, target: &Arc<T>) {
         if self.stopped.is_cancelled() {
@@ -271,6 +295,164 @@ impl<T: SweepTarget> DeadlineSweep<T> {
                     tokio::task::yield_now().await;
                 }
             }
+        }
+    }
+}
+
+/// A manager's own handle on the sweep of one of its registries: when the
+/// manager drops, it stops the sweep and expires the entries still in the
+/// registry.
+///
+/// An anchor keeps its registry alive past the manager, and with the sweep
+/// stopped nothing would reap it. After `stop()`, which `Velo` calls, the
+/// registry is already empty. A field that acts on drop does this without a
+/// `Drop` impl on the manager, which would stop callers from moving its
+/// public fields out.
+pub(crate) struct ManagerDeadlines<V: Expiring>
+where
+    DashMap<u64, V>: SweepTarget,
+{
+    sweep: SweepOwner<DashMap<u64, V>>,
+    /// The manager's registry, set when the manager is built.
+    registry: Option<Arc<DashMap<u64, V>>>,
+}
+
+impl<V: Expiring> Default for ManagerDeadlines<V>
+where
+    DashMap<u64, V>: SweepTarget,
+{
+    fn default() -> Self {
+        Self {
+            sweep: SweepOwner::default(),
+            registry: None,
+        }
+    }
+}
+
+impl<V: Expiring> ManagerDeadlines<V>
+where
+    DashMap<u64, V>: SweepTarget,
+{
+    /// Expire the entries of  when this handle drops.
+    pub(crate) fn set_registry(&mut self, registry: Arc<DashMap<u64, V>>) {
+        self.registry = Some(registry);
+    }
+}
+
+impl<V: Expiring> std::ops::Deref for ManagerDeadlines<V>
+where
+    DashMap<u64, V>: SweepTarget,
+{
+    type Target = Arc<DeadlineSweep<DashMap<u64, V>>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.sweep
+    }
+}
+
+impl<V: Expiring> Drop for ManagerDeadlines<V>
+where
+    DashMap<u64, V>: SweepTarget,
+{
+    fn drop(&mut self) {
+        self.sweep.stop();
+        let Some(registry) = self.registry.take() else {
+            return;
+        };
+        // Remove entries outside shard guards: an SPSC entry's Drop may close
+        // a mux slot.
+        let ids: Vec<u64> = registry.iter().map(|entry| *entry.key()).collect();
+        for id in ids {
+            if let Some((_, entry)) = registry.remove(&id) {
+                entry.expire();
+            }
+        }
+    }
+}
+
+/// What a sweep does with a due key, decided from the state of its entry.
+pub(crate) enum Due {
+    /// Nothing waits on the deadline (a sender is attached, or there is no
+    /// timeout), or the queue entry is a stale copy: forget the queue entry.
+    Drop,
+    /// A renewal moved the deadline past now: look again then.
+    Requeue(Instant),
+    /// The deadline has passed: remove the entry.
+    Expire,
+}
+
+impl Due {
+    /// The verdict for an entry that waits on `expires`.
+    pub(crate) fn at(expires: Option<Instant>, now: Instant) -> Self {
+        match expires {
+            Some(deadline) if deadline > now => Self::Requeue(deadline),
+            Some(_) => Self::Expire,
+            None => Self::Drop,
+        }
+    }
+
+    /// The verdict for the queue entry of `entry` that came due `at`.
+    fn of<V: Expiring>(entry: &V, at: Instant, now: Instant) -> Self {
+        // The entry queued a later copy: that one does the work. Acting on
+        // both would requeue each, and the copies would pile up.
+        if entry.queued() != Some(at) {
+            return Self::Drop;
+        }
+        entry.due(now)
+    }
+}
+
+/// An entry of a registry whose deadline a [`DeadlineSweep`] keeps.
+///
+/// The entry has one live entry in the queue, and records when it comes due,
+/// so the sweep can tell it from a stale copy. [`DeadlineSweep::arm`] queues
+/// it, and [`expire_due`] requeues it.
+pub(crate) trait Expiring {
+    /// What to do with the entry at `now`, from its own state.
+    fn due(&self, now: Instant) -> Due;
+    /// When the entry's live queue entry comes due.
+    fn queued(&self) -> Option<Instant>;
+    /// Record the instant of a requeued entry.
+    fn set_queued(&mut self, at: Instant);
+    /// End an entry that the sweep removed. Runs after the shard lock is
+    /// released.
+    fn expire(self);
+}
+
+/// Act on the due keys of a registry whose entries expire.
+///
+/// A read lock decides each key: most belong to entries that a sender took,
+/// that ended, or that are stale copies, and a write lock per key would
+/// contend with attach and detach. A requeue records its new instant in the
+/// entry, and an expiry removes it, so both take the write lock and decide
+/// again: a renewal, attach or re-arm can land in between.
+pub(crate) fn expire_due<V: Expiring>(
+    registry: &DashMap<u64, V>,
+    due: Vec<(Instant, u64)>,
+    now: Instant,
+    renewed: &mut Vec<(Instant, u64)>,
+) where
+    DashMap<u64, V>: SweepTarget,
+{
+    use dashmap::mapref::entry::Entry;
+    for (at, key) in due {
+        let Some(verdict) = registry.get(&key).map(|entry| Due::of(&*entry, at, now)) else {
+            continue; // already removed
+        };
+        if matches!(verdict, Due::Drop) {
+            continue;
+        }
+        let Entry::Occupied(mut entry) = registry.entry(key) else {
+            continue;
+        };
+        match Due::of(entry.get(), at, now) {
+            Due::Expire => entry.remove().expire(),
+            Due::Requeue(deadline) => {
+                let requeue_at = DeadlineSweep::<DashMap<u64, V>>::requeue_at(now, deadline);
+                entry.get_mut().set_queued(requeue_at);
+                renewed.push((requeue_at, key));
+            }
+            Due::Drop => {}
         }
     }
 }

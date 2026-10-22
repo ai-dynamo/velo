@@ -113,8 +113,8 @@ impl<T: Serialize> MpscStreamSender<T> {
             // nobody polls.
             retires_on: _,
             item_limit,
-            // MPSC anchors keep their own per-anchor timeout task; the SPSC
-            // shared deadline queue does not track them.
+            // An MPSC anchor re-arms its timeout through its own entry, on
+            // the manager's MPSC queue, not the SPSC one.
             deadline_queue: _,
             heartbeats,
         } = cancel;
