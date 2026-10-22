@@ -183,6 +183,13 @@ impl QuicTransport {
         self.fingerprint
     }
 
+    /// The address of the first server socket, with its bound port. Behind a
+    /// proxy or NAT that maps one port (see
+    /// [`QuicTransportBuilder::advertise_addrs`]), this is where it forwards.
+    pub fn bound_addr(&self) -> SocketAddr {
+        self.bind_addr
+    }
+
     fn reap_stale_connection(&self, key: LaneKey) {
         if let Some((_, stale)) = self
             .connections

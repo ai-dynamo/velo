@@ -31,6 +31,16 @@ Velo registers each peer with every transport that the peer and the local instan
 
 A `WorkerAddress` is a MessagePack map from `TransportKey` to endpoint bytes. Each transport adds its own entry, and a peer reads the entries for the transports that it has.
 
+### Advertised addresses
+
+By default, a transport advertises the address and port that it binds. If it binds a wildcard address, it advertises one entry for each network interface. `interface_filter` selects the interfaces. `InterfaceFilter::Explicit` sets the addresses, but it replaces each port with the bound port.
+
+A peer can reach a transport through a proxy, a NAT, or an overlay that maps another address and port to the bound socket. For this case, the TCP and QUIC builders have `advertise_addrs`. It advertises the given socket addresses, ports included, in place of the `interface_filter` result. The transport still listens on its bind address.
+
+A QUIC transport that uses `advertise_addrs` does not list its per-socket ports. A mapping covers one port, so every lane of a peer dials the advertised port. As a result, these lanes share one server socket.
+
+The per-stream TCP listener that `VeloBuilder` starts for streams does not use this setting. Behind a proxy, use `.mux_only()`, so that streams go through the messenger connections.
+
 ## The transport contract
 
 Every transport implements the `Transport` trait from `velo-ext`. The runtime relies on these rules:
