@@ -11,7 +11,9 @@ use anyhow::{Context, Result};
 use tracing::warn;
 use velo_ext::TransportKey;
 
-use crate::transports::utils::interfaces::{InterfaceFilter, resolve_advertise_endpoints};
+use crate::transports::utils::interfaces::{
+    InterfaceFilter, advertised_endpoints, resolve_advertise_endpoints,
+};
 
 use super::TcpTransport;
 use crate::transports::teardown_grace::{TEARDOWN_FLUSH_GRACE, TeardownStop};
@@ -25,6 +27,7 @@ pub struct TcpTransportBuilder {
     connect_timeout: Duration,
     listener: Option<std::net::TcpListener>,
     interface_filter: InterfaceFilter,
+    advertise: Vec<SocketAddr>,
     numa_hint: Option<u32>,
     shrink_threshold: Option<usize>,
     socket_buffers: Option<usize>,
@@ -42,6 +45,7 @@ impl TcpTransportBuilder {
             connect_timeout: Duration::from_secs(5),
             listener: None,
             interface_filter: InterfaceFilter::default(),
+            advertise: Vec::new(),
             numa_hint: None,
             shrink_threshold: None,
             socket_buffers: Some(super::super::listener::DEFAULT_SOCKET_BUFFERS),
@@ -100,6 +104,18 @@ impl TcpTransportBuilder {
     /// Set the interface selection filter for multi-NIC environments.
     pub fn interface_filter(mut self, filter: InterfaceFilter) -> Self {
         self.interface_filter = filter;
+        self
+    }
+
+    /// Advertise these addresses, ports included, instead of the bound one.
+    ///
+    /// For a transport that peers reach through a proxy, a NAT or an overlay
+    /// that maps another address and port to the bound socket. Peers dial
+    /// what is advertised; the transport still listens on its bind address.
+    /// Replaces the [`interface_filter`](Self::interface_filter) result. An
+    /// empty list (the default) advertises the bound address as before.
+    pub fn advertise_addrs(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        self.advertise = addrs.into_iter().collect();
         self
     }
 
@@ -231,7 +247,11 @@ impl TcpTransportBuilder {
         };
 
         // Resolve advertise endpoints (multi-interface discovery)
-        let endpoints = resolve_advertise_endpoints(bind_addr, &self.interface_filter)?;
+        let endpoints = if self.advertise.is_empty() {
+            resolve_advertise_endpoints(bind_addr, &self.interface_filter)?
+        } else {
+            advertised_endpoints(&self.advertise)
+        };
 
         // Warn if NUMA hint conflicts with interface filter
         if let (Some(numa), InterfaceFilter::ByName(name)) =

@@ -24,8 +24,9 @@ pub struct QuicEndpointInfo {
     pub fingerprint: Fingerprint,
     /// The port of each server socket. The first is the port in
     /// [`endpoints`](Self::endpoints). A dialer spreads its lanes over these.
-    /// Empty in an entry from a peer that predates per-socket ports: dial the
-    /// port in `endpoints` for every lane.
+    /// Empty in an entry from a peer that advertises explicit addresses, or
+    /// that predates per-socket ports: dial the port in `endpoints` for every
+    /// lane.
     #[serde(default)]
     pub ports: Vec<u16>,
 }

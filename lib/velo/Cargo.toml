@@ -143,6 +143,10 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(velo_endurance)'] }
 # Each top-level `.rs` becomes a [[test]] target with an explicit path.
 
 [[test]]
+name = "advertised_address"
+path = "tests/advertised_address.rs"
+
+[[test]]
 name = "discovery_etcd"
 path = "tests/discovery/etcd_discovery.rs"
 required-features = ["etcd"]
