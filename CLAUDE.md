@@ -41,6 +41,7 @@ The documentation is an mdBook in `docs/` (`docs/book.toml`, chapters in `docs/s
 
 Rules:
 
+- **Plans: Linear.** Plans, remaining work, and design rulings not yet built live in Linear (`linear-work` skill), never in the repository.
 - **`agent-docs/` never merges to `main`.** It holds in-progress `.md` work (plans, measurements, session notes) on a work branch only. Before a PR merges, carry the lasting parts into the book and delete `agent-docs/` from the branch.
 - **The book carries only the bare necessities**: how it works, why (with the rejected alternative), measured numbers with their setup, and negative results. No detailed plans, no phase or workstream labels ("Phase 3", "W2a", "a.5"), no PR numbers, no handoff notes. History belongs in git.
 - **Write the book, READMEs, and comments with the `simple-english` skill.** Comments are terse but readable: they say why, or which failure the code avoids.
