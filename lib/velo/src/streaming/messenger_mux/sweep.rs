@@ -174,6 +174,17 @@ async fn deferred_visit_due(due: Option<tokio::time::Instant>) {
     }
 }
 
+/// The work of one periodic tick: return parked credit, evict idle batchers,
+/// close expired binds, and forget doorbell state that can defer nothing.
+pub(super) fn periodic_tick(core: &MuxCore, visits: &mut DrainVisits, now: tokio::time::Instant) {
+    core.sweep();
+    core.expire_binds(now);
+    visits.forget_stale(now);
+    #[cfg(test)]
+    core.ticks
+        .fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
 /// Spawn the credit-return and eviction sweep.
 ///
 /// Two sources, and which one does the work matters for cost. A draining
@@ -250,11 +261,7 @@ pub(super) fn spawn_sweep(core: &Arc<MuxCore>) {
             };
             let now = tokio::time::Instant::now();
             match wake {
-                Wake::Tick => {
-                    core.sweep();
-                    core.expire_binds(now);
-                    visits.forget_stale(now);
-                }
+                Wake::Tick => periodic_tick(&core, &mut visits, now),
                 Wake::Peer(peer) => {
                     if let Some(peer) = visits.admit(peer, now) {
                         core.visit_drained_peer(peer);

@@ -248,6 +248,10 @@ struct MuxCore {
     /// and its commit. The mux bind does not await, so nothing else can.
     #[cfg(test)]
     bind_hook: std::sync::OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
+    /// Periodic ticks run, so a test can wait out the sweep task's first,
+    /// immediate tick before it sets up state that tick would disturb.
+    #[cfg(test)]
+    ticks: AtomicU64,
     /// Binds per lane that no `OpenSlot` has claimed yet, read when the next
     /// stream is placed ([`MessengerMuxTransport::choose_lane`]).
     lane_load: LaneLoad,
@@ -360,6 +364,8 @@ impl MessengerMuxTransport {
             hooks: std::sync::OnceLock::new(),
             #[cfg(test)]
             bind_hook: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            ticks: AtomicU64::new(0),
             lane_load: LaneLoad::default(),
         });
 

@@ -3195,3 +3195,199 @@ async fn the_sweep_does_not_shrink_the_queue_it_is_about_to_refill() {
     );
     node.mux.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// The periodic tick's cost on an idle node
+// ---------------------------------------------------------------------------
+
+/// A sweep interval no test waits out, so the only periodic ticks are the ones
+/// a test runs by hand. The sweep task's first tick is immediate.
+fn manual_tick_config() -> MuxConfig {
+    MuxConfig {
+        credit_sweep_interval: Duration::from_secs(3600),
+        ..MuxConfig::default()
+    }
+}
+
+/// Heap allocations one periodic tick makes on `mux`, counted on this thread.
+fn tick_allocations(mux: &MessengerMuxTransport) -> u64 {
+    let mut visits = sweep::DrainVisits::new(mux.core.config.drain_visit_floor);
+    let now = tokio::time::Instant::now();
+    crate::test_alloc::allocations_in(|| sweep::periodic_tick(&mux.core, &mut visits, now)).1
+}
+
+/// Run one stream to its end, then tick each side until its batcher ages out:
+/// the state of a node that served traffic and went idle.
+async fn serve_one_stream_then_idle(pair: &Pair) {
+    let rx = pair.bind(1, 1).await;
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, 1, 1)
+        .await
+        .expect("connect");
+    for n in 0..8u32 {
+        tx.send_async(item(n)).await.expect("send item");
+    }
+    tx.send_async(cached_finalized().clone())
+        .await
+        .expect("send terminal");
+    for n in 0..8u32 {
+        assert_eq!(rx.recv().await, item(n));
+    }
+    assert_eq!(rx.recv().await, *cached_finalized());
+    drop(tx);
+    eventually(|| rx.is_disconnected() && pair.live_slots() == 0.0).await;
+
+    // Idle: the stream is gone and each side's batcher has aged out.
+    for mux in [&pair.consumer, &pair.producer] {
+        eventually(|| {
+            mux.core.sweep();
+            mux.core.batchers.is_empty()
+        })
+        .await;
+    }
+    assert!(
+        !pair.consumer.core.ingress.peers().is_empty(),
+        "the consumer keeps the producer's ingress table after the stream ends"
+    );
+}
+
+/// An idle node's periodic tick allocates nothing, before and after traffic.
+///
+/// Every node ticks every `credit_sweep_interval` (200 ms by default), served
+/// or not. The tick walked its two `DashMap`s (batchers and ingress tables)
+/// with `iter()`, and that iterator allocates one `Arc` per shard, empty or
+/// not. A map has 4 shards per CPU, rounded up to a power of two, so an idle
+/// node paid 256 allocations per tick on 20 CPUs and 1,024 on 72: about 5,100
+/// a second for doing nothing. A downstream allocation-count test caught it as
+/// noise it could not explain.
+///
+/// "After traffic" is the case that matters. The ingress table of a peer is
+/// never pruned, so a node that served one stream keeps a non-empty map for
+/// life, and a check for an empty map alone would cover only a node that never
+/// served anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_tick_allocates_nothing_before_and_after_traffic() {
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    let shards = (cpus * 4).next_power_of_two();
+    let pair = mux_pair(manual_tick_config()).await;
+
+    for (side, mux) in [("consumer", &pair.consumer), ("producer", &pair.producer)] {
+        assert_eq!(
+            tick_allocations(mux),
+            0,
+            "{side} before any traffic: {cpus} CPUs, {shards} shards per map"
+        );
+    }
+
+    serve_one_stream_then_idle(&pair).await;
+    for (side, mux) in [("consumer", &pair.consumer), ("producer", &pair.producer)] {
+        assert_eq!(
+            tick_allocations(mux),
+            0,
+            "{side} idle after traffic: {cpus} CPUs, {shards} shards per map"
+        );
+    }
+}
+
+/// With a slot live, the periodic tick still returns its credit when no
+/// doorbell rings: the case the tick is the only answer to.
+///
+/// The control for the idle test above: skipping the walk on an idle node must
+/// not skip it on a busy one. The producer fills its window and parks, the
+/// consumer drains every record with its peer's wake already up (as if a visit
+/// were queued), so no doorbell visit runs and no further batch arrives to
+/// reconcile on. Only the tick can hand the credit back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_busy_tick_returns_credit_no_doorbell_asked_for() {
+    const WINDOW: u32 = 4;
+    let pair = mux_pair(MuxConfig {
+        initial_credit: WINDOW,
+        ..manual_tick_config()
+    })
+    .await;
+    // The sweep task's first tick is immediate, but runs whenever the task is
+    // first polled. Landing after the wake below is raised, it would take the
+    // wake down and let the doorbell answer the drains.
+    eventually(|| {
+        pair.consumer
+            .core
+            .ticks
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    })
+    .await;
+    // Raise the wake before the slot exists: every drain then finds it up and
+    // posts nothing.
+    pair.consumer
+        .core
+        .ingress
+        .pending_wake(lane0(pair.producer_worker))
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let rx = pair.bind(3, 3).await;
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, 3, 3)
+        .await
+        .expect("connect");
+    let producer = tokio::spawn(async move {
+        for n in 0..2 * WINDOW {
+            tx.send_async(item(n)).await.expect("send item");
+        }
+        tx
+    });
+
+    eventually(|| rx.rx.len() == WINDOW as usize).await;
+    for n in 0..WINDOW {
+        assert_eq!(rx.recv().await, item(n));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        rx.rx.is_empty(),
+        "credit came back without the tick: this test no longer isolates it"
+    );
+
+    pair.consumer.core.sweep();
+    for n in WINDOW..2 * WINDOW {
+        assert_eq!(rx.recv().await, item(n), "the tick returned no credit");
+    }
+    drop(producer.await.expect("producer task"));
+    pair.assert_no_reader_stall();
+}
+
+/// Time one periodic tick on an idle node, before and after traffic.
+///
+/// `cargo test --release -p velo --all-features --lib bench_idle_tick --
+/// --ignored --nocapture`. Prints one `RESULT` line per case.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark: prints ns and allocations per idle tick"]
+async fn bench_idle_tick() {
+    let pair = mux_pair(manual_tick_config()).await;
+    report_idle_tick("fresh", &pair.consumer);
+    serve_one_stream_then_idle(&pair).await;
+    report_idle_tick("after_traffic", &pair.consumer);
+}
+
+fn report_idle_tick(case: &str, mux: &MessengerMuxTransport) {
+    const TICKS: u32 = 100_000;
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    let shards = (cpus * 4).next_power_of_two();
+    let mut visits = sweep::DrainVisits::new(mux.core.config.drain_visit_floor);
+    let now = tokio::time::Instant::now();
+    for _ in 0..TICKS / 10 {
+        sweep::periodic_tick(&mux.core, &mut visits, now);
+    }
+    let start = std::time::Instant::now();
+    let ((), allocations) = crate::test_alloc::allocations_in(|| {
+        for _ in 0..TICKS {
+            sweep::periodic_tick(&mux.core, &mut visits, now);
+        }
+    });
+    let elapsed = start.elapsed();
+    println!(
+        "RESULT,idle_tick,{case},cpus={cpus},shards={shards},ns_per_tick={:.1},allocs_per_tick={:.2}",
+        elapsed.as_nanos() as f64 / f64::from(TICKS),
+        allocations as f64 / f64::from(TICKS),
+    );
+}
