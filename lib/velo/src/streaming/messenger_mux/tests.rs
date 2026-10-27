@@ -3391,3 +3391,42 @@ fn report_idle_tick(case: &str, mux: &MessengerMuxTransport) {
         allocations as f64 / f64::from(TICKS),
     );
 }
+
+/// A retired batcher can still flush credit that recreates its peer's batcher.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "F1: late credit replies recreate a batcher after the idle fixture returns"]
+async fn idle_fixture_waits_for_retired_batchers_to_flush() {
+    let pair = mux_pair(manual_tick_config()).await;
+    let hooks = Arc::new(TestHooks::default());
+    hooks.pause();
+    assert!(pair.consumer.core.hooks.set(Arc::clone(&hooks)).is_ok());
+
+    // A partial batch can return credit before its stream's terminal arrives.
+    let receiver = pair.bind(9, 9).await;
+    let sender = pair
+        .producer
+        .connect(pair.consumer_worker, 9, 9)
+        .await
+        .expect("connect");
+    sender.send_async(item(0)).await.expect("send item");
+    assert_eq!(receiver.recv().await, item(0));
+    hooks.wait_until_parked().await;
+    sender
+        .send_async(cached_finalized().clone())
+        .await
+        .expect("send terminal");
+    assert_eq!(receiver.recv().await, *cached_finalized());
+    drop(sender);
+    eventually(|| receiver.is_disconnected() && pair.live_slots() == 0.0).await;
+
+    serve_one_stream_then_idle(&pair).await;
+    assert!(pair.consumer.core.batchers.is_empty());
+    assert!(pair.producer.core.batchers.is_empty());
+    hooks.release();
+    eventually(|| !pair.producer.core.batchers.is_empty()).await;
+    assert_eq!(
+        tick_allocations(&pair.producer),
+        0,
+        "a late control recreated the producer batcher after the idle fixture returned",
+    );
+}
