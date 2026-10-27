@@ -3252,6 +3252,38 @@ async fn serve_one_stream_then_idle(pair: &Pair) {
     );
 }
 
+/// Heap allocations of one periodic tick on `mux`, taken while both sides of
+/// `pair` are quiet: no live slot, no batcher, and no mux task but the sweep,
+/// both before and after the tick.
+///
+/// A retired batcher's task can still flush a control reply after the maps
+/// read empty, and that reply recreates its peer's batcher. A tick that finds
+/// one walks the map, which is right for a node that is not idle. So a tick
+/// taken while anything is in flight is not counted, and is taken again. A
+/// tick taken while quiet is returned whatever it counts.
+async fn quiet_tick_allocations(pair: &Pair, mux: &MessengerMuxTransport) -> u64 {
+    let quiet = || {
+        pair.live_slots() == 0.0
+            && [&pair.consumer, &pair.producer]
+                .iter()
+                .all(|side| side.core.batchers.is_empty() && side.core.tasks.len() == 1)
+    };
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        for side in [&pair.consumer, &pair.producer] {
+            side.core.sweep();
+        }
+        if quiet() {
+            let allocations = tick_allocations(mux);
+            if quiet() {
+                return allocations;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the pair never went quiet within {RECV_TIMEOUT:?}");
+}
+
 /// An idle node's periodic tick allocates nothing, before and after traffic.
 ///
 /// Every node ticks every `credit_sweep_interval` (200 ms by default), served
@@ -3283,7 +3315,7 @@ async fn an_idle_tick_allocates_nothing_before_and_after_traffic() {
     serve_one_stream_then_idle(&pair).await;
     for (side, mux) in [("consumer", &pair.consumer), ("producer", &pair.producer)] {
         assert_eq!(
-            tick_allocations(mux),
+            quiet_tick_allocations(&pair, mux).await,
             0,
             "{side} idle after traffic: {cpus} CPUs, {shards} shards per map"
         );
@@ -3392,10 +3424,11 @@ fn report_idle_tick(case: &str, mux: &MessengerMuxTransport) {
     );
 }
 
-/// A retired batcher can still flush credit that recreates its peer's batcher.
+/// A retired batcher can still flush a control reply after the idle fixture
+/// returns, and that reply recreates its peer's batcher. The idle count must
+/// wait that out rather than count a tick that walks the new batcher.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "F1: late credit replies recreate a batcher after the idle fixture returns"]
-async fn idle_fixture_waits_for_retired_batchers_to_flush() {
+async fn a_late_reply_after_the_idle_fixture_is_not_counted_as_idle() {
     let pair = mux_pair(manual_tick_config()).await;
     let hooks = Arc::new(TestHooks::default());
     hooks.pause();
@@ -3425,8 +3458,8 @@ async fn idle_fixture_waits_for_retired_batchers_to_flush() {
     hooks.release();
     eventually(|| !pair.producer.core.batchers.is_empty()).await;
     assert_eq!(
-        tick_allocations(&pair.producer),
+        quiet_tick_allocations(&pair, &pair.producer).await,
         0,
-        "a late control recreated the producer batcher after the idle fixture returned",
+        "the producer, once its recreated batcher has aged out again",
     );
 }
