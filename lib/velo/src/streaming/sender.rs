@@ -8,7 +8,8 @@
 //! a [`flume::Sender<Vec<u8>>`], registers for heartbeats when the stream is remote, and guarantees
 //! a [`StreamFrame::Dropped`] sentinel on abnormal exit via `impl Drop`.
 //! A `StreamSender<Bytes>` can also send bytes that are already serialized with
-//! [`send_bytes`](StreamSender::send_bytes), which writes the same frame without serde.
+//! [`send_bytes`](StreamSender::send_bytes), which writes the same frame without serde,
+//! or an item written in place with [`send_frame`](StreamSender::send_frame).
 //!
 //! # Lifecycle
 //!
@@ -36,7 +37,7 @@ use serde::Serialize;
 use tokio_util::sync::CancellationToken;
 
 use crate::streaming::anchor::AnchorEntry;
-use crate::streaming::frame::{SendError, StreamFrame, encode_bytes_item};
+use crate::streaming::frame::{ByteItemFrame, SendError, StreamFrame, encode_bytes_item};
 use crate::streaming::handle::StreamAnchorHandle;
 
 /// Cancellation state for a [`StreamSender`].
@@ -660,6 +661,25 @@ impl StreamSender<Bytes> {
         let bytes = encode_bytes_item(payload.as_ref())?;
         self.send_item_frame(bytes).await
     }
+
+    /// Send an item built in place with
+    /// [`ByteItemBuilder`](crate::streaming::ByteItemBuilder). The frame goes
+    /// into the stream's channel as it is, with no copy.
+    ///
+    /// Use it when the encoder can write the payload straight into the frame,
+    /// instead of encoding into its own buffer for `send_bytes` to copy.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`send_bytes`](Self::send_bytes), with the same rules for
+    /// a cancel, a full channel, and the transport's item limit. The limit
+    /// counts the whole frame, whose header here is 11 bytes.
+    pub async fn send_frame(&self, frame: ByteItemFrame) -> Result<(), SendError> {
+        if self.closed.is_closed() {
+            return Err(SendError::ChannelClosed);
+        }
+        self.send_item_frame(frame.into_vec()).await
+    }
 }
 
 /// Hand a terminal sentinel to the frame channel without blocking a runtime worker.
@@ -857,6 +877,13 @@ mod tests {
 
     /// [`make_sender`] for any item type.
     fn make_sender_of<T: serde::Serialize>() -> (StreamSender<T>, flume::Receiver<Vec<u8>>) {
+        make_limited_sender_of(None)
+    }
+
+    /// [`make_sender_of`] with the transport's item limit.
+    fn make_limited_sender_of<T: serde::Serialize>(
+        item_limit: Option<usize>,
+    ) -> (StreamSender<T>, flume::Receiver<Vec<u8>>) {
         let (tx, rx) = flume::bounded::<Vec<u8>>(256);
         let handle = StreamAnchorHandle::pack(velo_ext::WorkerId::from_u64(1), 1);
         let cancel_token = tokio_util::sync::CancellationToken::new();
@@ -872,7 +899,7 @@ mod tests {
                 sender_registry,
                 closed: Default::default(),
                 retires_on: crate::streaming::sender::RetiresOn::Queue,
-                item_limit: None,
+                item_limit,
                 deadline_queue: None,
                 heartbeats: None,
             },
@@ -1469,6 +1496,157 @@ mod tests {
             Err(SendError::ChannelClosed)
         ));
         assert!(rx.is_empty());
+    }
+
+    fn built(payload: &[u8]) -> crate::streaming::ByteItemFrame {
+        let mut item = crate::streaming::ByteItemBuilder::with_capacity(payload.len());
+        item.buffer().extend_from_slice(payload);
+        item.finish().expect("finish")
+    }
+
+    /// `send_frame` puts the built frame in the channel unchanged, so the
+    /// consumer reads what `send_bytes` sends for the same payload. It shares
+    /// `send_bytes`' rules: a full channel waits, a cancel wakes the wait, and
+    /// a cancelled stream refuses at once.
+    #[tokio::test]
+    async fn send_frame_sends_the_built_frame_and_follows_the_send_rules() {
+        let (sender, rx) = make_sender_of::<bytes::Bytes>();
+        let frame = built(b"chunk");
+        let expected = frame.payload().as_ptr();
+        sender.send_frame(frame).await.unwrap();
+        sender.send_bytes(b"chunk").await.unwrap();
+        let (sent, reference) = (rx.recv().unwrap(), rx.recv().unwrap());
+        assert_eq!(sent[super::ITEM_PREFIX.len() + 5..].as_ptr(), expected);
+        assert_eq!(
+            format!("{:?}", decode::<bytes::Bytes>(&sent)),
+            format!("{:?}", decode::<bytes::Bytes>(&reference))
+        );
+
+        for _ in 0..rx.capacity().unwrap() {
+            sender.send_frame(built(b"x")).await.unwrap();
+        }
+        let blocked = sender.send_frame(built(b"late"));
+        tokio::pin!(blocked);
+        assert!(futures::poll!(&mut blocked).is_pending());
+        cancel_stream(&sender);
+        let blocked = tokio::time::timeout(Duration::from_secs(1), blocked)
+            .await
+            .expect("a blocked send_frame did not wake after cancellation");
+        assert!(matches!(blocked, Err(SendError::ChannelClosed)));
+
+        rx.drain().for_each(drop);
+        assert!(matches!(
+            sender.send_frame(built(b"after cancel")).await,
+            Err(SendError::ChannelClosed)
+        ));
+        assert!(rx.is_empty());
+    }
+
+    /// Building an item and sending it is one allocation when the payload
+    /// fits: the frame's buffer, which the channel then carries.
+    #[tokio::test]
+    async fn building_and_sending_an_item_allocates_once() {
+        use futures::FutureExt;
+        let (sender, rx) = make_sender_of::<bytes::Bytes>();
+        // The channel's queue allocates on its first item; warm it.
+        sender.send_frame(built(b"warm")).await.unwrap();
+        rx.recv().unwrap();
+        for len in [16, 1024, 16 * 1024] {
+            let payload = vec![7u8; len];
+            let (sent, allocations) = crate::test_alloc::allocations_in(|| {
+                sender.send_frame(built(&payload)).now_or_never()
+            });
+            assert!(matches!(sent, Some(Ok(()))), "len {len}");
+            assert_eq!(allocations, 1, "len {len}");
+            assert_eq!(rx.recv().unwrap().len(), len + 11);
+        }
+    }
+
+    /// The transport's item limit counts the frame, as for `send_bytes`. Over
+    /// 64 KiB both write a `bin32` length, so the two refuse at the same
+    /// payload size; the per-stream limit is 16 MiB.
+    #[tokio::test]
+    async fn send_frame_refuses_an_item_over_the_limit_as_send_bytes_does() {
+        const LIMIT: usize = 100_000;
+        let (sender, rx) = make_limited_sender_of::<bytes::Bytes>(Some(LIMIT));
+        let fits = vec![1u8; LIMIT - 11];
+        let over = vec![2u8; LIMIT - 10];
+        sender.send_frame(built(&fits)).await.unwrap();
+        sender.send_bytes(&fits).await.unwrap();
+        for refused in [
+            sender.send_frame(built(&over)).await,
+            sender.send_bytes(&over).await,
+        ] {
+            assert!(
+                matches!(
+                    refused,
+                    Err(SendError::ItemTooLarge { len, limit: LIMIT }) if len == LIMIT + 1
+                ),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(rx.len(), 2, "only the items under the limit were sent");
+        // The stream stays open after a refusal.
+        sender.send_frame(built(b"next")).await.unwrap();
+    }
+
+    /// What it costs a producer to send an item it encoded, per item: encoded
+    /// into its own buffer and copied by `send_bytes`, against built in place
+    /// and sent with `send_frame`. The encode is a copy of the payload, the
+    /// same in both, and the consumer takes and drops each frame. Run with
+    /// `timeout 300 cargo test --release -p velo --lib bench_byte_item_send -- --ignored --nocapture --test-threads=1`.
+    #[test]
+    #[ignore = "benchmark: prints timings, asserts nothing"]
+    fn bench_byte_item_send() {
+        use futures::FutureExt;
+        use std::time::Instant;
+        const ITEMS: u32 = 200_000;
+        const ROUNDS: usize = 9;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _guard = runtime.enter();
+        let (sender, rx) = make_sender_of::<bytes::Bytes>();
+        for len in [16, 1024, 16 * 1024] {
+            let payload = vec![7u8; len];
+            let copied = || {
+                // An encoder's own buffer, reserved as serde encoders do.
+                let mut encoded = Vec::with_capacity(128);
+                encoded.extend_from_slice(std::hint::black_box(&payload));
+                sender.send_bytes(&encoded).now_or_never().unwrap().unwrap();
+                drop(rx.try_recv().unwrap());
+            };
+            let in_place = || {
+                let mut item = crate::streaming::ByteItemBuilder::with_capacity(len);
+                item.buffer()
+                    .extend_from_slice(std::hint::black_box(&payload));
+                sender
+                    .send_frame(item.finish().unwrap())
+                    .now_or_never()
+                    .unwrap()
+                    .unwrap();
+                drop(rx.try_recv().unwrap());
+            };
+            let time = |f: &dyn Fn()| {
+                let start = Instant::now();
+                for _ in 0..ITEMS {
+                    f();
+                }
+                start.elapsed().as_nanos() as f64 / f64::from(ITEMS)
+            };
+            let (mut a, mut b) = (Vec::new(), Vec::new());
+            for _ in 0..ROUNDS {
+                a.push(time(&copied));
+                b.push(time(&in_place));
+            }
+            a.sort_by(f64::total_cmp);
+            b.sort_by(f64::total_cmp);
+            println!(
+                "RESULT len={len} send_bytes_ns={:.1} send_frame_ns={:.1} (median of {ROUNDS})",
+                a[ROUNDS / 2],
+                b[ROUNDS / 2]
+            );
+        }
     }
 
     // -----------------------------------------------------------------------

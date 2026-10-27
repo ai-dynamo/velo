@@ -95,7 +95,8 @@ A file that is not compiled (docs, CI, scripts) has no tier. Check for
 ## Streams and the mux: T1 per record
 
 - Producer: `StreamSender::send`, `StreamSender::send_bytes`,
-  `is_terminal_sentinel` (`streaming/sender.rs`); `encode_bytes_item`,
+  `StreamSender::send_frame`, `is_terminal_sentinel`
+  (`streaming/sender.rs`); `encode_bytes_item`, `ByteItemBuilder`,
   `decode_bytes_frame` (`streaming/frame.rs`); `send`
   (`streaming/mpsc/sender.rs`); `SenderClosed`
   (`streaming/control/registry.rs`).
