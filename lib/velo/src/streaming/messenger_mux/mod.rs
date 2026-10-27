@@ -603,11 +603,25 @@ impl MuxCore {
     }
 
     /// One sweep tick: return credit, then age out idle batchers.
+    ///
+    /// Each walk is skipped when it has nothing to visit, because an idle node
+    /// still ticks: `DashMap::iter` allocates one `Arc` per shard, empty or
+    /// not, so the two walks cost 256 allocations a tick on 20 CPUs and 1,024
+    /// on 72. The ingress tables are never pruned, so the credit walk is gated
+    /// on live slots rather than on an empty map: with no slot live there is no
+    /// credit to return. A slot opened during the check is reached by the
+    /// next tick, as one opened just after the walk always was.
     fn sweep(&self) {
-        for key in self.ingress.peers() {
-            self.sweep_peer(key);
+        if self.ingress.has_live_slots() {
+            for key in self.ingress.peers() {
+                self.sweep_peer(key);
+            }
         }
 
+        // `is_empty` takes each shard's read lock and allocates nothing.
+        if self.batchers.is_empty() {
+            return;
+        }
         let threshold = self.config.idle_ticks();
         let keys: Vec<PeerLane> = self.batchers.iter().map(|entry| *entry.key()).collect();
         for key in keys {

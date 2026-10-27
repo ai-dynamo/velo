@@ -13,6 +13,9 @@ use std::collections::{BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::StreamExt;
+use tokio_util::sync::CancellationToken;
+
 use super::{MuxCore, PeerLane};
 
 /// Ceiling on an operator's [`MuxConfig::drain_visit_floor`](super::MuxConfig::drain_visit_floor).
@@ -218,43 +221,11 @@ pub(super) fn spawn_sweep(core: &Arc<MuxCore>) {
     let floor = core.config.drain_visit_floor;
     let drain_rx = core.drain_rx.clone();
     core.tasks.spawn(async move {
-        enum Wake {
-            Tick,
-            Peer(PeerLane),
-            Due,
-        }
-        // Non-zero by construction: `interval` panics on a zero period, and
-        // `MessengerMuxTransport::new` refuses one before this task exists.
-        let mut ticker = tokio::time::interval(interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut wakes = SweepWakes::new(cancel, interval, drain_rx);
         let mut visits = DrainVisits::new(floor);
         loop {
-            // `biased` puts cancellation first, so teardown is never starved
-            // by a busy lane. The remaining arms are deliberately *not* biased
-            // against each other: an earlier version polled the ticker first,
-            // which at a short interval left it almost always ready and starved
-            // the drain arm — the event-driven path barely ran, and the periodic
-            // walk did the work it was meant to replace. The deferred-visit
-            // timer joins them on the same footing for the same reason.
-            let deferred_until = visits.next_due();
-            let wake = tokio::select! {
-                biased;
-                () = cancel.cancelled() => return,
-                wake = async {
-                    tokio::select! {
-                        _ = ticker.tick() => Wake::Tick,
-                        () = deferred_visit_due(deferred_until) => Wake::Due,
-                        drained = drain_rx.recv_async() => match drained {
-                            Ok(peer) => Wake::Peer(peer),
-                            // Every sender is gone with the transport. Fall back
-                            // to ticking so eviction still runs.
-                            Err(_) => {
-                                ticker.tick().await;
-                                Wake::Tick
-                            }
-                        },
-                    }
-                } => wake,
+            let Some(wake) = wakes.next(visits.next_due()).await else {
+                return;
             };
             let Some(core) = weak.upgrade() else {
                 return;
@@ -275,4 +246,159 @@ pub(super) fn spawn_sweep(core: &Arc<MuxCore>) {
             }
         }
     });
+}
+
+/// What woke the sweep task.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Wake {
+    Tick,
+    Peer(PeerLane),
+    Due,
+}
+
+/// The sweep task's wake sources, kept from one loop turn to the next.
+///
+/// The doorbell is read through one `RecvStream` kept here, not a new
+/// `recv_async` each turn. A receive future that finds the lane empty puts a
+/// waiter hook on the heap, and dropping it when another arm wins frees the
+/// hook. Built fresh each turn, that was one allocation per tick on a node with
+/// nothing to do. The stream keeps its hook while it waits, and a record that
+/// lands while the stream is not being polled stays in the channel for the
+/// next poll.
+pub(super) struct SweepWakes {
+    cancel: CancellationToken,
+    ticker: tokio::time::Interval,
+    drains: flume::r#async::RecvStream<'static, PeerLane>,
+}
+
+impl SweepWakes {
+    /// Call inside a runtime: the ticker registers a timer.
+    pub(super) fn new(
+        cancel: CancellationToken,
+        interval: Duration,
+        drain_rx: flume::Receiver<PeerLane>,
+    ) -> Self {
+        // Non-zero by construction: `interval` panics on a zero period, and
+        // `MessengerMuxTransport::new` refuses one before this task exists.
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        Self {
+            cancel,
+            ticker,
+            drains: drain_rx.into_stream(),
+        }
+    }
+
+    /// Wait for the next thing to do, or `None` once the mux is cancelled.
+    /// `deferred_until` is when the next deferred doorbell visit comes due.
+    pub(super) async fn next(
+        &mut self,
+        deferred_until: Option<tokio::time::Instant>,
+    ) -> Option<Wake> {
+        let Self {
+            cancel,
+            ticker,
+            drains,
+        } = self;
+        // `biased` puts cancellation first, so teardown is never starved
+        // by a busy lane. The remaining arms are deliberately *not* biased
+        // against each other: an earlier version polled the ticker first,
+        // which at a short interval left it almost always ready and starved
+        // the drain arm — the event-driven path barely ran, and the periodic
+        // walk did the work it was meant to replace. The deferred-visit
+        // timer joins them on the same footing for the same reason.
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => None,
+            wake = async {
+                tokio::select! {
+                    _ = ticker.tick() => Wake::Tick,
+                    () = deferred_visit_due(deferred_until) => Wake::Due,
+                    drained = drains.next() => match drained {
+                        Some(peer) => Wake::Peer(peer),
+                        // Every sender is gone with the transport. Fall back
+                        // to ticking so eviction still runs.
+                        None => {
+                            ticker.tick().await;
+                            Wake::Tick
+                        }
+                    },
+                }
+            } => Some(wake),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use velo_ext::WorkerId;
+
+    use crate::streaming::messenger_mux::LaneIndex;
+
+    /// The sweep task's wait allocates nothing per idle tick.
+    ///
+    /// The task waits on the ticker and the drain doorbell together. A
+    /// `recv_async` future that finds the doorbell empty registers a waiter
+    /// hook on the heap, and dropping the future when the ticker wins frees
+    /// it. Built fresh each loop turn, that is one allocation per tick on a
+    /// node with nothing to do, on top of whatever the tick itself costs.
+    #[test]
+    fn an_idle_wait_allocates_nothing_per_tick() {
+        const TICKS: usize = 10;
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let (drain_tx, drain_rx) = flume::unbounded::<PeerLane>();
+        let mut wakes = runtime.block_on(async {
+            SweepWakes::new(
+                CancellationToken::new(),
+                Duration::from_millis(200),
+                drain_rx,
+            )
+        });
+        let mut idle_ticks = |n: usize| {
+            runtime.block_on(async {
+                for _ in 0..n {
+                    assert_eq!(wakes.next(None).await, Some(Wake::Tick));
+                }
+            });
+        };
+        // The first tick is immediate; the second is the first real wait.
+        idle_ticks(2);
+        let ((), allocations) = crate::test_alloc::allocations_in(|| idle_ticks(TICKS));
+        assert_eq!(allocations, 0, "{TICKS} idle ticks");
+
+        // The waiter kept across turns still hears the doorbell.
+        let peer = PeerLane::new(WorkerId::from_u64(7), LaneIndex::ZERO);
+        drain_tx.send(peer).expect("send");
+        assert_eq!(runtime.block_on(wakes.next(None)), Some(Wake::Peer(peer)));
+    }
+
+    /// Cancellation wins over a ready doorbell, and a closed doorbell falls
+    /// back to ticking.
+    #[test]
+    fn the_wait_ends_on_cancel_and_ticks_without_a_doorbell() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .start_paused(true)
+            .build()
+            .expect("runtime");
+        let cancel = CancellationToken::new();
+        let (drain_tx, drain_rx) = flume::unbounded::<PeerLane>();
+        let mut wakes = runtime.block_on(async {
+            SweepWakes::new(cancel.clone(), Duration::from_millis(200), drain_rx)
+        });
+        runtime.block_on(async {
+            assert_eq!(wakes.next(None).await, Some(Wake::Tick), "first tick");
+            drop(drain_tx);
+            let before = tokio::time::Instant::now();
+            assert_eq!(wakes.next(None).await, Some(Wake::Tick));
+            assert!(before.elapsed() >= Duration::from_millis(200));
+            cancel.cancel();
+            assert_eq!(wakes.next(None).await, None);
+        });
+    }
 }

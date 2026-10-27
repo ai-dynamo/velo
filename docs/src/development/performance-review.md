@@ -47,6 +47,7 @@ that the test counts.
 | A `tokio::time::timeout` per record. Each one takes the time driver's lock twice. | One timer per stream, moved forward only inside half a window. | `a_thousand_records_arm_the_heartbeat_timer_a_handful_of_times` |
 | A full decode of each stream item, only to see whether it ends the stream. | Decide from the first bytes. | `classifying_an_item_does_not_allocate` |
 | A task per stream bind, to time out its accept window. | One deadline queue that the credit sweep drains. | `a_finished_zero_rtt_stream_leaves_no_task_behind` |
+| A `DashMap::iter()` walk of two maps on every credit sweep tick, idle or not. The iterator allocates one `Arc` per shard: 1,024 allocations per tick on 72 CPUs. A new doorbell receive future per tick added one more. | Skip each walk when no slot is live or no batcher exists. Keep one doorbell stream across ticks. | `an_idle_tick_allocates_nothing_before_and_after_traffic`, `an_idle_wait_allocates_nothing_per_tick` |
 | Three writes per large frame. | Stage the preamble and header in a stack buffer, so a frame is two writes. | `test_direct_path_stages_prefix_into_two_writes` |
 | A read buffer that doubled for a large frame, and copied at each step. | Reserve the whole frame once the preamble is read. | `test_decode_reserves_capacity_for_announced_frame` |
 | Socket buffers set on the accepted socket after data could flow. | Set them on the listener, before `listen`. | `socket_buffers_sizes_the_listener_or_leaves_it_to_the_kernel` |
