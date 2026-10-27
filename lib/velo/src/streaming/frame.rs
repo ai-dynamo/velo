@@ -4,7 +4,8 @@
 //! [`StreamFrame<T>`]: the seven-variant wire frame enum for the streaming protocol.
 //!
 //! Also the hand-written codec for `Item` frames of a `Bytes` stream, which
-//! skips serde on both ends. See `encode_bytes_item` and `decode_bytes_frame`.
+//! skips serde on both ends. See `encode_bytes_item`, [`ByteItemBuilder`] and
+//! `decode_bytes_frame`.
 
 use bytes::{Buf, Bytes};
 use serde::{Deserialize, Serialize};
@@ -129,19 +130,135 @@ fn bin_header(len: u32) -> ([u8; 5], usize) {
 /// limit of a msgpack `bin`. `rmp_serde` would cut the length to 32 bits and
 /// write a header that does not match the payload.
 pub(crate) fn encode_bytes_item(payload: &[u8]) -> Result<Vec<u8>, SendError> {
-    let len = u32::try_from(payload.len()).map_err(|_| {
-        SendError::SerializationError(format!(
-            "a byte item of {} bytes is over the msgpack bin limit of {} bytes",
-            payload.len(),
-            u32::MAX
-        ))
-    })?;
-    let (header, used) = bin_header(len);
+    let (header, used) = bin_header(bin_len(payload.len())?);
     let mut frame = Vec::with_capacity(ITEM_PREFIX.len() + used + payload.len());
     frame.extend_from_slice(ITEM_PREFIX);
     frame.extend_from_slice(&header[..used]);
     frame.extend_from_slice(payload);
     Ok(frame)
+}
+
+/// A payload length as a msgpack `bin` length, which is 32 bits.
+fn bin_len(len: usize) -> Result<u32, SendError> {
+    u32::try_from(len).map_err(|_| {
+        SendError::SerializationError(format!(
+            "a byte item of {len} bytes is over the msgpack bin limit of {} bytes",
+            u32::MAX
+        ))
+    })
+}
+
+/// The bytes before a built item's payload: [`ITEM_PREFIX`], then a `bin32`
+/// marker and its length.
+const BUILT_HEADER: [u8; 11] = [0x81, 0xa4, b'I', b't', b'e', b'm', BIN32, 0, 0, 0, 0];
+
+/// Writes one item of a `Bytes` stream in place: the payload goes straight
+/// into the buffer that is sent, with no copy.
+///
+/// It needs no sender, so an encoder can build the item before the producer
+/// holds one. Append the payload to [`buffer`](Self::buffer), then
+/// [`finish`](Self::finish) it and send it with
+/// [`StreamSender::send_frame`](crate::streaming::StreamSender::send_frame).
+///
+/// The frame decodes as the frame [`send_bytes`](crate::streaming::StreamSender::send_bytes)
+/// writes for the same payload, through `next`, `next_bytes`, and any typed
+/// consumer. It is not the same bytes: the length is always a 5-byte `bin32`,
+/// because it is written after the payload. An item under 64 KiB is up to 3
+/// bytes longer than a `send_bytes` frame.
+///
+/// ```
+/// use std::io::Write;
+/// use velo::streaming::ByteItemBuilder;
+///
+/// let mut item = ByteItemBuilder::with_capacity(64);
+/// write!(item.buffer(), "token").unwrap();
+/// let frame = item.finish().unwrap();
+/// assert_eq!(frame.payload(), b"token");
+/// ```
+pub struct ByteItemBuilder {
+    frame: Vec<u8>,
+}
+
+impl ByteItemBuilder {
+    /// A builder with room for `payload_capacity` payload bytes.
+    ///
+    /// A payload that fits costs one allocation for the whole frame. A larger
+    /// one grows the buffer as a `Vec` grows.
+    pub fn with_capacity(payload_capacity: usize) -> Self {
+        let mut frame = Vec::with_capacity(BUILT_HEADER.len().saturating_add(payload_capacity));
+        frame.extend_from_slice(&BUILT_HEADER);
+        Self { frame }
+    }
+
+    /// The frame's buffer, which already holds the item's header. Append the
+    /// payload to it.
+    ///
+    /// Do not change or remove the header: [`finish`](Self::finish) refuses a
+    /// frame whose header changed.
+    pub fn buffer(&mut self) -> &mut Vec<u8> {
+        &mut self.frame
+    }
+
+    /// The payload written so far. Empty if the header was cut.
+    pub fn payload(&self) -> &[u8] {
+        self.frame.get(BUILT_HEADER.len()..).unwrap_or_default()
+    }
+
+    /// Write the payload's length into the header, and return the frame to send.
+    ///
+    /// # Errors
+    ///
+    /// [`SendError::SerializationError`] if the header was changed, or if the
+    /// payload is over `u32::MAX` bytes, the limit of a msgpack `bin`.
+    pub fn finish(mut self) -> Result<ByteItemFrame, SendError> {
+        // Checked, not trusted: cleared and rewritten, the buffer could hold a
+        // terminal sentinel, which the mux would act on.
+        let marker = ITEM_PREFIX.len();
+        if self.frame.len() < BUILT_HEADER.len() || self.frame[..=marker] != BUILT_HEADER[..=marker]
+        {
+            return Err(SendError::SerializationError(
+                "the header of a built byte item was changed".to_string(),
+            ));
+        }
+        let len = bin_len(self.frame.len() - BUILT_HEADER.len())?;
+        self.frame[marker + 1..BUILT_HEADER.len()].copy_from_slice(&len.to_be_bytes());
+        Ok(ByteItemFrame { frame: self.frame })
+    }
+}
+
+impl std::fmt::Debug for ByteItemBuilder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ByteItemBuilder")
+            .field("payload_len", &self.payload().len())
+            .finish()
+    }
+}
+
+/// One item of a `Bytes` stream, encoded and ready to send with
+/// [`StreamSender::send_frame`](crate::streaming::StreamSender::send_frame).
+/// Made by [`ByteItemBuilder::finish`].
+pub struct ByteItemFrame {
+    frame: Vec<u8>,
+}
+
+impl ByteItemFrame {
+    /// The item's payload.
+    pub fn payload(&self) -> &[u8] {
+        &self.frame[BUILT_HEADER.len()..]
+    }
+
+    /// The whole frame, header first, as it goes into the stream's channel.
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        self.frame
+    }
+}
+
+impl std::fmt::Debug for ByteItemFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ByteItemFrame")
+            .field("payload_len", &self.payload().len())
+            .finish()
+    }
 }
 
 /// Decode one frame of a `Bytes` stream, keeping an item's payload in place.
@@ -278,6 +395,98 @@ mod tests {
             assert!(range.contains(&item.as_ptr()) || len == 0, "len {len}");
             assert_eq!(item, payload(len));
         }
+    }
+
+    fn build(payload: &[u8], capacity: usize) -> ByteItemFrame {
+        let mut item = ByteItemBuilder::with_capacity(capacity);
+        item.buffer().extend_from_slice(payload);
+        item.finish().expect("finish")
+    }
+
+    /// A built item decodes to the item `encode_bytes_item` writes, through
+    /// the byte decode and through serde, at every `bin` width and whether
+    /// or not the payload fit the capacity given. Its payload stays in the
+    /// buffer it was written into.
+    ///
+    /// The frames differ in bytes, because a built item always carries a
+    /// `bin32` length, so this compares what they decode to.
+    #[test]
+    fn built_items_decode_as_encoded_items_do() {
+        for &len in BYTE_ITEM_LENGTHS {
+            let payload = payload(len);
+            let encoded = encode_bytes_item(&payload).unwrap();
+            for capacity in [len, 0] {
+                let built = build(&payload, capacity);
+                assert_eq!(built.payload(), payload, "len {len}");
+                let frame = built.into_vec();
+                let typed = rmp_serde::from_slice::<StreamFrame<Bytes>>(&frame);
+                let expected = rmp_serde::from_slice::<StreamFrame<Bytes>>(&encoded);
+                assert_eq!(format!("{typed:?}"), format!("{expected:?}"), "len {len}");
+
+                let range = frame.as_ptr_range();
+                let decoded = decode_bytes_frame(frame);
+                let Ok(StreamFrame::Item(item)) = decoded else {
+                    panic!("len {len}: expected an item, got {decoded:?}");
+                };
+                assert_eq!(item, payload, "len {len}");
+                assert!(range.contains(&item.as_ptr()) || len == 0, "len {len}");
+            }
+        }
+    }
+
+    /// Building an item whose payload fits the capacity given is one
+    /// allocation: the frame's buffer, sized once. The payload is written
+    /// into it and never copied.
+    #[test]
+    fn building_an_item_that_fits_allocates_once() {
+        for &len in BYTE_ITEM_LENGTHS {
+            let payload = payload(len);
+            let (built, allocations) = crate::test_alloc::allocations_in(|| build(&payload, len));
+            assert_eq!(allocations, 1, "len {len}");
+            assert_eq!(built.payload(), payload, "len {len}");
+        }
+    }
+
+    /// `finish` refuses a frame whose header the caller changed, rather than
+    /// send bytes that are not an item.
+    ///
+    /// The builder hands out its `Vec`, so a caller can clear it. Bytes that
+    /// then spell `Finalized` would be read by the mux as the stream's
+    /// terminal: it would close the slot while the sender still holds the
+    /// stream.
+    #[test]
+    fn finish_refuses_a_changed_header() {
+        let finalized = rmp_serde::to_vec(&StreamFrame::<()>::Finalized).unwrap();
+        for i in 0..4 {
+            let mut item = ByteItemBuilder::with_capacity(16);
+            let buf = item.buffer();
+            buf.extend_from_slice(b"payload");
+            match i {
+                0 => {
+                    buf.clear();
+                    buf.extend_from_slice(&finalized);
+                }
+                1 => buf.truncate(BUILT_HEADER.len() - 1),
+                2 => buf[0] = 0x82,
+                // A `bin8` marker would let the payload's own bytes act as its length.
+                _ => buf[ITEM_PREFIX.len()] = BIN8,
+            }
+            assert!(
+                matches!(item.finish(), Err(SendError::SerializationError(_))),
+                "rewrite {i}"
+            );
+        }
+    }
+
+    /// A payload over `u32::MAX` bytes has no msgpack `bin` length. Both
+    /// byte encoders refuse it through the same check.
+    #[test]
+    fn a_payload_over_the_bin_limit_is_refused() {
+        assert_eq!(bin_len(u32::MAX as usize).unwrap(), u32::MAX);
+        assert!(matches!(
+            bin_len(u32::MAX as usize + 1),
+            Err(SendError::SerializationError(_))
+        ));
     }
 
     #[test]

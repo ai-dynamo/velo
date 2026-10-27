@@ -106,6 +106,24 @@ These counts are from the source, not measured. On the same worker, there is no 
 
 A kept item keeps its frame buffer in memory. The frame is the item plus at most 11 bytes.
 
+### Write an item in place
+
+`send_bytes` copies a payload that the application encoded into its own buffer. To skip that copy, encode straight into the frame with `ByteItemBuilder`, and send the result with `send_frame`. The builder needs no sender, so the encode can run before the producer holds one.
+
+```rust,ignore
+use velo::streaming::ByteItemBuilder;
+
+let mut item = ByteItemBuilder::with_capacity(size_hint);
+rmp_serde::encode::write(item.buffer(), &token)?;
+sender.send_frame(item.finish()?).await?;
+```
+
+`buffer` is a `Vec<u8>` that already holds the 11-byte item header. Append the payload to it. `finish` writes the payload's length into the header, and refuses a frame whose header was changed. `send_frame` has the rules of `send_bytes` for a cancel, a full channel, and the item limit.
+
+A payload that fits the capacity costs one allocation for the whole frame, and no copy before the batch. A larger payload grows the buffer as a `Vec` grows.
+
+The frame decodes as the `send_bytes` frame does, through `next`, `next_bytes`, and a typed consumer. The bytes differ in one way: the length is always a 5-byte `bin32`, because it is written after the payload. So an item under 64 KiB is up to 3 bytes longer on the wire. On the same worker, a frame with spare capacity costs the consumer one small allocation when it takes the buffer as `Bytes`. Over the mux, the batch copy removes that cost.
+
 Why separate methods: `next` cannot skip serde for `Bytes` alone. Rust has no specialization, and a type check at run time needs `T: 'static` on the `Stream` impl of `StreamAnchor`, which is a breaking change. A marker item type would still go through serde on the producer. Why the mux still copies each record out of its batch is in [Batched streaming design](../development/batched-streaming-design.md#ingress-copies-each-record-out-of-its-batch).
 
 ## Many producers (MPSC)

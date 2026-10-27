@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Byte items over the mux: `StreamSender<Bytes>::send_bytes` and
-//! `StreamAnchor<Bytes>::next_bytes`, between two real nodes.
+//! Byte items over the mux: `StreamSender<Bytes>::send_bytes`,
+//! `StreamSender<Bytes>::send_frame` and `StreamAnchor<Bytes>::next_bytes`,
+//! between two real nodes.
 //!
 //! These are for streams whose items the application already serialized, such
 //! as response chunks. The typed path sends each one through serde twice: the
@@ -10,8 +11,9 @@
 //! `Deserialize` copies it into a new one. The byte path writes the frame by
 //! hand and hands the consumer a slice of the buffer the frame arrived in.
 //!
-//! The byte path is not a second protocol. Its frames are the typed frames
-//! byte for byte, so each end may use either path, and every frame that is
+//! The byte path is not a second protocol. `send_bytes` writes the typed
+//! frames byte for byte, and a frame built in place differs only in the width
+//! of its length. So each end may use either path, and every frame that is
 //! not an item goes through the same code on the consumer. These tests hold
 //! both claims over a real wire, where a mismatch would show up as a payload
 //! that differs or a stream that ends differently.
@@ -22,7 +24,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use velo::Velo;
-use velo::streaming::{MESSENGER_MUX_KEY, StreamAnchor, StreamFrame, StreamSender};
+use velo::streaming::{
+    ByteItemBuilder, MESSENGER_MUX_KEY, StreamAnchor, StreamFrame, StreamSender,
+};
 use velo::transports::tcp::TcpTransportBuilder;
 
 const PATIENCE: Duration = Duration::from_secs(30);
@@ -118,6 +122,32 @@ async fn open(
     sender
 }
 
+/// How the producer sends each item.
+#[derive(Debug, Clone, Copy)]
+enum Write {
+    /// `send`, through serde.
+    Typed,
+    /// `send_bytes`, which copies the payload into the frame.
+    Bytes,
+    /// `send_frame`, with the payload written into the frame in place.
+    Built,
+}
+
+async fn write(sender: &StreamSender<Bytes>, payload: &[u8], how: Write) {
+    match how {
+        Write::Typed => sender.send(Bytes::copy_from_slice(payload)).await,
+        Write::Bytes => sender.send_bytes(payload).await,
+        Write::Built => {
+            // A capacity smaller than the payload, so large items also cover
+            // a buffer that grew.
+            let mut item = ByteItemBuilder::with_capacity(payload.len().min(256));
+            item.buffer().extend_from_slice(payload);
+            sender.send_frame(item.finish().expect("finish")).await
+        }
+    }
+    .unwrap_or_else(|e| panic!("{how:?}: {e}"));
+}
+
 /// Which consumer read to use.
 #[derive(Debug, Clone, Copy)]
 enum Read {
@@ -158,19 +188,15 @@ async fn outcomes(anchor: &mut StreamAnchor<Bytes>, read: Read) -> Vec<String> {
 
 /// Send `payloads` one way and read them the other, then `Finalized`, and the
 /// end of the stream after it.
-async fn round_trip(consumer: &Velo, producer: &Velo, how: Open, send_raw: bool, read: Read) {
+async fn round_trip(consumer: &Velo, producer: &Velo, how: Open, send: Write, read: Read) {
     let mut anchor = consumer.create_anchor::<Bytes>();
     let sender = open(consumer, producer, &anchor, how).await;
     let sent = payloads();
-    let send = {
+    let producer_task = {
         let sent = sent.clone();
         tokio::spawn(async move {
             for payload in sent {
-                if send_raw {
-                    sender.send_bytes(&payload).await.expect("send_bytes");
-                } else {
-                    sender.send(payload).await.expect("send");
-                }
+                write(&sender, &payload, send).await;
             }
             sender.finalize().expect("finalize");
         })
@@ -189,8 +215,8 @@ async fn round_trip(consumer: &Velo, producer: &Velo, how: Open, send_raw: bool,
     let items = tokio::time::timeout(PATIENCE, collect)
         .await
         .expect("timed out collecting items");
-    send.await.expect("send task");
-    assert_eq!(items, sent, "{how:?} raw={send_raw} {read:?}");
+    producer_task.await.expect("send task");
+    assert_eq!(items, sent, "{how:?} {send:?} {read:?}");
     assert!(
         next(&mut anchor, read).await.is_none(),
         "{how:?} {read:?}: nothing follows Finalized"
@@ -198,7 +224,8 @@ async fn round_trip(consumer: &Velo, producer: &Velo, how: Open, send_raw: bool,
 }
 
 /// Byte items cross the mux whole and in order, from an empty payload to
-/// 1 MiB, on every way a sender opens.
+/// 1 MiB, on every way a sender opens, whether `send_bytes` copies them into
+/// the frame or the producer built the frame in place.
 ///
 /// 1 MiB plus its 11-byte frame header is over the default 1 MiB slot byte
 /// budget, so the largest item also checks that one record above the cap is
@@ -207,22 +234,26 @@ async fn round_trip(consumer: &Velo, producer: &Velo, how: Open, send_raw: bool,
 async fn byte_items_round_trip() {
     let (consumer, producer) = pair().await;
     for how in [Open::Ticket, Open::Attach, Open::Local] {
-        round_trip(&consumer, &producer, how, true, Read::Bytes).await;
+        for send in [Write::Bytes, Write::Built] {
+            round_trip(&consumer, &producer, how, send, Read::Bytes).await;
+        }
     }
 }
 
 /// Each end may use either path, and the payloads come out the same.
 ///
 /// `send_bytes` writes by hand the frame `send` writes through serde for a
-/// `Bytes` item, and `next_bytes` decodes what `next` decodes. A frame that
-/// differed by one header byte would fail here as a deserialization error or
-/// a changed payload.
+/// `Bytes` item, and `next_bytes` decodes what `next` decodes. A built frame
+/// carries a wider length, which serde must read too. A frame with a wrong
+/// header byte would fail here as a deserialization error or a changed
+/// payload.
 #[tokio::test(flavor = "multi_thread")]
 async fn byte_and_typed_ends_interoperate() {
     let (consumer, producer) = pair().await;
     for how in [Open::Ticket, Open::Attach] {
-        round_trip(&consumer, &producer, how, true, Read::Typed).await;
-        round_trip(&consumer, &producer, how, false, Read::Bytes).await;
+        round_trip(&consumer, &producer, how, Write::Bytes, Read::Typed).await;
+        round_trip(&consumer, &producer, how, Write::Built, Read::Typed).await;
+        round_trip(&consumer, &producer, how, Write::Typed, Read::Bytes).await;
     }
 }
 

@@ -53,7 +53,7 @@ pub use anchor::{
     AnchorConfig, AnchorManager, AnchorManagerBuilder, AnchorReservation, AttachError,
     ReservationConfig, StreamAnchor, StreamController,
 };
-pub use frame::{SendError, StreamError, StreamFrame};
+pub use frame::{ByteItemBuilder, ByteItemFrame, SendError, StreamError, StreamFrame};
 #[cfg(feature = "grpc")]
 pub use grpc_transport::GrpcFrameTransport;
 pub use handle::{AnchorKind, StreamAnchorHandle};
