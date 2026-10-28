@@ -433,6 +433,15 @@ impl IngressRegistry {
         self.live_per_peer.get(key)
     }
 
+    /// Whether any receive-side slot is live, from any peer on any lane.
+    ///
+    /// Reads one atomic per lane and takes no lock. A slot holds its count
+    /// for as long as it sits in a table, so `false` means no table has a slot
+    /// to reconcile.
+    pub(crate) fn has_live_slots(&self) -> bool {
+        LaneIndex::all().any(|lane| self.live.get(lane) > 0)
+    }
+
     /// Every (peer, lane) with receive-side state, for the credit sweep.
     pub(crate) fn peers(&self) -> Vec<PeerLane> {
         self.peers.iter().map(|entry| *entry.key()).collect()
