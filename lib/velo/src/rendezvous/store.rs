@@ -540,7 +540,7 @@ impl DataStore {
         if let Some(slot) = self.slots.get(&local_id) {
             let result =
                 slot.read_lock_count
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                         if v > 0 { Some(v - 1) } else { None }
                     });
             match result {
@@ -580,7 +580,7 @@ impl DataStore {
         if let Some(slot) = self.slots.get(&local_id) {
             let result = slot
                 .refcount
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
                     if v > 0 { Some(v - 1) } else { None }
                 });
             match result {

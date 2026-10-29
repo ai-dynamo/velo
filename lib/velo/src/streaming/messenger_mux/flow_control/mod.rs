@@ -612,7 +612,7 @@ impl SharedByteBudget {
             });
         }
         self.used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 (requested <= self.limit - used).then_some(used + requested)
             })
             .map(|_| ())
@@ -632,7 +632,7 @@ impl SharedByteBudget {
         let released = bytes as u64;
         let before = self
             .used
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
                 Some(used.saturating_sub(released))
             })
             .unwrap_or_else(|used| used);
