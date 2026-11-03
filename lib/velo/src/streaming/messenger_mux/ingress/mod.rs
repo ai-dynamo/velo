@@ -398,11 +398,6 @@ impl IngressRegistry {
         self.binds.remove(&(anchor_id, session_id)).is_some()
     }
 
-    /// Whether an unclaimed bind is registered for the pair.
-    pub(crate) fn has_bind(&self, anchor_id: u64, session_id: u64) -> bool {
-        self.binds.contains_key(&(anchor_id, session_id))
-    }
-
     /// `peer`'s byte budget, created at `limit` on first use.
     fn peer_budget(&self, peer: WorkerId, limit: u64) -> Arc<SharedByteBudget> {
         Arc::clone(

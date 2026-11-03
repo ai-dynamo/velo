@@ -2,6 +2,8 @@
 
 A stream moves a sequence of typed items from a producer to a consumer. The consumer owns a `StreamAnchor<T>`. A producer attaches to the anchor and gets a `StreamSender<T>`. The anchor has a compact `u128` handle, so the consumer can send the handle to a producer on a different worker.
 
+The handle is all that a peer needs to attach to the anchor, cancel it, or open its slot on the mux, and velo does not authenticate peers. So the local ID in the handle is random: 63 bits, and never 0. With a counter, any host that could reach a node could attach to the next handle and take over the stream of another request. Send the handle only to the producer that needs it.
+
 ## Single producer (SPSC)
 
 A default anchor accepts one producer at a time.
@@ -174,8 +176,6 @@ sender.finalize()?;
 - For all other causes, Velo logs at debug level and counts `outcome="error"` under `velo_streaming_anchor_operations_total{operation="prebind"}`. These causes are an MPSC anchor, the handle of another node, an anchor that is already attached or pre-bound, and an anchor that was removed. Call `prebind_anchor` only on SPSC anchors that this node created.
 
 Call `prebind_anchor` from a runtime context, because it starts tasks. A ticket that the worker never opens does not stay forever. After the configured accept window (180 seconds by default), the bind is reclaimed and the anchor sees `SenderDropped`. `velo_streaming_unclaimed_bind_reaped_total` counts these tickets.
-
-The ticket's session id is random, so a host that has not seen the ticket cannot guess it and open the stream. Velo does not authenticate peers, so keep the ticket inside the request it belongs to. See [Session ids](batched-streaming.md#session-ids).
 
 Ticket senders support `stop_token()` and `cancellation_token()` through messenger mux version 2. The existing slot-open exchange carries the stream session identity; no extra stream registration is needed. A peer epoch and slot generation reject stale lifecycle signals. Applications that require this lifecycle must require `messenger-mux-v2`; legacy attach fallback does not establish that capability.
 

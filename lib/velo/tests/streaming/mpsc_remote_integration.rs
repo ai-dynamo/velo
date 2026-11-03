@@ -124,10 +124,6 @@ async fn remote_sender_detach_and_drop_preserve_unrelated_local_slots() {
         max_senders: Some(2),
         ..Default::default()
     });
-    assert_eq!(
-        remote_anchor.handle().unpack().1,
-        local_anchor.handle().unpack().1
-    );
 
     let local_one = am_b
         .attach_mpsc_stream_anchor::<u32>(local_anchor.handle())

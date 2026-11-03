@@ -787,12 +787,6 @@ impl MessengerMuxTransport {
         self.core.ingress.expire_bind(anchor_id, session_id);
     }
 
-    /// Whether a bind on `(anchor_id, session_id)` is waiting for its
-    /// `OpenSlot`. A second bind on the pair would replace it.
-    pub(crate) fn has_bind(&self, anchor_id: u64, session_id: u64) -> bool {
-        self.core.ingress.has_bind(anchor_id, session_id)
-    }
-
     /// Retire a live slot whose consumer has gone, and tell the peer that owns
     /// it to abandon its end.
     ///

@@ -368,9 +368,16 @@ pub(crate) fn mpsc_anchor_attach_handler(
 
                 // Step 2: async bind outside the shard lock.
                 //
-                // Picked here, never taken from the sender's `req.session_id`.
-                // See `AnchorManager::mint_routing_session_id`.
-                let routing_session_id = manager.mint_routing_session_id(local_id);
+                // Allocate a receiver-side routing_session_id rather than
+                // reusing req.session_id (sender's local stream counter):
+                // two MPSC senders from different workers both start at 1
+                // and would otherwise collide on the same `(local_id,
+                // session_id)` transport routing slot. See
+                // [`crate::streaming::AnchorManager::next_routing_session_id`].
+                let routing_session_id = manager
+                    .next_routing_session_id
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
                 // Same intersection the SPSC handler makes; MPSC negotiates in
                 // the same version so there is no half-migrated state.
                 let selection = manager.select_streaming_transport(
