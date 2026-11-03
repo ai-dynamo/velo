@@ -104,7 +104,7 @@ Each record header is 13 bytes. On a 40-byte token that is about 33% overhead, a
 Record bodies:
 
 - **`Data`** carries the `rmp_serde`-encoded `StreamFrame` bytes, identical to the per-stream path. `is_terminal_sentinel()` works unchanged on a record body, so terminal detection has one code path.
-- **`OpenSlot`** carries `[u64 anchor_id][u64 session_id]`. This is the 16-byte attach handshake, moved into a record.
+- **`OpenSlot`** carries `[u64 anchor_id][u64 session_id]`. This is the 16-byte attach handshake, moved into a record. The receiver picks `session_id` at random, and never 0. See [Session ids](#session-ids).
 - **`CloseSlot`** carries `[u8 reason]`: `0` terminal sent, `1` peer gone, `2` unknown slot, `3` protocol error.
 - **`CreditUpdate`** carries `[u32 delta]` from receiver to sender.
 - **`LifecycleSlot`** carries the 64-bit session identity from `OpenSlot` and a one-byte action (0 = stop, 1 = cancel). Stop leaves the slot open for remaining output. Cancel takes precedence for the same session. Both the queued signal and the live producer check session identity, so a delayed signal cannot target a reused slot even if its compact generation has wrapped. Early stop is retained by the pre-bind until `OpenSlot` claims it.
@@ -187,11 +187,19 @@ The sender writes `OpenSlot` when the stream attaches, in a flush of its own. It
 
 An `OpenSlot` for an `(anchor_id, session_id)` pair that was never registered does not fail the peer. The receiver replies `CloseSlot{UnknownSlot}` and discards the records of that slot. When the accept window closes on an unclaimed bind, the stream watchdog (or the consumer, if it sees the close first) reaps the registry entry, injects `Dropped` and increments `velo_streaming_unclaimed_bind_reaped_total`.
 
+### Session ids
+
+The receiver picks the `session_id` of each bind, in the attach handler or in `prebind_anchor`. It does not use the stream id of the sender, because senders on two workers both count their streams from 1 and would collide on one anchor.
+
+The id is a random 64-bit number, not a counter. An `OpenSlot` names only `(anchor_id, session_id)`, and anchor ids count up from 1. With a counter, a host that could reach a node could guess the pair of a live bind and take over the stream of another request. Each `UnknownSlot` reply told it that it had missed. A random id leaves 2^64 values to try for each anchor. A host that sees the attach response or the ticket can still open the stream, because velo does not authenticate peers.
+
+The id is never 0. A sender reads 0 as "the receiver picked no id" and uses its own stream id, as a receiver from before receiver-picked ids expects. If a drawn id names a bind that is already waiting on the mux for the same anchor, the receiver draws again, because a second bind on one pair would replace the first. Nothing depends on the order of session ids. The receiver and the sender only compare them for equality.
+
 By default, `connect` returns after the transport admits the `OpenSlot`. `MuxConfig::async_open_ack` changes this. The `OpenSlot` still goes out in a batch of its own before `connect` returns, but the acknowledgement does not wait for admission. If the transport admits the frame synchronously, per-target FIFO already orders the slot's later records behind it, and no fence goes up. Otherwise the slot is fenced until the admission resolves. A failed admission is epoch death in both modes. Measured at load, this option did not improve first-token latency. See [Response plane performance](../operations/response-plane-performance.md).
 
 ### Zero-RTT stream setup
 
-The receiver chooses every field of the attach response without input from the sender. It can therefore bind a slot before any sender asks. `AnchorManager::prebind_anchor` does the work of the attach handler at request registration. It binds the slot, allocates the routing session, takes the drain signal, installs the direct feed and spawns the stream watchdog. It returns a `StreamOpenTicket` with the six values an attach response carries. The application puts the ticket in the request envelope that it already sends to the worker.
+The receiver chooses every field of the attach response without input from the sender. It can therefore bind a slot before any sender asks. `AnchorManager::prebind_anchor` does the work of the attach handler at request registration. It picks a random [session id](#session-ids), binds the slot, takes the drain signal, installs the direct feed and spawns the stream watchdog. It returns a `StreamOpenTicket` with the six values an attach response carries. The application puts the ticket in the request envelope that it already sends to the worker.
 
 The worker calls `AnchorManager::open_anchor_stream` with the ticket. Its first batch carries an `OpenSlot`, which claims the pre-bound slot the same way an attached sender's does. No `_anchor_attach` crosses the wire. The wire format does not change: `StreamOpenTicket` is a separate type in the application's envelope. When no mux is installed, `prebind_anchor` returns `None` and the stream attaches the ordinary way.
 

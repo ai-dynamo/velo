@@ -1157,15 +1157,6 @@ pub struct AnchorManager {
     #[builder(setter(skip), default = "AtomicU64::new(0)")]
     next_sender_stream_id: AtomicU64,
 
-    /// Receiver-allocated counter for transport routing session ids. Each
-    /// remote attach reserves a unique routing slot from this counter so the
-    /// `(anchor_id, session_id)` pair used by the transport layer cannot
-    /// collide across senders from different worker_ids (their local
-    /// `next_sender_stream_id` counters are independent and both start at 0).
-    /// See the cross-worker MPSC attach regression test for the bug class.
-    #[builder(setter(skip), default = "AtomicU64::new(0)")]
-    pub(crate) next_routing_session_id: AtomicU64,
-
     /// Sender-side registry: maps sender_stream_id -> SenderEntry.
     /// Shared with the _stream_cancel handler registered on this AnchorManager.
     /// Also accessed by StreamSender::Drop / finalize / detach for cleanup.
@@ -1617,10 +1608,7 @@ impl AnchorManager {
             Some(_) => {}
         }
 
-        // Receiver-allocated, for the reason the attach handler allocates one:
-        // two senders reusing their own local counters would collide on the
-        // transport's `(anchor_id, session_id)` routing key.
-        let routing_session_id = self.next_routing_session_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let routing_session_id = self.mint_routing_session_id(local_id);
         // No sender is known yet, so the lane is placed against this node's
         // own pre-binds. Chosen before the bind so the bind is counted on it.
         let lane = mux.choose_lane(None, lane_key);
@@ -1915,6 +1903,41 @@ impl AnchorManager {
         self.mux
             .get()
             .and_then(|mux| mux.take_drain_signal(anchor_id, session_id))
+    }
+
+    /// Pick the routing session id for a new bind on `anchor_id`.
+    ///
+    /// The receiver picks it, not the sender: senders on two workers both
+    /// count their streams from 1, and would collide on the transport's
+    /// `(anchor_id, session_id)` routing key.
+    ///
+    /// Random, not a counter. An `OpenSlot` names only that pair, and anchor
+    /// ids count up from 1, so the session id is all that stops a host that
+    /// can reach this node from claiming another request's stream. A counter
+    /// was easy to guess, and each `UnknownSlot` reply told the guesser it had
+    /// missed.
+    ///
+    /// Never 0, which tells a sender "no receiver-picked id". Drawn again if
+    /// the pair already names a bind waiting on the mux, because a second bind
+    /// on one pair replaces the first. Only the mux is checked: the per-stream
+    /// transports keep their tables behind `FrameTransport`. The check and the
+    /// bind are two steps, so two binds that draw the same id at the same
+    /// moment still collide, at the same 1 in 2^64 odds.
+    pub(crate) fn mint_routing_session_id(&self, anchor_id: u64) -> u64 {
+        loop {
+            // A v4 UUID comes from a cryptographic source and fixes 6 of its
+            // 128 bits. Each fixed bit in one half lines up with a random bit
+            // in the other, so the XOR of the halves has 64 random bits.
+            let (high, low) = uuid::Uuid::new_v4().as_u64_pair();
+            let session_id = high ^ low;
+            let taken = self
+                .mux
+                .get()
+                .is_some_and(|mux| mux.has_bind(anchor_id, session_id));
+            if session_id != 0 && !taken {
+                return session_id;
+            }
+        }
     }
 
     /// Write what the mux's batchers have staged, if a mux is installed.

@@ -175,6 +175,8 @@ sender.finalize()?;
 
 Call `prebind_anchor` from a runtime context, because it starts tasks. A ticket that the worker never opens does not stay forever. After the configured accept window (180 seconds by default), the bind is reclaimed and the anchor sees `SenderDropped`. `velo_streaming_unclaimed_bind_reaped_total` counts these tickets.
 
+The ticket's session id is random, so a host that has not seen the ticket cannot guess it and open the stream. Velo does not authenticate peers, so keep the ticket inside the request it belongs to. See [Session ids](batched-streaming.md#session-ids).
+
 Ticket senders support `stop_token()` and `cancellation_token()` through messenger mux version 2. The existing slot-open exchange carries the stream session identity; no extra stream registration is needed. A peer epoch and slot generation reject stale lifecycle signals. Applications that require this lifecycle must require `messenger-mux-v2`; legacy attach fallback does not establish that capability.
 
 ## Reservation renewal

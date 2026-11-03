@@ -202,8 +202,9 @@ pub enum AnchorAttachResponse {
         heartbeat_interval_ms: u64,
         /// Receiver-allocated routing slot id. The sender uses this for the
         /// `transport.connect(...)` call so the transport-layer
-        /// `(anchor_id, session_id)` routing key is globally unique on the
-        /// receiver, independent of the sender's local stream counter.
+        /// `(anchor_id, session_id)` routing key is unique on the receiver,
+        /// independent of the sender's local stream counter. It is random and
+        /// never 0, so a host that has not seen this response cannot guess it.
         /// `#[serde(default)]` so older senders (which never set it) still
         /// deserialize; in that case the sender falls back to its local
         /// `sender_stream_id` (the legacy collision-prone behavior).
@@ -415,17 +416,9 @@ pub(crate) fn anchor_attach_handler(manager: Weak<AnchorManager>) -> crate::mess
 
                 // Step 2: Async bind OUTSIDE shard lock.
                 //
-                // Allocate a receiver-side routing_session_id rather than
-                // reusing the sender's local stream counter (req.session_id):
-                // two senders from different workers both attaching to the
-                // same anchor would otherwise hit the same `(local_id,
-                // session_id)` routing slot and silently overwrite each
-                // other at the transport layer. See
-                // [`crate::streaming::AnchorManager::next_routing_session_id`].
-                let routing_session_id = manager
-                    .next_routing_session_id
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-                    + 1;
+                // Picked here, never taken from the sender's `req.session_id`.
+                // See `AnchorManager::mint_routing_session_id`.
+                let routing_session_id = manager.mint_routing_session_id(local_id);
                 // Which transport this attach rides is decided here, from what
                 // the sender advertised: `messenger-mux-v2` when both sides
                 // named it. Otherwise use the per-stream default, or reject
