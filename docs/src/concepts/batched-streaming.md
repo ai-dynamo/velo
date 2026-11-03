@@ -104,7 +104,7 @@ Each record header is 13 bytes. On a 40-byte token that is about 33% overhead, a
 Record bodies:
 
 - **`Data`** carries the `rmp_serde`-encoded `StreamFrame` bytes, identical to the per-stream path. `is_terminal_sentinel()` works unchanged on a record body, so terminal detection has one code path.
-- **`OpenSlot`** carries `[u64 anchor_id][u64 session_id]`. This is the 16-byte attach handshake, moved into a record.
+- **`OpenSlot`** carries `[u64 anchor_id][u64 session_id]`. This is the 16-byte attach handshake, moved into a record. The anchor id is random, so a peer cannot guess the pair. See [Streaming](streaming.md).
 - **`CloseSlot`** carries `[u8 reason]`: `0` terminal sent, `1` peer gone, `2` unknown slot, `3` protocol error.
 - **`CreditUpdate`** carries `[u32 delta]` from receiver to sender.
 - **`LifecycleSlot`** carries the 64-bit session identity from `OpenSlot` and a one-byte action (0 = stop, 1 = cancel). Stop leaves the slot open for remaining output. Cancel takes precedence for the same session. Both the queued signal and the live producer check session identity, so a delayed signal cannot target a reused slot even if its compact generation has wrapped. Early stop is retained by the pre-bind until `OpenSlot` claims it.

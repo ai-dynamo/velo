@@ -41,7 +41,7 @@ use serde::de::DeserializeOwned;
 use tokio_util::sync::CancellationToken;
 
 use crate::streaming::frame::{StreamError, StreamFrame, decode_bytes_frame};
-use crate::streaming::handle::StreamAnchorHandle;
+use crate::streaming::handle::{MPSC_STREAM_BIT, StreamAnchorHandle};
 
 /// Grouped handles needed by anchor constructors and background tasks to
 /// keep both registries and the metrics collector in a single parameter.
@@ -1065,12 +1065,41 @@ impl StreamAnchor<Bytes> {
 // AnchorManager
 // ---------------------------------------------------------------------------
 
+/// Insert `entry` under a random local id that `registry` does not hold yet,
+/// and return it still held.
+///
+/// The handle is all a peer needs to attach to an anchor, cancel it, or open
+/// its mux slot, and velo does not authenticate peers. A counter let any host
+/// that could reach this node guess the next handle and take over another
+/// request's stream, so the id is random. It has 63 bits, because the top bit
+/// marks an MPSC handle (`kind_bit` sets it), and is never 0, which is
+/// reserved. An id the registry already holds is drawn again, under the same
+/// shard lock as the insert.
+fn insert_at_random_id<V>(
+    registry: &DashMap<u64, V>,
+    kind_bit: u64,
+    entry: V,
+) -> dashmap::mapref::one::RefMut<'_, u64, V> {
+    use dashmap::mapref::entry::Entry;
+    loop {
+        // A v4 UUID comes from a cryptographic source and fixes 6 of its 128
+        // bits. Each fixed bit in one half lines up with a random bit in the
+        // other, so the XOR of the halves has 64 random bits.
+        let (high, low) = uuid::Uuid::new_v4().as_u64_pair();
+        let id = (high ^ low) & !MPSC_STREAM_BIT;
+        if id != 0
+            && let Entry::Vacant(vacant) = registry.entry(id | kind_bit)
+        {
+            return vacant.insert(entry);
+        }
+    }
+}
+
 /// Central registry that creates and tracks streaming anchors.
 ///
 /// `worker_id` is stamped into every [`StreamAnchorHandle`] so that remote
-/// peers can route responses back to the correct worker. `next_local_id`
-/// starts at 0 and is incremented with `fetch_add(1)` -- the *result + 1*
-/// is the first valid local ID (i.e., IDs start at 1; 0 is reserved).
+/// peers can route responses back to the correct worker. The local ID beside
+/// it is random and never 0, so a peer cannot guess a handle it was not given.
 ///
 /// The `registry` is wrapped in an `Arc` so that control handlers and the
 /// consumer-side tasks can hold a cheap clone of the registry reference without
@@ -1084,16 +1113,13 @@ impl StreamAnchor<Bytes> {
 pub struct AnchorManager {
     worker_id: velo_ext::WorkerId,
 
-    #[builder(setter(skip), default = "AtomicU64::new(0)")]
-    next_local_id: AtomicU64,
-
     #[builder(default = "Arc::new(DashMap::new())")]
     pub(crate) registry: Arc<DashMap<u64, AnchorEntry>>,
 
     /// MPSC-variant registry. Separate from `registry` so existing SPSC
-    /// handler code paths do not need enum-matching. Local IDs are still
-    /// allocated from the shared `next_local_id` counter so the two
-    /// namespaces never collide.
+    /// handler code paths do not need enum-matching. MPSC local IDs have
+    /// `MPSC_STREAM_BIT` set and SPSC ones do not, so the two namespaces never
+    /// collide.
     #[builder(default = "Arc::new(DashMap::new())")]
     pub(crate) mpsc_registry: Arc<DashMap<u64, crate::streaming::mpsc::anchor::MpscAnchorEntry>>,
 
@@ -1153,7 +1179,7 @@ pub struct AnchorManager {
     pub metrics: Option<Arc<VeloMetrics>>,
 
     /// Monotonically increasing counter for sender_stream_id values.
-    /// Separate from next_local_id to keep anchor-side and sender-side namespaces distinct.
+    /// Separate from the anchor IDs to keep anchor-side and sender-side namespaces distinct.
     #[builder(setter(skip), default = "AtomicU64::new(0)")]
     next_sender_stream_id: AtomicU64,
 
@@ -1402,7 +1428,7 @@ impl AnchorManager {
     /// The returned `StreamAnchor` embeds the [`StreamAnchorHandle`]; obtain it via
     /// [`.handle()`](StreamAnchor::handle) to pass to a sender for attachment.
     ///
-    /// Local IDs start at 1 and increment monotonically; ID 0 is reserved.
+    /// The local ID is random and never 0, so a peer cannot guess the handle.
     /// A flume bounded channel (capacity 256) is created per anchor to deliver raw frame bytes.
     pub fn create_anchor<T>(&self) -> StreamAnchor<T> {
         self.create_anchor_with_config(AnchorConfig::default())
@@ -1416,9 +1442,6 @@ impl AnchorManager {
     /// via [`crate::streaming::control::AnchorAttachResponse`] so both sides agree without
     /// hardcoded constants.
     pub fn create_anchor_with_config<T>(&self, config: AnchorConfig) -> StreamAnchor<T> {
-        // fetch_add returns the *old* value (starts at 0), so +1 gives us IDs starting at 1.
-        let local_id = self.next_local_id.fetch_add(1, Ordering::Relaxed) + 1;
-
         let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(256);
         let cancel_token = CancellationToken::new();
 
@@ -1453,7 +1476,8 @@ impl AnchorManager {
         // Queue while holding the inserted entry: the sweep reads `expires`
         // and `queued` from it, and must not see the queue entry before
         // `queued` names it, or it drops that entry as stale.
-        let mut entry = self.registry.entry(local_id).insert(entry);
+        let mut entry = insert_at_random_id(&self.registry, 0, entry);
+        let local_id = *entry.key();
         if let Some(deadline) = expires {
             self.deadline_queue
                 .arm(&self.registry, &mut entry.queued, deadline, local_id);
@@ -2810,19 +2834,12 @@ impl AnchorManager {
 
     /// Create a new MPSC anchor with per-anchor config overrides.
     ///
-    /// Shares `next_local_id` with the SPSC registry so handles are unique
-    /// across both kinds; the two DashMaps never see the same key.
+    /// The local ID is random, like an SPSC one, with `MPSC_STREAM_BIT` set,
+    /// so the two DashMaps never see the same key.
     pub fn create_mpsc_anchor_with_config<T>(
         &self,
         config: crate::streaming::mpsc::MpscAnchorConfig,
     ) -> crate::streaming::mpsc::MpscStreamAnchor<T> {
-        // Raw 63-bit counter; the MPSC discriminator bit is applied at handle
-        // pack time (and is stored with the entry in `mpsc_registry` so
-        // registry keys match `handle.unpack().1` exactly).
-        let raw_local = self.next_local_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let handle = StreamAnchorHandle::pack_mpsc(self.worker_id, raw_local);
-        let (_, local_id) = handle.unpack();
-
         let capacity = config.channel_capacity.unwrap_or(256);
         let (frame_tx, frame_rx) = flume::bounded::<(u64, Vec<u8>)>(capacity);
         let cancel_token = CancellationToken::new();
@@ -2851,12 +2868,15 @@ impl AnchorManager {
 
         // Queue while holding the inserted entry: the sweep must not see the
         // queue entry before `queued` names it, or it drops it as stale.
-        let mut entry = self.mpsc_registry.entry(local_id).insert(entry);
+        let mut entry = insert_at_random_id(&self.mpsc_registry, MPSC_STREAM_BIT, entry);
+        // Registry keys keep the MPSC bit, so they match `handle.unpack().1`.
+        let local_id = *entry.key();
         if let Some(deadline) = expires {
             self.mpsc_deadlines
                 .arm(&self.mpsc_registry, &mut entry.queued, deadline, local_id);
         }
         drop(entry);
+        let handle = StreamAnchorHandle::pack_mpsc(self.worker_id, local_id & !MPSC_STREAM_BIT);
 
         crate::streaming::mpsc::MpscStreamAnchor::new(
             handle,
@@ -3331,24 +3351,38 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Test 1: Monotonic local IDs starting at 1
+    // Test 1: Random local IDs
     // -----------------------------------------------------------------------
 
-    #[test]
-    fn test_create_anchor_monotonic_ids() {
+    /// A peer cannot guess the handle of an anchor it was not given.
+    ///
+    /// The handle is all a peer needs to attach to an anchor, cancel it, or
+    /// open its mux slot, and velo does not authenticate peers. Local IDs used
+    /// to count up from 1. A host that could reach a node then attached to the
+    /// next handle and took over another request's stream; on a pre-bound
+    /// anchor, the attach also answered with the ticket's session id.
+    #[tokio::test]
+    async fn anchor_ids_are_random() {
         let mgr = make_manager();
 
-        let a1 = mgr.create_anchor::<u8>();
-        let a2 = mgr.create_anchor::<u8>();
-        let a3 = mgr.create_anchor::<u8>();
+        let (_, id1) = mgr.create_anchor::<u8>().handle().unpack();
+        let (_, id2) = mgr.create_anchor::<u8>().handle().unpack();
+        let (_, mpsc) = mgr.create_mpsc_anchor::<u8>().handle().unpack();
 
-        let (_, id1) = a1.handle().unpack();
-        let (_, id2) = a2.handle().unpack();
-        let (_, id3) = a3.handle().unpack();
-
-        assert_eq!(id1, 1, "first local_id must be 1");
-        assert_eq!(id2, 2, "second local_id must be 2");
-        assert_eq!(id3, 3, "third local_id must be 3");
+        for id in [id1, id2] {
+            assert_ne!(id, 0, "local_id 0 is reserved");
+            assert_eq!(
+                id & MPSC_STREAM_BIT,
+                0,
+                "an SPSC id leaves the MPSC bit clear"
+            );
+        }
+        assert_ne!(mpsc & MPSC_STREAM_BIT, 0, "an MPSC id sets the MPSC bit");
+        assert_ne!(
+            id2,
+            id1.wrapping_add(1),
+            "the next handle must not follow from this one"
+        );
     }
 
     // -----------------------------------------------------------------------

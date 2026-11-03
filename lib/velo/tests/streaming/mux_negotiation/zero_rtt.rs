@@ -1036,16 +1036,12 @@ async fn a_finished_zero_rtt_stream_leaves_no_task_behind() {
     );
 }
 
-/// Worker-local anchor IDs can match; detaching a remote sender must not change a local anchor.
+/// Detaching a remote sender must not change a local anchor.
 #[tokio::test(flavor = "multi_thread")]
 async fn remote_detach_leaves_an_unrelated_local_anchor_attached() {
     let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
     let mut remote_anchor = consumer.velo.create_anchor::<u32>();
     let local_anchor = producer.velo.create_anchor::<u32>();
-    assert_eq!(
-        remote_anchor.handle().unpack().1,
-        local_anchor.handle().unpack().1
-    );
     let _local_sender = producer
         .velo
         .attach_anchor::<u32>(local_anchor.handle())

@@ -2,6 +2,8 @@
 
 A stream moves a sequence of typed items from a producer to a consumer. The consumer owns a `StreamAnchor<T>`. A producer attaches to the anchor and gets a `StreamSender<T>`. The anchor has a compact `u128` handle, so the consumer can send the handle to a producer on a different worker.
 
+The handle is all that a peer needs to attach to the anchor, cancel it, or open its slot on the mux, and velo does not authenticate peers. So the local ID in the handle is random: 63 bits, and never 0. With a counter, any host that could reach a node could attach to the next handle and take over the stream of another request. Send the handle only to the producer that needs it.
+
 ## Single producer (SPSC)
 
 A default anchor accepts one producer at a time.
