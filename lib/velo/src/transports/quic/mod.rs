@@ -19,10 +19,14 @@
 //! is bound to about one core, so lanes are how one peer gets more than about
 //! 0.8 GB/s.
 //!
-//! TLS 1.3 uses a self-signed certificate per transport. Its SHA-256
-//! fingerprint travels in the `WorkerAddress` entry, and dialers accept only
-//! that certificate.
+//! TLS 1.3 uses a self-signed certificate per transport by default. Its
+//! SHA-256 fingerprint travels in the `WorkerAddress` entry, and dialers
+//! accept only that certificate. With [`QuicTls`], both ends instead present
+//! certificates from a private CA and verify each other, and a
+//! [`QuicAuthorizer`] decides on each connection before any frame on it is
+//! dispatched. See the [`auth`] module.
 
+pub mod auth;
 mod endpoint;
 mod listener;
 // Public, and with quinn's types in its API, only under `test-helpers`: the
@@ -35,5 +39,8 @@ pub mod tls;
 pub(crate) mod tls;
 mod transport;
 
+pub use auth::{ConnectionOrigin, PeerIdentity, QuicAuthorizer, QuicTls};
 pub use endpoint::QuicEndpointInfo;
+/// The DER types that [`QuicTls`] takes, from `rustls-pki-types`.
+pub use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 pub use transport::{QuicTransport, QuicTransportBuilder};
