@@ -25,7 +25,7 @@ exclude = ["examples"]
 resolver = "3"
 
 [workspace.package]
-version = "0.21.0"
+version = "0.22.0"
 edition = "2024"
 description = "Velo Active Messenging Library"
 authors = ["NVIDIA Inc. <sw-dl-dynamo@nvidia.com>"]
@@ -45,10 +45,10 @@ velo-ext = { path = "lib/velo-ext", version = "=0.6.0" }
 # second minor. `=` would only stop a velo patch reaching velo-hub users.
 # scripts/check-semver.sh fails if this major.minor differs from
 # [workspace.package] version. Features are left to each dependent.
-velo = { path = "lib/velo", version = "0.21.0", default-features = false }
+velo = { path = "lib/velo", version = "0.22.0", default-features = false }
 # Caret on the workspace version for the same reason, and guarded by the same
 # check in scripts/check-semver.sh. velo-hub re-exports this crate.
-velo-hub-ext = { path = "lib/velo-hub-ext", version = "0.21.0" }
+velo-hub-ext = { path = "lib/velo-hub-ext", version = "0.22.0" }
 
 # External dependencies.
 #
