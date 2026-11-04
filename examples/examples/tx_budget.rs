@@ -426,7 +426,7 @@ async fn l3_transport(
     let reader = tokio::spawn(async move {
         let mut hist = new_hist();
         for _ in 0..total {
-            let Ok((h, _p)) = streams_c.response_stream.recv_async().await else {
+            let Ok((h, _p, _sender)) = streams_c.response_stream.recv_async().await else {
                 break;
             };
             GOT.fetch_add(1, Ordering::Relaxed);
