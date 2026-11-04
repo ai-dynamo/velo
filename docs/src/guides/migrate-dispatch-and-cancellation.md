@@ -26,7 +26,9 @@ Drop requests cancellation and starts transport cleanup on an owned thread. It d
 
 ## Handler dispatch
 
-Replace `.inline()` with `.spawn()`, or omit the selector to use the default. The `DispatchMode` enum is removed. Select behavior with the builder methods: `.spawn()`, `.ordered()`, `.ordered_global()`, or `.ordered_with(config)`.
+The `DispatchMode` enum is no longer public. Select behavior with the builder methods: `.spawn()` (the default), `.ordered()`, `.ordered_global()`, `.ordered_with(config)`, or `.inline()`.
+
+The `.inline()` of 0.18 and earlier still spawned a task for each message. Replace it with `.spawn()`, or omit the selector, to keep that behavior. Since 0.22, `.inline()` means something else: the handler runs on the receive loop itself, with no task, while every other inbound message waits behind it. Use it only for a synchronous handler (`am_handler`, `unary_handler`, or `typed_unary`) that never blocks, on traffic whose in-flight volume the application already bounds. `build` panics on an `_async` handler with `.inline()`.
 
 Both old modes ran one task for each message. Neither guaranteed message order. Use `.ordered()` or `.ordered_with(...)` when handlers need to run in arrival order.
 
