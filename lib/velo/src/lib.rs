@@ -1154,7 +1154,11 @@ impl Velo {
     /// messaging and streaming. The identity is self-reported, not authenticated.
     /// Temporary routing state is removed on success, error, or cancellation.
     pub async fn connect(&self, endpoint: Endpoint) -> Result<PeerInfo> {
-        let peer = self.inner.messenger.connect(endpoint.worker_address()?).await?;
+        let peer = self
+            .inner
+            .messenger
+            .connect(endpoint.worker_address()?)
+            .await?;
         self.register_peer(peer.clone())?;
         Ok(peer)
     }
