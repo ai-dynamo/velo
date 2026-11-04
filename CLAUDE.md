@@ -18,7 +18,7 @@ to crates.io before a `velo` release that enables the `ucx` feature can ship.
 A second documented exception: **`lib/velo-hub`** — a crate for building a hub, one service that is the peer discovery for a velo application and hosts pluggable extensions. Unlike `ucx-rs` it *does* share types with `velo` (its API names `Velo`, `PeerInfo`, and axum `Router`), so moving it to another velo minor is a breaking change cargo-semver-checks cannot see. These rules make that safe:
 
 1. `lib/velo-hub/Cargo.toml` uses `version.workspace = true` and `velo = { workspace = true }`, so a velo minor bump is always a velo-hub minor bump.
-2. `[workspace.dependencies]` requires velo with a **caret** on the workspace version (`velo = { path = "lib/velo", version = "0.22.0", ... }`), not `=`. Pre-1.0 a caret on `0.Y.Z` never admits a second minor; `=` would only stop a velo patch reaching velo-hub users. `scripts/check-semver.sh` fails if the requirement's major.minor differs from `[workspace.package] version`, even under `semver:skip`.
+2. `[workspace.dependencies]` requires velo with a **caret** on the workspace version (`velo = { path = "lib/velo", version = "0.21.0", ... }`), not `=`. Pre-1.0 a caret on `0.Y.Z` never admits a second minor; `=` would only stop a velo patch reaching velo-hub users. `scripts/check-semver.sh` fails if the requirement's major.minor differs from `[workspace.package] version`, even under `semver:skip`.
 3. velo and velo-hub publish together, from one commit.
 4. velo-hub re-exports what its API exposes (`velo_hub::velo`, `velo_hub::axum`, `velo_hub::protocol`); downstream hub crates use those re-exports and depend on `velo-hub` with a caret.
 
@@ -27,7 +27,7 @@ velo-hub carries `publish = false` until a real port (kvbm's indexer and p2p as 
 A third documented exception: **`lib/velo-hub-ext`** — the wire protocol of velo-hub, on `velo-ext` alone. It is for crates that speak the hub's wire protocol without the velo runtime. It depends on `velo-ext`, `serde`, `serde_json`, `uuid`, and `http`, and never on `velo`; CI fails if `cargo tree -p velo-hub-ext` shows `velo` or `prometheus`. It shares types with velo-hub, so the same four rules apply:
 
 1. `lib/velo-hub-ext/Cargo.toml` uses `version.workspace = true`, so a velo minor bump is always a velo-hub-ext minor bump.
-2. `[workspace.dependencies]` requires it with a **caret** on the workspace version (`velo-hub-ext = { path = "lib/velo-hub-ext", version = "0.22.0" }`), not `=`. `scripts/check-semver.sh` fails if the requirement's major.minor differs from `[workspace.package] version`, even under `semver:skip`.
+2. `[workspace.dependencies]` requires it with a **caret** on the workspace version (`velo-hub-ext = { path = "lib/velo-hub-ext", version = "0.21.0" }`), not `=`. `scripts/check-semver.sh` fails if the requirement's major.minor differs from `[workspace.package] version`, even under `semver:skip`.
 3. velo, velo-hub, and velo-hub-ext publish together, from one commit.
 4. velo-hub re-exports it as `velo_hub::protocol`; downstream hub crates use that re-export.
 
