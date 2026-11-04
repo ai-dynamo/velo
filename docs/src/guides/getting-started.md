@@ -100,8 +100,13 @@ let response = node_a.unary("echo")?
 Both nodes must have the matching default transport key (`tcp` or `uds`). The
 `_hello` exchange registers both peers and returns the responder's advertised
 messenger and streaming endpoints. Temporary routing state is removed even if
-connect fails or its future is dropped. The exchange uses the messenger's
-30-second handshake deadline; callers may wrap it in a shorter timeout.
+connect fails or its future is dropped. The registered peer is not temporary:
+if the exchange succeeds but the peer's streaming endpoint cannot be
+registered (for example, its address entry does not decode), `connect` returns
+that error with the peer still registered for messaging, so active messages to
+it work and streams do not. Call `Velo::unregister_peer` to remove it. The
+exchange uses the messenger's 30-second handshake deadline; callers may wrap it
+in a shorter timeout.
 
 The identity is self-reported, not authenticated. Applications must perform
 their own admission checks before trusting a peer. A peer without endpoint
