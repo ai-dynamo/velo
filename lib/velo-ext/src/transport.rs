@@ -1222,8 +1222,6 @@ mod tests {
         assert_eq!(adapter.shutdown_state.in_flight_count(), 0);
     }
 
-    /// Admission during drain rejects and hands the frame back, and the guard
-    /// it acquired to close the check-then-act race is released again.
     /// `admit_message_from` stamps the connection's identity onto the queued
     /// message; the plain `admit_message` leaves it `Unattributed`, which is
     /// what out-of-tree transports that predate the API produce.
@@ -1253,6 +1251,8 @@ mod tests {
         assert_eq!(second.sender().instance_id(), None);
     }
 
+    /// Admission during drain rejects and hands the frame back, and the guard
+    /// it acquired to close the check-then-act race is released again.
     #[tokio::test]
     async fn admit_message_rejects_during_drain() {
         let (adapter, streams) = make_channels();
