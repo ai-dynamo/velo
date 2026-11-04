@@ -539,6 +539,18 @@ impl Transport for UcxTransport {
 
         // Pre-wire failures report through on_error and return Admitted:
         // there is nothing for the caller to wait on (trait contract).
+        //
+        // Identify is a TCP/UDS connection-open record, not a frame: UCX
+        // announces no connection identity, and Identify's kind id is the
+        // health-ping AM id here, so a peer would answer it as a ping.
+        if task.msg_type == MessageType::Identify {
+            task.on_error.on_error(
+                task.header,
+                task.payload,
+                "ucx does not carry Identify (a TCP/UDS connection-open record)".into(),
+            );
+            return SendOutcome::Admitted;
+        }
         if self.runtime.get().is_none() {
             task.on_error.on_error(
                 task.header,

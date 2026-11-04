@@ -220,6 +220,45 @@ async fn recv_message(
 
 const T: Duration = Duration::from_secs(10);
 
+/// Identify is a TCP/UDS connection-open record whose kind id is UCX's ping
+/// id. The transport refuses it at the send boundary, so the peer never
+/// receives it (as a ping or otherwise), and the connection still carries
+/// real frames.
+#[tokio::test(flavor = "multi_thread")]
+async fn identify_is_refused_at_the_send_boundary() {
+    let a = start_node().await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    let errs = CountingErrors::new();
+
+    let out = a.transport.send_message(
+        b.instance_id,
+        Bytes::copy_from_slice(a.instance_id.as_bytes()),
+        Bytes::new(),
+        MessageType::Identify,
+        errs.clone(),
+    );
+    assert!(matches!(out, SendOutcome::Admitted));
+    assert_eq!(errs.count(), 1, "the refusal reports through on_error");
+
+    a.transport.send_message(
+        b.instance_id,
+        Bytes::from_static(b"after"),
+        Bytes::from_static(b"payload"),
+        MessageType::Message,
+        errs.clone(),
+    );
+    let (h, _) = recv_message(&b.streams.message_stream, T)
+        .await
+        .expect("the connection still carries messages");
+    assert_eq!(&h[..], b"after");
+    assert_eq!(errs.count(), 1, "only the Identify was refused");
+    assert!(b.streams.message_stream.is_empty());
+    assert!(b.streams.response_stream.is_empty());
+    assert!(b.streams.event_stream.is_empty());
+    assert!(b.streams.shutdown_stream.is_empty());
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn message_round_trip_and_stream_routing() {
     let a = start_node().await;

@@ -31,7 +31,9 @@ pub(crate) const BLOB_VERSION: u8 = 2;
 /// UCX AM ids are worker-global and (since UCX 1.18) must fit in 16 bits.
 /// Velo claims the contiguous range `AM_ID_BASE .. AM_ID_BASE + 7`:
 /// ids 0-4 mirror [`MessageType`](velo_ext::MessageType), 5/6 carry the
-/// health ping/pong. The base is a shared constant rather than a negotiated
+/// health ping/pong. `MessageType::Identify` (also 5) is a TCP/UDS
+/// connection-open record that UCX refuses to send, so it never takes an id
+/// here. The base is a shared constant rather than a negotiated
 /// value so that control replies (`ShuttingDown`, pong) can be addressed to a
 /// peer we never registered; the blob still carries it so `register()` can
 /// reject a peer built with an incompatible id layout.

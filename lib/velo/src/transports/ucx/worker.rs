@@ -1225,16 +1225,11 @@ unsafe extern "C" fn recv_trampoline(
                             );
                         }
                     }
-                    // Identify is a TCP/UDS connection-open record; it never
-                    // travels as a UCX active message.
-                    Some(MessageType::Identify) => {
-                        record_rejection(
-                            &ra.shared.worker,
-                            velo_ext::TransportRejection::DecodeError,
-                        );
-                        warn!("ucx: inbound AM with connection-only kind Identify");
-                    }
-                    None => {
+                    // Identify's kind id is AM_KIND_PING, so that AM is
+                    // answered as a ping above and never decodes here; the
+                    // send side refuses Identify. It is matched only to keep
+                    // the match exhaustive.
+                    Some(MessageType::Identify) | None => {
                         record_rejection(
                             &ra.shared.worker,
                             velo_ext::TransportRejection::DecodeError,
