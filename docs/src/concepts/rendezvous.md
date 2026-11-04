@@ -132,11 +132,17 @@ Chunked reads of an external slot never form a Rust reference into the region. A
 
 ### Transparent staging
 
-The messenger stages any payload above 256 KiB through rendezvous and replaces it in the frame with a handle. The receiver resolves the handle before the handler runs, so handler code never sees the difference.
+By default the messenger stages any payload above 256 KiB through rendezvous and replaces it in the frame with a handle. The receiver resolves the handle before the handler runs, so handler code never sees the difference.
+
+`VeloBuilder::large_payload_staging` chooses this behavior. `TransparentStaging::AboveDefault`, the default, stages above 256 KiB. `TransparentStaging::Above(n)` stages above `n` bytes instead. `TransparentStaging::Disabled` never stages: a payload above the transport's frame ceiling fails when the writer encodes it, and an inbound staged handle gets an error reply instead of a pull. A node that stages needs its peers to be able to pull from it, so pair `Disabled`, or a threshold above your largest frame, with [`install_rendezvous_handlers(false)`](#withhold-the-built-in-pull-routes).
 
 The transparent stager runs inside the synchronous `send_message`. It uses only arenas that the pool has already mapped. It never maps a new arena, because mapping is an `ibv_reg_mr` whose cost is linear in size. A send must not stall on that.
 
 The result: **a process whose only staging is transparent never maps an arena and never takes the RDMA path.** One explicit `register_data_pinned` call maps the first arena. After that, transparent payloads use it. Growing the pool from a send on a background task was rejected. A caller cannot reason about a message send that causes a 64 MiB pin.
+
+### Withhold the built-in pull routes
+
+By default the builder registers the built-in `_rv_*` handlers, so any peer that holds a `DataHandle` can pull its data. The handle is a bearer capability, and the built-in handlers check nothing else. `VeloBuilder::install_rendezvous_handlers(false)` registers none of them. Local `register_data` and `get` still work, and a remote pull fails as an unknown handler. A deployment that needs admission on pulls registers its own handlers over `RendezvousManager::data_store`, where its admission policy lives.
 
 ## Reading on the consumer
 
@@ -318,7 +324,9 @@ See [Shutdown and drain](shutdown.md) for the messenger half.
 
 | Knob | Set through | Default | Effect |
 |---|---|---|---|
-| `DEFAULT_THRESHOLD` | constant (the `Velo` builder uses it) | 256 KiB | Messenger payloads above this go through rendezvous. |
+| `DEFAULT_THRESHOLD` | constant (the `Velo` builder's default) | 256 KiB | Messenger payloads above this go through rendezvous. |
+| `large_payload_staging` | `VeloBuilder` | `TransparentStaging::AboveDefault` | Stage above the default threshold, above `n` bytes, or never. See [Transparent staging](#transparent-staging). |
+| `install_rendezvous_handlers` | `VeloBuilder` | `true` | Register the built-in `_rv_*` pull routes. See [Withhold the built-in pull routes](#withhold-the-built-in-pull-routes). |
 | `DEFAULT_CHUNK_SIZE` | constant | 512 KiB | Chunk size of the chunked path. |
 | `rdma_min_bytes` | `RdmaRendezvousConfig` | 64 KiB | Pinned slots below this answer chunked. |
 | `enabled` | `RdmaRendezvousConfig` | `true` | The kill switch. |

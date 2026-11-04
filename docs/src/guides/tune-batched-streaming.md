@@ -100,6 +100,7 @@ The settings below are fields of `MuxConfig`. Always build it with `..Default::d
 | `flush_policy` | `Auto` with `on_admission: true` | When a batcher writes. See [Select a flush policy](#select-a-flush-policy). |
 | `async_open_ack` | `false` | Whether a slot open returns before the transport admits its `OpenSlot`. |
 | `reply_linger` | 1 ms | How long a credit reply waits for other records to share its batch. Zero writes each reply at once. |
+| `reserved_lanes` | 0 | Top transport lanes that stream placement does not use, kept for other traffic that `am_send`, `am_sync`, or `unary` sends with an explicit `.lane(n)`. Receive serves a batch on whatever lane it arrives, so peers with different reservations interoperate. Building refuses a count that is not below the smallest lane count of an installed transport. |
 
 ## Change the credit window
 

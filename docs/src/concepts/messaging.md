@@ -74,9 +74,13 @@ node.register_handler(
 node.register_handler(Handler::am_handler_async("notify", |ctx: Context| async move { Ok(()) }).build())?;
 ```
 
-The handler context holds the payload, the message headers, and the messenger (`ctx.msg`). A handler can use the messenger to send messages, register handlers, or wait for events. `ctx.sender_worker_id()` is always available. `ctx.sender_instance_id()` returns the `InstanceId` of the sender after its handshake is complete.
+The handler context holds the payload, the message headers, and the messenger (`ctx.msg`). A handler can use the messenger to send messages, register handlers, or wait for events. `ctx.sender_worker_id()` is always available. `ctx.sender_instance_id()` returns the `InstanceId` of the sender after its handshake is complete. `ctx.sender_identity()` reports the peer that the message's connection belongs to, and `ctx.sender_peer_info()` the `PeerInfo` that peer registered. Both come from the connection, not the message. Over TCP and UDS they name the peer; other transports report `SenderIdentity::Unattributed`. See [Connection identity](transports.md#connection-identity).
 
 Handler names that start with `_` are reserved for system handlers.
+
+## Lanes
+
+`am_send`, `am_sync`, and `unary` send on lane 0 by default. `.lane(n)` sends on transport lane `n` instead. Frames on one (peer, lane) arrive in the order they were admitted, and nothing is ordered across lanes. `Messenger::lanes(target)` reports how many lanes the transport to a peer keeps. A lane the peer does not keep fails the send instead of being remapped onto another lane's connection. To keep streams off a lane that you send on this way, set [`MuxConfig::reserved_lanes`](../guides/tune-batched-streaming.md#settings-reference).
 
 ## Dispatch modes
 
@@ -86,6 +90,7 @@ Handler names that start with `_` are reserved for system handlers.
 | `.ordered()` | One lane for each sending instance. A lane handles its messages in arrival order. Different senders run in parallel. |
 | `.ordered_global()` | One lane for all senders. This gives total order and no parallelism. |
 | `.ordered_with(OrderedConfig)` | Ordered dispatch with an explicit configuration |
+| `.inline()` | Runs the handler on the receive loop itself, with no task, in dequeue order. Only for a synchronous handler (`am_handler`, `unary_handler`, `typed_unary`) that never blocks, on traffic whose in-flight volume the application bounds. `build` panics on an `_async` handler. |
 
 `.max_concurrent(n)` limits how many lanes run the handler at the same time. A lane takes the permit for each message inside the lane, so the limit does not change the order in a lane. The builder rejects `0` because it would stop every lane.
 
