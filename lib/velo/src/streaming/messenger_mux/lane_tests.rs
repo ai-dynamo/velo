@@ -111,6 +111,15 @@ async fn pair_reserved(consumer_lanes: u16, producer_lanes: u16, reserved: u16) 
     (consumer, producer)
 }
 
+/// A pair with `lanes` QUIC lanes each whose muxes reserve different numbers
+/// of top lanes from stream placement.
+async fn pair_mixed(lanes: u16, consumer_reserved: u16, producer_reserved: u16) -> (Node, Node) {
+    let consumer = Node::new_with_mux(lanes, consumer_reserved).await;
+    let producer = Node::new_with_mux(lanes, producer_reserved).await;
+    connect(&consumer, &producer).await;
+    (consumer, producer)
+}
+
 /// Make `a` and `b` peers of each other and wait for their control planes.
 async fn connect(a: &Node, b: &Node) {
     a.velo
@@ -783,6 +792,97 @@ async fn a_reserved_lane_carries_no_stream_in_either_direction() {
             .quic
             .has_lane_connection(consumer.velo.instance_id(), 3),
         "the producer's batches must never ride its reserved lane 3"
+    );
+    assert!(
+        !consumer
+            .quic
+            .has_lane_connection(producer.velo.instance_id(), 3),
+        "the consumer's credit must never ride its reserved lane 3"
+    );
+}
+
+/// An unreserved consumer serves a reserving producer's stream on the lane
+/// the producer remapped it to, and replies there.
+///
+/// The consumer places nothing in reserve, so a key bound for lane 3 of 4 is
+/// placed on lane 3. The producer reserves its top lane and sends that stream
+/// on 3 modulo its three placement lanes: lane 0. The consumer takes the
+/// batches where they arrive (its (producer, 0) table holds the slot, its
+/// (producer, 3) table nothing) and its credit rides lane 0 back. The item
+/// count is past the credit window, so the stream finishing proves credit
+/// came back; the consumer never opening its QUIC lane 3 to the producer
+/// proves the credit did not ride the lane it placed the stream on, and the
+/// producer never opens its reserved lane 3.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unreserved_consumer_serves_a_reserving_producer_on_the_arrival_lane() {
+    let (consumer, producer) = pair_mixed(4, 0, 1).await;
+    let consumer_mux = consumer.mux();
+    let on_named = PeerLane::new(producer.worker(), LaneIndex::new(3));
+    let on_arrival = PeerLane::new(producer.worker(), LaneIndex::ZERO);
+
+    let anchor = consumer.velo.create_anchor::<u32>();
+    let sender = producer
+        .velo
+        .attach_anchor_keyed::<u32>(transfer(anchor.handle()), key_for(3, 4))
+        .await
+        .expect("remote attach");
+    sender.send(u32::MAX).await.expect("first send");
+    eventually("the slot to open on the arrival lane", || {
+        consumer_mux.live_ingress_slots(on_arrival) == 1
+    })
+    .await;
+    assert_eq!(consumer_mux.live_ingress_slots(on_named), 0);
+    stream_through(sender, drain_first(anchor).await).await;
+
+    assert!(
+        !producer
+            .quic
+            .has_lane_connection(consumer.velo.instance_id(), 3),
+        "the producer's batches must never ride its reserved lane 3"
+    );
+    assert!(
+        !consumer
+            .quic
+            .has_lane_connection(producer.velo.instance_id(), 3),
+        "the consumer's credit must ride the arrival lane, not the lane it placed"
+    );
+}
+
+/// A reserving consumer places an unreserved producer's stream below its
+/// reservation, and the producer follows it there.
+///
+/// The consumer reserves its top lane, so a key bound for lane 3 of 4 is
+/// placed on `keyed_lane(key, 3)`. The producer reserves nothing and sends on
+/// that lane as named. The stream is served there, and neither side opens a
+/// lane-3 connection.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_reserving_consumer_places_an_unreserved_producers_stream_below_its_reservation() {
+    let (consumer, producer) = pair_mixed(4, 1, 0).await;
+    let consumer_mux = consumer.mux();
+    let key = key_for(3, 4);
+    let placed = keyed_lane(key, std::num::NonZeroU16::new(3).expect("non-zero"));
+    let on_placed = PeerLane::new(producer.worker(), placed);
+    let on_reserved = PeerLane::new(producer.worker(), LaneIndex::new(3));
+
+    let anchor = consumer.velo.create_anchor::<u32>();
+    let sender = producer
+        .velo
+        .attach_anchor_keyed::<u32>(transfer(anchor.handle()), key)
+        .await
+        .expect("remote attach");
+    sender.send(u32::MAX).await.expect("first send");
+    eventually("the slot to open on the placed lane", || {
+        consumer_mux.live_ingress_slots(on_placed) == 1
+    })
+    .await;
+    assert_eq!(consumer_mux.live_ingress_slots(on_reserved), 0);
+    stream_through(sender, drain_first(anchor).await).await;
+
+    assert!(
+        !producer
+            .quic
+            .has_lane_connection(consumer.velo.instance_id(), 3),
+        "the producer must send on the lane the consumer placed, not lane 3"
     );
     assert!(
         !consumer

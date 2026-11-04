@@ -421,8 +421,14 @@ pub struct MuxConfig {
     /// and a peer whose transport keeps fewer lanes still maps every stream
     /// below its own reservation — spread is lost before isolation is.
     ///
-    /// Receive is unaffected: a batch is accepted on every lane, reserved or
-    /// not, so a peer built without the reservation is still served.
+    /// The reservation shapes only placement and sending. Receive does not
+    /// filter by lane: a batch is served on whichever lane it arrives, and
+    /// its credit and replies ride that lane back. So peers with different
+    /// reservations interoperate in either role. A reserving consumer places
+    /// an unreserved producer's stream below its reservation. A reserving
+    /// producer sends a lane its unreserved consumer named on that lane
+    /// modulo its own placement lanes, and the consumer serves it there. In
+    /// both, the reserved lanes carry no stream batches or credit.
     ///
     /// Building a mux refuses a count that leaves some installed messenger
     /// transport no lane to place on: `reserved_lanes` must be below the
