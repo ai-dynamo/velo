@@ -143,8 +143,8 @@ async fn drive_one_stream(
     frame_count: u64,
     blob: bytes::Bytes,
 ) -> Result<()> {
-    let consumer = Arc::clone(&pair.server.velo);
-    let producer = Arc::clone(&pair.client.velo);
+    let consumer = pair.server.velo.clone();
+    let producer = pair.client.velo.clone();
 
     // Consumer creates anchor; gets handle.
     let anchor = consumer.create_anchor::<Item>();
@@ -219,8 +219,8 @@ pub async fn run_s2_many_streams(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
 
     let mut set: JoinSet<Result<()>> = JoinSet::new();
     for _ in 0..anchors {
-        let consumer = Arc::clone(&pair.server.velo);
-        let producer = Arc::clone(&pair.client.velo);
+        let consumer = pair.server.velo.clone();
+        let producer = pair.client.velo.clone();
         let oracle = Arc::clone(&oracle);
         set.spawn(
             async move { run_one_stream("S2", consumer, producer, oracle, per_stream).await },
@@ -262,8 +262,8 @@ pub async fn run_s2_many_streams(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
 /// flake, which sent the last investigation at the wrong scenario entirely.
 async fn run_one_stream(
     scenario: &'static str,
-    consumer: Arc<Velo>,
-    producer: Arc<Velo>,
+    consumer: Velo,
+    producer: Velo,
     oracle: Arc<Oracle>,
     frames: u64,
 ) -> Result<()> {
@@ -356,8 +356,8 @@ pub async fn run_s4_rapid_cycle(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     for _ in 0..cycles {
         run_one_stream(
             "S4",
-            Arc::clone(&pair.server.velo),
-            Arc::clone(&pair.client.velo),
+            pair.server.velo.clone(),
+            pair.client.velo.clone(),
             Arc::clone(&oracle),
             8,
         )
@@ -426,8 +426,8 @@ pub async fn run_f1s_sender_panic(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let pair = fresh_pair(ctx, "f1s").await?;
     let started = Instant::now();
 
-    let consumer = Arc::clone(&pair.server.velo);
-    let producer = Arc::clone(&pair.client.velo);
+    let consumer = pair.server.velo.clone();
+    let producer = pair.client.velo.clone();
 
     let anchor = consumer.create_anchor::<Item>();
     let handle = anchor.handle();
@@ -495,8 +495,8 @@ pub async fn run_f2s_cancel_storm(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let pair = fresh_pair(ctx, "f2s").await?;
     let started = Instant::now();
 
-    let consumer = Arc::clone(&pair.server.velo);
-    let producer = Arc::clone(&pair.client.velo);
+    let consumer = pair.server.velo.clone();
+    let producer = pair.client.velo.clone();
 
     let anchor = consumer.create_anchor::<Item>();
     let handle = anchor.handle();
@@ -568,8 +568,8 @@ pub async fn run_f3s_slow_consumer(ctx: &ScenarioCtx) -> Result<ScenarioReport> 
     let pair = fresh_pair(ctx, "f3s").await?;
     let started = Instant::now();
 
-    let consumer = Arc::clone(&pair.server.velo);
-    let producer = Arc::clone(&pair.client.velo);
+    let consumer = pair.server.velo.clone();
+    let producer = pair.client.velo.clone();
 
     let anchor = consumer.create_anchor::<Item>();
     let handle = anchor.handle();

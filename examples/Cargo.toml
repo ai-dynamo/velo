@@ -17,16 +17,18 @@ quic = ["velo/quic"]
 
 [dependencies]
 velo = { path = "../lib/velo", features = ["test-helpers"] }
+velo-hub = { path = "../lib/velo-hub", features = ["server", "client"] }
 
 anyhow = "1"
 bytes = { version = "1", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
+dashmap = "6.1"
 flume = "0.12.0"
 futures = "0.3"
 rmp-serde = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokio = { version = "=1.48.0", features = ["full"] }
+tokio = { version = "1.54", features = ["full"] }
 tokio-util = "0.7"
 uuid = { version = "1.18.1", features = ["v4"] }
 tracing = "0.1"
@@ -57,6 +59,12 @@ name = "batched_streaming"
 name = "response_plane_bench"
 
 [[example]]
+name = "anchor_setup_bench"
+
+[[example]]
+name = "stream_lifecycle"
+
+[[example]]
 name = "rendezvous_rdma_two_proc"
 required-features = ["ucx"]
 
@@ -66,3 +74,6 @@ path = "examples/soak/main.rs"
 required-features = ["grpc"]
 
 [workspace]
+
+[[example]]
+name = "hub"

@@ -95,7 +95,7 @@ When changing `lib/velo-ext/`:
 4. **`velo`'s dep on `velo-ext` is an exact `=` pin in `[workspace.dependencies]`.** Bumping `velo-ext` without bumping the pin will break the workspace lockfile.
 5. **The CI `semver:` job is the enforcement gate** — it runs `cargo semver-checks` for each changed crate against that crate's latest version on crates.io, and fails the build if a breaking change is not covered by the version bump over that published version. A bump is measured against the latest published version, so several breaking PRs between two publishes share one bump. Use the `semver:skip` PR label only with explicit reviewer agreement.
 
-Any other workspace crate is marked `publish = false` and is internal to this repository — `crates/ucx-rs` is the one documented exception, versioned independently as a leaf FFI crate (see `CLAUDE.md`, *Workspace layout*). External consumers can only depend on `velo` and `velo-ext`, so internal API changes do not require version coordination.
+Any other workspace crate is marked `publish = false` and is internal to this repository. There are two documented exceptions (see `CLAUDE.md`, *Workspace layout*): `crates/ucx-rs`, versioned independently as a leaf FFI crate, and `lib/velo-hub`, which takes the workspace version and is published together with `velo` once its publish gate clears (it carries `publish = false` until then). Today external consumers can only depend on `velo` and `velo-ext`, so internal API changes do not require version coordination.
 
 ## DCO & Licensing
 

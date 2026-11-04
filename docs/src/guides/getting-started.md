@@ -28,6 +28,10 @@ The default features are `http`, `nats-transport`, `grpc`, and `services`. Add o
 | `simulation` | Discrete-event simulation transport |
 | `test-helpers` | Prometheus snapshot helpers for tests |
 
+## Platforms
+
+velo builds on Linux and macOS. On macOS every feature builds except `ucx`. There the `ucx` feature compiles but adds no transport, and the `ucx-rs` crate builds as an empty stub, so `cargo build --workspace --all-features` still works. Linux sockets also set `TCP_USER_TIMEOUT`, which macOS does not have.
+
 TCP is always available. UDS is always available on Unix. Filesystem discovery needs `services`. Discovery and queue backend features enable `services` too.
 
 `nats-transport`, `nats-discovery`, and `nats-queue` are independent. They share the `async-nats` dependency, but one does not enable the others.

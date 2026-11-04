@@ -43,7 +43,7 @@ fn new_messenger_transport() -> Arc<velo::transports::tcp::TcpTransport> {
     )
 }
 
-async fn make_pair() -> (Arc<Velo>, Registry, Arc<Velo>, Registry) {
+async fn make_pair() -> (Velo, Registry, Velo, Registry) {
     let producer_reg = Registry::new();
     let producer_metrics = Arc::new(VeloMetrics::register(&producer_reg).unwrap());
     let consumer_reg = Registry::new();

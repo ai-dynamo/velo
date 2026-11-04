@@ -114,7 +114,6 @@ mod test_support;
 #[cfg(test)]
 mod tests;
 
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -130,6 +129,7 @@ use self::lane_choice::LaneLoad;
 use self::peer_batcher::{BatcherHandle, BatcherMap, OpenRejected, OpenSlotRequest};
 use crate::messenger::{Context, Handler, Messenger};
 use crate::observability::{MuxMetricsHandle, VeloMetrics};
+use crate::streaming::deadline::DeadlineQueue;
 use crate::streaming::transport::FrameTransport;
 
 pub use self::config::{AutoFlush, FlushPolicy, MuxConfig};
@@ -147,27 +147,6 @@ pub(crate) use self::lane_choice::LaneReservation;
 /// is compared against — a caller that had to spell the string itself would be
 /// re-deriving the one value negotiation is keyed on.
 pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
-
-/// How long a bind waits for the `OpenSlot` that claims it.
-///
-/// Deliberately the same 60 s the TCP transport gives a pending session, and
-/// deliberately measuring the same thing: "time until a batch bearing this
-/// `OpenSlot` arrives". That sentence holds without qualification for the
-/// attach path's bind: a sender has already asked by
-/// the time the bind exists, so the window is one response leg plus one batch
-/// leg, and `OpenSlot` is eager precisely so it cannot quietly become "time
-/// until the producer produces its first token" there.
-///
-/// It does not hold for the zero-RTT pre-bind (`AnchorManager::prebind_anchor`),
-/// where the same clock starts before any sender has asked at all: the window
-/// there is envelope transit plus however long the ticket sits in a request
-/// envelope before its worker calls `open_anchor_stream`, which can be exactly
-/// the producer-side wait the paragraph above rules out for `bind`. See
-/// `AnchorManager::prebind_anchor`'s doc for that bound. An attach that adopts
-/// an existing pre-bind does not restart this timer either way — adoption
-/// takes over the bind the pre-bind already registered rather than binding
-/// again, so it inherits whatever is left of the 60 s, not a fresh one.
-const ACCEPT_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// Attempts `connect` makes before giving up on a batcher that keeps retiring
 /// underneath it. Two is already generous — losing the race twice requires two
@@ -201,6 +180,20 @@ pub(crate) struct MessengerMuxTransport {
     core: Arc<MuxCore>,
     key: TransportKey,
 }
+
+/// The longest an expiry entry waits before the sweep looks at its bind.
+///
+/// A claimed or released bind leaves its entry queued, and only the sweep
+/// drops it. Queued at the bind's own deadline, that entry lived for the whole
+/// accept window: 30 years for a `Duration::MAX` window, so the queue grew for
+/// the life of the process. Capped here, a stale entry goes within 60 s at any
+/// window. A bind still open past it costs one requeue per recheck.
+const BIND_RECHECK: Duration = Duration::from_secs(60);
+
+/// The most bind entries one hold of the queue's lock pops. Every bind takes
+/// that lock, so a sweep that popped a whole burst at once would stall new
+/// streams for as long as the burst took.
+const EXPIRE_BATCH: usize = 4096;
 
 /// State shared between the transport, its batchers and the ingress handler.
 struct MuxCore {
@@ -237,17 +230,15 @@ struct MuxCore {
     /// `bind` returns. Take-once: whoever collects it owns it, and the bind
     /// expiry that already exists drops any that was never collected.
     drains: DashMap<(u64, u64), Arc<ingress::DrainSignal>>,
-    /// Accept-window deadlines, one per bind, oldest first.
-    ///
-    /// Every bind gets the same `ACCEPT_TIMEOUT`, so pushing at bind time keeps
-    /// the queue in deadline order and the sweep only ever pops its front. A
-    /// bind claimed or released early stays queued and costs a failed lookup
-    /// when its deadline comes; that is cheaper than finding and removing it.
-    /// It used to be one timer task per bind, which nothing but shutdown
-    /// cancelled: a claimed bind's task lived out the full minute, so a
-    /// frontend opening 2,000 streams a second carried about 120,000 idle
-    /// tasks.
-    bind_deadlines: std::sync::Mutex<VecDeque<(tokio::time::Instant, (u64, u64))>>,
+    /// One expiry entry per bind. Renewal moves the deadline stored with the
+    /// bind, not this entry; when the entry comes due, the sweep reads the
+    /// stored deadline and queues the entry again if it moved. A bind claimed
+    /// or released early leaves its entry here until it comes due, at most
+    /// [`BIND_RECHECK`] ahead.
+    bind_deadlines: DeadlineQueue<(u64, u64)>,
+    /// The accept window of every bind, attach or pre-bind
+    /// (`ReservationConfig::prebind_timeout`).
+    accept_window: Duration,
     /// A barrier handed to every batcher this core spawns, installed by the
     /// tests that need one held mid-wake. See [`peer_batcher::test_hooks`].
     #[cfg(test)]
@@ -257,12 +248,27 @@ struct MuxCore {
     /// and its commit. The mux bind does not await, so nothing else can.
     #[cfg(test)]
     bind_hook: std::sync::OnceLock<Box<dyn Fn(u64) + Send + Sync>>,
+    /// Periodic ticks run, so a test can wait out the sweep task's first,
+    /// immediate tick before it sets up state that tick would disturb.
+    #[cfg(test)]
+    ticks: AtomicU64,
     /// Binds per lane that no `OpenSlot` has claimed yet, read when the next
     /// stream is placed ([`MessengerMuxTransport::choose_lane`]).
     lane_load: LaneLoad,
 }
 
 impl MessengerMuxTransport {
+    /// Extend an unclaimed bind's accept window, if it has not closed.
+    ///
+    /// Called with an anchor registry entry held, like
+    /// [`release_bind`](Self::release_bind): it touches only the mux's own
+    /// maps and must never reach back into the anchor registry.
+    pub(crate) fn renew_reservation(&self, anchor: u64, session: u64) {
+        self.core
+            .ingress
+            .renew_bind(anchor, session, self.core.accept_window);
+    }
+
     /// Ask the sender of a claimed slot to stop, through the batcher of the
     /// lane its `OpenSlot` arrived on.
     pub(crate) fn request_stop(&self, key: PeerLane, slot: protocol::SlotId, session_id: u64) {
@@ -321,6 +327,7 @@ impl MessengerMuxTransport {
         messenger: Arc<Messenger>,
         config: MuxConfig,
         metrics: Option<Arc<VeloMetrics>>,
+        accept_window: Duration,
     ) -> Result<Arc<Self>> {
         let limits = NegotiatedLimits::from_wire(config.initial_credit, config.slot_byte_budget)
             .map_err(|error| anyhow!("messenger mux: {error}"))?;
@@ -366,11 +373,14 @@ impl MessengerMuxTransport {
             drain_tx,
             drain_rx,
             drains: DashMap::new(),
-            bind_deadlines: std::sync::Mutex::default(),
+            bind_deadlines: DeadlineQueue::new(BIND_RECHECK, BIND_RECHECK),
+            accept_window,
             #[cfg(test)]
             hooks: std::sync::OnceLock::new(),
             #[cfg(test)]
             bind_hook: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            ticks: AtomicU64::new(0),
             lane_load: LaneLoad::default(),
         });
 
@@ -581,46 +591,52 @@ impl MuxCore {
     /// Close the accept window on every bind whose deadline has passed.
     ///
     /// Runs on the sweep tick, so a window closes up to one
-    /// `credit_sweep_interval` late -- 200 ms on a 60 s window by default.
+    /// `credit_sweep_interval` late -- 200 ms on a 180 s window by default.
     fn expire_binds(&self, now: tokio::time::Instant) {
-        let due: Vec<(u64, u64)> = {
-            let mut deadlines = self
-                .bind_deadlines
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let ready = deadlines.partition_point(|(deadline, _)| *deadline <= now);
-            let due = deadlines.drain(..ready).map(|(_, key)| key).collect();
-            // A burst of binds leaves the queue's capacity behind it. Give it
-            // back only once the queue is nearly empty: the shrink copies what
-            // is left while holding the lock every bind takes, so shrinking a
-            // queue still tens of thousands deep would stall new streams.
-            if deadlines.len() <= 1024 && deadlines.capacity() > 8192 {
-                deadlines.shrink_to(2048);
+        loop {
+            let due = self.bind_deadlines.pop_due(now, EXPIRE_BATCH);
+            // Nothing due: most ticks. The requeue would only take the lock
+            // again; after a burst, the requeue of its last chunk shrinks.
+            if due.is_empty() {
+                return;
             }
-            due
-        };
-        for (anchor_id, session_id) in due {
-            // Whether or not the bind was still there, drop any drain signal
-            // no attach collected. Without this an attach that failed between
-            // `bind` and `take_drain_signal` would leak one entry per attempt
-            // for the process's life.
-            self.drains.remove(&(anchor_id, session_id));
-            if self.ingress.expire_bind(anchor_id, session_id) {
-                tracing::warn!(
-                    anchor_id,
-                    session_id,
-                    "messenger mux: no OpenSlot arrived before the accept window closed"
-                );
+            let more = due.len() == EXPIRE_BATCH;
+            let mut renewed = Vec::new();
+            for (_, (anchor_id, session_id)) in due {
+                if let Some(deadline) = self.ingress.expire_due(anchor_id, session_id, now) {
+                    renewed.push((deadline, (anchor_id, session_id)));
+                } else {
+                    self.drains.remove(&(anchor_id, session_id));
+                }
+            }
+            // One lock for every requeue: binds take this lock too.
+            self.bind_deadlines.requeue(now, renewed);
+            if !more {
+                return;
             }
         }
     }
 
     /// One sweep tick: return credit, then age out idle batchers.
+    ///
+    /// Each walk is skipped when it has nothing to visit, because an idle node
+    /// still ticks: `DashMap::iter` allocates one `Arc` per shard, empty or
+    /// not, so the two walks cost 256 allocations a tick on 20 CPUs and 1,024
+    /// on 72. The ingress tables are never pruned, so the credit walk is gated
+    /// on live slots rather than on an empty map: with no slot live there is no
+    /// credit to return. A slot opened during the check is reached by the
+    /// next tick, as one opened just after the walk always was.
     fn sweep(&self) {
-        for key in self.ingress.peers() {
-            self.sweep_peer(key);
+        if self.ingress.has_live_slots() {
+            for key in self.ingress.peers() {
+                self.sweep_peer(key);
+            }
         }
 
+        // `is_empty` takes each shard's read lock and allocates nothing.
+        if self.batchers.is_empty() {
+            return;
+        }
         let threshold = self.config.idle_ticks();
         let keys: Vec<PeerLane> = self.batchers.iter().map(|entry| *entry.key()).collect();
         for key in keys {
@@ -669,8 +685,12 @@ fn open_bind(
     let drain = Arc::new(ingress::DrainSignal::new(core.drain_tx.clone()));
     core.drains
         .insert((anchor_id, session_id), Arc::clone(&drain));
+    // The deadline that counts is stored with the bind, and renewal moves it.
+    // The queue entry below only says when to look again, at most
+    // `BIND_RECHECK` ahead.
+    let expires = crate::streaming::deadline::deadline_after(core.accept_window);
     core.ingress
-        .register_bind(anchor_id, session_id, frame_tx, drain, lane);
+        .register_bind(anchor_id, session_id, frame_tx, drain, lane, expires);
 
     // Close the race with shutdown between the initial check and registration.
     if core.tasks.is_stopped() {
@@ -682,16 +702,7 @@ fn open_bind(
     // A deadline, not a task: the sweep expires it (`MuxCore::expire_binds`).
     // Nothing here may pin the core either, which a task holding a strong
     // handle would, for the full window after the last owner dropped it.
-    // The clock is read under the lock, so pushes land in deadline order.
-    let mut deadlines = core
-        .bind_deadlines
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    deadlines.push_back((
-        tokio::time::Instant::now() + ACCEPT_TIMEOUT,
-        (anchor_id, session_id),
-    ));
-    drop(deadlines);
+    core.bind_deadlines.push(expires, (anchor_id, session_id));
 
     Ok(frame_rx)
 }
@@ -758,8 +769,8 @@ impl MessengerMuxTransport {
     /// to ask.
     ///
     /// Nothing about the resulting bind is special. A peer's `OpenSlot` claims
-    /// it by the same `(anchor_id, session_id)` lookup, the accept window runs
-    /// the same 60 s, and [`release_bind`](Self::release_bind) is what an owner
+    /// it by the same `(anchor_id, session_id)` lookup, the accept window is
+    /// the same configured lifetime, and [`release_bind`](Self::release_bind) is what an owner
     /// that gives up before then calls.
     pub(crate) fn bind_on_lane(
         &self,
@@ -780,9 +791,9 @@ impl MessengerMuxTransport {
     ///
     /// The accept window does the same thing when it expires, and stays as the
     /// backstop. This is for the owner that already knows: a pre-bound anchor
-    /// whose request died before its first token knows a minute earlier than
-    /// the timer does, and at the rate a frontend registers requests that
-    /// minute is thousands of leaked binds.
+    /// whose request died before its first token knows up to a whole window
+    /// earlier than the timer does, and at the rate a frontend registers
+    /// requests that window is thousands of leaked binds.
     ///
     /// Idempotent: a bind already claimed or already released is not there to
     /// remove, and removing nothing is the right answer for both.

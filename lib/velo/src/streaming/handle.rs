@@ -17,8 +17,7 @@ const WORKER_SHIFT: u32 = 64;
 /// MPSC anchor. See [`StreamAnchorHandle::pack_mpsc`] and
 /// [`StreamAnchorHandle::is_mpsc_stream`].
 ///
-/// A 63-bit MPSC counter permits 9.2 × 10^18 MPSC anchors per worker — not a
-/// practical limit. SPSC `local_id`s are constrained to the lower 63 bits.
+/// Local IDs of both kinds are random in the lower 63 bits.
 pub(crate) const MPSC_STREAM_BIT: u64 = 1 << 63;
 
 /// Discriminator returned by [`StreamAnchorHandle::kind`].
@@ -55,7 +54,8 @@ impl std::fmt::Display for AnchorKind {
 /// let the attach entry points fail fast on the wrong kind without wasting an
 /// AM round-trip.
 ///
-/// `local_id` of `0` is reserved; [`crate::streaming::anchor::AnchorManager`] assigns IDs starting at `1`.
+/// `local_id` of `0` is reserved. [`crate::streaming::anchor::AnchorManager`] picks
+/// the lower 63 bits at random, so a peer cannot guess a handle it was not given.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StreamAnchorHandle(u128);
 

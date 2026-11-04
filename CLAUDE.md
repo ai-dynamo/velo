@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Workspace layout
 
-Two crates only:
+Two crates only, plus the documented exceptions below:
 
 - **`lib/velo`** — the runtime. All concrete transport / discovery / streaming / messenger / queue / rendezvous / observability code lives here as modules (`velo::transports::tcp`, `velo::discovery::etcd`, `velo::streaming`, etc.). This is what application authors depend on.
 - **`lib/velo-ext`** — the extension trait surface. Out-of-tree implementors of `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, or `TransportObservability` depend only on this crate. It must remain small, free of heavy deps (especially `prometheus`), and stable.
@@ -14,6 +14,24 @@ build of UCX, backing the `ucx` transport feature. It is a leaf FFI crate that
 exports no types shared with `velo`/`velo-ext` (so it cannot reproduce the
 dual-copy semver bug class below), versions independently, and must be published
 to crates.io before a `velo` release that enables the `ucx` feature can ship.
+
+A second documented exception: **`lib/velo-hub`** — a crate for building a hub, one service that is the peer discovery for a velo application and hosts pluggable extensions. Unlike `ucx-rs` it *does* share types with `velo` (its API names `Velo`, `PeerInfo`, and axum `Router`), so moving it to another velo minor is a breaking change cargo-semver-checks cannot see. These rules make that safe:
+
+1. `lib/velo-hub/Cargo.toml` uses `version.workspace = true` and `velo = { workspace = true }`, so a velo minor bump is always a velo-hub minor bump.
+2. `[workspace.dependencies]` requires velo with a **caret** on the workspace version (`velo = { path = "lib/velo", version = "0.21.0", ... }`), not `=`. Pre-1.0 a caret on `0.Y.Z` never admits a second minor; `=` would only stop a velo patch reaching velo-hub users. `scripts/check-semver.sh` fails if the requirement's major.minor differs from `[workspace.package] version`, even under `semver:skip`.
+3. velo and velo-hub publish together, from one commit.
+4. velo-hub re-exports what its API exposes (`velo_hub::velo`, `velo_hub::axum`, `velo_hub::protocol`); downstream hub crates use those re-exports and depend on `velo-hub` with a caret.
+
+velo-hub carries `publish = false` until a real port (kvbm's indexer and p2p as extensions) passes kvbm's lifecycle suite against it.
+
+A third documented exception: **`lib/velo-hub-ext`** — the wire protocol of velo-hub, on `velo-ext` alone. It is for crates that speak the hub's wire protocol without the velo runtime. It depends on `velo-ext`, `serde`, `serde_json`, `uuid`, and `http`, and never on `velo`; CI fails if `cargo tree -p velo-hub-ext` shows `velo` or `prometheus`. It shares types with velo-hub, so the same four rules apply:
+
+1. `lib/velo-hub-ext/Cargo.toml` uses `version.workspace = true`, so a velo minor bump is always a velo-hub-ext minor bump.
+2. `[workspace.dependencies]` requires it with a **caret** on the workspace version (`velo-hub-ext = { path = "lib/velo-hub-ext", version = "0.21.0" }`), not `=`. `scripts/check-semver.sh` fails if the requirement's major.minor differs from `[workspace.package] version`, even under `semver:skip`.
+3. velo, velo-hub, and velo-hub-ext publish together, from one commit.
+4. velo-hub re-exports it as `velo_hub::protocol`; downstream hub crates use that re-export.
+
+velo-hub-ext carries `publish = false` and publishes with velo-hub, once velo-hub's publish gate clears.
 
 Anything else under `lib/` or as a workspace member is a mistake — there used to be 9 sibling crates (`velo-messenger`, `velo-transports`, `velo-streaming`, …). They were collapsed into `lib/velo/src/` because independent versioning between them silently shipped broken releases. Do not reintroduce them.
 
@@ -57,7 +75,7 @@ The bug class that motivated the workspace collapse: a 0.1.1 "patch" of an inter
 
 ### Hard rules
 
-1. **Only `velo` and `velo-ext` are publishable.** Any new crate added to the workspace must have `publish = false` in its `Cargo.toml` unless there is a deliberate, documented reason to publish it. Adding a third publishable crate reopens the bug class.
+1. **Only `velo` and `velo-ext` are publishable** (plus `ucx-rs` and, once its publish gate clears, `velo-hub` and `velo-hub-ext` — the documented exceptions above). Any new crate added to the workspace must have `publish = false` in its `Cargo.toml` unless there is a deliberate, documented reason to publish it. Adding a third publishable crate reopens the bug class.
 2. **`velo-ext` is `=`-pinned in `[workspace.dependencies]`.** The line is:
    ```toml
    velo-ext = { path = "lib/velo-ext", version = "=0.5.6" }
@@ -115,7 +133,7 @@ All transports implement the `Transport` trait (`lib/velo-ext/src/transport.rs`,
 
 - **Fire-and-forget sends** with `TransportErrorHandler` callbacks for failures
 - **Four inbound streams**: message, response, event, shutdown — routed via `TransportAdapter` flume channels. `ShuttingDown` drain rejections carry the rejected *request's* header (request format, not response format), which is why they have their own stream
-- **4-phase graceful shutdown**: Gate (drain flag) → Drain (wait for in-flight) → Teardown (cancel tokens) → Close (await `Transport::closed()`; QUIC waits there for unacknowledged data, TCP/UDS wait only for their accept loop to close its listening socket)
+- **4-phase graceful shutdown**: Gate (drain flag) → Drain (wait for in-flight) → Teardown (cancel tokens) → Close (await `Transport::closed()`; QUIC waits there for unacknowledged data; TCP/UDS wait for their writers to write the frames queued at teardown, then for their accept loop to close its listening socket)
 - **`ShutdownState`** is shared between transport and adapter — `is_draining()` is a best-effort observer for reporting only; admission of inbound `MessageType::Message` frames goes through `TransportAdapter::admit_message`, which acquires the in-flight guard *first* and then re-reads the drain flag, closing the check-then-enqueue race that a bare `is_draining()` gate reopens. While draining, it refuses the frame unless the `DrainExemption` installed with `ShutdownState::set_drain_exemption` lets its header through; the messenger installs one that passes the handlers registered through `Messenger::register_drain_exempt_handler`, which serve work already accepted
 - **`WorkerAddress`** uses MessagePack-encoded maps of `TransportKey` → endpoint bytes
 - **Observability** flows through `Transport::set_observability(Arc<dyn TransportObservability>)` — the runtime hands each transport a pre-bound metrics handle. In-tree transports store it in `OnceLock<Arc<dyn TransportObservability>>` and call trait methods on the hot path. External transport authors get the same handle and emit into the same `velo_transport_*` Prometheus series.
@@ -146,5 +164,8 @@ velo-ext = "0.5"  # exact pin tracked by velo's workspace
 - No `#[allow(clippy::too_many_arguments)]` on new code — use config structs instead
 - Prefer `Bytes` / `BytesMut` for message data (zero-copy slicing via `split_to().freeze()`). When converting from owned `Vec<u8>`, use `Bytes::from(vec)` (O(1) ownership transfer) not `Bytes::copy_from_slice(&vec)` (O(n) memcpy).
 - Use `DashMap` for lock-free concurrent state, `flume` for bounded channels
+- Use `parking_lot::Mutex` and `parking_lot::RwLock` in new code, not the `std::sync` locks. A `parking_lot` lock has no poison state, so a lock call needs no `unwrap_or_else(PoisonError::into_inner)`. Do not convert an existing `std::sync` lock in a change that has a different concern.
 - For ZMQ socket options that need non-Send thread isolation, use `OnceLock` for set-once values (lock-free reads) instead of `Mutex<Option<T>>` when the value never needs to be cleared.
 - The review skills' 1000-line-file threshold applies to `src` files, not test modules (`tests.rs`, `#[cfg(test)] mod tests`, `tests/*.rs`). Splitting a test file to dodge it routinely costs more than it buys — a `tests/*.rs` split needs a matching `[[test]]` entry in `lib/velo/Cargo.toml` and can break a hard-coded `--test <name>` invocation elsewhere (CI, a rig script). Note the length in review, don't split on sight.
+- Before a PR that changes code run per message, frame or record (the T1 and T2 paths in `.claude/skills/perf-review/references/hot-paths.md`), run the `perf-review` skill on the diff. A functional test cannot see a perf regression. `thermonuclear-review` runs the same regression pass as its performance dimension. A hard-earned perf lesson goes into a test that counts the cost (allocations, timer arms, tasks, writes), not into a comment.
+- Write "performance-sensitive" and the affected path in the commit message and the PR description of such a change. If you can show that its effect is small, give the reason and do not measure it. Example: the change adds one atomic load per stream, and the path already takes a lock per stream. Otherwise measure it in isolation, as perf-review's `references/measure.md` says. Run a full end-to-end bench only when the change cannot be isolated, or when the isolated numbers do not agree with the expected result.

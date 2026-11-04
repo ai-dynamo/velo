@@ -208,7 +208,7 @@ pub struct MuxConfig {
     /// `docs/src/operations/response-plane-performance.md`.
     ///
     /// The same tick closes expired accept windows, so an unclaimed bind is
-    /// reclaimed up to one interval after its 60 s window: a long interval
+    /// reclaimed up to one interval after its accept window closes: a long interval
     /// delays the `SenderDropped` an abandoned ticket's anchor is owed by as
     /// much.
     ///

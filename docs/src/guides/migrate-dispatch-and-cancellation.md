@@ -9,13 +9,13 @@ Velo 0.19 makes runtime ownership explicit and removes duplicate dispatch and ca
 
 ## Runtime ownership
 
-Keep a `Velo` owner for as long as its streams are needed. `Velo` values and `Arc<Velo>` can still be cloned. Dropping one clone does not stop streams. Dropping the final Velo owner cancels its streams and stops the builder-owned streaming listener and tasks, even if an `Arc<Messenger>` remains alive.
+Keep a `Velo` owner for as long as its streams are needed. `Velo` is a handle, and clones share one instance. Dropping one clone does not stop streams. Dropping the final Velo owner cancels its streams and stops the builder-owned streaming listener and tasks, even if an `Arc<Messenger>` remains alive.
 
 `Messenger` values no longer implement `Clone`. Clone `Arc<Messenger>` to share the instance:
 
 ```rust,ignore
 let messages = Arc::clone(velo.messenger());
-let streams = Arc::clone(&velo); // Keep this owner while streams are active.
+let streams = velo.clone(); // Keep this owner while streams are active.
 ```
 
 The handlers that `AnchorManager::register_handlers` installs no longer keep their manager alive, so keep your own `Arc<AnchorManager>` for as long as you use it. The manager still keeps its Messenger alive: drop the manager too before you expect final Messenger drop to start teardown. `RendezvousManager::register_handlers` no longer keeps the Messenger alive. The public handler factories `streaming::control::create_anchor_{attach,detach,finalize,cancel}_handler` and `streaming::mpsc::create_mpsc_anchor_{attach,detach,cancel}_handler` are removed; call `AnchorManager::register_handlers` instead. A manager whose handlers owned it formed a cycle with its Messenger, so neither was ever dropped.
@@ -36,6 +36,6 @@ Accepted handler calls still count toward graceful shutdown until the handler an
 
 `SenderEntry::rx_closer` is removed, and `SenderEntry` has a new `closed` field. Code that constructs `SenderEntry` must omit `rx_closer` and set `closed: Default::default()`. Code that dropped its receiver to cancel a sender must call `entry.cancel()` instead. If you remove an entry from `SenderRegistry` to cancel its sender, call `cancel()` on it before you drop it.
 
-The normal `StreamController::cancel()` and `MpscStreamController::cancel()` APIs need no changes. SPSC and MPSC senders check a cancelled flag before they send an item. `SenderEntry::cancel` sets the flag first, so the next send fails. Checking the token itself takes a lock on every item: 8.7 ns, against 0.3 ns for the flag. A token cancelled in another way sets the flag only once the cancelling task yields and the sender's heartbeat task runs. Until then, each send that finds space in the channel is accepted, up to the free capacity of the channel. That task runs on the Tokio runtime that built the sender: if that runtime is gone, a direct token cancel never reaches `send`. Cancel through the stream controller or `SenderEntry::cancel` instead. A cancelled token also wakes a send that waits for channel space. Item and error sends return `SendError::ChannelClosed` after cancellation.
+The normal `StreamController::cancel()` and `MpscStreamController::cancel()` APIs need no changes. SPSC and MPSC senders check a cancelled flag before they send an item. `SenderEntry::cancel` sets the flag first, so the next send fails. Checking the token itself takes a lock on every item: 8.7 ns, against 0.3 ns for the flag. The token that `cancellation_token()` returns only observes the stream: it fires when the stream is cancelled, and cancelling it does not stop the sender. To end a stream from the producer, finalize, detach, or drop the sender. A cancelled stream also wakes a send that waits for channel space. Item and error sends return `SendError::ChannelClosed` after cancellation.
 
 Graceful stop remains separate. For SPSC streams, `request_stop()` signals `stop_token()` and lets the producer send buffered output and call `finalize()`. Hard cancellation also signals the stop token, but rejects further item and error sends. Do not replace a graceful stop with `cancel_token.cancel()`.

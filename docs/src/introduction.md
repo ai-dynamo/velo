@@ -28,14 +28,15 @@ graph TD
     V --> O["VeloMetrics<br>(Prometheus)"]
 ```
 
-## Two crates
+## Crates
 
 | Crate | For | Contents |
 |---|---|---|
 | `velo` | Application authors | The runtime: messaging, streaming, rendezvous, events, queues, discovery, all in-tree transports, metrics |
 | `velo-ext` | Authors of out-of-tree plugins | The stable trait surface: `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`, and the value types these traits use |
+| `velo-hub` | Authors of a hub service | A hub: peer discovery, registration, and liveness for a velo application, plus hosted extensions. See [The hub](concepts/hub.md). |
 
-Application authors depend on `velo` only. See [Workspace crates](development/architecture.md) for why there are only two crates.
+Application authors depend on `velo` only. See [Workspace crates](development/architecture.md) for why the runtime is one crate, and why `velo-hub` is a crate of its own.
 
 ## How to read this book
 

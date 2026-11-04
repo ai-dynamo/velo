@@ -18,6 +18,7 @@
 
 mod listener;
 mod transport;
+mod writer;
 
 pub use listener::{UdsListener, UdsListenerBuilder};
 pub use transport::{UdsTransport, UdsTransportBuilder};

@@ -205,3 +205,83 @@ async fn test_02_remote_attach() {
 // job. Shared scenario coverage therefore lives in `mock_transport.rs`, which
 // runs all eight macro-generated tests; TEST-02 above is what validates a real
 // remote data plane end to end.
+
+/// A remote stream that sends nothing for many heartbeat intervals stays
+/// alive: the producer's heartbeats keep the consumer's watchdog fed.
+///
+/// The watchdog ends a stream after `DETECTION_MULTIPLIER` (3) silent
+/// intervals. Heartbeats come from one sweep per manager, not from a task
+/// per sender, and this test fails if the sweep stops beating an idle
+/// remote sender.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_silent_remote_stream_outlives_the_watchdog_window() {
+    use futures::StreamExt;
+    use velo::streaming::AnchorConfig;
+
+    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let stream_a = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .expect("stream listener A");
+    let stream_b = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .expect("stream listener B");
+    stream_b
+        .register(&PeerInfo::new(
+            messenger_a.instance_id(),
+            stream_a.address(),
+        ))
+        .expect("register A on B");
+    stream_a
+        .register(&PeerInfo::new(
+            messenger_b.instance_id(),
+            stream_b.address(),
+        ))
+        .expect("register B on A");
+    let am_a = Arc::new(
+        AnchorManagerBuilder::default()
+            .worker_id(messenger_a.instance_id().worker_id())
+            .transport(Arc::clone(&stream_a) as Arc<dyn FrameTransport>)
+            .build()
+            .expect("AM worker A"),
+    );
+    am_a.register_handlers(Arc::clone(&messenger_a))
+        .expect("register_handlers on A");
+    let am_b = Arc::new(
+        AnchorManagerBuilder::default()
+            .worker_id(messenger_b.instance_id().worker_id())
+            .transport(Arc::clone(&stream_b) as Arc<dyn FrameTransport>)
+            .build()
+            .expect("AM worker B"),
+    );
+    am_b.register_handlers(Arc::clone(&messenger_b))
+        .expect("register_handlers on B");
+
+    let interval = Duration::from_millis(100);
+    let mut anchor = am_a.create_anchor_with_config::<u32>(AnchorConfig {
+        heartbeat_interval: Some(interval),
+        ..Default::default()
+    });
+    let sender = am_b
+        .attach_stream_anchor::<u32>(anchor.handle())
+        .await
+        .expect("remote attach");
+
+    tokio::time::sleep(interval * 10).await;
+    sender.send(7).await.expect("the stream is still open");
+    sender.finalize().expect("finalize");
+
+    let frames = tokio::time::timeout(Duration::from_secs(10), async {
+        let mut frames = Vec::new();
+        while let Some(frame) = anchor.next().await {
+            let done = matches!(frame, Ok(StreamFrame::Finalized) | Err(_));
+            frames.push(format!("{frame:?}"));
+            if done {
+                break;
+            }
+        }
+        frames
+    })
+    .await
+    .expect("bounded read");
+    assert_eq!(frames, vec!["Ok(Item(7))", "Ok(Finalized)"]);
+}

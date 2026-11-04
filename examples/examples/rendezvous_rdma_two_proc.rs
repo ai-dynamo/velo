@@ -277,7 +277,7 @@ async fn consumer(args: Args) -> Result<()> {
 /// messages; the RDMA path only needs UCX to be *registered* for the peer,
 /// which is what makes "control plane on TCP" a supported deployment rather
 /// than a compromise.
-async fn build() -> Result<(Arc<Velo>, Registry)> {
+async fn build() -> Result<(Velo, Registry)> {
     let registry = Registry::new();
     let metrics = Arc::new(VeloMetrics::register(&registry)?);
 

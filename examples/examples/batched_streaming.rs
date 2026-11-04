@@ -291,7 +291,7 @@ struct HostStats {
 /// engine that made them and attaches to the host that answered them — one
 /// shared registry would sum both away.
 struct Node {
-    velo: Arc<Velo>,
+    velo: Velo,
     registry: Registry,
 }
 

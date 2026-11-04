@@ -50,9 +50,9 @@ pub use velo_ext as ext;
 pub use crate::messenger::{
     Admitted, AmHandlerBuilder, AmSendBuilder, AmSyncBuilder, AsyncExecutor, Context, FireResult,
     Handler, HandlerExecutor, Messenger, MessengerBuilder, OrderedConfig, OrderingKey,
-    OverflowPolicy, PeerDiscovery, SyncExecutor, SyncResult, TypedContext, TypedUnaryBuilder,
-    TypedUnaryHandlerBuilder, TypedUnaryResult, UnaryBuilder, UnaryHandlerBuilder, UnaryResult,
-    UnifiedResponse,
+    OverflowPolicy, PeerDiscovery, RequestTimeout, SyncExecutor, SyncResult, TypedContext,
+    TypedUnaryBuilder, TypedUnaryHandlerBuilder, TypedUnaryResult, UnaryBuilder,
+    UnaryHandlerBuilder, UnaryResult, UnifiedResponse,
 };
 
 // Events
@@ -182,11 +182,58 @@ pub enum StreamConfig {
 /// Wraps a [`Messenger`], [`AnchorManager`], and [`RendezvousManager`]
 /// and provides the same public API with a simpler name.
 ///
+/// `Velo` is a handle: cloning it is one reference-count increment, and every
+/// clone is the same instance. Share it by cloning; do not wrap it in an
+/// [`Arc`].
+///
 /// Clones share ownership of streaming services. Final drop cancels them;
 /// a retained [`Arc<Messenger>`] keeps only active messaging available.
 /// Use [`Self::shutdown`] to drain work and join owned tasks before dropping.
 #[derive(Clone)]
 pub struct Velo {
+    inner: Arc<VeloInner>,
+}
+
+/// A reference to a [`Velo`] that does not keep it alive.
+///
+/// A handler lives in its own instance's registry. A handler that holds a
+/// `Velo` clone makes the instance hold itself, so its final drop never runs
+/// and streaming is never cancelled. Hold a `WeakVelo` there instead, and
+/// [`upgrade`](Self::upgrade) it on each call.
+#[derive(Clone)]
+pub struct WeakVelo {
+    inner: std::sync::Weak<VeloInner>,
+}
+
+impl WeakVelo {
+    /// The instance, if a [`Velo`] clone of it is still alive.
+    pub fn upgrade(&self) -> Option<Velo> {
+        self.inner.upgrade().map(|inner| Velo { inner })
+    }
+}
+
+/// Prints no state, as `std::sync::Weak` does: reading the instance would
+/// need an upgrade, and a `Debug` call must not extend its life.
+impl std::fmt::Debug for WeakVelo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("WeakVelo")
+    }
+}
+
+/// A handle that points at no instance; [`upgrade`](WeakVelo::upgrade)
+/// returns `None`, as it does for `std::sync::Weak::new()`.
+impl Default for WeakVelo {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Weak::new(),
+        }
+    }
+}
+
+/// The state every [`Velo`] clone shares. One `Arc` around it makes a clone a
+/// single increment and makes the final drop of the last clone the one place
+/// a drop cancels the streaming services.
+struct VeloInner {
     messenger: Arc<Messenger>,
     anchor_manager: Arc<crate::streaming::AnchorManager>,
     rendezvous_manager: Arc<crate::rendezvous::RendezvousManager>,
@@ -194,7 +241,7 @@ pub struct Velo {
     /// the configured per-stream transport. Used for peer registration and
     /// address publication. The mux adds no streaming listener or endpoint.
     stream_transport: Arc<dyn crate::streaming::FrameTransport>,
-    stream_owner: Arc<StreamOwner>,
+    stream_owner: StreamOwner,
     /// RDMA registration layer, present only when a UCX transport was added
     /// through [`VeloBuilder::add_ucx_transport`].
     #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -205,9 +252,9 @@ pub struct Velo {
     /// second caller finds the transport's join handle already taken, skips the
     /// join, and races ahead to declare registrations released — while the
     /// first caller is still inside that join and the progress thread is still
-    /// running. It would free arena pages the NIC may still have. Shared, so
-    /// every clone contends on the same lock.
-    shutdown: Arc<ShutdownOnce>,
+    /// running. It would free arena pages the NIC may still have. Every clone
+    /// reaches the same `VeloInner`, so every clone contends on the same lock.
+    shutdown: ShutdownOnce,
 }
 
 /// Makes [`Velo::graceful_shutdown`] run exactly once, and makes concurrent
@@ -242,7 +289,8 @@ impl OwnedStreamTransport {
     }
 }
 
-/// Shared by Velo clones, but not by Messenger or individual stream handles.
+/// Owned by [`VeloInner`], so shared by Velo clones, but not by Messenger or
+/// individual stream handles.
 ///
 /// Drop detaches streams before the Messenger can tear its transports down,
 /// because `AnchorManager` holds its Messenger strongly. A weak back-link
@@ -267,6 +315,7 @@ pub struct VeloBuilder {
     inner: MessengerBuilder,
     stream_config: Option<StreamConfig>,
     mux_config: Option<crate::streaming::MuxConfig>,
+    reservation_config: crate::streaming::ReservationConfig,
     mux_only: bool,
     metrics: Option<Arc<VeloMetrics>>,
     /// Whether the built-in `_rv_*` rendezvous handlers are registered.
@@ -285,12 +334,19 @@ pub struct VeloBuilder {
 }
 
 impl VeloBuilder {
+    /// Configure anchor waiting lifetimes.
+    pub fn reservation_config(mut self, config: crate::streaming::ReservationConfig) -> Self {
+        self.reservation_config = config;
+        self
+    }
+
     /// Create a new empty builder.
     pub fn new() -> Self {
         Self {
             inner: MessengerBuilder::new(),
             stream_config: None,
             mux_config: None,
+            reservation_config: Default::default(),
             mux_only: false,
             metrics: None,
             install_rendezvous_handlers: true,
@@ -456,11 +512,12 @@ impl VeloBuilder {
     /// Validates the streaming mode before starting transports. Default builds
     /// install the mux beside a per-stream TCP or gRPC listener. `mux_only`
     /// installs only the mux. Both modes retain the full rendezvous API.
-    pub async fn build(self) -> Result<Arc<Velo>> {
+    pub async fn build(self) -> Result<Velo> {
         anyhow::ensure!(
             !self.mux_only || self.stream_config.is_none(),
             "mux_only cannot be combined with stream_config or stream_bind_addr"
         );
+        self.reservation_config.validate()?;
         // Read the override once at build so this instance keeps the same
         // transport offers for every attach.
         let config = resolve_mux_config(
@@ -475,6 +532,7 @@ impl VeloBuilder {
                 Arc::clone(&messenger),
                 config,
                 self.metrics.clone(),
+                self.reservation_config.prebind_timeout,
             )?;
             Some(mux)
         } else {
@@ -536,6 +594,7 @@ impl VeloBuilder {
 
         let anchor_manager = Arc::new(
             crate::streaming::AnchorManagerBuilder::default()
+                .default_unattached_timeout(self.reservation_config.unattached_timeout)
                 .worker_id(worker_id)
                 .transport(Arc::clone(&stream_transport))
                 .transport_registry(Arc::new(registry))
@@ -544,6 +603,20 @@ impl VeloBuilder {
                 .build()
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
         );
+        // The per-stream transport of this crate reports a stream's
+        // retirement from its pump; the registry's public type cannot say so.
+        if let Some(owned) = &owned_stream_transport {
+            let retiring: Arc<dyn crate::streaming::transport::RetiringFrameTransport> = match owned
+            {
+                OwnedStreamTransport::Tcp(tcp) => Arc::clone(tcp) as _,
+                #[cfg(feature = "grpc")]
+                OwnedStreamTransport::Grpc(grpc) => Arc::clone(grpc) as _,
+            };
+            anchor_manager.install_retiring_transports(std::collections::HashMap::from([(
+                stream_transport.key().as_str().to_string(),
+                retiring,
+            )]));
+        }
 
         if let Some(mux) = mux {
             anchor_manager.install_mux(mux)?;
@@ -624,24 +697,27 @@ impl VeloBuilder {
         };
 
         // Assemble Velo
-        let velo = Arc::new(Velo {
-            messenger,
-            stream_owner: Arc::new(StreamOwner {
-                manager: Arc::clone(&anchor_manager),
-                transport: owned_stream_transport,
+        let velo = Velo {
+            inner: Arc::new(VeloInner {
+                messenger,
+                stream_owner: StreamOwner {
+                    manager: Arc::clone(&anchor_manager),
+                    transport: owned_stream_transport,
+                },
+                anchor_manager,
+                rendezvous_manager,
+                stream_transport,
+                #[cfg(all(target_os = "linux", feature = "ucx"))]
+                rdma,
+                shutdown: ShutdownOnce {
+                    lock: tokio::sync::Mutex::new(()),
+                    done: std::sync::atomic::AtomicBool::new(false),
+                },
             }),
-            anchor_manager,
-            rendezvous_manager,
-            stream_transport,
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
-            rdma,
-            shutdown: Arc::new(ShutdownOnce {
-                lock: tokio::sync::Mutex::new(()),
-                done: std::sync::atomic::AtomicBool::new(false),
-            }),
-        });
-        velo.messenger
-            .advertise_peer_info(velo.peer_info(), &velo.stream_transport);
+        };
+        velo.inner
+            .messenger
+            .advertise_peer_info(velo.peer_info(), &velo.inner.stream_transport);
         Ok(velo)
     }
 }
@@ -718,9 +794,17 @@ impl Velo {
         VeloBuilder::new()
     }
 
+    /// A [`WeakVelo`] for this instance. Use it where a strong clone would
+    /// make the instance keep itself alive, such as in its own handlers.
+    pub fn downgrade(&self) -> WeakVelo {
+        WeakVelo {
+            inner: Arc::downgrade(&self.inner),
+        }
+    }
+
     /// Get the underlying messenger.
     pub fn messenger(&self) -> &Arc<Messenger> {
-        &self.messenger
+        &self.inner.messenger
     }
 
     /// Begin Phase 1 (Gate) of graceful shutdown: reject new inbound requests
@@ -728,7 +812,7 @@ impl Velo {
     /// keep flowing. See
     /// [`Messenger::begin_drain`].
     pub fn begin_drain(&self) {
-        self.messenger.begin_drain();
+        self.inner.messenger.begin_drain();
     }
 
     /// Perform a graceful shutdown of the messenger transports: gate inbound
@@ -801,7 +885,8 @@ impl Velo {
     /// together, rather than giving each phase the full duration. Joining mux
     /// tasks comes after the drain and needs the owning runtime to make
     /// progress. The transports' close step also comes on top: it is bounded by each
-    /// transport's own [`Transport::closed`] (QUIC: 2.5 s), not by the policy,
+    /// transport's own [`Transport::closed`] (QUIC: 2.5 s; TCP and UDS: their
+    /// teardown grace, 1 s unless the builder set it, plus 1.5 s), not by the policy,
     /// because cutting it short would discard frames already written.
     /// Under [`ShutdownPolicy::WaitForever`] the sweep still takes
     /// [`RdmaConfig::shutdown_timeout`], because a peer that crashed
@@ -819,8 +904,9 @@ impl Velo {
         // then declares memory released on the strength of that join having
         // finished, which is only true for whoever took it. A second caller
         // waits here and returns as soon as the first is done.
-        let _running = self.shutdown.lock.lock().await;
+        let _running = self.inner.shutdown.lock.lock().await;
         if self
+            .inner
             .shutdown
             .done
             .load(std::sync::atomic::Ordering::Acquire)
@@ -830,7 +916,7 @@ impl Velo {
         // A failed teardown is final. Running the RDMA sweep again would spend
         // its budget against torn-down transports, then panic anyway. (The
         // backend refuses to drain again on its own.)
-        if let Some(error) = self.messenger.backend().teardown_failure() {
+        if let Some(error) = self.inner.messenger.backend().teardown_failure() {
             panic!("transport teardown failed: {error}");
         }
 
@@ -839,7 +925,7 @@ impl Velo {
         #[cfg(all(target_os = "linux", feature = "ucx"))]
         let policy = {
             let started = std::time::Instant::now();
-            if let Some(rdma) = &self.rdma {
+            if let Some(rdma) = &self.inner.rdma {
                 self.begin_drain();
                 // Before the sweep, and load-bearing for it. This stops the
                 // lease reaper — so it is not taking the same memory apart
@@ -860,7 +946,7 @@ impl Velo {
                 // may still complete. That overlap is benign — both paths end
                 // a lease through the same atomic store operations, and the
                 // sweep is trying to make slots disappear anyway.
-                self.rendezvous_manager.shutdown();
+                self.inner.rendezvous_manager.shutdown();
                 let budget = match &policy {
                     ShutdownPolicy::Timeout(deadline) => *deadline,
                     ShutdownPolicy::WaitForever => rdma.shutdown_timeout(),
@@ -875,22 +961,23 @@ impl Velo {
             }
         };
 
-        let backend = self.messenger.backend();
+        let backend = self.inner.messenger.backend();
         backend.drain(policy).await;
         // A cancelled task can still be in a poll that sends a batch. Join it
         // before transport teardown, but leave ingress for reader detachment.
-        self.anchor_manager.stop_mux_sending().await;
+        self.inner.anchor_manager.stop_mux_sending().await;
         backend.finish_shutdown().await;
 
         // Teardown has returned, so the progress thread has force-unmapped
         // everything it still held: nothing is pinned any more, and every latch
         // the sweep could not resolve honestly can be resolved now.
         #[cfg(all(target_os = "linux", feature = "ucx"))]
-        if let Some(rdma) = &self.rdma {
+        if let Some(rdma) = &self.inner.rdma {
             rdma.latch_all_deregistered();
         }
 
-        self.shutdown
+        self.inner
+            .shutdown
             .done
             .store(true, std::sync::atomic::Ordering::Release);
     }
@@ -915,16 +1002,16 @@ impl Velo {
     /// released. A later call panics at once, without draining again.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
         self.graceful_shutdown(policy).await;
-        self.anchor_manager.shutdown().await;
-        if let Some(transport) = &self.stream_owner.transport {
+        self.inner.anchor_manager.shutdown().await;
+        if let Some(transport) = &self.inner.stream_owner.transport {
             transport.shutdown().await;
         }
-        self.messenger.closed().await;
+        self.inner.messenger.closed().await;
     }
 
     /// Get the instance ID of this system.
     pub fn instance_id(&self) -> InstanceId {
-        self.messenger.instance_id()
+        self.inner.messenger.instance_id()
     }
 
     /// Write everything the messenger mux has staged, to every peer.
@@ -962,7 +1049,7 @@ impl Velo {
     /// batch in between, so a caller may not assume what it bracketed arrives as
     /// one `_stream_batch`. See `docs/src/concepts/batched-streaming.md` § "Flush policy".
     pub fn flush_batch(&self) {
-        self.anchor_manager.flush_mux_batches();
+        self.inner.anchor_manager.flush_mux_batches();
     }
 
     /// Get the peer information for this instance.
@@ -973,8 +1060,8 @@ impl Velo {
     /// In [`VeloBuilder::mux_only`] mode the primary stream transport is the
     /// mux, which uses the messenger endpoints and adds no streaming endpoint.
     pub fn peer_info(&self) -> PeerInfo {
-        let messenger_peer = self.messenger.transport_peer_info();
-        let stream_addr = self.stream_transport.address();
+        let messenger_peer = self.inner.messenger.transport_peer_info();
+        let stream_addr = self.inner.stream_transport.address();
         // Empty streaming address (a transport that opens no listener of its
         // own, e.g. the messenger mux) → no merge needed.
         if stream_addr.as_bytes().is_empty()
@@ -999,7 +1086,7 @@ impl Velo {
         if let Err(e) = builder.merge(&stream_addr) {
             tracing::warn!(
                 instance_id = %messenger_peer.instance_id(),
-                streaming_key = %self.stream_transport.key(),
+                streaming_key = %self.inner.stream_transport.key(),
                 error = %e,
                 "peer_info: failed to merge streaming WorkerAddress into builder; \
                  falling back to messenger-only PeerInfo (likely a key collision \
@@ -1024,28 +1111,28 @@ impl Velo {
     /// Get the distributed event system.
     #[cfg(feature = "services")]
     pub fn events(&self) -> &Arc<VeloEvents> {
-        self.messenger.events()
+        self.inner.messenger.events()
     }
 
     /// Create an EventManager wired with the distributed backend.
     #[cfg(feature = "services")]
     pub fn event_manager(&self) -> EventManager {
-        self.messenger.event_manager()
+        self.inner.messenger.event_manager()
     }
 
     /// Fire-and-forget builder (no response expected).
     pub fn am_send(&self, handler: &str) -> Result<AmSendBuilder> {
-        self.messenger.am_send(handler)
+        self.inner.messenger.am_send(handler)
     }
 
     /// Active-message synchronous completion (await handler finish).
     pub fn am_sync(&self, handler: &str) -> Result<AmSyncBuilder> {
-        self.messenger.am_sync(handler)
+        self.inner.messenger.am_sync(handler)
     }
 
     /// Unary builder returning raw bytes.
     pub fn unary(&self, handler: &str) -> Result<UnaryBuilder> {
-        self.messenger.unary(handler)
+        self.inner.messenger.unary(handler)
     }
 
     /// Typed unary builder returning deserialized response.
@@ -1053,12 +1140,12 @@ impl Velo {
         &self,
         handler: &str,
     ) -> Result<TypedUnaryBuilder<R>> {
-        self.messenger.typed_unary(handler)
+        self.inner.messenger.typed_unary(handler)
     }
 
     /// Register a handler on this instance.
     pub fn register_handler(&self, handler: Handler) -> Result<()> {
-        self.messenger.register_handler(handler)
+        self.inner.messenger.register_handler(handler)
     }
 
     /// Connect to a known endpoint without discovery or a pre-shared identity.
@@ -1067,7 +1154,7 @@ impl Velo {
     /// messaging and streaming. The identity is self-reported, not authenticated.
     /// Temporary routing state is removed on success, error, or cancellation.
     pub async fn connect(&self, endpoint: Endpoint) -> Result<PeerInfo> {
-        let peer = self.messenger.connect(endpoint.worker_address()?).await?;
+        let peer = self.inner.messenger.connect(endpoint.worker_address()?).await?;
         self.register_peer(peer.clone())?;
         Ok(peer)
     }
@@ -1083,10 +1170,10 @@ impl Velo {
         // streaming transport key). Any other failure -- WorkerAddress decode,
         // endpoint parse, NUMA mismatch -- is a real problem and must propagate
         // so it surfaces at register time, not at first attach.
-        let stream_key = self.stream_transport.key();
+        let stream_key = self.inner.stream_transport.key();
         match peer_info.worker_address().get_entry(stream_key.as_str()) {
             Ok(Some(_)) => {
-                self.stream_transport.register(&peer_info)?;
+                self.inner.stream_transport.register(&peer_info)?;
             }
             Ok(None) => {
                 tracing::debug!(
@@ -1102,7 +1189,7 @@ impl Velo {
                 ));
             }
         }
-        self.messenger.register_peer(peer_info)
+        self.inner.messenger.register_peer(peer_info)
     }
 
     /// Forget a peer that [`register_peer`](Self::register_peer) added.
@@ -1122,8 +1209,8 @@ impl Velo {
     /// from the peer registers it again too. The messenger mux keeps small
     /// per-peer receive tables that this does not drop.
     pub fn unregister_peer(&self, instance_id: InstanceId) {
-        self.stream_transport.unregister(instance_id);
-        self.messenger.unregister_peer(instance_id);
+        self.inner.stream_transport.unregister(instance_id);
+        self.inner.messenger.unregister_peer(instance_id);
     }
 
     /// Discover a peer by instance_id and register it for communication.
@@ -1135,7 +1222,7 @@ impl Velo {
     /// streaming-side `register()` and surface as "peer not registered" on
     /// the next [`Self::attach_anchor`].
     pub async fn discover_and_register_peer(&self, instance_id: InstanceId) -> Result<()> {
-        let discovery = self.messenger.discovery().ok_or_else(|| {
+        let discovery = self.inner.messenger.discovery().ok_or_else(|| {
             anyhow::anyhow!(
                 "No discovery backend configured. Cannot discover instance {}",
                 instance_id
@@ -1148,17 +1235,19 @@ impl Velo {
     /// Check whether a specific instance has subscribed to a locally-owned event.
     #[cfg(feature = "services")]
     pub fn has_event_subscriber(&self, handle: EventHandle, subscriber: InstanceId) -> bool {
-        self.messenger.has_event_subscriber(handle, subscriber)
+        self.inner
+            .messenger
+            .has_event_subscriber(handle, subscriber)
     }
 
     /// Get the list of handlers available on a remote instance.
     pub async fn available_handlers(&self, instance_id: InstanceId) -> Result<Vec<String>> {
-        self.messenger.available_handlers(instance_id).await
+        self.inner.messenger.available_handlers(instance_id).await
     }
 
     /// Refresh the handler list for a remote instance.
     pub async fn refresh_handlers(&self, instance_id: InstanceId) -> Result<()> {
-        self.messenger.refresh_handlers(instance_id).await
+        self.inner.messenger.refresh_handlers(instance_id).await
     }
 
     /// Wait for a specific handler to become available on a remote instance.
@@ -1176,24 +1265,25 @@ impl Velo {
         instance_id: InstanceId,
         handler_name: &str,
     ) -> Result<()> {
-        self.messenger
+        self.inner
+            .messenger
             .wait_for_handler(instance_id, handler_name)
             .await
     }
 
     /// Get the list of handlers registered on this local instance.
     pub fn list_local_handlers(&self) -> Vec<String> {
-        self.messenger.list_local_handlers()
+        self.inner.messenger.list_local_handlers()
     }
 
     /// Get the tokio runtime handle.
     pub fn runtime(&self) -> &tokio::runtime::Handle {
-        self.messenger.runtime()
+        self.inner.messenger.runtime()
     }
 
     /// Get the task tracker.
     pub fn tracker(&self) -> &tokio_util::task::TaskTracker {
-        self.messenger.tracker()
+        self.inner.messenger.tracker()
     }
 
     /// Create a new streaming anchor.
@@ -1202,7 +1292,7 @@ impl Velo {
     /// obtain it via [`.handle()`](StreamAnchor::handle) to pass to a sender
     /// (possibly on another worker) for attachment.
     pub fn create_anchor<T>(&self) -> StreamAnchor<T> {
-        self.anchor_manager.create_anchor::<T>()
+        self.inner.anchor_manager.create_anchor::<T>()
     }
 
     /// Attach a sender to an existing anchor (local or remote).
@@ -1213,7 +1303,10 @@ impl Velo {
         &self,
         handle: StreamAnchorHandle,
     ) -> Result<StreamSender<T>, AttachError> {
-        self.anchor_manager.attach_stream_anchor::<T>(handle).await
+        self.inner
+            .anchor_manager
+            .attach_stream_anchor::<T>(handle)
+            .await
     }
 
     /// Attach a sender to an anchor, placing the stream on the mux lane `key`
@@ -1229,7 +1322,8 @@ impl Velo {
         handle: StreamAnchorHandle,
         key: u64,
     ) -> Result<StreamSender<T>, AttachError> {
-        self.anchor_manager
+        self.inner
+            .anchor_manager
             .attach_stream_anchor_keyed::<T>(handle, key)
             .await
     }
@@ -1249,7 +1343,7 @@ impl Velo {
         &self,
         handle: StreamAnchorHandle,
     ) -> Option<streaming::control::StreamOpenTicket> {
-        self.anchor_manager.prebind_anchor(handle)
+        self.inner.anchor_manager.prebind_anchor(handle)
     }
 
     /// As [`prebind_anchor`](Velo::prebind_anchor), placing the stream on the
@@ -1261,7 +1355,7 @@ impl Velo {
         handle: StreamAnchorHandle,
         key: u64,
     ) -> Option<streaming::control::StreamOpenTicket> {
-        self.anchor_manager.prebind_anchor_keyed(handle, key)
+        self.inner.anchor_manager.prebind_anchor_keyed(handle, key)
     }
 
     /// Open a sender for an anchor whose slot the consumer already bound.
@@ -1278,14 +1372,15 @@ impl Velo {
         handle: StreamAnchorHandle,
         ticket: streaming::control::StreamOpenTicket,
     ) -> Result<StreamSender<T>, AttachError> {
-        self.anchor_manager
+        self.inner
+            .anchor_manager
             .open_anchor_stream::<T>(handle, ticket)
             .await
     }
 
     /// Get the underlying anchor manager for direct registry access.
     pub fn anchor_manager(&self) -> &crate::streaming::AnchorManager {
-        &self.anchor_manager
+        &self.inner.anchor_manager
     }
 
     // -----------------------------------------------------------------------
@@ -1300,7 +1395,7 @@ impl Velo {
     /// Sender lifecycle events (`Detached`, `Dropped`) are non-terminal — the
     /// stream only ends when the consumer cancels it or the anchor is dropped.
     pub fn create_mpsc_anchor<T>(&self) -> streaming::mpsc::MpscStreamAnchor<T> {
-        self.anchor_manager.create_mpsc_anchor::<T>()
+        self.inner.anchor_manager.create_mpsc_anchor::<T>()
     }
 
     /// Create a new MPSC streaming anchor with per-anchor config
@@ -1310,7 +1405,8 @@ impl Velo {
         &self,
         config: streaming::mpsc::MpscAnchorConfig,
     ) -> streaming::mpsc::MpscStreamAnchor<T> {
-        self.anchor_manager
+        self.inner
+            .anchor_manager
             .create_mpsc_anchor_with_config::<T>(config)
     }
 
@@ -1320,7 +1416,8 @@ impl Velo {
         &self,
         handle: StreamAnchorHandle,
     ) -> Result<streaming::mpsc::MpscStreamSender<T>, AttachError> {
-        self.anchor_manager
+        self.inner
+            .anchor_manager
             .attach_mpsc_stream_anchor::<T>(handle)
             .await
     }
@@ -1334,7 +1431,8 @@ impl Velo {
         handle: StreamAnchorHandle,
         key: u64,
     ) -> Result<streaming::mpsc::MpscStreamSender<T>, AttachError> {
-        self.anchor_manager
+        self.inner
+            .anchor_manager
             .attach_mpsc_stream_anchor_keyed::<T>(handle, key)
             .await
     }
@@ -1349,12 +1447,12 @@ impl Velo {
     /// consumers via any channel (AM, event, typed message field).
     /// Default refcount is 1.
     pub fn register_data(&self, data: bytes::Bytes) -> DataHandle {
-        self.rendezvous_manager.register_data(data)
+        self.inner.rendezvous_manager.register_data(data)
     }
 
     /// Stage data with options (TTL, etc.) and return a [`DataHandle`].
     pub fn register_data_with(&self, data: bytes::Bytes, opts: RegisterOptions) -> DataHandle {
-        self.rendezvous_manager.register_data_with(data, opts)
+        self.inner.rendezvous_manager.register_data_with(data, opts)
     }
 
     /// Stage data in RDMA-registered memory, so a capable consumer reads it
@@ -1365,7 +1463,10 @@ impl Velo {
     /// the data in plain memory instead. See
     /// [`RendezvousManager::register_data_pinned`] for the full contract.
     pub async fn register_data_pinned(&self, data: &[u8]) -> DataHandle {
-        self.rendezvous_manager.register_data_pinned(data).await
+        self.inner
+            .rendezvous_manager
+            .register_data_pinned(data)
+            .await
     }
 
     /// Stage a range of memory this instance already registered, zero-copy.
@@ -1379,13 +1480,14 @@ impl Velo {
         guard: &RegionGuard,
         range: std::ops::Range<u64>,
     ) -> Result<DataHandle, RdmaError> {
-        self.rendezvous_manager
+        self.inner
+            .rendezvous_manager
             .register_data_in_region(guard, range)
     }
 
     /// Query metadata about the data behind a handle (no lock acquired).
     pub async fn metadata(&self, handle: DataHandle) -> Result<DataMetadata> {
-        self.rendezvous_manager.metadata(handle).await
+        self.inner.rendezvous_manager.metadata(handle).await
     }
 
     /// Pull data from a handle. Acquires a read lock on the owner side.
@@ -1393,7 +1495,7 @@ impl Velo {
     /// Returns `(data, lease_id)`. The `lease_id` must be passed to
     /// [`detach()`](Self::detach) or [`release()`](Self::release) when done.
     pub async fn get(&self, handle: DataHandle) -> Result<(bytes::Bytes, u64)> {
-        self.rendezvous_manager.get(handle).await
+        self.inner.rendezvous_manager.get(handle).await
     }
 
     /// Pull data from a handle into registered memory, with no copy out.
@@ -1403,14 +1505,14 @@ impl Velo {
     /// and does not cover.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub async fn get_pinned(&self, handle: DataHandle) -> Result<(PinnedBuf, u64)> {
-        self.rendezvous_manager.get_pinned(handle).await
+        self.inner.rendezvous_manager.get_pinned(handle).await
     }
 
     /// Allocate a registered [`get_into`](Self::get_into) destination, so an
     /// RDMA transfer into it costs no copy at all.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub async fn alloc_pinned_writer(&self, len: usize) -> Result<PinnedWriter, RdmaError> {
-        self.rendezvous_manager.alloc_pinned_writer(len).await
+        self.inner.rendezvous_manager.alloc_pinned_writer(len).await
     }
 
     /// Pull data from a handle into an explicit destination buffer.
@@ -1421,24 +1523,27 @@ impl Velo {
         handle: DataHandle,
         dest: &mut impl RendezvousWrite,
     ) -> Result<u64> {
-        self.rendezvous_manager.get_into(handle, dest).await
+        self.inner.rendezvous_manager.get_into(handle, dest).await
     }
 
     /// Increment the refcount on a handle (for additional consumers).
     pub async fn ref_handle(&self, handle: DataHandle) -> Result<()> {
-        self.rendezvous_manager.ref_handle(handle).await
+        self.inner.rendezvous_manager.ref_handle(handle).await
     }
 
     /// Release the read lock WITHOUT decrementing refcount.
     /// The handle remains alive and can be `get()`-ed again.
     pub async fn detach(&self, handle: DataHandle, lease_id: u64) -> Result<()> {
-        self.rendezvous_manager.detach(handle, lease_id).await
+        self.inner.rendezvous_manager.detach(handle, lease_id).await
     }
 
     /// Release the read lock AND decrement refcount.
     /// Data is freed when both refcount and read_lock_count reach zero.
     pub async fn release(&self, handle: DataHandle, lease_id: u64) -> Result<()> {
-        self.rendezvous_manager.release(handle, lease_id).await
+        self.inner
+            .rendezvous_manager
+            .release(handle, lease_id)
+            .await
     }
 
     /// Which transport this instance chose as `instance`'s primary, if it is
@@ -1452,15 +1557,31 @@ impl Velo {
     /// the coverage back onto the primary path with nothing failing.
     #[cfg(feature = "test-helpers")]
     pub fn primary_transport_key(&self, instance: InstanceId) -> Option<String> {
-        self.messenger
+        self.inner
+            .messenger
             .backend()
             .primary_transport_key(instance)
             .map(|key| key.as_str().to_string())
     }
 
+    /// How many response slots this instance holds right now: one for each
+    /// request that is still waiting for its answer.
+    ///
+    /// Exposed for tests only. A request that gives up (`.timeout` runs out, or
+    /// its result is dropped) must give its slot back, and the arena is fixed
+    /// size, so a leak shows up here long before it exhausts the arena.
+    #[cfg(feature = "test-helpers")]
+    pub fn response_slots_in_use(&self) -> usize {
+        self.inner
+            .messenger
+            .client()
+            .response_manager
+            .pending_outcome_count()
+    }
+
     /// Get the underlying rendezvous manager for direct access.
     pub fn rendezvous_manager(&self) -> &crate::rendezvous::RendezvousManager {
-        &self.rendezvous_manager
+        &self.inner.rendezvous_manager
     }
 
     // -----------------------------------------------------------------------
@@ -1543,7 +1664,7 @@ impl Velo {
         &self,
         buf: Box<[u8]>,
     ) -> Result<RegionGuard, crate::rendezvous::rdma::RegisterOwnedError> {
-        let Some(rdma) = self.rdma.as_ref() else {
+        let Some(rdma) = self.inner.rdma.as_ref() else {
             return Err(crate::rendezvous::rdma::RegisterOwnedError {
                 buffer: Some(buf),
                 cause: RdmaError::NotConfigured,
@@ -1555,7 +1676,8 @@ impl Velo {
     /// Bytes currently registered for RDMA, pool and external together.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub fn rdma_registered_bytes(&self) -> u64 {
-        self.rdma
+        self.inner
+            .rdma
             .as_ref()
             .map(|r| r.registered_bytes())
             .unwrap_or(0)
@@ -1569,7 +1691,8 @@ impl Velo {
     /// looks identical whether the transfer began or never did.
     #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
     pub fn rdma_in_flight_transfers(&self) -> usize {
-        self.rdma
+        self.inner
+            .rdma
             .as_ref()
             .map(|r| r.in_flight_transfers())
             .unwrap_or(0)
@@ -1578,7 +1701,7 @@ impl Velo {
     /// The registration layer, for tests that need to observe it directly.
     #[cfg(all(target_os = "linux", feature = "ucx", test))]
     pub(crate) fn rdma(&self) -> Option<&Arc<crate::rendezvous::rdma::RdmaRegistry>> {
-        self.rdma.as_ref()
+        self.inner.rdma.as_ref()
     }
 
     /// The registration layer, for staging and transfers.
@@ -1586,7 +1709,7 @@ impl Velo {
     pub(crate) fn rdma_registry(
         &self,
     ) -> Result<&Arc<crate::rendezvous::rdma::RdmaRegistry>, RdmaError> {
-        self.rdma.as_ref().ok_or(RdmaError::NotConfigured)
+        self.inner.rdma.as_ref().ok_or(RdmaError::NotConfigured)
     }
 }
 
@@ -1744,6 +1867,154 @@ mod tests {
         stream.shutdown().await;
     }
 
+    /// A `Velo` is one pointer, so a clone is one reference-count increment
+    /// and carries no state of its own. Per-clone state added beside `inner`
+    /// would make clones diverge and the clone cost grow; this size check is
+    /// what fails when that happens.
+    ///
+    /// Dropping a clone while another lives must not cancel streaming; that
+    /// is covered by `final_velo_drop_stops_streaming_but_keeps_a_retained_messenger`,
+    /// which drops one owner, drives a stream through the other, and only then
+    /// drops the last.
+    #[test]
+    fn velo_is_one_pointer() {
+        assert_eq!(std::mem::size_of::<Velo>(), std::mem::size_of::<usize>());
+        assert_eq!(
+            std::mem::size_of::<WeakVelo>(),
+            std::mem::size_of::<usize>()
+        );
+    }
+
+    /// `WeakVelo` replaces `std::sync::Weak<Velo>`, which is `Debug` and
+    /// `Default` for every target. A type that holds a weak handle and derives
+    /// either trait compiled against `Weak<Velo>`; it must keep compiling. The
+    /// default handle points at nothing, as `Weak::new()` does.
+    #[test]
+    fn weak_velo_keeps_the_debug_and_default_of_weak() {
+        #[derive(Debug, Default)]
+        struct Holder {
+            velo: WeakVelo,
+        }
+        let holder = Holder::default();
+        assert!(holder.velo.upgrade().is_none());
+        assert!(format!("{holder:?}").contains("WeakVelo"));
+    }
+
+    /// A handler lives in its own instance's registry. If it held a `Velo`
+    /// clone, the instance would hold itself, its final drop would never run,
+    /// and streaming would never be cancelled. A `WeakVelo` is how a handler
+    /// reaches its own instance without that cycle: it upgrades while a clone
+    /// is alive, and stops upgrading once the last clone drops. The request
+    /// is sent from a peer so the upgrade runs inside real dispatch.
+    #[tokio::test]
+    async fn weak_velo_in_a_handler_does_not_keep_the_instance_alive() {
+        let velo = tcp_stream_node(None).await;
+        let client = tcp_stream_node(None).await;
+        velo.register_peer(client.peer_info()).unwrap();
+        client.register_peer(velo.peer_info()).unwrap();
+
+        let weak = velo.downgrade();
+        let captured = weak.clone();
+        velo.register_handler(
+            Handler::unary_handler("self_ref", move |_ctx| {
+                let own = captured
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("instance is gone"))?;
+                Ok(Some(bytes::Bytes::from(own.instance_id().to_string())))
+            })
+            .build(),
+        )
+        .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.wait_for_handler(velo.instance_id(), "self_ref"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client
+                .unary("self_ref")
+                .unwrap()
+                .raw_payload(bytes::Bytes::new())
+                .instance(velo.instance_id())
+                .send(),
+        )
+        .await
+        .unwrap()
+        .expect("the handler must reach its own instance through the WeakVelo");
+        assert_eq!(reply, velo.instance_id().to_string().as_bytes());
+
+        velo.shutdown(ShutdownPolicy::WaitForever).await;
+        client.shutdown(ShutdownPolicy::WaitForever).await;
+        drop(velo);
+        assert!(
+            weak.upgrade().is_none(),
+            "a handler holding a WeakVelo kept the instance alive"
+        );
+    }
+
+    /// Shutdown through one clone is shutdown of the instance: the other clone
+    /// sees it as done, and a repeat call through the other clone returns.
+    ///
+    /// This test cannot tell one teardown from two, because a second pass over
+    /// a TCP-only node is idempotent. The once-only guarantee is proven by
+    /// `rendezvous::rdma::tests::concurrent_graceful_shutdowns_are_serialised`,
+    /// which counts one RDMA sweep across eight clones.
+    #[tokio::test]
+    async fn shutdown_through_one_clone_is_seen_by_the_other() {
+        let velo = tcp_stream_node(None).await;
+        let clone = velo.clone();
+        let ran = |velo: &Velo| {
+            velo.inner
+                .shutdown
+                .done
+                .load(std::sync::atomic::Ordering::Acquire)
+        };
+        assert!(!ran(&clone));
+
+        velo.shutdown(ShutdownPolicy::WaitForever).await;
+        assert!(ran(&clone), "the other clone did not see the shutdown");
+        assert!(clone.messenger().backend().teardown_requested());
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            clone.shutdown(ShutdownPolicy::WaitForever),
+        )
+        .await
+        .expect("a second shutdown through another clone did not return");
+    }
+
+    /// Every clone contends on one shutdown lock, so a second caller waits for
+    /// the first rather than starting a teardown of its own. Holding the lock
+    /// stands in for a first caller that is mid-sequence.
+    #[tokio::test]
+    async fn clones_serialise_graceful_shutdown_on_one_lock() {
+        let velo = tcp_stream_node(None).await;
+        let clone = velo.clone();
+
+        let guard = velo.inner.shutdown.lock.lock().await;
+        let blocked = clone.graceful_shutdown(ShutdownPolicy::WaitForever);
+        futures::pin_mut!(blocked);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), blocked.as_mut())
+                .await
+                .is_err(),
+            "a clone ran shutdown while another held the lock"
+        );
+        assert!(!velo.messenger().backend().teardown_requested());
+        drop(guard);
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), blocked)
+            .await
+            .expect("shutdown stayed blocked after the lock was released");
+        assert!(velo.messenger().backend().teardown_requested());
+
+        velo.shutdown(ShutdownPolicy::WaitForever).await;
+    }
+
     /// Shutdown must close resources while Tokio remains alive.
     #[tokio::test]
     async fn shutdown_joins_owned_tasks_and_closes_listener() {
@@ -1764,17 +2035,17 @@ mod tests {
             .await
             .unwrap();
 
-        let stream_addr = match velo.stream_owner.transport.as_ref().unwrap() {
+        let stream_addr = match velo.inner.stream_owner.transport.as_ref().unwrap() {
             OwnedStreamTransport::Tcp(transport) => transport.bound_addr(),
             #[cfg(feature = "grpc")]
             OwnedStreamTransport::Grpc(_) => unreachable!(),
         };
 
-        let messenger = Arc::downgrade(&velo.messenger);
-        let manager = Arc::downgrade(&velo.anchor_manager);
-        let rendezvous = Arc::downgrade(&velo.rendezvous_manager);
+        let messenger = Arc::downgrade(&velo.inner.messenger);
+        let manager = Arc::downgrade(&velo.inner.anchor_manager);
+        let rendezvous = Arc::downgrade(&velo.inner.rendezvous_manager);
         #[cfg(feature = "services")]
-        let events = Arc::downgrade(velo.messenger.events());
+        let events = Arc::downgrade(velo.inner.messenger.events());
         let events_alive = || {
             #[cfg(feature = "services")]
             {
@@ -1787,7 +2058,13 @@ mod tests {
         };
         #[cfg(feature = "services")]
         {
-            let pending_event = velo.messenger.events().new_event().unwrap().into_handle();
+            let pending_event = velo
+                .inner
+                .messenger
+                .events()
+                .new_event()
+                .unwrap()
+                .into_handle();
             #[derive(serde::Serialize)]
             struct Subscription {
                 handle: u128,
@@ -1799,7 +2076,8 @@ mod tests {
                 subscriber_worker: velo.instance_id().worker_id().as_u64(),
                 subscriber_instance: velo.instance_id(),
             };
-            velo.messenger
+            velo.inner
+                .messenger
                 .events()
                 .handle_subscribe(bytes::Bytes::from(serde_json::to_vec(&subscribe).unwrap()))
                 .await
@@ -1817,7 +2095,7 @@ mod tests {
         drop(anchor);
         velo.shutdown(ShutdownPolicy::Timeout(std::time::Duration::from_secs(1)))
             .await;
-        assert!(velo.anchor_manager.registry.is_empty());
+        assert!(velo.inner.anchor_manager.registry.is_empty());
         velo.tracker().close();
         tokio::time::timeout(std::time::Duration::from_secs(2), velo.tracker().wait())
             .await
@@ -1843,7 +2121,7 @@ mod tests {
     async fn final_velo_drop_stops_streaming_but_keeps_a_retained_messenger() {
         use futures::StreamExt;
 
-        async fn node(mux_only: bool) -> (Arc<Velo>, std::net::SocketAddr) {
+        async fn node(mux_only: bool) -> (Velo, std::net::SocketAddr) {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = listener.local_addr().unwrap();
             let builder = Velo::builder().add_transport(Arc::new(
@@ -1886,12 +2164,12 @@ mod tests {
                 )
                 .unwrap();
             let mut anchor = server.create_anchor::<u32>();
-            let manager = Arc::downgrade(&server.anchor_manager);
+            let manager = Arc::downgrade(&server.inner.anchor_manager);
             let retained = Arc::clone(server.messenger());
             let messenger = Arc::downgrade(&retained);
             let backend = Arc::clone(retained.backend());
             let tracker = retained.tracker().clone();
-            let frame_transport = match &server.stream_owner.transport {
+            let frame_transport = match &server.inner.stream_owner.transport {
                 Some(OwnedStreamTransport::Tcp(transport)) => Some(Arc::clone(transport)),
                 #[cfg(feature = "grpc")]
                 Some(OwnedStreamTransport::Grpc(_)) => unreachable!(),
@@ -1900,7 +2178,7 @@ mod tests {
             let stream_addr = frame_transport
                 .as_ref()
                 .map(|transport| transport.bound_addr());
-            let last_owner = server.as_ref().clone();
+            let last_owner = server.clone();
             drop(server);
 
             let sender = tokio::time::timeout(
@@ -2020,7 +2298,7 @@ mod tests {
     async fn unregister_peer_forgets_the_peer_and_leaves_others_alone() {
         use crate::transports::tcp::{TcpTransport, TcpTransportBuilder};
 
-        async fn node(mux_only: bool) -> (Arc<Velo>, Arc<TcpTransport>) {
+        async fn node(mux_only: bool) -> (Velo, Arc<TcpTransport>) {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let tcp = Arc::new(
                 TcpTransportBuilder::new()
@@ -2056,7 +2334,7 @@ mod tests {
 
         /// The stream transport's address cache, or `None` in mux-only mode.
         fn stream_knows(node: &Velo, peer: InstanceId) -> Option<bool> {
-            match &node.stream_owner.transport {
+            match &node.inner.stream_owner.transport {
                 Some(OwnedStreamTransport::Tcp(transport)) => {
                     Some(transport.knows_peer(peer.worker_id()))
                 }
@@ -2113,7 +2391,7 @@ mod tests {
     }
 
     /// A node with one TCP transport on a loopback port and a loopback stream listener.
-    async fn tcp_stream_node(metrics: Option<Arc<VeloMetrics>>) -> Arc<Velo> {
+    async fn tcp_stream_node(metrics: Option<Arc<VeloMetrics>>) -> Velo {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let mut builder = Velo::builder()
             .add_transport(Arc::new(
@@ -2134,7 +2412,7 @@ mod tests {
     async fn connected_pair(
         consumer_metrics: Option<Arc<VeloMetrics>>,
         attach_handler: &str,
-    ) -> (Arc<Velo>, Arc<Velo>) {
+    ) -> (Velo, Velo) {
         let consumer = tcp_stream_node(consumer_metrics).await;
         let producer = tcp_stream_node(None).await;
         consumer.register_peer(producer.peer_info()).unwrap();
@@ -2557,15 +2835,15 @@ mod tests {
         let _anchor = velo.create_anchor::<u32>();
         let _mpsc_anchor = velo.create_mpsc_anchor::<u32>();
         {
-            let shutdown = velo.anchor_manager.shutdown();
+            let shutdown = velo.inner.anchor_manager.shutdown();
             futures::pin_mut!(shutdown);
             assert!(
                 futures::poll!(shutdown.as_mut()).is_pending(),
                 "the test needs shutdown to wait at its first poll"
             );
         }
-        assert!(velo.anchor_manager.registry.is_empty());
-        assert!(velo.anchor_manager.mpsc_registry.is_empty());
+        assert!(velo.inner.anchor_manager.registry.is_empty());
+        assert!(velo.inner.anchor_manager.mpsc_registry.is_empty());
     }
 
     /// Final Velo drop can run on a thread with no Tokio context, and after
@@ -3164,5 +3442,80 @@ mod tests {
             gone.is_ok() && !still_alive,
             "a notice parked in admission to a stalled peer kept the Messenger alive after its final drop"
         );
+    }
+
+    /// The per-stream transports of this crate report a stream's retirement
+    /// from their pump, but only because the builder names them to the anchor
+    /// manager. A sender over either of them retires on its transport; a
+    /// builder that forgot to install them would silently fall back to
+    /// reporting as the terminal enters the channel.
+    async fn per_stream_node(config: StreamConfig) -> Velo {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        Velo::builder()
+            .add_transport(Arc::new(
+                crate::transports::tcp::TcpTransportBuilder::new()
+                    .from_listener(listener)
+                    .unwrap()
+                    .build()
+                    .unwrap(),
+            ))
+            .stream_config(config)
+            .unwrap()
+            .messenger_mux(crate::streaming::MuxConfig {
+                enabled: false,
+                ..crate::streaming::MuxConfig::default()
+            })
+            .unwrap()
+            .build()
+            .await
+            .unwrap()
+    }
+
+    async fn per_stream_sender_retires_on_its_transport(
+        config: impl Fn() -> StreamConfig,
+        key: &str,
+    ) {
+        let consumer = per_stream_node(config()).await;
+        let producer = per_stream_node(config()).await;
+        consumer.register_peer(producer.peer_info()).unwrap();
+        producer.register_peer(consumer.peer_info()).unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            producer.wait_for_handler(consumer.instance_id(), "_anchor_attach"),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let anchor = consumer.create_anchor::<u32>();
+        let sender = producer
+            .attach_anchor::<u32>(anchor.handle())
+            .await
+            .unwrap();
+        assert_eq!(sender.negotiated_transport().map(|k| k.as_str()), Some(key));
+        assert_eq!(
+            sender.retires_on(),
+            crate::streaming::sender::RetiresOn::Transport,
+            "the builder must name its per-stream transport to the anchor manager"
+        );
+        drop(anchor);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_tcp_per_stream_sender_retires_on_its_transport() {
+        per_stream_sender_retires_on_its_transport(|| StreamConfig::Tcp(None), "tcp-stream").await;
+    }
+
+    #[cfg(feature = "grpc")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_grpc_per_stream_sender_retires_on_its_transport() {
+        per_stream_sender_retires_on_its_transport(
+            || {
+                StreamConfig::Grpc(Some(GrpcConfig {
+                    bind_addr: "127.0.0.1:0".parse().unwrap(),
+                }))
+            },
+            "grpc-stream",
+        )
+        .await;
     }
 }

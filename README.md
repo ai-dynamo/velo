@@ -13,9 +13,13 @@ NOTE: Velo is experimental. Its design, development, and tests are still in prog
 
 Typed streams support graceful stop, cancellation, and ordered finalization, including prebound tickets. See [Stream lifecycle](docs/src/concepts/streaming.md).
 
+A producer can wait until velo has handed a stream's output on: `StreamSender::retired()` resolves to `Sent` or `Discarded`. TCP and UDS write the frames that they admitted before they close at graceful shutdown. See [Know when the output has left](docs/src/concepts/streaming.md#know-when-the-output-has-left), and [Known limitations](docs/src/appendix/limitations.md) for what `Sent` does not cover yet.
+
 Streams of bytes that the application already serialized can skip msgpack on both ends. `StreamSender<Bytes>::send_bytes` and `StreamAnchor<Bytes>::next_bytes` use the same frames as `send` and `next`, and the consumer gets each item as a slice of the received buffer, not a copy. See [Byte items](docs/src/concepts/streaming.md#byte-items).
 
 Velo 0.19 gives Velo and Messenger explicit drop lifetimes, removes value-level Messenger cloning, and removes duplicate dispatch and cancellation APIs. See [Migrate ownership, dispatch, and cancellation](docs/src/guides/migrate-dispatch-and-cancellation.md).
+
+Velo 0.21 makes `Velo` a handle. `VeloBuilder::build()` returns `Velo`, not `Arc<Velo>`. To share it, clone it. See [Migrate to the Velo handle](docs/src/guides/migrate-velo-handle.md).
 
 Use `Velo::shutdown(policy)` to close resources and join owned tasks while Tokio keeps running. The instance and its handles stay valid after shutdown, and shutdown does not release them from memory. Accepted requests remain counted until their replies are submitted, including error replies. See [Shutdown and drain](docs/src/concepts/shutdown.md).
 
@@ -31,14 +35,18 @@ Batched streams give each stream a window of 32 records in flight by default. A 
 |---|---|---|
 | `velo` | Application authors | The runtime: messaging, streaming, rendezvous, events, queues, discovery, all in-tree transports (TCP, UDS, NATS, gRPC, ZMQ, UCX, QUIC), metrics |
 | `velo-ext` | Authors of out-of-tree plugins | The stable trait surface: `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`, and the types they use |
+| `velo-hub-ext` | Programs that speak the hub's wire protocol without the velo runtime | The hub's wire protocol on `velo-ext` alone: paths, request and response bodies, errors, and ids. `velo-hub` re-exports it as `velo_hub::protocol`. Not published yet. |
+| `velo-hub` | Authors of a hub service, and programs that use a hub | A hub (`server`): peer and service discovery, registration, and liveness for a velo application, plus hosted extensions. Its etcd store (`etcd`): registrations that survive a hub restart. Its client (`client`): registration, peer and service discovery through the hub, and calls to extensions. Not published yet. |
 
-Application authors depend on `velo` only. See [Workspace crates](docs/src/development/architecture.md) and [Versioning](docs/src/development/versioning.md).
+Application authors depend on `velo` only. `velo-hub` builds one service that is the peer discovery for an application and hosts extensions. It takes the workspace version and requires `velo` and `velo-hub-ext` with a caret on it. See [The hub](docs/src/concepts/hub.md), [Workspace crates](docs/src/development/architecture.md), and [Versioning](docs/src/development/versioning.md).
 
 Streams to one peer can share its connection through the messenger mux. What the mux costs a serving frontend, and how that was measured, is in [Response-plane performance](docs/src/operations/response-plane-performance.md).
 
 QUIC and TCP can keep several lanes, each its own connection, to one peer. See [TCP lanes](docs/src/concepts/transports.md#tcp-lanes) and [QUIC lanes](docs/src/operations/quic-performance.md#lanes).
 
 Streams through the mux spread over those lanes, and each stream stays on one lane. If the caller gives a key (`attach_anchor_keyed`, `prebind_anchor_keyed`), the receiver places the stream by that key, so streams with one key to one receiver share a lane. The key is a placement hint: the mux never orders records across streams. Without a key, the receiver uses the lane with the least load. See [Lanes](docs/src/concepts/batched-streaming.md#lanes).
+
+The local ID in an anchor handle is random. The handle is all that a peer needs to attach to an anchor or open its mux slot, and velo does not authenticate peers, so a host that can reach a node cannot guess the handle of another request's stream. See [Streaming](docs/src/concepts/streaming.md).
 
 Build with `default-features = false` to omit distributed events, work queues, and built-in discovery services. The default `services` feature keeps those APIs available. Use `.mux_only()` to avoid an extra stream listener when all peers support the messenger mux. See [Services and mux-only mode](docs/src/guides/migrate-services.md).
 
@@ -95,6 +103,8 @@ async fn main() -> anyhow::Result<()> {
 
 See [Getting started](docs/src/guides/getting-started.md) for the feature flags.
 
+Stream reservations default to 120 seconds before ordinary attachment and 180 seconds for a messenger-mux bind to receive its first batch. `VeloBuilder::reservation_config` configures these lifetimes. Applications can batch held reservations through `AnchorManager::renew_reservations`; see [reservation renewal](docs/src/concepts/streaming.md#reservation-renewal).
+
 ## Build and test
 
 ```bash
@@ -108,6 +118,10 @@ bash scripts/build-book.sh                # needs mdbook, mdbook-mermaid, mdbook
 ```
 
 The `zmq` feature needs `cmake`. The `ucx` feature needs the `libibverbs-dev` and `librdmacm-dev` headers. See [Testing](docs/src/development/testing.md).
+
+A change on a hot path also needs a test that counts its cost. See [Review for performance](docs/src/development/performance-review.md).
+
+On macOS the whole workspace builds with `--all-features`, but the `ucx` transport is Linux only. See [Platforms](docs/src/guides/getting-started.md#platforms).
 
 ## Contributing
 

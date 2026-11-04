@@ -34,8 +34,8 @@ fn new_tcp_transport() -> Arc<velo::transports::tcp::TcpTransport> {
 }
 
 struct VeloPair {
-    owner: Arc<Velo>,
-    consumer: Arc<Velo>,
+    owner: Velo,
+    consumer: Velo,
 }
 
 impl VeloPair {

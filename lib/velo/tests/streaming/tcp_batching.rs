@@ -43,7 +43,7 @@ use velo::{StreamConfig, TcpConfig, Velo};
 /// Build a `Velo` node on TCP loopback with a TCP streaming data plane and its
 /// own Prometheus registry. The mux is off: these tests measure the per-stream
 /// path, and with the mux on (the default) the streams would ride it instead.
-async fn make_node() -> (Arc<Velo>, Registry) {
+async fn make_node() -> (Velo, Registry) {
     let registry = Registry::new();
     let metrics = Arc::new(VeloMetrics::register(&registry).expect("metrics"));
 
@@ -78,7 +78,7 @@ async fn make_node() -> (Arc<Velo>, Registry) {
 /// Two nodes registered with each other. Returns `(consumer, producer,
 /// producer_registry)` — the producer's registry is where the egress-side
 /// batching counters land.
-async fn make_pair() -> (Arc<Velo>, Arc<Velo>, Registry) {
+async fn make_pair() -> (Velo, Velo, Registry) {
     let (consumer, _consumer_registry) = make_node().await;
     let (producer, producer_registry) = make_node().await;
 

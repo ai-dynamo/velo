@@ -1,0 +1,11 @@
+{
+  "server": {
+    "bind_addr": "127.0.0.1",
+    "public_port": 1337,
+    "control_port": 8337
+  },
+  "bundles": {
+    "counter": { "start": 10 },
+    "greeter": { "greeting": "hello" }
+  }
+}

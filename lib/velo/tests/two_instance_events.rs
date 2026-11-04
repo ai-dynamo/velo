@@ -36,7 +36,7 @@ fn new_transport() -> Arc<velo::transports::tcp::TcpTransport> {
     )
 }
 
-async fn make_pair() -> (Arc<Velo>, Arc<Velo>, tempfile::TempDir) {
+async fn make_pair() -> (Velo, Velo, tempfile::TempDir) {
     let tmp = tempfile::tempdir().unwrap();
     let discovery_file = tmp.path().join("peers.json");
     let discovery = Arc::new(FilesystemPeerDiscovery::new(&discovery_file).unwrap());

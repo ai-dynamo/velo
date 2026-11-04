@@ -285,6 +285,19 @@ pub(super) struct EgressSlot {
     starved: bool,
 }
 
+/// A slot that dies still holding its producer's lifecycle never wrote the
+/// stream's terminal: the terminal path takes the lifecycle out first. So the
+/// stream retires as discarded here, on every way a slot ends (`close`,
+/// `close_all`, a table dropped with its task), with nothing to remember at
+/// each call site.
+impl Drop for EgressSlot {
+    fn drop(&mut self) {
+        if let Some(entry) = &self.lifecycle {
+            entry.closed.retire(crate::streaming::Retirement::Discarded);
+        }
+    }
+}
+
 impl EgressSlot {
     /// Whether an outstanding singleton (rendezvous, or an `OpenSlot` under
     /// `MuxConfig::async_open_ack`) fences this slot.

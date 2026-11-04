@@ -26,10 +26,12 @@
 
 pub mod anchor;
 pub mod control;
+pub(crate) mod deadline;
 pub mod frame;
 #[cfg(feature = "grpc")]
 pub mod grpc_transport;
 pub mod handle;
+pub(crate) mod heartbeat;
 /// Batched, multiplexed streaming over the Messenger (`messenger-mux-v2`).
 ///
 /// The transport itself is internal — it is on by default and selected when a
@@ -42,14 +44,16 @@ pub(crate) mod messenger_mux;
 pub mod mpsc;
 pub(crate) mod negotiation;
 pub mod sender;
+pub(crate) mod sweep;
 mod tasks;
 pub mod tcp_transport;
 pub mod transport;
 
 pub use anchor::{
-    AnchorConfig, AnchorManager, AnchorManagerBuilder, AttachError, StreamAnchor, StreamController,
+    AnchorConfig, AnchorManager, AnchorManagerBuilder, AnchorReservation, AttachError,
+    ReservationConfig, StreamAnchor, StreamController,
 };
-pub use frame::{SendError, StreamError, StreamFrame};
+pub use frame::{ByteItemBuilder, ByteItemFrame, SendError, StreamError, StreamFrame};
 #[cfg(feature = "grpc")]
 pub use grpc_transport::GrpcFrameTransport;
 pub use handle::{AnchorKind, StreamAnchorHandle};
@@ -57,6 +61,6 @@ pub use messenger_mux::{AutoFlush, FlushPolicy, MESSENGER_MUX_KEY, MuxConfig};
 pub use mpsc::{
     MpscAnchorConfig, MpscFrame, MpscStreamAnchor, MpscStreamController, MpscStreamSender, SenderId,
 };
-pub use sender::StreamSender;
+pub use sender::{Retired, Retirement, StreamSender};
 pub use tcp_transport::TcpFrameTransport;
-pub use transport::FrameTransport;
+pub use transport::{FrameTransport, MAX_ITEM_BYTES};

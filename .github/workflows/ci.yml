@@ -36,7 +36,7 @@ jobs:
   pr-metadata:
     name: Read copied PR metadata
     if: startsWith(github.ref, 'refs/heads/pull-request/')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       pull-requests: read
@@ -201,6 +201,25 @@ jobs:
         for backend in services etcd nats-discovery nats-queue queue-messenger; do
           cargo check --locked -p velo --lib --no-default-features --features "$backend"
         done
+    - name: Check velo-hub feature sets
+      if: matrix.features == 'test-helpers'
+      run: |
+        # The protocol is its own crate; the client builds without the server.
+        for features in "" client server "client,server" etcd "client,etcd"; do
+          cargo check --locked -p velo-hub --lib --no-default-features --features "$features"
+        done
+    - name: Check velo-hub-ext has no velo runtime
+      if: matrix.features == 'test-helpers'
+      run: |
+        # velo-hub-ext is for programs that speak the hub protocol without the
+        # velo runtime. It may depend on velo-ext, never on velo or prometheus.
+        cargo check --locked -p velo-hub-ext --lib
+        tree=$(cargo tree --locked -p velo-hub-ext -e normal --prefix none)
+        if offending=$(printf '%s\n' "$tree" | grep -E '^(velo v|prometheus)'); then
+          echo "::error::velo-hub-ext pulls in the velo runtime or prometheus:"
+          printf '%s\n' "$offending"
+          exit 1
+        fi
 
   soak-smoke:
     name: Soak smoke
@@ -312,6 +331,9 @@ jobs:
     - name: Run throughput
       timeout-minutes: 3
       run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example throughput -- --count 1000 --payload-sizes 0,1024 --concurrency 1,10
+    - name: Run the hub example (demo)
+      timeout-minutes: 2
+      run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example hub -- --config examples/hub.json --demo
     - name: Run mpsc_fanin
       timeout-minutes: 2
       run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example mpsc_fanin -- --producers 4 --items 40
@@ -341,7 +363,7 @@ jobs:
 
   book:
     name: Book
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
     - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 #v6.0.1
     - name: Build book and check links

@@ -34,5 +34,6 @@ mod instruments;
 mod open_ack;
 mod reject_lane;
 mod reply_linger;
+mod retire;
 mod support;
 mod writer;

@@ -83,6 +83,12 @@ impl StreamTasks {
     pub(crate) async fn wait(&self) {
         self.tracker.wait().await;
     }
+
+    /// Tasks spawned here that have not finished yet.
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.tracker.len()
+    }
 }
 
 /// Enter `runtime` when the calling thread has none, so a drop or callback

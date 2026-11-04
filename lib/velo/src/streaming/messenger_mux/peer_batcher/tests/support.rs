@@ -250,9 +250,35 @@ impl Harness {
         credit: u32,
     ) -> (flume::Sender<Vec<u8>>, SlotId) {
         let (inlet, (slot, _)) = self
-            .open_inner(anchor_id, session_id, 512, SlotCredit::new(credit))
+            .open_inner(anchor_id, session_id, 512, SlotCredit::new(credit), None)
             .await;
         (inlet, slot)
+    }
+
+    /// As [`Self::open_credited`], with the slot holding a producer's
+    /// lifecycle, as the attach path opens one. The returned flag is the
+    /// producer's side of it, where the stream's retirement shows.
+    pub(super) async fn open_watched(
+        &self,
+        anchor_id: u64,
+        session_id: u64,
+        credit: u32,
+    ) -> (
+        flume::Sender<Vec<u8>>,
+        SlotId,
+        crate::streaming::control::SenderClosed,
+    ) {
+        let (lifecycle, closed) = watched_lifecycle();
+        let (inlet, (slot, _)) = self
+            .open_inner(
+                anchor_id,
+                session_id,
+                512,
+                SlotCredit::new(credit),
+                Some(lifecycle),
+            )
+            .await;
+        (inlet, slot, closed)
     }
 
     /// As [`Self::open_with_header`], with a caller-chosen inlet depth — the
@@ -263,7 +289,7 @@ impl Harness {
         session_id: u64,
         depth: usize,
     ) -> (flume::Sender<Vec<u8>>, (SlotId, BatchHeader)) {
-        self.open_inner(anchor_id, session_id, depth, SlotCredit::new(0))
+        self.open_inner(anchor_id, session_id, depth, SlotCredit::new(0), None)
             .await
     }
 
@@ -273,6 +299,7 @@ impl Harness {
         session_id: u64,
         depth: usize,
         credit: SlotCredit,
+        lifecycle: Option<crate::streaming::control::SenderEntry>,
     ) -> (flume::Sender<Vec<u8>>, (SlotId, BatchHeader)) {
         let (inlet_tx, inlet_rx) = flume::bounded::<Vec<u8>>(depth);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
@@ -281,7 +308,7 @@ impl Harness {
                 anchor_id,
                 session_id,
                 inlet: inlet_rx,
-                lifecycle: None,
+                lifecycle,
                 // The default is deliberately starved. On the attach path a
                 // slot opens holding the window its peer advertised, but most
                 // arms below are about what the batcher does once a slot has
@@ -391,6 +418,28 @@ impl Drop for Harness {
     fn drop(&mut self) {
         self.cancel.cancel();
     }
+}
+
+/// A producer's lifecycle for a slot, and the flag the producer keeps of it.
+pub(super) fn watched_lifecycle() -> (
+    crate::streaming::control::SenderEntry,
+    crate::streaming::control::SenderClosed,
+) {
+    let cancel_token = CancellationToken::new();
+    let closed = crate::streaming::control::SenderClosed::default();
+    let entry = crate::streaming::control::SenderEntry {
+        stop_token: cancel_token.child_token(),
+        cancel_token,
+        closed: closed.clone(),
+    };
+    (entry, closed)
+}
+
+/// The stream's retirement, as `StreamSender::retired` polls it.
+pub(super) fn retired(
+    closed: &crate::streaming::control::SenderClosed,
+) -> impl std::future::Future<Output = crate::streaming::Retirement> + '_ {
+    crate::streaming::Retired::new(closed.clone())
 }
 
 pub(super) fn item(n: u32) -> Vec<u8> {
@@ -514,6 +563,39 @@ impl StalledHarness {
         flume::Sender<Vec<u8>>,
         oneshot::Receiver<Result<(), OpenRejected>>,
     ) {
+        self.open_with(anchor_id, session_id, credit, None).await
+    }
+
+    /// As [`Self::open`], with the slot holding a producer's lifecycle, as the
+    /// attach path opens one. The returned flag is the producer's side of it,
+    /// where the stream's retirement shows.
+    pub(super) async fn open_watched(
+        &self,
+        anchor_id: u64,
+        session_id: u64,
+        credit: u32,
+    ) -> (
+        flume::Sender<Vec<u8>>,
+        oneshot::Receiver<Result<(), OpenRejected>>,
+        crate::streaming::control::SenderClosed,
+    ) {
+        let (lifecycle, closed) = watched_lifecycle();
+        let (inlet, ack) = self
+            .open_with(anchor_id, session_id, credit, Some(lifecycle))
+            .await;
+        (inlet, ack, closed)
+    }
+
+    async fn open_with(
+        &self,
+        anchor_id: u64,
+        session_id: u64,
+        credit: u32,
+        lifecycle: Option<crate::streaming::control::SenderEntry>,
+    ) -> (
+        flume::Sender<Vec<u8>>,
+        oneshot::Receiver<Result<(), OpenRejected>>,
+    ) {
         // Deep enough that a producer never meets a full channel while the
         // batcher is parked on admission and therefore not draining it.
         let (inlet_tx, inlet_rx) = flume::bounded::<Vec<u8>>(512);
@@ -523,7 +605,7 @@ impl StalledHarness {
                 anchor_id,
                 session_id,
                 inlet: inlet_rx,
-                lifecycle: None,
+                lifecycle,
                 credit: SlotCredit::new(credit),
                 slot_byte_budget: self.config.slot_byte_budget,
                 ack: ack_tx,

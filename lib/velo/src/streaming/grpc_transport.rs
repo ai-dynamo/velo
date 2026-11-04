@@ -28,7 +28,8 @@ use velo_ext::{PeerInfo, TransportKey, WorkerAddress, WorkerId};
 
 mod connection;
 
-use crate::streaming::transport::FrameTransport;
+use crate::streaming::control::RetireGuard;
+use crate::streaming::transport::{FrameTransport, RetiringFrameTransport};
 use crate::transports::address::WorkerAddressBuilder;
 use crate::transports::utils::interfaces::{
     InterfaceEndpoint, InterfaceFilter, parse_endpoints, resolve_advertise_endpoints,
@@ -65,6 +66,12 @@ const SESSION_ID_META: &str = "x-session-id";
 /// (`DETECTION_MULTIPLIER * heartbeat_interval`, 15s at the protocol defaults)
 /// so the heartbeat watchdog is what reports a wedged consumer, not this.
 const TERMINAL_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+use crate::streaming::transport::MAX_ITEM_BYTES;
+
+/// Room for the protobuf envelope around an item at the limit: a few bytes
+/// of field tags and lengths, with margin to spare.
+const MESSAGE_ENVELOPE: usize = 64 * 1024;
 
 /// How long `shutdown` lets open HTTP/2 connections finish GOAWAY before it
 /// cancels connection I/O. A clean close takes one round trip; this bounds the case
@@ -117,7 +124,9 @@ impl VeloStreaming for GrpcStreamingService {
         // if it lived inside the response body it would simply be dropped
         // mid-poll and the consumer would be left waiting on the 15s heartbeat
         // watchdog instead.
-        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
+        // `true` once every request frame reached the consumer's channel;
+        // `false`, or dropped, when the consumer left first.
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel::<bool>();
         if !self.tasks.spawn(async move {
             let mut last_was_terminal = false;
             let mut frames_seen = 0u64;
@@ -140,10 +149,13 @@ impl VeloStreaming for GrpcStreamingService {
                                     m.record_server_pump_backpressure();
                                 }
                                 if frame_tx.send_async(b).await.is_err() {
-                                    return; // consumer dropped, no Dropped injection
+                                    // Consumer dropped: no Dropped injection.
+                                    let _ = done_tx.send(false);
+                                    return;
                                 }
                             }
                             Err(flume::TrySendError::Disconnected(_)) => {
+                                let _ = done_tx.send(false);
                                 return;
                             }
                         }
@@ -179,8 +191,11 @@ impl VeloStreaming for GrpcStreamingService {
             // Release the client's post-terminal drain (see `connect`). This
             // fires only after every request frame has been handed to the
             // consumer's channel, so the client observing end-of-response is a
-            // genuine delivery acknowledgement.
-            let _ = done_tx.send(());
+            // genuine delivery acknowledgement. A stream that ended without
+            // its terminal (a receive error, such as a frame over the decode
+            // limit) was not taken: the client's pump must not report it
+            // sent, so the call ends with an error instead.
+            let _ = done_tx.send(last_was_terminal);
         }) {
             return Err(Status::unavailable("streaming transport shut down"));
         }
@@ -190,10 +205,18 @@ impl VeloStreaming for GrpcStreamingService {
         // consumed". Returning an already-empty stream here would let tonic
         // send the trailers before the request body was read, which is what
         // made the client's teardown race the delivery of its last frames.
-        let response_stream = futures::stream::once(async move {
-            let _ = done_rx.await;
-        })
-        .filter_map(|()| std::future::ready(None::<Result<FramedData, Status>>));
+        // A consumer that left, a stream that ended without its terminal, or
+        // a pump dropped with the transport, ends the call with an error
+        // instead: the client's pump then reports the stream discarded, not
+        // sent for frames nobody took.
+        let response_stream = futures::stream::once(done_rx).filter_map(|taken| {
+            std::future::ready(match taken {
+                Ok(true) => None::<Result<FramedData, Status>>,
+                _ => Some(Err(Status::aborted(
+                    "the server did not take the whole stream",
+                ))),
+            })
+        });
 
         Ok(Response::new(Box::pin(response_stream)))
     }
@@ -289,8 +312,10 @@ impl GrpcFrameTransport {
                     connection::Connection::new(socket, force_close.clone(), accepted.token())
                 })
             });
-            let server =
-                tonic::transport::Server::builder().add_service(VeloStreamingServer::new(service));
+            let server = tonic::transport::Server::builder().add_service(
+                VeloStreamingServer::new(service)
+                    .max_decoding_message_size(MAX_ITEM_BYTES + MESSAGE_ENVELOPE),
+            );
             let serve = server.serve_with_incoming_shutdown(incoming, cancel.cancelled());
             tokio::pin!(serve);
             let grace_expired = async {
@@ -374,6 +399,171 @@ impl Drop for GrpcFrameTransport {
     }
 }
 
+impl GrpcFrameTransport {
+    /// Open the call and start the pump; `retire` goes to the pump, which
+    /// reports `Sent` once the server has taken the terminal, and drops it,
+    /// as `Discarded`, on every other exit.
+    fn connect_with(
+        &self,
+        peer: WorkerId,
+        anchor_id: u64,
+        session_id: u64,
+        retire: Option<RetireGuard>,
+    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
+        let peers = self.peers.clone();
+        Box::pin(async move {
+            if self.tasks.is_stopped() {
+                return Err(anyhow!("gRPC streaming transport shut down"));
+            }
+            let addr = *peers.get(&peer).ok_or_else(|| {
+                anyhow!(
+                    "gRPC streaming: peer {} not registered (call register_peer first)",
+                    peer
+                )
+            })?;
+
+            let channel = tonic::transport::Channel::from_shared(format!("http://{}", addr))?
+                .connect()
+                .await?;
+
+            let mut client = VeloStreamingClient::new(channel)
+                .max_encoding_message_size(MAX_ITEM_BYTES + MESSAGE_ENVELOPE);
+
+            let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel::<FramedData>(256);
+            let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(4096);
+
+            let request_stream = tokio_stream::wrappers::ReceiverStream::new(mpsc_rx);
+
+            let mut request = Request::new(request_stream);
+            request.metadata_mut().insert(
+                ANCHOR_ID_META,
+                anchor_id
+                    .to_string()
+                    .parse()
+                    .map_err(|_| anyhow!("failed to encode anchor_id as metadata"))?,
+            );
+            request.metadata_mut().insert(
+                SESSION_ID_META,
+                session_id
+                    .to_string()
+                    .parse()
+                    .map_err(|_| anyhow!("failed to encode session_id as metadata"))?,
+            );
+
+            let response = client
+                .stream(request)
+                .await
+                .map_err(|status| anyhow!("gRPC stream rejected: {}", status))?;
+
+            if !self.tasks.spawn(async move {
+                // Hold the inbound half (and thus the underlying H2 bidi call)
+                // for as long as we are pumping frames; dropping it sends
+                // RST_STREAM and cancels the call.
+                let mut inbound = response.into_inner();
+                let mut sent_terminal = false;
+                while let Ok(payload) = frame_rx.recv_async().await {
+                    let is_terminal = is_terminal_sentinel(&payload);
+                    let framed = FramedData {
+                        preamble: vec![],
+                        header: vec![],
+                        payload,
+                    };
+                    if mpsc_tx.send(framed).await.is_err() {
+                        break;
+                    }
+                    // Mirror TCP: after pushing a terminal sentinel (Finalized
+                    // / Dropped / Detached / TransportError), exit the pump.
+                    // Any frame still queued behind the terminal (e.g. a
+                    // heartbeat that snuck through between cancel and drop)
+                    // would otherwise reach the server and be interpreted as
+                    // the new last frame, causing the server to inject Dropped
+                    // on close -- which kills a reattached session.
+                    if is_terminal {
+                        sent_terminal = true;
+                        break;
+                    }
+                }
+
+                // Half-close the request stream: this is the gRPC equivalent of
+                // the TCP pump's `shutdown()` and is what makes the server's
+                // `stream.next()` return `None`.
+                drop(mpsc_tx);
+
+                // Then wait for the server to end its response. `mpsc_tx.send`
+                // only queues into a 256-slot channel — it says nothing about
+                // whether the bytes reached the wire — and tearing the call
+                // down here cancels the H2 stream, discarding whatever is still
+                // buffered. On a short stream this routinely threw away *every*
+                // frame including the terminal sentinel, leaving the server to
+                // inject `Dropped` and the consumer to fail with
+                // `StreamError::SenderDropped` even though the producer had
+                // finalized cleanly. The server completes its response only
+                // after consuming the whole request stream, so end-of-response
+                // is the acknowledgement that the terminal sentinel landed.
+                let drain = async {
+                    while let Some(next) = inbound.next().await {
+                        if let Err(status) = next {
+                            tracing::debug!(
+                                anchor_id,
+                                session_id,
+                                %status,
+                                "gRPC streaming: error draining response after terminal sentinel"
+                            );
+                            return false;
+                        }
+                    }
+                    true
+                };
+                match tokio::time::timeout(TERMINAL_ACK_TIMEOUT, drain).await {
+                    // The server took the whole request stream, terminal
+                    // included: the stream retires as sent. Anything else
+                    // drops the guard, as discarded.
+                    Ok(true) if sent_terminal => {
+                        if let Some(retire) = retire {
+                            retire.sent();
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        // Only reachable when the consumer has wedged its own
+                        // channel: the server pump is blocked forwarding a frame,
+                        // so it never completes the call. Give up rather than leak
+                        // the task; the consumer's heartbeat watchdog is the
+                        // backstop from here.
+                        tracing::warn!(
+                            anchor_id,
+                            session_id,
+                            timeout_ms = TERMINAL_ACK_TIMEOUT.as_millis() as u64,
+                            "gRPC streaming: timed out waiting for the server to acknowledge the \
+                             terminal sentinel"
+                        );
+                    }
+                }
+            }) {
+                return Err(anyhow!("gRPC streaming transport shut down"));
+            }
+
+            Ok(frame_tx)
+        })
+    }
+}
+
+impl RetiringFrameTransport for GrpcFrameTransport {
+    fn connect_retiring(
+        &self,
+        peer: WorkerId,
+        anchor_id: u64,
+        session_id: u64,
+        closed: crate::streaming::control::SenderClosed,
+    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
+        self.connect_with(peer, anchor_id, session_id, Some(RetireGuard::new(closed)))
+    }
+
+    fn item_limit(&self) -> Option<usize> {
+        Some(MAX_ITEM_BYTES)
+    }
+}
+
 impl FrameTransport for GrpcFrameTransport {
     fn key(&self) -> TransportKey {
         self.key.clone()
@@ -453,129 +643,7 @@ impl FrameTransport for GrpcFrameTransport {
         anchor_id: u64,
         session_id: u64,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
-        let peers = self.peers.clone();
-        Box::pin(async move {
-            if self.tasks.is_stopped() {
-                return Err(anyhow!("gRPC streaming transport shut down"));
-            }
-            let addr = *peers.get(&peer).ok_or_else(|| {
-                anyhow!(
-                    "gRPC streaming: peer {} not registered (call register_peer first)",
-                    peer
-                )
-            })?;
-
-            let channel = tonic::transport::Channel::from_shared(format!("http://{}", addr))?
-                .connect()
-                .await?;
-
-            let mut client = VeloStreamingClient::new(channel);
-
-            let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel::<FramedData>(256);
-            let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(4096);
-
-            let request_stream = tokio_stream::wrappers::ReceiverStream::new(mpsc_rx);
-
-            let mut request = Request::new(request_stream);
-            request.metadata_mut().insert(
-                ANCHOR_ID_META,
-                anchor_id
-                    .to_string()
-                    .parse()
-                    .map_err(|_| anyhow!("failed to encode anchor_id as metadata"))?,
-            );
-            request.metadata_mut().insert(
-                SESSION_ID_META,
-                session_id
-                    .to_string()
-                    .parse()
-                    .map_err(|_| anyhow!("failed to encode session_id as metadata"))?,
-            );
-
-            let response = client
-                .stream(request)
-                .await
-                .map_err(|status| anyhow!("gRPC stream rejected: {}", status))?;
-
-            if !self.tasks.spawn(async move {
-                // Hold the inbound half (and thus the underlying H2 bidi call)
-                // for as long as we are pumping frames; dropping it sends
-                // RST_STREAM and cancels the call.
-                let mut inbound = response.into_inner();
-                while let Ok(payload) = frame_rx.recv_async().await {
-                    let is_terminal = is_terminal_sentinel(&payload);
-                    let framed = FramedData {
-                        preamble: vec![],
-                        header: vec![],
-                        payload,
-                    };
-                    if mpsc_tx.send(framed).await.is_err() {
-                        break;
-                    }
-                    // Mirror TCP: after pushing a terminal sentinel (Finalized
-                    // / Dropped / Detached / TransportError), exit the pump.
-                    // Any frame still queued behind the terminal (e.g. a
-                    // heartbeat that snuck through between cancel and drop)
-                    // would otherwise reach the server and be interpreted as
-                    // the new last frame, causing the server to inject Dropped
-                    // on close -- which kills a reattached session.
-                    if is_terminal {
-                        break;
-                    }
-                }
-
-                // Half-close the request stream: this is the gRPC equivalent of
-                // the TCP pump's `shutdown()` and is what makes the server's
-                // `stream.next()` return `None`.
-                drop(mpsc_tx);
-
-                // Then wait for the server to end its response. `mpsc_tx.send`
-                // only queues into a 256-slot channel — it says nothing about
-                // whether the bytes reached the wire — and tearing the call
-                // down here cancels the H2 stream, discarding whatever is still
-                // buffered. On a short stream this routinely threw away *every*
-                // frame including the terminal sentinel, leaving the server to
-                // inject `Dropped` and the consumer to fail with
-                // `StreamError::SenderDropped` even though the producer had
-                // finalized cleanly. The server completes its response only
-                // after consuming the whole request stream, so end-of-response
-                // is the acknowledgement that the terminal sentinel landed.
-                let drain = async {
-                    while let Some(next) = inbound.next().await {
-                        if let Err(status) = next {
-                            tracing::debug!(
-                                anchor_id,
-                                session_id,
-                                %status,
-                                "gRPC streaming: error draining response after terminal sentinel"
-                            );
-                            break;
-                        }
-                    }
-                };
-                if tokio::time::timeout(TERMINAL_ACK_TIMEOUT, drain)
-                    .await
-                    .is_err()
-                {
-                    // Only reachable when the consumer has wedged its own
-                    // channel: the server pump is blocked forwarding a frame,
-                    // so it never completes the call. Give up rather than leak
-                    // the task; the consumer's heartbeat watchdog is the
-                    // backstop from here.
-                    tracing::warn!(
-                        anchor_id,
-                        session_id,
-                        timeout_ms = TERMINAL_ACK_TIMEOUT.as_millis() as u64,
-                        "gRPC streaming: timed out waiting for the server to acknowledge the \
-                         terminal sentinel"
-                    );
-                }
-            }) {
-                return Err(anyhow!("gRPC streaming transport shut down"));
-            }
-
-            Ok(frame_tx)
-        })
+        self.connect_with(peer, anchor_id, session_id, None)
     }
 }
 
@@ -965,5 +1033,131 @@ mod tests {
             );
         }
         // Ok(Err(_)) (channel closed) and Err(_) (timeout) are both fine.
+    }
+
+    /// The pump reports `Sent` only once the server has taken the whole
+    /// stream. A server whose consumer left answers the call with an error,
+    /// and the stream retires as discarded; a call that ended cleanly here
+    /// would have said `Sent` for frames nobody took.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stream_the_server_does_not_take_retires_as_discarded() {
+        let server = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let client = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let (peer, info) = fresh_peer(server.address());
+        client.register(&info).unwrap();
+        let consumer = server.bind(3, 3).await.unwrap();
+        let closed = crate::streaming::control::SenderClosed::default();
+        let tx = client
+            .connect_retiring(peer, 3, 3, closed.clone())
+            .await
+            .unwrap();
+        drop(consumer);
+        tx.send_async(b"data".to_vec()).await.unwrap();
+        tx.send_async(crate::streaming::sender::cached_finalized().clone())
+            .await
+            .unwrap();
+        let retired = crate::streaming::Retired::new(closed.clone());
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(5), retired).await,
+            Ok(crate::streaming::Retirement::Discarded)
+        );
+        tokio::time::timeout(Duration::from_secs(2), server.shutdown())
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), client.shutdown())
+            .await
+            .unwrap();
+    }
+
+    /// Open a call on `server` for stream `session` through a raw tonic
+    /// client with no encode limit, as a client from another velo might,
+    /// send one frame of `len` bytes and then the terminal, and return
+    /// whether the response ended cleanly.
+    async fn call_ends_cleanly_after(
+        server: &GrpcFrameTransport,
+        session: u64,
+        len: usize,
+    ) -> bool {
+        let addr = SocketAddr::new(
+            std::net::Ipv4Addr::LOCALHOST.into(),
+            server.bound_addr().port(),
+        );
+        let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+            .unwrap()
+            .connect()
+            .await
+            .unwrap();
+        let mut client = VeloStreamingClient::new(channel).max_encoding_message_size(usize::MAX);
+        let (tx, req_rx) = tokio::sync::mpsc::channel::<FramedData>(8);
+        let mut request = Request::new(tokio_stream::wrappers::ReceiverStream::new(req_rx));
+        request
+            .metadata_mut()
+            .insert(ANCHOR_ID_META, session.to_string().parse().unwrap());
+        request
+            .metadata_mut()
+            .insert(SESSION_ID_META, session.to_string().parse().unwrap());
+        let mut inbound = client.stream(request).await.unwrap().into_inner();
+        let framed = |payload: Vec<u8>| FramedData {
+            preamble: vec![],
+            header: vec![],
+            payload,
+        };
+        tx.send(framed(vec![7u8; len])).await.unwrap();
+        tx.send(framed(crate::streaming::sender::cached_finalized().clone()))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut clean = true;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(item) = inbound.next().await {
+                if item.is_err() {
+                    clean = false;
+                }
+            }
+        })
+        .await
+        .expect("the call ends");
+        clean
+    }
+
+    /// A frame the server cannot receive, one past the decode limit it sets
+    /// from `MAX_ITEM_BYTES`, ends the request stream with an error; the
+    /// terminal behind it never reaches the consumer, which reads `Dropped`.
+    /// The call must end with an error too, so that a client's pump reads
+    /// `Discarded`: a call that ended cleanly here said `Sent` for a stream
+    /// the consumer never got. A velo client never sends such a frame (its
+    /// sender refuses it, and its encoder would too), so the frame comes
+    /// from a raw client with no encode limit. The control, well under the
+    /// limit, ends cleanly with its item and terminal delivered.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_frame_the_server_cannot_receive_ends_the_call_with_an_error() {
+        const OVER_THE_DECODE_LIMIT: usize = MAX_ITEM_BYTES + (1 << 20);
+        const UNDER_IT: usize = 1 << 20;
+        let server = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+
+        let consumer = server.bind(4, 4).await.unwrap();
+        assert!(call_ends_cleanly_after(&server, 4, UNDER_IT).await);
+        let item = consumer.recv_async().await.unwrap();
+        assert_eq!(item.len(), UNDER_IT);
+        assert_eq!(
+            consumer.recv_async().await.unwrap(),
+            *crate::streaming::sender::cached_finalized()
+        );
+
+        let consumer = server.bind(5, 5).await.unwrap();
+        assert!(!call_ends_cleanly_after(&server, 5, OVER_THE_DECODE_LIMIT).await);
+        assert_eq!(
+            consumer.recv_async().await.unwrap(),
+            *crate::streaming::sender::cached_dropped()
+        );
+        tokio::time::timeout(Duration::from_secs(2), server.shutdown())
+            .await
+            .unwrap();
     }
 }

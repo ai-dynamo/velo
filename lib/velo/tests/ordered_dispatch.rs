@@ -32,7 +32,7 @@ fn new_transport() -> Arc<TcpTransport> {
     )
 }
 
-async fn new_node() -> Arc<Velo> {
+async fn new_node() -> Velo {
     let node = Velo::builder()
         .add_transport(new_transport())
         .build()
@@ -43,7 +43,7 @@ async fn new_node() -> Arc<Velo> {
 }
 
 /// Build a receiver plus `sender_count` senders, all mutually registered.
-async fn cluster(sender_count: usize) -> (Arc<Velo>, Vec<Arc<Velo>>) {
+async fn cluster(sender_count: usize) -> (Velo, Vec<Velo>) {
     let receiver = new_node().await;
     let mut senders = Vec::with_capacity(sender_count);
     for _ in 0..sender_count {
@@ -378,7 +378,7 @@ async fn max_queue_depth_rejects_without_metrics() {
     receiver.register_handler(handler).unwrap();
     tokio::time::sleep(Duration::from_millis(100)).await;
 
-    let first_sender = Arc::clone(sender);
+    let first_sender = sender.clone();
     let first_target = receiver.instance_id();
     let first = tokio::spawn(async move {
         first_sender
@@ -532,7 +532,7 @@ async fn ordered_unary_responses_are_correct() {
     // caller must still get its own response back.
     let mut tasks = Vec::new();
     for seq in 0..100u32 {
-        let sender = Arc::clone(sender);
+        let sender = sender.clone();
         let target = receiver.instance_id();
         tasks.push(tokio::spawn(async move {
             let response: Bytes = sender

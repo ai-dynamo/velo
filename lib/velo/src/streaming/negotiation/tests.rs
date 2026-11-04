@@ -81,7 +81,13 @@ async fn mux(config: MuxConfig) -> Arc<MessengerMuxTransport> {
         .build()
         .await
         .expect("messenger");
-    MessengerMuxTransport::new(messenger, config, None).expect("mux")
+    MessengerMuxTransport::new(
+        messenger,
+        config,
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("mux")
 }
 
 fn keys(names: &[&str]) -> Vec<TransportKey> {

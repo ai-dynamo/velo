@@ -410,9 +410,7 @@ async fn test_discover_and_register_peer_fans_out_to_streaming() {
 // The mux is the default
 // ---------------------------------------------------------------------------
 
-async fn default_pair(
-    mux: Option<velo::streaming::MuxConfig>,
-) -> (Arc<velo::Velo>, Arc<velo::Velo>) {
+async fn default_pair(mux: Option<velo::streaming::MuxConfig>) -> (velo::Velo, velo::Velo) {
     let mk = || async {
         let mut builder = velo::Velo::builder();
         if let Some(config) = mux.clone() {
@@ -477,7 +475,7 @@ async fn turning_the_mux_off_falls_back_to_the_per_stream_transport() {
     assert_eq!(negotiated_key(Some(off)).await, "tcp-stream");
 }
 
-async fn tcp_node(builder: velo::VeloBuilder) -> Arc<velo::Velo> {
+async fn tcp_node(builder: velo::VeloBuilder) -> velo::Velo {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let transport = velo::transports::tcp::TcpTransportBuilder::new()
         .from_listener(listener)

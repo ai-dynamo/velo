@@ -180,8 +180,13 @@ pub(super) async fn stalled_producer(config: MuxConfig) -> Stalled {
     messenger
         .register_peer(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
         .expect("register peer");
-    let producer =
-        MessengerMuxTransport::new(Arc::clone(&messenger), config, None).expect("producer mux");
+    let producer = MessengerMuxTransport::new(
+        Arc::clone(&messenger),
+        config,
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("producer mux");
     Stalled {
         producer,
         key: lane0(peer_instance.worker_id()),

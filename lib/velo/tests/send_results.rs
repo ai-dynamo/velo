@@ -31,7 +31,7 @@ fn new_transport() -> Arc<TcpTransport> {
 
 /// Two peers that know about each other, with `handler` registered on the
 /// server. Returns `(client, server_instance)`.
-async fn connected_pair(handler: Handler) -> (Arc<Velo>, Arc<Velo>) {
+async fn connected_pair(handler: Handler) -> (Velo, Velo) {
     let server = Velo::builder()
         .add_transport(new_transport())
         .build()

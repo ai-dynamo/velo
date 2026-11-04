@@ -342,7 +342,7 @@ fn cancel_mux_config() -> MuxConfig {
     }
 }
 
-async fn velo_node() -> Arc<Velo> {
+async fn velo_node() -> Velo {
     Velo::builder()
         .add_transport(new_tcp_transport())
         .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
@@ -354,7 +354,7 @@ async fn velo_node() -> Arc<Velo> {
 }
 
 /// Two cross-registered nodes: `consumer` owns the anchors, `producer` sends.
-async fn velo_pair() -> (Arc<Velo>, Arc<Velo>) {
+async fn velo_pair() -> (Velo, Velo) {
     let consumer = velo_node().await;
     let producer = velo_node().await;
     consumer

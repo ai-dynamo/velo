@@ -4,7 +4,7 @@ This guide builds velo with the `ucx` feature and wires the UCX transport for th
 
 ## What you need
 
-- Linux on x86_64 or aarch64. The `ucx` feature does not exist on other platforms.
+- Linux on x86_64 or aarch64. On other platforms the `ucx` feature builds but adds no transport.
 - A C compiler and GNU `make`. The vendored UCX tarball ships a generated `configure`, so autotools and `cmake` are not necessary for this crate.
 - The rdma-core development headers. The build looks for three files: `infiniband/verbs.h`, `infiniband/mlx5dv.h`, and `rdma/rdma_cma.h`. On Debian and Ubuntu, `libibverbs-dev` and `librdmacm-dev` supply them.
 - For real RDMA: an InfiniBand or RoCE port in state `PORT_ACTIVE`, and a memlock limit large enough for the registered-bytes budget.

@@ -86,6 +86,7 @@ use super::protocol::{
 use super::{MuxConfig, PeerLane};
 use crate::messenger::Messenger;
 use crate::observability::{BatcherWake, MuxDropReason, MuxMetricsHandle};
+use crate::streaming::control::RetireGuard;
 use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
 use crate::streaming::sender::is_terminal_sentinel;
 use crate::transports::AdmissionState;
@@ -336,6 +337,7 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
         teardown_complete: false,
         async_open_ack,
         staged_credit: Vec::new(),
+        retire_on_flush: Vec::new(),
         #[cfg(test)]
         hooks: ctx.hooks,
     };
@@ -420,6 +422,12 @@ struct Batcher {
     /// copy, kept so a batch thrown away rather than written can hand it back
     /// — see [`Batcher::repost_staged_credit`].
     staged_credit: Vec<(SlotId, u32)>,
+    /// One guard per stream whose terminal is in the batch the writer has
+    /// open. The stream retires as sent once that batch is admitted; a batch
+    /// thrown away instead (epoch death, teardown, a dropped task) drops the
+    /// guards, which retires those streams as discarded. Empty but for batches
+    /// that end a stream, so a batch pays one emptiness check for it.
+    retire_on_flush: Vec<RetireGuard>,
     #[cfg(test)]
     hooks: Option<Arc<TestHooks>>,
 }
@@ -833,7 +841,7 @@ impl Batcher {
         // `docs/src/operations/response-plane-performance.md` rather than a
         // fix owed here.
         let seq = self.open_seq(id);
-        self.fire_singleton(id, FenceSkip::IfAdmitted, |encoder| {
+        self.fire_singleton(id, FenceSkip::IfAdmitted, None, |encoder| {
             encoder.push_open_slot(id, seq, anchor_id, session_id)
         });
         let _ = ack.send(Ok(()));
@@ -888,10 +896,16 @@ impl Batcher {
     /// record of every stream wait out hops that were never on the critical
     /// path — on an uncongested peer, exactly the wait
     /// `MuxConfig::async_open_ack` exists to remove.
+    ///
+    /// `retire` is the guard of a stream whose terminal this dispatch carries.
+    /// The task reports the stream sent once the admission succeeds; a refused
+    /// admission, or the task dropped before it resolves, drops the guard and
+    /// reports it discarded.
     fn fire_singleton(
         &mut self,
         id: SlotId,
         skip: FenceSkip,
+        retire: Option<RetireGuard>,
         write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
     ) -> bool {
         let Some(fire) = self.writer.dispatch_singleton(write) else {
@@ -917,6 +931,14 @@ impl Batcher {
             #[cfg(test)]
             if let Some(hooks) = &hooks {
                 hooks.await_resolutions_release().await;
+            }
+            // A terminal sent alone retires its stream on admission. Refused,
+            // or this task dropped with its runtime, the guard reports the
+            // stream discarded.
+            if admission.is_ok()
+                && let Some(retire) = retire
+            {
+                retire.sent();
             }
             // A failure is epoch death regardless of whether this dispatch
             // fenced, so it is always reported. A success is reported only
@@ -1048,7 +1070,16 @@ impl Batcher {
         // `epoch_death` therefore finds nothing to hand back on this path, and
         // everything to hand back on its other two.
         self.staged_credit.clear();
-        if let Err(writer::FlushFailed(error)) = self.writer.flush().await {
+        let flushed = self.writer.flush().await;
+        // Admitted: the terminals in this batch have left behind every record
+        // before them. Drained in place, so the vector keeps its capacity.
+        // Refused: `epoch_death` below drops the guards, as discarded.
+        if flushed.is_ok() && !self.retire_on_flush.is_empty() {
+            for guard in self.retire_on_flush.drain(..) {
+                guard.sent();
+            }
+        }
+        if let Err(writer::FlushFailed(error)) = flushed {
             tracing::warn!(
                 peer = %self.key.peer,
                 lane = %self.key.lane,
@@ -1097,6 +1128,9 @@ impl Batcher {
     /// within an epoch. Dropping the `SelectAll` drops every slot's
     /// `flume::Receiver`, which is the death signal a producer sees.
     fn epoch_death(&mut self) {
+        // The staged batch dies with the epoch, and the terminals in it with
+        // it: their streams retire as discarded.
+        self.retire_on_flush.clear();
         let closed = self.slots.close_all();
         self.streams = SelectAll::new();
         if let Some(metrics) = &self.metrics {
@@ -1203,6 +1237,8 @@ impl Batcher {
         // re-advertise into — and the inbox is closed one line above, so a
         // re-post would be refused anyway.
         self.gate.discarded();
+        // As in `epoch_death`: terminals staged but never written.
+        self.retire_on_flush.clear();
         let closed = self.slots.close_all();
         self.streams = SelectAll::new();
         self.account_closed(closed);

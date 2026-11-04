@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Result, anyhow};
 use bytes::Bytes;
@@ -23,8 +24,10 @@ mod results;
 #[cfg(test)]
 mod tests;
 
-use results::{AdmissionReport, Dispatched, SendStage, drive_send_outcome};
-pub use results::{Admitted, FireResult, SyncResult, TypedUnaryResult, UnaryResult};
+use results::{AdmissionReport, Deadline, Dispatched, SendStage, drive_send_outcome};
+pub use results::{
+    Admitted, FireResult, RequestTimeout, SyncResult, TypedUnaryResult, UnaryResult,
+};
 
 /// Fire-and-forget builder.
 pub struct AmSendBuilder {
@@ -174,6 +177,13 @@ impl AmSyncBuilder {
         self
     }
 
+    /// Fail the call with [`RequestTimeout`] if it has no answer within
+    /// `timeout`. See [`UnaryBuilder::timeout`].
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.inner = self.inner.timeout(timeout);
+        self
+    }
+
     pub fn send(self) -> SyncResult {
         self.inner.sync()
     }
@@ -240,6 +250,31 @@ impl UnaryBuilder {
     /// fail fast with `ResponseRegistrationError::Exhausted`).
     pub fn await_capacity(mut self) -> Self {
         self.inner = self.inner.await_capacity();
+        self
+    }
+
+    /// Fail the call with [`RequestTimeout`] if it has no answer within
+    /// `timeout`.
+    ///
+    /// Without this, the call waits until the remote answers or the send
+    /// fails; velo sets no deadline of its own. That wait has no end when the
+    /// remote never replies, and a remote that has forgotten this instance
+    /// never does, because a reply goes through the remote's peer table.
+    ///
+    /// The clock starts at `send()` and covers everything after it: the wait
+    /// for a response slot under [`await_capacity`](Self::await_capacity),
+    /// discovery and the handshake, admission, and the response. When it runs
+    /// out, the call releases its response slot at once, even if the result is
+    /// kept, and a reply that comes later is discarded. The remote may still
+    /// have run the handler. Only awaiting the result is bounded;
+    /// `admitted()` is not. If the time runs out while the call still waits
+    /// for a free response slot, the send is never issued: `admission_state()`
+    /// then reads `Failed` and `admitted()` returns an error that is not a
+    /// `RequestTimeout`.
+    ///
+    /// Costs nothing when not set: no timer and no allocation.
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.inner = self.inner.timeout(timeout);
         self
     }
 
@@ -312,6 +347,13 @@ where
         self
     }
 
+    /// Fail the call with [`RequestTimeout`] if it has no answer within
+    /// `timeout`. See [`UnaryBuilder::timeout`].
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.inner = self.inner.timeout(timeout);
+        self
+    }
+
     pub fn send(self) -> TypedUnaryResult<R> {
         self.inner.typed()
     }
@@ -374,6 +416,9 @@ pub struct MessageBuilder {
     // The transport lane to send on. Lane 0 is the default: the one ordered
     // channel every transport keeps and the messenger's own traffic uses.
     lane: u16,
+    // How long a sync or unary call may wait for its answer. `None` waits
+    // until the remote answers or the send fails. Fire sends ignore it.
+    timeout: Option<Duration>,
 }
 
 /// Translate a synchronous fast-path `send_message` result into a
@@ -539,6 +584,7 @@ impl MessageBuilder {
             headers: None,
             await_capacity: false,
             lane: 0,
+            timeout: None,
         }
     }
 
@@ -593,6 +639,18 @@ impl MessageBuilder {
     pub fn await_capacity(mut self) -> Self {
         self.await_capacity = true;
         self
+    }
+
+    /// Bound a sync or unary call. See [`UnaryBuilder::timeout`].
+    pub fn timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = Some(timeout);
+        self
+    }
+
+    /// The call's deadline, fixed now: before slot acquisition and the send,
+    /// so the timeout covers both.
+    fn deadline(&self) -> Option<Deadline> {
+        self.timeout.and_then(Deadline::starting_now)
     }
 
     fn resolve_target(&self) -> Result<InstanceId, ResolveError> {
@@ -783,14 +841,18 @@ impl MessageBuilder {
     }
 
     pub fn sync(self) -> SyncResult {
+        let deadline = self.deadline();
         SyncResult {
             stage: self.make_stage(MsgType::Sync),
+            deadline,
         }
     }
 
     pub fn unary(self) -> UnaryResult {
+        let deadline = self.deadline();
         UnaryResult {
             stage: self.make_stage(MsgType::Unary),
+            deadline,
         }
     }
 
@@ -798,8 +860,10 @@ impl MessageBuilder {
     where
         R: DeserializeOwned + Send + 'static,
     {
+        let deadline = self.deadline();
         TypedUnaryResult {
             stage: self.make_stage(MsgType::Unary),
+            deadline,
             _marker: std::marker::PhantomData,
         }
     }

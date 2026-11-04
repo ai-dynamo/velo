@@ -75,6 +75,10 @@ pub(crate) const MAX_INGRESS_SLOTS_PER_PEER: usize = 1 << 16;
 
 /// A `bind()` waiting for the `OpenSlot` that will claim it.
 struct BindEntry {
+    /// When the accept window closes. This is the deadline that counts:
+    /// renewal moves it, and the entry in `MuxCore::bind_deadlines` only says
+    /// when the sweep reads it again.
+    expires: tokio::time::Instant,
     /// The mux-owned `C + 1` buffer whose receiver went to the anchor.
     frame_tx: flume::Sender<Vec<u8>>,
     /// Handed to the anchor's direct feed and stream watchdog at attach (or to
@@ -349,15 +353,44 @@ impl IngressRegistry {
         frame_tx: flume::Sender<Vec<u8>>,
         drain: Arc<DrainSignal>,
         lane: LaneReservation,
+        expires: tokio::time::Instant,
     ) {
         self.binds.insert(
             (anchor_id, session_id),
             BindEntry {
+                expires,
                 frame_tx,
                 drain,
                 lane,
             },
         );
+    }
+
+    pub(crate) fn renew_bind(&self, anchor: u64, session: u64, timeout: std::time::Duration) {
+        if let Some(mut bind) = self.binds.get_mut(&(anchor, session)) {
+            crate::streaming::deadline::renew_if_live(&mut bind.expires, timeout);
+        }
+    }
+
+    pub(crate) fn expire_due(
+        &self,
+        anchor: u64,
+        session: u64,
+        now: tokio::time::Instant,
+    ) -> Option<tokio::time::Instant> {
+        use dashmap::mapref::entry::Entry;
+        if let Entry::Occupied(entry) = self.binds.entry((anchor, session)) {
+            if entry.get().expires > now {
+                return Some(entry.get().expires);
+            }
+            entry.remove();
+            tracing::warn!(
+                anchor_id = anchor,
+                session_id = session,
+                "messenger mux: no OpenSlot arrived before the accept window closed"
+            );
+        }
+        None
     }
 
     /// Drop an unclaimed bind, reporting whether one was there.
@@ -398,6 +431,15 @@ impl IngressRegistry {
     /// the table [`live_slots`](Self::live_slots) finds it in.
     pub(crate) fn live_count(&self, key: PeerLane) -> usize {
         self.live_per_peer.get(key)
+    }
+
+    /// Whether any receive-side slot is live, from any peer on any lane.
+    ///
+    /// Reads one atomic per lane and takes no lock. A slot holds its count
+    /// for as long as it sits in a table, so `false` means no table has a slot
+    /// to reconcile.
+    pub(crate) fn has_live_slots(&self) -> bool {
+        LaneIndex::all().any(|lane| self.live.get(lane) > 0)
     }
 
     /// Every (peer, lane) with receive-side state, for the credit sweep.

@@ -11,6 +11,7 @@
 - [Batched streaming](concepts/batched-streaming.md)
 - [Transports](concepts/transports.md)
 - [Discovery](concepts/discovery.md)
+- [The hub](concepts/hub.md)
 - [Work queues](concepts/queues.md)
 - [Shutdown and drain](concepts/shutdown.md)
 - [Rendezvous and RDMA](concepts/rendezvous.md)
@@ -18,6 +19,7 @@
 # Guides
 
 - [Migrate ownership, dispatch, and cancellation to 0.19](guides/migrate-dispatch-and-cancellation.md)
+- [Migrate to the Velo handle in 0.21](guides/migrate-velo-handle.md)
 - [Services and mux-only mode](guides/migrate-services.md)
 - [Write an out-of-tree transport](guides/out-of-tree-transport.md)
 - [Tune batched streaming](guides/tune-batched-streaming.md)
@@ -38,6 +40,7 @@
 - [Workspace crates](development/architecture.md)
 - [Versioning](development/versioning.md)
 - [Testing](development/testing.md)
+- [Review for performance](development/performance-review.md)
 - [Documentation](development/documentation.md)
 - [Batched streaming design](development/batched-streaming-design.md)
 - [RDMA design](development/rdma-design.md)
@@ -46,3 +49,4 @@
 
 - [Glossary](appendix/glossary.md)
 - [Metrics reference](appendix/metrics.md)
+- [Known limitations](appendix/limitations.md)

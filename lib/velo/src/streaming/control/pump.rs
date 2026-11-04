@@ -173,7 +173,10 @@ pub(crate) async fn reader_pump(
     heartbeat_deadline: Duration,
 ) {
     let crate::streaming::anchor::AnchorContext {
-        registry, metrics, ..
+        registry,
+        metrics,
+        deadline_queue,
+        ..
     } = ctx;
     let mut missed_heartbeats: u8 = 0;
     // One timer for the stream, not one per record. `tokio::time::timeout`
@@ -263,7 +266,11 @@ pub(crate) async fn reader_pump(
                             {
                                 entry.retire_pump();
                                 entry.attachment = false;
-                                entry.restart_unattached_timeout(&registry, local_id);
+                                entry.restart_unattached_timeout(
+                                    &registry,
+                                    local_id,
+                                    &deadline_queue,
+                                );
                             }
                             break;
                         }

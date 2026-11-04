@@ -31,6 +31,27 @@ let reply: MyResponse = node_a.typed_unary::<MyResponse>("rpc")?.payload(&req)?.
 
 A payload that is larger than the large-payload threshold does not travel in the message. The messenger stages it with [rendezvous](rendezvous.md) and sends a handle. The receiver pulls the bytes before the handler runs.
 
+## Timeouts
+
+velo puts no deadline on a request. A sync or unary call waits until the remote answers or the send fails. To bound the wait, set `.timeout(d)` on an `am_sync`, `unary`, or `typed_unary` builder.
+
+```rust,ignore
+use std::time::Duration;
+use velo::RequestTimeout;
+
+match node_a.unary("ping")?.timeout(Duration::from_secs(2)).instance(b).send().await {
+    Ok(reply) => { /* the answer */ }
+    Err(e) if e.is::<RequestTimeout>() => { /* no answer in time */ }
+    Err(e) => return Err(e),
+}
+```
+
+The clock starts at `send()`. It covers the wait for a response slot, discovery, the handshake, the send, and the answer. When the time runs out, the call fails with `RequestTimeout`. Every other error is a failed send or an error from the remote. Only awaiting the result is bounded, not `admitted()`.
+
+At expiry, the call gives back its response slot, also when the caller keeps the result. A reply that arrives later is discarded. The remote can still run the handler. A call without `.timeout` makes no timer.
+
+A remote that forgot the caller never answers. The remote sends a reply through its own peer table, not back over the connection of the request. So a call to a remote that called `unregister_peer` on the caller waits until its timeout, and without a timeout it waits for ever.
+
 ## Handlers
 
 You register a handler by name. Each handler kind has a sync form and an async form.

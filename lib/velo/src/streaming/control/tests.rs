@@ -79,6 +79,7 @@ async fn reader_pump_watchdog_firing_increments_counter() {
         registry: base_ctx.registry,
         mpsc_registry: base_ctx.mpsc_registry,
         metrics: Some(metrics.clone()),
+        deadline_queue: crate::streaming::anchor::AnchorDeadlineQueue::new(),
     };
 
     // Open transport channel that never delivers a frame: the receiver
@@ -159,6 +160,7 @@ async fn stream_watchdog_unclaimed_bind_reap_increments_counter() {
         registry: base_ctx.registry,
         mpsc_registry: base_ctx.mpsc_registry,
         metrics: Some(metrics.clone()),
+        deadline_queue: crate::streaming::anchor::AnchorDeadlineQueue::new(),
     };
 
     let local_id = 999u64;
@@ -172,7 +174,8 @@ async fn stream_watchdog_unclaimed_bind_reap_increments_counter() {
             cancel_token: cancel_token.clone(),
             active_pump_token: None,
             attachment: true,
-            timeout_cancel: None,
+            expires: None,
+            queued: None,
             unattached_timeout: None,
             heartbeat_interval: std::time::Duration::from_secs(5),
             stream_cancel_handle: None,
@@ -253,6 +256,7 @@ async fn reader_pump_watchdog_saturated_channel_drops_sentinel_silently() {
         registry: base_ctx.registry,
         mpsc_registry: base_ctx.mpsc_registry,
         metrics: Some(metrics.clone()),
+        deadline_queue: crate::streaming::anchor::AnchorDeadlineQueue::new(),
     };
 
     // Transport channel that never delivers: watchdog will fire after
@@ -817,7 +821,8 @@ fn make_pump_test_infra() -> (
             cancel_token: cancel_token.clone(),
             active_pump_token: None,
             attachment: true,
-            timeout_cancel: None,
+            expires: None,
+            queued: None,
             unattached_timeout: None,
             heartbeat_interval: Duration::from_secs(5),
             stream_cancel_handle: None,
@@ -832,6 +837,7 @@ fn make_pump_test_infra() -> (
         registry: registry.clone(),
         mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
         metrics: None,
+        deadline_queue: crate::streaming::anchor::AnchorDeadlineQueue::new(),
     };
     tokio::spawn(reader_pump(
         transport_rx,
@@ -904,7 +910,8 @@ fn make_watchdog_test_infra(
             cancel_token: cancel_token.clone(),
             active_pump_token: None,
             attachment,
-            timeout_cancel: None,
+            expires: None,
+            queued: None,
             unattached_timeout: None,
             heartbeat_interval: heartbeat_deadline,
             stream_cancel_handle: None,
@@ -924,6 +931,7 @@ fn make_watchdog_test_infra(
         registry: registry.clone(),
         mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
         metrics: None,
+        deadline_queue: crate::streaming::anchor::AnchorDeadlineQueue::new(),
     };
     tokio::spawn(stream_watchdog(
         Arc::new(super::DirectFeed {
@@ -1056,7 +1064,7 @@ async fn test_watchdog_reaps_an_unclaimed_prebind_when_its_bind_is_reclaimed() {
 /// from already returned (see `WatchdogContext::prebound`). Before gating on
 /// `prebound` instead, this pump silently stopped counting heartbeat misses
 /// for the same window, so a sender that attached and then died before its
-/// first frame went undetected until the mux's 60 s accept-window timer
+/// first frame went undetected until the mux's configured accept-window timer
 /// reclaimed the bind, instead of the configured
 /// `DETECTION_MULTIPLIER * heartbeat_interval`.
 #[tokio::test]
@@ -1089,8 +1097,9 @@ async fn test_watchdog_reaps_an_ordinary_attach_with_unclaimed_mux_drain_after_m
 /// attach whose peer died before its first `OpenSlot`) relying solely on the
 /// heartbeat watchdog to reap it. That race is not always won: the watchdog
 /// restarts counting from whenever this arm's caller stopped exempting it,
-/// while the accept window is a fixed 60 s from bind creation, so at
-/// `heartbeat_interval >= 20 s` the window always closes first -- and, before
+/// while the accept window is a fixed span from bind creation, so when
+/// `DETECTION_MULTIPLIER * heartbeat_interval` is longer than that span (a
+/// 60 s interval against the 180 s default) the window always closes first -- and, before
 /// this fix, closing first left the registry entry behind forever, with the
 /// consumer's `StreamAnchor` wedged on `Poll::Pending`.
 #[tokio::test]
@@ -1159,6 +1168,7 @@ async fn a_thousand_records_arm_the_heartbeat_timer_a_handful_of_times() {
         registry: std::sync::Arc::new(dashmap::DashMap::new()),
         mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
         metrics: None,
+        deadline_queue: crate::streaming::anchor::AnchorDeadlineQueue::new(),
     };
 
     tokio::spawn(TIMER_ARMS.scope(
@@ -1262,6 +1272,7 @@ async fn a_stream_under_traffic_never_fires_its_heartbeat_timer() {
         registry: std::sync::Arc::new(dashmap::DashMap::new()),
         mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
         metrics: None,
+        deadline_queue: crate::streaming::anchor::AnchorDeadlineQueue::new(),
     };
 
     tokio::spawn(TIMER_FIRES.scope(
@@ -1363,6 +1374,7 @@ async fn a_stream_that_stops_is_caught_a_detection_window_after_its_last_record(
         registry: std::sync::Arc::new(dashmap::DashMap::new()),
         mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
         metrics: None,
+        deadline_queue: crate::streaming::anchor::AnchorDeadlineQueue::new(),
     };
 
     let pump = tokio::spawn(TIMER_FIRES.scope(
@@ -1487,7 +1499,8 @@ async fn reader_pump_does_not_count_a_blocked_forward_as_heartbeat_silence() {
             cancel_token: cancel_token.clone(),
             active_pump_token: None,
             attachment: true,
-            timeout_cancel: None,
+            expires: None,
+            queued: None,
             unattached_timeout: None,
             heartbeat_interval: deadline,
             stream_cancel_handle: None,
@@ -1499,6 +1512,7 @@ async fn reader_pump_does_not_count_a_blocked_forward_as_heartbeat_silence() {
         registry: registry.clone(),
         mpsc_registry: std::sync::Arc::new(dashmap::DashMap::new()),
         metrics: None,
+        deadline_queue: crate::streaming::anchor::AnchorDeadlineQueue::new(),
     };
     tokio::spawn(reader_pump(
         transport_rx,
@@ -1694,7 +1708,8 @@ async fn test_child_token_reattach_pump_survives() {
             cancel_token: parent.clone(),
             active_pump_token: Some(child1.clone()),
             attachment: true,
-            timeout_cancel: None,
+            expires: None,
+            queued: None,
             unattached_timeout: None,
             heartbeat_interval: Duration::from_secs(5),
             stream_cancel_handle: None,
@@ -1710,6 +1725,7 @@ async fn test_child_token_reattach_pump_survives() {
         registry: registry.clone(),
         mpsc_registry: mpsc_reg.clone(),
         metrics: None,
+        deadline_queue: crate::streaming::anchor::AnchorDeadlineQueue::new(),
     };
     tokio::spawn(reader_pump(
         rx1,
@@ -1754,6 +1770,7 @@ async fn test_child_token_reattach_pump_survives() {
         registry: registry.clone(),
         mpsc_registry: mpsc_reg.clone(),
         metrics: None,
+        deadline_queue: crate::streaming::anchor::AnchorDeadlineQueue::new(),
     };
     tokio::spawn(reader_pump(
         rx2,
@@ -2196,4 +2213,111 @@ async fn reader_pump_cancel_ends_a_send_waiting_on_a_full_channel() {
         .await
         .expect("a cancelled pump kept waiting on a full channel")
         .unwrap();
+}
+
+// -----------------------------------------------------------------------
+// Retirement
+// -----------------------------------------------------------------------
+
+/// Several `Retired` futures of one stream, each polled from its own task.
+/// Retirement wakes every one of them, and a waiter that gave up (its future
+/// dropped after it registered) strands none of the others. One stored waker
+/// would keep only the last registration, and wake only that task.
+#[test]
+fn retirement_wakes_every_waiting_future() {
+    use futures::task::{ArcWake, waker};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    struct Counter(AtomicUsize);
+    impl ArcWake for Counter {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    let counters: Vec<Arc<Counter>> = (0..3)
+        .map(|_| Arc::new(Counter(AtomicUsize::new(0))))
+        .collect();
+    let wakers: Vec<_> = counters.iter().map(|c| waker(c.clone())).collect();
+
+    let closed = SenderClosed::default();
+    for w in &wakers {
+        let mut cx = Context::from_waker(w);
+        let mut registration = None;
+        assert_eq!(
+            closed.poll_retired(&mut cx, &mut registration),
+            Poll::Pending
+        );
+        // The same future polling again keeps its one entry.
+        assert_eq!(
+            closed.poll_retired(&mut cx, &mut registration),
+            Poll::Pending
+        );
+    }
+    assert_eq!(closed.waiting(), 3);
+    // The last waiter gives up: its future goes, its waker stays registered.
+    drop(wakers);
+
+    closed.retire(crate::streaming::Retirement::Sent);
+    for (i, counter) in counters.iter().enumerate().take(2) {
+        assert_eq!(
+            counter.0.load(Ordering::SeqCst),
+            1,
+            "waiter {i} was not woken"
+        );
+    }
+
+    let again = waker(counters[0].clone());
+    let mut cx = Context::from_waker(&again);
+    assert_eq!(
+        closed.poll_retired(&mut cx, &mut None),
+        Poll::Ready(crate::streaming::Retirement::Sent)
+    );
+    // A later report changes nothing, and wakes nobody.
+    closed.retire(crate::streaming::Retirement::Discarded);
+    assert_eq!(
+        closed.poll_retired(&mut cx, &mut None),
+        Poll::Ready(crate::streaming::Retirement::Sent)
+    );
+    assert_eq!(counters[0].0.load(Ordering::SeqCst), 1);
+}
+
+/// A `Retired` future that is dropped before the stream retires takes its
+/// waker with it.
+///
+/// Each one registered its task's waker and left it behind. A long-lived
+/// stream whose retirement was awaited under a timeout, from a new task each
+/// time, kept one waker per abandoned wait, and with it each task's
+/// allocation, until the stream retired; retirement then woke all of them.
+#[test]
+fn a_dropped_retired_future_takes_its_waker_with_it() {
+    use futures::task::{ArcWake, waker};
+    use std::future::Future;
+    use std::task::{Context, Poll};
+
+    struct Task;
+    impl ArcWake for Task {
+        fn wake_by_ref(_: &Arc<Self>) {}
+    }
+    let closed = SenderClosed::default();
+    let live_waker = waker(Arc::new(Task));
+    let mut live = Box::pin(crate::streaming::Retired::new(closed.clone()));
+    assert_eq!(
+        live.as_mut().poll(&mut Context::from_waker(&live_waker)),
+        Poll::Pending
+    );
+    for _ in 0..8 {
+        let task = waker(Arc::new(Task));
+        let mut abandoned = Box::pin(crate::streaming::Retired::new(closed.clone()));
+        assert_eq!(
+            abandoned.as_mut().poll(&mut Context::from_waker(&task)),
+            Poll::Pending
+        );
+    }
+    assert_eq!(closed.waiting(), 1, "only the live wait is registered");
+    closed.retire(crate::streaming::Retirement::Sent);
+    assert_eq!(
+        live.as_mut().poll(&mut Context::from_waker(&live_waker)),
+        Poll::Ready(crate::streaming::Retirement::Sent)
+    );
 }

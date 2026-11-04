@@ -1,0 +1,24 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "velo-hub-ext"
+version.workspace = true
+edition.workspace = true
+description = "The wire protocol of a velo hub, on velo-ext alone: no velo runtime"
+authors.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+# Publishes together with velo-hub, once velo-hub's publish gate clears.
+publish = false
+
+[dependencies]
+# Never `velo`: this crate exists so a program can speak the hub protocol
+# without the velo runtime.
+velo-ext = { workspace = true }
+http = { version = "1" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true, features = ["v4", "serde"] }

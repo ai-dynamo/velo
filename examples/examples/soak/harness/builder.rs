@@ -21,7 +21,7 @@ use super::StreamTransportKind;
 
 /// One side of a server/client pair.
 pub struct VeloSide {
-    pub velo: Arc<Velo>,
+    pub velo: Velo,
     pub registry: Registry,
     pub metrics: Arc<VeloMetrics>,
     pub instance_id: InstanceId,

@@ -20,7 +20,9 @@ impl std::fmt::Display for SenderId {
 
 /// Per-anchor configuration overrides for [`crate::AnchorManager::create_mpsc_anchor_with_config`].
 ///
-/// `None` on any field inherits the manager-level default.
+/// `None` on `heartbeat_interval` inherits the manager-level default.
+/// `None` on `unattached_timeout` means no timeout: the manager's
+/// `default_unattached_timeout` applies to SPSC anchors only.
 #[derive(Debug, Clone, Default)]
 pub struct MpscAnchorConfig {
     /// How long an anchor with zero attached senders may live before being

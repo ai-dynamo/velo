@@ -83,11 +83,16 @@ async fn mux_pair(config: MuxConfig) -> Pair {
         Arc::clone(&m_consumer),
         config.clone(),
         Some(Arc::clone(&metrics)),
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .expect("consumer mux");
-    let producer =
-        MessengerMuxTransport::new(Arc::clone(&m_producer), config, Some(Arc::clone(&metrics)))
-            .expect("producer mux");
+    let producer = MessengerMuxTransport::new(
+        Arc::clone(&m_producer),
+        config,
+        Some(Arc::clone(&metrics)),
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("producer mux");
     let consumer_worker = m_consumer.instance_id().worker_id();
     let producer_worker = m_producer.instance_id().worker_id();
     Pair {
@@ -260,6 +265,7 @@ fn aborting_a_retiring_batchers_final_flush_stops_the_mux() {
                 ..MuxConfig::default()
             },
             None,
+            crate::streaming::ReservationConfig::default().prebind_timeout,
         )
         .unwrap();
         let hooks = Arc::new(TestHooks::default());
@@ -316,7 +322,13 @@ async fn a_batcher_dropped_by_stop_sending_leaves_slots_to_shutdown() {
     messenger
         .register_peer(velo_ext::PeerInfo::new(peer, stalling_address()))
         .unwrap();
-    let mux = MessengerMuxTransport::new(messenger, MuxConfig::default(), None).unwrap();
+    let mux = MessengerMuxTransport::new(
+        messenger,
+        MuxConfig::default(),
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .unwrap();
     let hooks = Arc::new(TestHooks::default());
     assert!(mux.core.hooks.set(hooks.clone()).is_ok());
     let receiver = mux.bind(1, 1).await.unwrap();
@@ -345,9 +357,15 @@ async fn a_batcher_dropped_by_stop_sending_leaves_slots_to_shutdown() {
 #[tokio::test]
 async fn velo_joins_mux_tasks_before_transport_teardown() {
     let velo = crate::Velo::builder().build().await.unwrap();
-    let mux = velo.anchor_manager.mux_handle().unwrap().upgrade().unwrap();
+    let mux = velo
+        .inner
+        .anchor_manager
+        .mux_handle()
+        .unwrap()
+        .upgrade()
+        .unwrap();
     let stopped = mux.core.tasks.cancellation_token();
-    let state = velo.messenger.backend().shutdown_state();
+    let state = velo.inner.messenger.backend().shutdown_state();
     let teardown = state.teardown_token();
     let accepted = state.acquire();
     let (exiting, exit_started) = tokio::sync::oneshot::channel();
@@ -528,6 +546,7 @@ async fn a_zero_sweep_interval_is_refused_when_the_mux_is_built() {
             ..MuxConfig::default()
         },
         None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .err()
     .expect("a zero sweep interval cannot tick, so the build must say so");
@@ -543,6 +562,7 @@ async fn a_zero_sweep_interval_is_refused_when_the_mux_is_built() {
             ..MuxConfig::default()
         },
         None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .expect("the same messenger takes a mux with a positive interval");
 }
@@ -783,8 +803,8 @@ async fn live_slots_returns_to_zero_when_the_producers_go_away() {
 /// Dropping the transports themselves has to reach zero too, and promptly.
 ///
 /// The failure this guards against is a strong reference held across `bind`'s
-/// 60-second accept window: the transport would keep every slot, batcher task
-/// and ingress entry alive for a minute after its last owner let go, and the
+/// accept window: the transport would keep every slot, batcher task
+/// and ingress entry alive for the whole window after its last owner let go, and the
 /// gauge would come back only when the timers did.
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_the_transports_tears_every_slot_down_promptly() {
@@ -855,10 +875,20 @@ async fn a_remote_stream_preserves_send_order_under_a_slow_consumer() {
     let consumer_worker = m_consumer.instance_id().worker_id();
     let producer_worker = m_producer.instance_id().worker_id();
 
-    let mux_consumer =
-        MessengerMuxTransport::new(Arc::clone(&m_consumer), test_config(), None).expect("mux a");
-    let mux_producer =
-        MessengerMuxTransport::new(Arc::clone(&m_producer), test_config(), None).expect("mux b");
+    let mux_consumer = MessengerMuxTransport::new(
+        Arc::clone(&m_consumer),
+        test_config(),
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("mux a");
+    let mux_producer = MessengerMuxTransport::new(
+        Arc::clone(&m_producer),
+        test_config(),
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("mux b");
 
     let am_consumer = Arc::new(
         AnchorManagerBuilder::default()
@@ -983,6 +1013,7 @@ async fn one_flush_reaches_every_peer_batcher() {
         Arc::clone(&producer_messenger),
         config.clone(),
         Some(Arc::clone(&metrics)),
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .expect("producer mux");
 
@@ -990,8 +1021,13 @@ async fn one_flush_reaches_every_peer_batcher() {
     let mut senders = Vec::new();
     let mut consumer_muxes = Vec::new();
     for (peer, messenger) in consumers.iter().enumerate() {
-        let mux = MessengerMuxTransport::new(Arc::clone(messenger), config.clone(), None)
-            .expect("consumer mux");
+        let mux = MessengerMuxTransport::new(
+            Arc::clone(messenger),
+            config.clone(),
+            None,
+            crate::streaming::ReservationConfig::default().prebind_timeout,
+        )
+        .expect("consumer mux");
         let worker = messenger.instance_id().worker_id();
         for slot in 0..SLOTS_PER_PEER {
             let id = (peer as u64 + 1) * 100 + slot;
@@ -1096,10 +1132,16 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
         Arc::clone(&consumer_messenger),
         config.clone(),
         Some(Arc::clone(&consumer_metrics)),
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .expect("consumer mux");
-    let producer = MessengerMuxTransport::new(Arc::clone(&producer_messenger), config, None)
-        .expect("producer mux");
+    let producer = MessengerMuxTransport::new(
+        Arc::clone(&producer_messenger),
+        config,
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("producer mux");
 
     let rx = consumer.bind(1, 1).await.expect("bind");
     let tx = producer
@@ -1534,12 +1576,27 @@ async fn prebinding_node(
     config: MuxConfig,
     unattached_timeout: Option<Duration>,
 ) -> PrebindingNode {
+    prebinding_node_with_window(
+        config,
+        unattached_timeout,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .await
+}
+
+/// [`prebinding_node`] with the mux's accept window set.
+async fn prebinding_node_with_window(
+    config: MuxConfig,
+    unattached_timeout: Option<Duration>,
+    accept_window: Duration,
+) -> PrebindingNode {
     let messenger = Messenger::builder()
         .add_transport(tcp_transport())
         .build()
         .await
         .expect("messenger");
-    let mux = MessengerMuxTransport::new(Arc::clone(&messenger), config, None).expect("mux");
+    let mux = MessengerMuxTransport::new(Arc::clone(&messenger), config, None, accept_window)
+        .expect("mux");
     let mut builder = AnchorManagerBuilder::default()
         .worker_id(messenger.instance_id().worker_id())
         .transport(Arc::clone(&mux) as Arc<dyn crate::streaming::transport::FrameTransport>);
@@ -1560,8 +1617,8 @@ async fn prebinding_node(
 ///
 /// Zero-RTT setup binds a slot at request registration, so a request that dies
 /// before its first token — a client that hangs up, a prompt that is refused —
-/// leaves one behind. [`ACCEPT_TIMEOUT`] would collect it eventually and stays
-/// as the backstop, but at the rate a frontend registers requests, a minute of
+/// leaves one behind. The accept window would collect it eventually and stays
+/// as the backstop, but at the rate a frontend registers requests, a whole window of
 /// leaked bind, drain signal and stream watchdog per abandoned one is not a
 /// reclamation policy.
 ///
@@ -1570,7 +1627,7 @@ async fn prebinding_node(
 /// can have run in between, so the reclamation is the drop and nothing else.
 /// That is stronger than pausing the clock and advancing it a little, and it
 /// avoids the trap in the weaker version: under `start_paused` an idle runtime
-/// auto-advances to the next deadline, which is exactly the 60 s accept window
+/// auto-advances to the next deadline, which is the configured accept window
 /// this test exists to prove is not involved.
 #[tokio::test(flavor = "multi_thread")]
 async fn unclaimed_bind_is_reclaimed_on_anchor_death_without_the_timer() {
@@ -1928,7 +1985,7 @@ async fn a_refused_prebind_gives_the_unattached_timer_back() {
 /// which is exactly the window a sender that dies right after attaching (a
 /// worker crash before its first record) sits in. If the watchdog still believes
 /// no sender exists, that death is invisible to the heartbeat watchdog and
-/// waits for the mux's 60 s accept window instead of the usual
+/// waits for the mux's configured accept window instead of the usual
 /// `DETECTION_MULTIPLIER * heartbeat_interval`.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot() {
@@ -1973,7 +2030,7 @@ async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot(
 /// End-to-end version of the reap-on-reclaim fix (`control::reap_unclaimed`,
 /// run by the stream watchdog or the consumer), driven through the real
 /// `AnchorManager` / mux stack rather than a synthetic fixture: at a heartbeat interval the watchdog alone cannot
-/// beat the 60 s accept window with (`>= 20 s` -- `DETECTION_MULTIPLIER`
+/// beat the 60 s accept window this test sets with (`>= 20 s` -- `DETECTION_MULTIPLIER`
 /// is 3, so the watchdog's earliest fire from a fresh window is `3 *
 /// heartbeat`), an adopted pre-bind whose sender never delivers its
 /// `OpenSlot` must still be reaped once the accept window closes, and the
@@ -1981,13 +2038,13 @@ async fn an_adopted_prebind_is_reaped_on_heartbeat_silence_before_its_open_slot(
 /// forever.
 ///
 /// The sibling above uses a 50 ms heartbeat, so its watchdog always wins the
-/// race against the 60 s window and this path never runs there -- this test
+/// race against the accept window and this path never runs there -- this test
 /// is the one that actually exercises the accept window as the reaper.
 #[tokio::test]
 async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window() {
     tokio::time::pause();
     let heartbeat = Duration::from_secs(25);
-    let node = prebinding_node(test_config(), None).await;
+    let node = prebinding_node_with_window(test_config(), None, Duration::from_secs(60)).await;
     let mut anchor = node.manager.create_anchor_with_config::<u32>(AnchorConfig {
         heartbeat_interval: Some(heartbeat),
         ..Default::default()
@@ -2017,7 +2074,7 @@ async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window
     );
 
     // The watchdog alone would not fire until 25 s * (0 + DETECTION_MULTIPLIER)
-    // = 75 s from adoption -- after the fixed 60 s accept window, not before.
+    // = 75 s from adoption -- after the 60 s accept window set above, not before.
     // Advance well past both so whichever fires first has already run.
     tokio::time::sleep(Duration::from_secs(65)).await;
 
@@ -2039,7 +2096,7 @@ async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window
     );
 }
 
-/// An unclaimed pre-bind lives out its 60 s accept window and no longer.
+/// An unclaimed pre-bind lives out its configured accept window and no longer.
 ///
 /// The window is a deadline the credit sweep expires rather than a timer task
 /// per bind, so both edges are pinned here: just short of the window the bind
@@ -2058,7 +2115,10 @@ async fn an_unclaimed_prebind_closes_at_its_accept_window_and_not_before() {
         .prebind_anchor(handle)
         .expect("a mux is installed, so a ticket is minted");
 
-    tokio::time::sleep(ACCEPT_TIMEOUT - Duration::from_millis(500)).await;
+    tokio::time::sleep(
+        crate::streaming::ReservationConfig::default().prebind_timeout - Duration::from_millis(500),
+    )
+    .await;
     assert!(
         node.manager.registry.contains_key(&local_id),
         "the accept window has not closed yet, so the pre-bound anchor must still be registered"
@@ -2899,7 +2959,7 @@ async fn a_stale_detached_spares_a_prebind_installed_mid_poll() {
 
 /// Dropping an anchor before any sender opened its slot gives the bind back.
 ///
-/// The bind would otherwise wait out the 60 s accept window, one per request
+/// The bind would otherwise wait out the accept window, one per request
 /// a frontend abandoned before its worker got to it.
 #[tokio::test(flavor = "multi_thread")]
 async fn dropping_an_anchor_before_its_sender_opens_releases_the_bind() {
@@ -2960,4 +3020,502 @@ async fn a_removed_anchor_withdraws_its_feed() {
         "the removed entry must withdraw its feed"
     );
     drop(anchor);
+}
+
+/// A pre-bind pauses the unattached timer, and the entry says so: `expires`
+/// is `None` while the anchor is pre-bound. See
+/// `anchor::tests::a_local_attach_clears_the_unattached_deadline`.
+#[tokio::test]
+async fn a_prebind_clears_the_unattached_deadline() {
+    tokio::time::pause();
+    let node = prebinding_node(test_config(), Some(Duration::from_secs(120))).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let id = anchor.handle().unpack().1;
+    assert!(node.manager.registry.get(&id).unwrap().expires.is_some());
+    node.manager
+        .prebind_anchor(anchor.handle())
+        .expect("ticket");
+    assert_eq!(node.manager.registry.get(&id).unwrap().expires, None);
+    drop(anchor);
+    node.mux.shutdown().await;
+}
+
+#[tokio::test]
+async fn reservation_renewal_extends_one_deadline_without_reallocating_slots() {
+    tokio::time::pause();
+    let node = prebinding_node_with_window(test_config(), None, Duration::from_secs(3)).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let ticket = node.manager.prebind_anchor(handle).expect("ticket");
+    let reservation = crate::streaming::AnchorReservation::new(handle, Some(&ticket));
+    for _ in 0..5 {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        node.manager.renew_reservations_local(&[reservation]);
+        assert_eq!(node.mux.core.bind_deadlines.heap().len(), 1);
+        assert_eq!(node.manager.active_anchor_count(), 1);
+    }
+    tokio::time::sleep(Duration::from_secs(4)).await;
+    node.mux.core.expire_binds(tokio::time::Instant::now());
+    tokio::task::yield_now().await;
+    node.manager.renew_reservations_local(&[reservation]);
+    assert_eq!(node.manager.active_anchor_count(), 0);
+    node.mux.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_reservation_for_another_session_does_not_renew_the_bind() {
+    tokio::time::pause();
+    let node = prebinding_node_with_window(test_config(), None, Duration::from_secs(3)).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let ticket = node.manager.prebind_anchor(handle).expect("ticket");
+    let mut stale = ticket.clone();
+    stale.routing_session_id += 1;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    node.manager
+        .renew_reservations_local(&[crate::streaming::AnchorReservation::new(
+            handle,
+            Some(&stale),
+        )]);
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    node.mux.core.expire_binds(tokio::time::Instant::now());
+    tokio::task::yield_now().await;
+    assert_eq!(node.manager.active_anchor_count(), 0);
+    node.mux.shutdown().await;
+}
+
+/// A prepared-slot lifetime keeps its full precision. Stored in whole
+/// milliseconds, 1.5 ms became 1 ms, so a bind expired before the lifetime the
+/// caller configured, and a renewal cadence that fit the configured lifetime
+/// arrived too late.
+#[tokio::test]
+async fn a_sub_millisecond_reservation_lifetime_is_not_truncated() {
+    tokio::time::pause();
+    let node = prebinding_node_with_window(test_config(), None, Duration::from_micros(1500)).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    node.manager
+        .prebind_anchor(anchor.handle())
+        .expect("ticket");
+    tokio::time::advance(Duration::from_micros(1200)).await;
+    node.mux.core.expire_binds(tokio::time::Instant::now());
+    tokio::task::yield_now().await;
+    assert_eq!(
+        node.manager.active_anchor_count(),
+        1,
+        "1.2 ms into a 1.5 ms lifetime the bind is still live"
+    );
+    node.mux.shutdown().await;
+}
+
+/// A huge prepared-slot lifetime means "never" and must not panic on
+/// `Instant + Duration` overflow, at bind or at renewal.
+#[tokio::test]
+async fn an_oversized_reservation_lifetime_does_not_panic() {
+    tokio::time::pause();
+    let node = prebinding_node_with_window(test_config(), None, Duration::MAX).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let ticket = node.manager.prebind_anchor(handle).expect("ticket");
+    node.manager
+        .renew_reservations_local(&[crate::streaming::AnchorReservation::new(
+            handle,
+            Some(&ticket),
+        )]);
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    node.mux.core.expire_binds(tokio::time::Instant::now());
+    tokio::task::yield_now().await;
+    assert_eq!(node.manager.active_anchor_count(), 1);
+    node.mux.shutdown().await;
+}
+
+/// A ticket reservation keeps its anchor after the pre-bind is released.
+///
+/// A refused adoption (or a detach) gives the pre-bind back and resumes the
+/// anchor's unattached timer. The holder's request is still open and the
+/// anchor still waits for a sender, so renewing with the ticket must extend
+/// that timer; a no-op here let the anchor expire under a holder whose every
+/// renewal returned `Ok`.
+#[tokio::test]
+async fn a_ticket_reservation_renews_the_anchor_after_its_prebind_is_released() {
+    const UNATTACHED: Duration = Duration::from_secs(2);
+    let node = prebinding_node(test_config(), Some(UNATTACHED)).await;
+    let anchor = node.manager.create_anchor::<u32>();
+    let handle = anchor.handle();
+    let (_, local_id) = handle.unpack();
+    let ticket = node.manager.prebind_anchor(handle).expect("ticket");
+    let reservation = crate::streaming::AnchorReservation::new(handle, Some(&ticket));
+    let request = crate::streaming::control::AnchorAttachRequest {
+        handle,
+        session_id: 1,
+        stream_cancel_handle: crate::streaming::control::StreamCancelHandle::pack(
+            WorkerId::from_u64(7),
+            1,
+        ),
+        supported_transport_keys: vec![velo_ext::TransportKey::new(
+            crate::streaming::tcp_transport::TCP_STREAM_KEY,
+        )],
+        lane_key: None,
+    };
+    assert!(matches!(
+        node.manager.adopt_prebind(local_id, &request),
+        crate::streaming::anchor::PrebindAdoption::Refused(_)
+    ));
+    tokio::time::pause();
+    for _ in 0..8 {
+        tokio::time::sleep(UNATTACHED / 2).await;
+        node.manager.renew_reservations_local(&[reservation]);
+        assert!(
+            node.manager.registry.contains_key(&local_id),
+            "renewal with the ticket keeps the anchor"
+        );
+    }
+    tokio::time::sleep(UNATTACHED * 2).await;
+    assert!(!node.manager.registry.contains_key(&local_id));
+    drop(anchor);
+    node.mux.shutdown().await;
+}
+
+/// A released bind's expiry entry leaves the queue within the recheck horizon,
+/// whatever the accept window.
+///
+/// The queue does not remove an entry when its bind is claimed or released;
+/// the sweep drops it when it comes due. Queued at the bind's own deadline, an
+/// entry for a `Duration::MAX` window came due in 30 years, so every claimed
+/// or released bind grew the queue for the life of the process.
+#[tokio::test]
+async fn a_released_bind_leaves_the_queue_within_the_recheck_horizon() {
+    tokio::time::pause();
+    let node = prebinding_node_with_window(test_config(), None, Duration::MAX).await;
+    let released = node.manager.create_anchor::<u32>();
+    node.manager
+        .prebind_anchor(released.handle())
+        .expect("ticket");
+    let held = node.manager.create_anchor::<u32>();
+    node.manager.prebind_anchor(held.handle()).expect("ticket");
+    drop(released);
+    eventually(|| node.mux.pending_binds() == 1).await;
+    assert_eq!(node.mux.core.bind_deadlines.heap().len(), 2);
+
+    tokio::time::advance(super::BIND_RECHECK + Duration::from_secs(1)).await;
+    node.mux.core.expire_binds(tokio::time::Instant::now());
+    assert_eq!(
+        node.mux.core.bind_deadlines.heap().len(),
+        1,
+        "the released bind's entry is gone; the held one is queued again"
+    );
+    assert_eq!(node.mux.pending_binds(), 1, "the held bind is still open");
+    drop(held);
+    node.mux.shutdown().await;
+}
+
+/// The sweep sizes the queue after it requeues the binds that are still open.
+///
+/// It decided on the shrink first. A sweep that found thousands of held binds
+/// due at once saw a nearly empty queue, gave the capacity back, and then grew
+/// it again to requeue them: one shrink and one grow under the lock every bind
+/// takes, each `BIND_RECHECK` for as long as the binds were held.
+#[tokio::test]
+async fn the_sweep_does_not_shrink_the_queue_it_is_about_to_refill() {
+    const HELD: u64 = 9_000;
+    tokio::time::pause();
+    let node = prebinding_node_with_window(test_config(), None, Duration::MAX).await;
+    let core = &node.mux.core;
+    let due = tokio::time::Instant::now() + Duration::from_secs(1);
+    let capacity = {
+        let mut deadlines = core.bind_deadlines.heap();
+        deadlines.reserve(16_384);
+        for anchor in 1..=HELD {
+            let (tx, _rx) = flume::bounded(1);
+            core.ingress.register_bind(
+                anchor,
+                1,
+                tx,
+                Arc::new(ingress::DrainSignal::new(core.drain_tx.clone())),
+                LaneReservation::uncounted(LaneIndex::ZERO),
+                crate::streaming::deadline::deadline_after(Duration::MAX),
+            );
+            deadlines.push(std::cmp::Reverse((due, (anchor, 1))));
+        }
+        deadlines.capacity()
+    };
+    tokio::time::advance(Duration::from_secs(2)).await;
+    core.expire_binds(tokio::time::Instant::now());
+    let (len, after) = {
+        let deadlines = core.bind_deadlines.heap();
+        (deadlines.len(), deadlines.capacity())
+    };
+    assert_eq!(len, HELD as usize, "every held bind is queued again");
+    assert_eq!(
+        after, capacity,
+        "the queue kept its capacity instead of shrinking and growing back"
+    );
+    node.mux.shutdown().await;
+}
+
+// ---------------------------------------------------------------------------
+// The periodic tick's cost on an idle node
+// ---------------------------------------------------------------------------
+
+/// A sweep interval no test waits out, so the only periodic ticks are the ones
+/// a test runs by hand. The sweep task's first tick is immediate.
+fn manual_tick_config() -> MuxConfig {
+    MuxConfig {
+        credit_sweep_interval: Duration::from_secs(3600),
+        ..MuxConfig::default()
+    }
+}
+
+/// Heap allocations one periodic tick makes on `mux`, counted on this thread.
+fn tick_allocations(mux: &MessengerMuxTransport) -> u64 {
+    let mut visits = sweep::DrainVisits::new(mux.core.config.drain_visit_floor);
+    let now = tokio::time::Instant::now();
+    crate::test_alloc::allocations_in(|| sweep::periodic_tick(&mux.core, &mut visits, now)).1
+}
+
+/// Run one stream to its end, then tick each side until its batcher ages out:
+/// the state of a node that served traffic and went idle.
+async fn serve_one_stream_then_idle(pair: &Pair) {
+    let rx = pair.bind(1, 1).await;
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, 1, 1)
+        .await
+        .expect("connect");
+    for n in 0..8u32 {
+        tx.send_async(item(n)).await.expect("send item");
+    }
+    tx.send_async(cached_finalized().clone())
+        .await
+        .expect("send terminal");
+    for n in 0..8u32 {
+        assert_eq!(rx.recv().await, item(n));
+    }
+    assert_eq!(rx.recv().await, *cached_finalized());
+    drop(tx);
+    eventually(|| rx.is_disconnected() && pair.live_slots() == 0.0).await;
+
+    // Idle: the stream is gone and each side's batcher has aged out.
+    for mux in [&pair.consumer, &pair.producer] {
+        eventually(|| {
+            mux.core.sweep();
+            mux.core.batchers.is_empty()
+        })
+        .await;
+    }
+    assert!(
+        !pair.consumer.core.ingress.peers().is_empty(),
+        "the consumer keeps the producer's ingress table after the stream ends"
+    );
+}
+
+/// Heap allocations of one periodic tick on `mux`, taken while both sides of
+/// `pair` are quiet: no live slot, no batcher, and no mux task but the sweep,
+/// both before and after the tick.
+///
+/// A retired batcher's task can still flush a control reply after the maps
+/// read empty, and that reply recreates its peer's batcher. A tick that finds
+/// one walks the map, which is right for a node that is not idle. So a tick
+/// taken while anything is in flight is not counted, and is taken again. A
+/// tick taken while quiet is returned whatever it counts.
+async fn quiet_tick_allocations(pair: &Pair, mux: &MessengerMuxTransport) -> u64 {
+    let quiet = || {
+        pair.live_slots() == 0.0
+            && [&pair.consumer, &pair.producer]
+                .iter()
+                .all(|side| side.core.batchers.is_empty() && side.core.tasks.len() == 1)
+    };
+    let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
+    while tokio::time::Instant::now() < deadline {
+        for side in [&pair.consumer, &pair.producer] {
+            side.core.sweep();
+        }
+        if quiet() {
+            let allocations = tick_allocations(mux);
+            if quiet() {
+                return allocations;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("the pair never went quiet within {RECV_TIMEOUT:?}");
+}
+
+/// An idle node's periodic tick allocates nothing, before and after traffic.
+///
+/// Every node ticks every `credit_sweep_interval` (200 ms by default), served
+/// or not. The tick walked its two `DashMap`s (batchers and ingress tables)
+/// with `iter()`, and that iterator allocates one `Arc` per shard, empty or
+/// not. A map has 4 shards per CPU, rounded up to a power of two, so an idle
+/// node paid 256 allocations per tick on 20 CPUs and 1,024 on 72: about 5,100
+/// a second for doing nothing. A downstream allocation-count test caught it as
+/// noise it could not explain.
+///
+/// "After traffic" is the case that matters. The ingress table of a peer is
+/// never pruned, so a node that served one stream keeps a non-empty map for
+/// life, and a check for an empty map alone would cover only a node that never
+/// served anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idle_tick_allocates_nothing_before_and_after_traffic() {
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    let shards = (cpus * 4).next_power_of_two();
+    let pair = mux_pair(manual_tick_config()).await;
+
+    for (side, mux) in [("consumer", &pair.consumer), ("producer", &pair.producer)] {
+        assert_eq!(
+            tick_allocations(mux),
+            0,
+            "{side} before any traffic: {cpus} CPUs, {shards} shards per map"
+        );
+    }
+
+    serve_one_stream_then_idle(&pair).await;
+    for (side, mux) in [("consumer", &pair.consumer), ("producer", &pair.producer)] {
+        assert_eq!(
+            quiet_tick_allocations(&pair, mux).await,
+            0,
+            "{side} idle after traffic: {cpus} CPUs, {shards} shards per map"
+        );
+    }
+}
+
+/// With a slot live, the periodic tick still returns its credit when no
+/// doorbell rings: the case the tick is the only answer to.
+///
+/// The control for the idle test above: skipping the walk on an idle node must
+/// not skip it on a busy one. The producer fills its window and parks, the
+/// consumer drains every record with its peer's wake already up (as if a visit
+/// were queued), so no doorbell visit runs and no further batch arrives to
+/// reconcile on. Only the tick can hand the credit back.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_busy_tick_returns_credit_no_doorbell_asked_for() {
+    const WINDOW: u32 = 4;
+    let pair = mux_pair(MuxConfig {
+        initial_credit: WINDOW,
+        ..manual_tick_config()
+    })
+    .await;
+    // The sweep task's first tick is immediate, but runs whenever the task is
+    // first polled. Landing after the wake below is raised, it would take the
+    // wake down and let the doorbell answer the drains.
+    eventually(|| {
+        pair.consumer
+            .core
+            .ticks
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    })
+    .await;
+    // Raise the wake before the slot exists: every drain then finds it up and
+    // posts nothing.
+    pair.consumer
+        .core
+        .ingress
+        .pending_wake(lane0(pair.producer_worker))
+        .store(true, std::sync::atomic::Ordering::Release);
+
+    let rx = pair.bind(3, 3).await;
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, 3, 3)
+        .await
+        .expect("connect");
+    let producer = tokio::spawn(async move {
+        for n in 0..2 * WINDOW {
+            tx.send_async(item(n)).await.expect("send item");
+        }
+        tx
+    });
+
+    eventually(|| rx.rx.len() == WINDOW as usize).await;
+    for n in 0..WINDOW {
+        assert_eq!(rx.recv().await, item(n));
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        rx.rx.is_empty(),
+        "credit came back without the tick: this test no longer isolates it"
+    );
+
+    pair.consumer.core.sweep();
+    for n in WINDOW..2 * WINDOW {
+        assert_eq!(rx.recv().await, item(n), "the tick returned no credit");
+    }
+    drop(producer.await.expect("producer task"));
+    pair.assert_no_reader_stall();
+}
+
+/// Time one periodic tick on an idle node, before and after traffic.
+///
+/// `cargo test --release -p velo --all-features --lib bench_idle_tick --
+/// --ignored --nocapture`. Prints one `RESULT` line per case.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "benchmark: prints ns and allocations per idle tick"]
+async fn bench_idle_tick() {
+    let pair = mux_pair(manual_tick_config()).await;
+    report_idle_tick("fresh", &pair.consumer);
+    serve_one_stream_then_idle(&pair).await;
+    report_idle_tick("after_traffic", &pair.consumer);
+}
+
+fn report_idle_tick(case: &str, mux: &MessengerMuxTransport) {
+    const TICKS: u32 = 100_000;
+    let cpus = std::thread::available_parallelism().map_or(1, usize::from);
+    let shards = (cpus * 4).next_power_of_two();
+    let mut visits = sweep::DrainVisits::new(mux.core.config.drain_visit_floor);
+    let now = tokio::time::Instant::now();
+    for _ in 0..TICKS / 10 {
+        sweep::periodic_tick(&mux.core, &mut visits, now);
+    }
+    let start = std::time::Instant::now();
+    let ((), allocations) = crate::test_alloc::allocations_in(|| {
+        for _ in 0..TICKS {
+            sweep::periodic_tick(&mux.core, &mut visits, now);
+        }
+    });
+    let elapsed = start.elapsed();
+    println!(
+        "RESULT,idle_tick,{case},cpus={cpus},shards={shards},ns_per_tick={:.1},allocs_per_tick={:.2}",
+        elapsed.as_nanos() as f64 / f64::from(TICKS),
+        allocations as f64 / f64::from(TICKS),
+    );
+}
+
+/// A retired batcher can still flush a control reply after the idle fixture
+/// returns, and that reply recreates its peer's batcher. The idle count must
+/// wait that out rather than count a tick that walks the new batcher.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_reply_after_the_idle_fixture_is_not_counted_as_idle() {
+    let pair = mux_pair(manual_tick_config()).await;
+    let hooks = Arc::new(TestHooks::default());
+    hooks.pause();
+    assert!(pair.consumer.core.hooks.set(Arc::clone(&hooks)).is_ok());
+
+    // A partial batch can return credit before its stream's terminal arrives.
+    let receiver = pair.bind(9, 9).await;
+    let sender = pair
+        .producer
+        .connect(pair.consumer_worker, 9, 9)
+        .await
+        .expect("connect");
+    sender.send_async(item(0)).await.expect("send item");
+    assert_eq!(receiver.recv().await, item(0));
+    hooks.wait_until_parked().await;
+    sender
+        .send_async(cached_finalized().clone())
+        .await
+        .expect("send terminal");
+    assert_eq!(receiver.recv().await, *cached_finalized());
+    drop(sender);
+    eventually(|| receiver.is_disconnected() && pair.live_slots() == 0.0).await;
+
+    serve_one_stream_then_idle(&pair).await;
+    assert!(pair.consumer.core.batchers.is_empty());
+    assert!(pair.producer.core.batchers.is_empty());
+    hooks.release();
+    eventually(|| !pair.producer.core.batchers.is_empty()).await;
+    assert_eq!(
+        quiet_tick_allocations(&pair, &pair.producer).await,
+        0,
+        "the producer, once its recreated batcher has aged out again",
+    );
 }

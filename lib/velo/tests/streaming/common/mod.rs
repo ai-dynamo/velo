@@ -382,7 +382,7 @@ macro_rules! run_transport_tests {
             ///
             /// Validates:
             /// - StreamAnchorHandle::pack/unpack roundtrip preserves WorkerId and local_id
-            /// - AnchorManager::create_anchor assigns monotonically increasing local IDs
+            /// - AnchorManager::create_anchor assigns distinct local IDs
             /// - A second concurrent attach returns AttachError::AlreadyAttached
             #[tokio::test(flavor = "multi_thread")]
             async fn test_13_unit_coverage() {
@@ -393,13 +393,13 @@ macro_rules! run_transport_tests {
                 assert_eq!(got_wid, wid);
                 assert_eq!(got_lid, 99u64);
 
-                // Monotonically increasing local IDs
+                // Distinct local IDs
                 let mgr = manager().await;
                 let a1 = mgr.create_anchor::<u32>();
                 let a2 = mgr.create_anchor::<u32>();
                 let (_, lid1) = a1.handle().unpack();
                 let (_, lid2) = a2.handle().unpack();
-                assert!(lid2 > lid1, "local IDs must be monotonically increasing");
+                assert_ne!(lid1, lid2, "local IDs must be distinct");
 
                 // Exclusive attachment: second attach must be rejected
                 let anchor = mgr.create_anchor::<u32>();
