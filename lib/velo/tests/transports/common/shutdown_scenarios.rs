@@ -496,7 +496,7 @@ where
         );
     }
     // Tear down once frames are flowing, so it lands mid-stream.
-    let (first, _) = timeout(
+    let (first, _, _) = timeout(
         Duration::from_secs(5),
         handle_b.streams.response_stream.recv_async(),
     )
@@ -517,7 +517,7 @@ where
         )
         .await
         {
-            Ok(Ok((header, _))) => delivered.push(header),
+            Ok(Ok((header, _, _))) => delivered.push(header),
             _ => break,
         }
     }
@@ -566,7 +566,7 @@ where
         .await
         .expect("closed() bounds its wait");
 
-    let (header, _) = timeout(
+    let (header, _, _) = timeout(
         Duration::from_secs(3),
         handle_b.streams.response_stream.recv_async(),
     )
