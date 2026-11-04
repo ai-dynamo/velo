@@ -18,7 +18,7 @@ use velo::{Handler, ShutdownPolicy, Velo};
 
 const BOUND: Duration = Duration::from_secs(10);
 
-async fn tcp_node() -> Arc<Velo> {
+async fn tcp_node() -> Velo {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     Velo::builder()
         .add_transport(Arc::new(

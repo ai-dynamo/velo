@@ -1543,6 +1543,7 @@ async fn teardown_keeps_a_pending_dial_until_its_deadline() {
             teardown: Arc::new(TeardownStop::new(teardown.clone(), TEARDOWN_FLUSH_GRACE)),
             writing: tokio_util::task::TaskTracker::new().token(),
             connect_timeout: Duration::from_secs(5),
+            own_instance: None,
             reader_ctx: None,
             metrics: None,
             socket_buffers: None,

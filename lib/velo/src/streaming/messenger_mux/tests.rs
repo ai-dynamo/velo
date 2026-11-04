@@ -598,6 +598,7 @@ async fn a_reservation_that_leaves_no_placement_lane_is_refused_when_the_mux_is_
             ..MuxConfig::default()
         },
         None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .err()
     .expect("reserving both lanes leaves none for streams, so the build must say so");
@@ -613,6 +614,7 @@ async fn a_reservation_that_leaves_no_placement_lane_is_refused_when_the_mux_is_
             ..MuxConfig::default()
         },
         None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
     )
     .expect("the same messenger takes a reservation that leaves a lane");
 }

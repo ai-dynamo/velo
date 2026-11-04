@@ -9,7 +9,7 @@ use futures::StreamExt;
 use velo::transports::tcp::TcpTransportBuilder;
 use velo::{Endpoint, Handler, ShutdownPolicy, StreamFrame, Velo};
 
-async fn tcp_node(mux_only: bool) -> (Arc<Velo>, std::net::SocketAddr) {
+async fn tcp_node(mux_only: bool) -> (Velo, std::net::SocketAddr) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
     let builder = Velo::builder().add_transport(Arc::new(

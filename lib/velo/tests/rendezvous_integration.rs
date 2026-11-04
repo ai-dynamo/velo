@@ -483,7 +483,7 @@ async fn a_draining_owner_serves_get_but_refuses_a_new_consumer() {
 // ---------------------------------------------------------------------------
 
 /// Build one node, with the built-in pull routes installed or withheld.
-async fn node(install_rendezvous_handlers: bool) -> Arc<Velo> {
+async fn node(install_rendezvous_handlers: bool) -> Velo {
     Velo::builder()
         .add_transport(new_tcp_transport())
         .install_rendezvous_handlers(install_rendezvous_handlers)
