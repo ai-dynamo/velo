@@ -38,9 +38,19 @@ Every transport implements the `Transport` trait from `velo-ext`. The runtime re
 - **Sends do not wait for the wire.** `send_message` takes the frame and reports when it reached the send channel for the target. Failures after that point go to a `TransportErrorHandler` callback.
 - **Order holds per lane.** `lanes(target)` tells how many ordered channels the transport keeps to a peer. The default is 1. `send_message_on_lane` keeps order within one lane only, and `send_message` sends on lane 0. A lane never fails over to another lane's connection, because that would reorder it. The messenger sends its own traffic on lane 0, because ordered handlers need the messages of one peer on one lane. QUIC and TCP implement lanes. The other transports keep one lane.
 - **Inbound frames go to four streams**: message, response, event, and shutdown. The `TransportAdapter` routes each frame to its stream.
-- **Admission owns the in-flight count.** Each inbound `MessageType::Message` goes through `TransportAdapter::admit_message`. See [Shutdown and drain](shutdown.md) for why a transport must not check `is_draining()` itself.
+- **Admission owns the in-flight count.** Each inbound `MessageType::Message` goes through `TransportAdapter::admit_message`, or `admit_message_from` when the transport knows the peer on the frame's connection. See [Shutdown and drain](shutdown.md) for why a transport must not check `is_draining()` itself.
 - **Unregister forgets a peer.** `unregister(instance_id)` drops what the transport keeps for the peer and closes its connections. The runtime calls it on every transport, also on one that never registered the peer, so it must be cheap and idempotent. The default does nothing, which is right only for a transport with no per-peer state.
 - **Metrics use one handle.** The runtime gives each transport an observability handle through `set_observability`. In-tree and out-of-tree transports write the same `velo_transport_*` series.
+
+## Connection identity
+
+TCP and UDS attribute every inbound frame to the peer on its connection. The node that dials a connection sends a `MessageType::Identify` frame first, announcing its `InstanceId`. The accepting side's reader consumes it, and attributes every later frame on that connection to the announced peer (`SenderIdentity::AnnouncedPeer`). Frames on a connection a node dialed itself are attributed to the peer it dialed (`SenderIdentity::DialedPeer`). A handler reads the result with `Context::sender_identity`, and `Context::sender_peer_info` returns the `PeerInfo` that peer registered.
+
+The identity comes from the connection, never from the frame, so a frame cannot claim a different sender than its connection. It is not authenticated: `AnnouncedPeer` is what the peer said when it opened the connection. QUIC, gRPC, NATS, ZMQ, and UCX deliver every frame as `SenderIdentity::Unattributed`. A guard that needs an identity must fail closed on `Unattributed`.
+
+TCP and UDS promise that every frame they deliver is attributed (`Transport::identifies_connections` returns `true`). So a reply that arrives unattributed from a peer reached over TCP or UDS is treated as forged and dropped.
+
+**Upgrade all TCP and UDS peers together.** A node from velo 0.21 or earlier cannot decode the `Identify` frame and drops the connection, so it receives nothing from a newer node. In the other direction, the older node's connections announce nothing, so its replies reach the newer node unattributed and are dropped as forged. During a rolling upgrade, an old node and a new node cannot exchange requests over TCP or UDS.
 
 ## Coalescing writer
 
