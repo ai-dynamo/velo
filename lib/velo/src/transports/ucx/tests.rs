@@ -190,11 +190,18 @@ fn cross_register(a: &Node, b: &Node) {
         .expect("register a in b");
 }
 
-async fn recv(rx: &flume::Receiver<(Bytes, Bytes)>, timeout: Duration) -> Option<(Bytes, Bytes)> {
-    tokio::time::timeout(timeout, rx.recv_async())
+/// Receive one frame from a response, event or shutdown stream. UCX carries
+/// no connection identity, so every frame it routes must be unattributed.
+async fn recv(
+    rx: &flume::Receiver<(Bytes, Bytes, velo_ext::SenderIdentity)>,
+    timeout: Duration,
+) -> Option<(Bytes, Bytes)> {
+    let (header, payload, sender) = tokio::time::timeout(timeout, rx.recv_async())
         .await
         .ok()?
-        .ok()
+        .ok()?;
+    assert_eq!(sender, velo_ext::SenderIdentity::Unattributed);
+    Some((header, payload))
 }
 
 /// Like `recv`, but for `message_stream`, whose items carry a mandatory

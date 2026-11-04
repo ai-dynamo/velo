@@ -1225,6 +1225,15 @@ unsafe extern "C" fn recv_trampoline(
                             );
                         }
                     }
+                    // Identify is a TCP/UDS connection-open record; it never
+                    // travels as a UCX active message.
+                    Some(MessageType::Identify) => {
+                        record_rejection(
+                            &ra.shared.worker,
+                            velo_ext::TransportRejection::DecodeError,
+                        );
+                        warn!("ucx: inbound AM with connection-only kind Identify");
+                    }
                     None => {
                         record_rejection(
                             &ra.shared.worker,
