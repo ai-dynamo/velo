@@ -37,13 +37,16 @@ impl IngressRegistry {
             .map(|slot| slot.open_terms())
     }
 
-    /// The ids of `key`'s live slots.
+    /// The ids of `key`'s live slots, `closing` included.
     pub(crate) fn live_slot_ids(&self, key: PeerLane) -> Vec<SlotId> {
         self.peers.get(&key).map_or_else(Vec::new, |entry| {
-            lock(entry.value())
+            let state = lock(entry.value());
+            state
                 .slots
                 .iter()
-                .filter_map(|slot| slot.as_ref().map(|slot| slot.id))
+                .flatten()
+                .chain(&state.closing)
+                .map(|slot| slot.id)
                 .collect()
         })
     }
@@ -74,10 +77,12 @@ impl IngressRegistry {
             .iter()
             .filter(|entry| peer.is_none_or(|peer| entry.key().peer == peer))
             .map(|entry| {
-                lock(entry.value())
+                let state = lock(entry.value());
+                state
                     .slots
                     .iter()
                     .flatten()
+                    .chain(&state.closing)
                     .filter(|slot| slot.placed_lane() == lane)
                     .count()
             })
@@ -321,7 +326,9 @@ fn an_out_of_range_open_slot_is_rejected_without_touching_the_table() {
 /// A colliding `OpenSlot` is rejected; the incumbent keeps running.
 ///
 /// The sender's free list only yields an index after that slot's `CloseSlot`,
-/// so an open over a live occupant is a protocol violation however it arose.
+/// so an open over a live occupant whose close has not arrived is a protocol
+/// violation however it arose. (With the close already here, the reuse is
+/// legitimate: `a_reused_index_opens_while_its_predecessor_waits_on_rendezvous`.)
 /// Retiring the occupant to make room would kill a healthy stream silently: no
 /// `Dropped` for its consumer, and its held bytes left charged to the peer
 /// budget forever.
@@ -1003,6 +1010,141 @@ fn a_terminal_close_defers_behind_records_still_in_the_hold() {
         "the consumer sees Finalized, not the Dropped an early close would have injected"
     );
     assert_eq!(registry.live_slots(peer()), 0);
+}
+
+/// Index 0 at generation 0, ended behind a rendezvous record that has not
+/// resolved, and index 0 at generation 1 opened over it with one record
+/// delivered. Returns the two consumers, old stream first.
+fn reopen_behind_rendezvous(
+    registry: &IngressRegistry,
+    config: &MuxConfig,
+) -> (Consumer, Consumer) {
+    let old_consumer = register(registry, config, SESSION);
+    let new_consumer = register(registry, config, SESSION + 1);
+    let old = slot(0, 0);
+    open(registry, config, old, 1);
+
+    // Seq 1 went by rendezvous. The terminal and its close overtook it, so
+    // the terminal waits in the hold and the close waits behind it.
+    let payload = batch(1, 1, |encoder| {
+        encoder.push_data(old, 2, cached_finalized()).unwrap();
+        encoder
+            .push_close_slot(old, 3, CloseReason::TerminalSent)
+            .unwrap();
+    });
+    handle_batch(registry, config, None, peer(), &payload);
+
+    // The sender freed index 0 when it wrote that close, and its next stream
+    // took it at the next generation.
+    let payload = batch(1, 2, |encoder| {
+        encoder
+            .push_open_slot(slot(0, 1), 0, ANCHOR, SESSION + 1)
+            .unwrap();
+        encoder.push_data(slot(0, 1), 1, &item(7)).unwrap();
+    });
+    let outcome = handle_batch(registry, config, None, peer(), &payload);
+    assert_eq!(
+        outcome.replies,
+        vec![],
+        "this side already holds the old slot's close, so the reuse is not a collision"
+    );
+    assert_eq!(outcome.opened, 1);
+    (old_consumer, new_consumer)
+}
+
+/// A reused index opens while the stream before it still waits for a
+/// rendezvous record, and both streams finish.
+///
+/// The sender frees a slot index as soon as it writes the stream's terminal
+/// and `CloseSlot`, and its free list hands that index to the next stream at
+/// once. A record larger than the eager limit goes by rendezvous, which the
+/// receiver resolves outside the ordered lane, so the terminal and the close
+/// can arrive first: the terminal waits in the hold and the close waits
+/// behind it. The next stream's `OpenSlot` then finds the old slot still in
+/// the table. Rejecting it as a collision failed the new stream on the
+/// sender (`ChannelClosed`), and its consumer waited for the accept window to
+/// expire. That is not a collision: this side has the old slot's close, so it
+/// knows the sender is done with it. The old stream must still finish, with
+/// the rendezvous record and `Finalized`, not `Dropped`.
+#[test]
+fn a_reused_index_opens_while_its_predecessor_waits_on_rendezvous() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let (old_consumer, new_consumer) = reopen_behind_rendezvous(&registry, &config);
+    assert_eq!(new_consumer.pump(), vec![item(7)]);
+    assert_eq!(registry.live_slots(peer()), 2, "both streams are live");
+    assert!(old_consumer.pump().is_empty(), "the old stream still waits");
+
+    // The rendezvous record resolves and the old stream ends as it should.
+    let payload = batch(1, 3, |encoder| {
+        encoder.push_data(slot(0, 0), 1, &item(1)).unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(outcome.closed, 1);
+    assert_eq!(
+        old_consumer.pump(),
+        vec![item(1), cached_finalized().clone()]
+    );
+    assert!(old_consumer.rx.is_disconnected());
+    assert_eq!(registry.peer_bytes_used(peer().peer), 0);
+
+    // The new stream was not touched by the old one's close.
+    let payload = batch(1, 4, |encoder| {
+        encoder
+            .push_data(slot(0, 1), 2, cached_finalized())
+            .unwrap();
+        encoder
+            .push_close_slot(slot(0, 1), 3, CloseReason::TerminalSent)
+            .unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(outcome.closed, 1);
+    assert_eq!(new_consumer.pump(), vec![cached_finalized().clone()]);
+    assert_eq!(registry.live_slots(peer()), 0);
+}
+
+/// A stream that waits for a rendezvous record behind a reused index still
+/// retires with its epoch, like a slot in the table: the mux lets go of its
+/// buffer and its held bytes go back. Without that, a sender that reconnects
+/// before the record resolves leaves the slot and its bytes held for good.
+#[test]
+fn a_new_epoch_retires_a_predecessor_still_waiting_on_rendezvous() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let (old_consumer, new_consumer) = reopen_behind_rendezvous(&registry, &config);
+    assert!(
+        registry.peer_bytes_used(peer().peer) > 0,
+        "the hold is charged"
+    );
+
+    let payload = batch(2, 0, |_| {});
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+
+    assert_eq!(outcome.closed, 2);
+    assert_eq!(registry.live_slots(peer()), 0);
+    assert_eq!(registry.peer_bytes_used(peer().peer), 0);
+    assert!(old_consumer.rx.is_disconnected());
+    assert_eq!(new_consumer.pump(), vec![item(7), cached_dropped().clone()]);
+}
+
+/// A consumer that leaves while its stream waits behind a reused index
+/// retires that stream by its full id, and the stream now at the index runs
+/// on. Retiring by index would end the wrong stream.
+#[test]
+fn a_gone_consumer_retires_its_own_stream_behind_a_reused_index() {
+    let config = config();
+    let registry = IngressRegistry::default();
+    let (old_consumer, new_consumer) = reopen_behind_rendezvous(&registry, &config);
+    drop(old_consumer);
+
+    assert!(
+        registry
+            .close_consumer_gone(peer(), slot(0, 0), None, None)
+            .is_some()
+    );
+    assert_eq!(registry.live_slot_ids(peer()), vec![slot(0, 1)]);
+    assert_eq!(registry.peer_bytes_used(peer().peer), 0);
+    assert!(!new_consumer.rx.is_disconnected());
 }
 
 #[test]

@@ -72,23 +72,23 @@ pub(super) fn note_batch_seq(
 }
 
 /// Retire every slot of a dying epoch, injecting exactly one `Dropped` each.
+///
+/// The slots in `closing` too: each still has a consumer waiting for its end.
 pub(super) fn retire_epoch(state: &mut PeerIngress, metrics: Option<&MuxMetricsHandle>) -> usize {
     let mut closed = 0;
-    for index in 0..state.slots.len() {
-        if let Some(mut slot) = state.slots[index].take() {
-            // Only this slot's holds go back: the budget is shared with the
-            // peer's other lanes, whose epochs live on.
-            state.peer_bytes.release(slot.hold_bytes_used() as usize);
-            if let Some(metrics) = metrics
-                && slot.held() > 0
-            {
-                metrics.held_records_delta(-(slot.held() as i64));
-            }
-            slot.inject_dropped();
-            closed += 1;
+    let closing = std::mem::take(&mut state.closing);
+    for mut slot in state.slots.drain(..).flatten().chain(closing) {
+        // Only this slot's holds go back: the budget is shared with the
+        // peer's other lanes, whose epochs live on.
+        state.peer_bytes.release(slot.hold_bytes_used() as usize);
+        if let Some(metrics) = metrics
+            && slot.held() > 0
+        {
+            metrics.held_records_delta(-(slot.held() as i64));
         }
+        slot.inject_dropped();
+        closed += 1;
     }
-    state.slots.clear();
     // The entries here name slots of the epoch being retired. On the ordinary
     // path the list is already empty at this point — the epoch check runs
     // before any record is applied, and `shutdown` runs with no batch in

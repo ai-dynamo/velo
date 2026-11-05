@@ -948,3 +948,102 @@ async fn a_synchronously_admitted_rendezvous_record_still_fences_its_slot() {
          OpenSlot may skip the fence on that path"
     );
 }
+
+/// The next stream reuses a slot index while the receiver still waits for
+/// the old stream's rendezvous record, and it opens and delivers.
+///
+/// Once the rendezvous record is admitted, the sender writes the terminal and
+/// its `CloseSlot` and frees the index. The free list is last in, first out,
+/// so the next stream this (peer, lane) opens takes that index, however many
+/// slots are live. It collides if it opens before the receiver has the
+/// rendezvous record; a pair with one stream at a time, as here, is the
+/// simplest way to get there. The receiver resolves the rendezvous record
+/// outside the ordered lane, so the close and the reopen both reach it first.
+/// The receiver rejected that reopen as a slot collision: the producer saw
+/// `ChannelClosed` and the consumer waited for its accept window to expire.
+///
+/// This drives the real batcher and gives its batches to a real ingress
+/// table in that arrival order. Holding back the rendezvous batch stands in
+/// for the pull that has not finished.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_reused_behind_a_rendezvous_record_opens_on_the_receiver() {
+    use crate::streaming::messenger_mux::LaneIndex;
+    use crate::streaming::messenger_mux::flow_control::slot_buffer_depth;
+    use crate::streaming::messenger_mux::ingress::{DrainSignal, IngressRegistry, handle_batch};
+    use crate::streaming::messenger_mux::lane_choice::LaneReservation;
+
+    let cap = 256;
+    let config = MuxConfig {
+        max_batch_bytes: cap,
+        ..MuxConfig::default()
+    };
+    let harness = harness(config.clone()).await;
+
+    let ingress = IngressRegistry::default();
+    let from = PeerLane::new(velo_ext::WorkerId::from_u64(1), LaneIndex::ZERO);
+    let (wake, _wakes) = flume::unbounded();
+    let bind = |session: u64| {
+        let (tx, rx) = flume::bounded(slot_buffer_depth(config.initial_credit));
+        ingress.register_bind(
+            1,
+            session,
+            tx,
+            Arc::new(DrainSignal::new(wake.clone())),
+            LaneReservation::uncounted(LaneIndex::ZERO),
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        );
+        rx
+    };
+    let old_rx = bind(1);
+    let new_rx = bind(2);
+    let apply = |batch: &OwnedBatch| handle_batch(&ingress, &config, None, from, &batch.payload);
+
+    let (old_inlet, old_open) = harness
+        .open_credited_batch(1, 1, config.initial_credit)
+        .await;
+    apply(&old_open);
+    let oversized = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(vec![
+        7u8;
+        cap * 2
+    ]))
+    .expect("encode oversized");
+    old_inlet.send(oversized.clone()).expect("queue oversized");
+    old_inlet
+        .send(cached_finalized().clone())
+        .expect("queue terminal");
+
+    let rendezvous = harness.next_batch().await;
+    assert_eq!(rendezvous.records.len(), 1);
+    assert_eq!(rendezvous.records[0].data, oversized);
+    let terminal = harness.next_batch().await;
+    let kinds: Vec<_> = terminal.records.iter().map(|r| r.kind).collect();
+    assert_eq!(kinds, [RecordType::Data, RecordType::CloseSlot]);
+    apply(&terminal);
+
+    let (new_inlet, new_open) = harness
+        .open_credited_batch(1, 2, config.initial_credit)
+        .await;
+    assert_eq!(
+        new_open.records[0].slot.index(),
+        old_open.records[0].slot.index(),
+        "the sender reuses the freed index at once; without that this test \
+         reproduces nothing"
+    );
+    let outcome = apply(&new_open);
+    assert_eq!(
+        outcome.replies,
+        vec![],
+        "the reopen must not be rejected as a slot collision"
+    );
+    new_inlet.send(item(1)).expect("queue record");
+    apply(&harness.next_batch().await);
+    assert_eq!(new_rx.try_recv().ok(), Some(item(1)));
+
+    // The rendezvous pull finishes, and the old stream ends as it should.
+    apply(&rendezvous);
+    assert_eq!(
+        old_rx.drain().collect::<Vec<_>>(),
+        vec![oversized, cached_finalized().clone()]
+    );
+    assert!(old_rx.is_disconnected());
+}
