@@ -302,6 +302,50 @@ async fn a_send_carries_only_a_budget_of_its_own() {
     }
 }
 
+/// An eager send that forwards a staged handle (`_rv`) is resolved as that
+/// handle.
+///
+/// The receiver treats any message with `_rv` as staged: it fetches the handle
+/// and replaces the payload with what it fetched. A forwarded handle has been
+/// fetched and released already, so the call fails with a resolution error
+/// and the handler never sees the payload that was sent. Were the handle still
+/// staged, the receiver would hand the handler that payload instead, and
+/// release it under its rightful consumer. This was so before the fetch
+/// deadline existed.
+#[tokio::test]
+#[ignore = "inherited _rv: an eager send that forwards a staged handle is resolved as that handle, not delivered"]
+async fn an_eager_send_that_forwards_a_staged_handle_delivers_its_own_payload() {
+    let (client, server, mut seen, _sent) = capture_pair().await;
+    let target = server.instance_id();
+    client
+        .unary("capture")
+        .unwrap()
+        .instance(target)
+        .raw_payload(Bytes::from(vec![0x5a; 512 * 1024]))
+        .send()
+        .await
+        .unwrap();
+    let forwarded = seen.recv().await.unwrap();
+    assert!(forwarded.contains_key("_rv"));
+
+    let reply = tokio::time::timeout(
+        Duration::from_secs(5),
+        client
+            .unary("echo")
+            .unwrap()
+            .instance(target)
+            .headers(forwarded)
+            .raw_payload(Bytes::from_static(b"mine"))
+            .send(),
+    )
+    .await
+    .expect("the forwarded call ended");
+    assert_eq!(
+        reply.expect("the eager payload was delivered"),
+        Bytes::from_static(b"mine")
+    );
+}
+
 /// A tracing propagator writes headers after the send path has built the
 /// message. One that carries `_rv_budget_ms` in its context wrote an
 /// inherited budget back after the send path had removed it, so an untimed

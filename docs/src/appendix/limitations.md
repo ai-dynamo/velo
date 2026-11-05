@@ -181,8 +181,8 @@ released, so its rightful consumer loses it.
 own.
 
 **Why.** Only the receiver reads `_rv`, and the sender does not remove one
-that it did not write. The fetch budget, `_rv_budget_ms`, is removed on every
-send for this reason.
+that it did not write. The encoder drops a fetch budget, `_rv_budget_ms`,
+that the send did not set, for this reason.
 
 **Workaround.** Do not forward `_rv` (or any header that starts with `_rv`)
 from a handler's headers.
@@ -190,4 +190,4 @@ from a handler's headers.
 **Lifted by.** Not scheduled. The ignored test
 `an_eager_send_that_forwards_a_staged_handle_delivers_its_own_payload` in
 `lib/velo/tests/staged_budget_forwarding.rs` shows it; removing `_rv` on
-every send that does not stage, as the budget is removed, would lift it.
+every send that does not stage, as the budget is dropped, would lift it.
