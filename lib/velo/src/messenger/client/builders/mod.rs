@@ -390,6 +390,9 @@ pub struct MessageBuilder {
     // How long a sync or unary call may wait for its answer. `None` waits
     // until the remote answers or the send fails. Fire sends ignore it.
     timeout: Option<Duration>,
+    // The instant that timeout ends, fixed when the call is sent. A staged
+    // payload carries what is left of it to the receiver.
+    fetch_by: Option<tokio::time::Instant>,
 }
 
 /// Translate a synchronous fast-path `send_message` result into a
@@ -451,6 +454,7 @@ struct SlowPath {
     response_id: ResponseId,
     message_type: MsgType,
     lane: u16,
+    fetch_by: Option<tokio::time::Instant>,
 }
 
 impl SlowPath {
@@ -510,7 +514,8 @@ impl SlowPath {
         };
         drive_send_outcome(
             &self.client,
-            self.client.send_message(target, message, self.lane),
+            self.client
+                .send_message(target, message, self.lane, self.fetch_by),
             self.response_id,
             "slow-path",
         )
@@ -555,6 +560,7 @@ impl MessageBuilder {
             await_capacity: false,
             lane: 0,
             timeout: None,
+            fetch_by: None,
         }
     }
 
@@ -619,9 +625,11 @@ impl MessageBuilder {
     }
 
     /// The call's deadline, fixed now: before slot acquisition and the send,
-    /// so the timeout covers both.
-    fn deadline(&self) -> Option<Deadline> {
-        self.timeout.and_then(Deadline::starting_now)
+    /// so the timeout covers both. The send carries it as `fetch_by`.
+    fn deadline(&mut self) -> Option<Deadline> {
+        let deadline = self.timeout.and_then(Deadline::starting_now);
+        self.fetch_by = deadline.as_ref().map(Deadline::at);
+        deadline
     }
 
     fn resolve_target(&self) -> Result<InstanceId, ResolveError> {
@@ -694,6 +702,7 @@ impl MessageBuilder {
             response_id,
             message_type,
             lane: self.lane,
+            fetch_by: self.fetch_by,
         };
 
         tokio::spawn(async move {
@@ -732,7 +741,8 @@ impl MessageBuilder {
                     payload: self.payload.unwrap_or_default(),
                 };
                 stage_from_send(
-                    self.client.send_message(target, message, self.lane),
+                    self.client
+                        .send_message(target, message, self.lane, self.fetch_by),
                     awaiter,
                 )
             }
@@ -810,7 +820,7 @@ impl MessageBuilder {
         }
     }
 
-    pub fn sync(self) -> SyncResult {
+    pub fn sync(mut self) -> SyncResult {
         let deadline = self.deadline();
         SyncResult {
             stage: self.make_stage(MsgType::Sync),
@@ -818,7 +828,7 @@ impl MessageBuilder {
         }
     }
 
-    pub fn unary(self) -> UnaryResult {
+    pub fn unary(mut self) -> UnaryResult {
         let deadline = self.deadline();
         UnaryResult {
             stage: self.make_stage(MsgType::Unary),
@@ -826,7 +836,7 @@ impl MessageBuilder {
         }
     }
 
-    pub fn typed<R>(self) -> TypedUnaryResult<R>
+    pub fn typed<R>(mut self) -> TypedUnaryResult<R>
     where
         R: DeserializeOwned + Send + 'static,
     {

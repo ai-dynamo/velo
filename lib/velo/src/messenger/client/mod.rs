@@ -137,11 +137,18 @@ impl ActiveMessageClient {
         }
     }
 
+    /// Send `message` to `target` on `lane`.
+    ///
+    /// `fetch_by` is the call's deadline, if it has one. When the payload is
+    /// staged, what is left of it goes beside the handle, so the receiver
+    /// stops fetching when the caller stops waiting
+    /// ([`RV_BUDGET_HEADER_KEY`](crate::messenger::large_payload::RV_BUDGET_HEADER_KEY)).
     pub(crate) fn send_message(
         &self,
         target: InstanceId,
         mut message: ActiveMessage,
         lane: u16,
+        fetch_by: Option<tokio::time::Instant>,
     ) -> Result<SendOutcome> {
         // Transparent large payload staging: if payload exceeds threshold,
         // stage it via rendezvous and replace with a handle in the headers.
@@ -150,14 +157,21 @@ impl ActiveMessageClient {
         {
             let staged_payload = std::mem::replace(&mut message.payload, bytes::Bytes::new());
             let handle_str = stager.stage(staged_payload);
-            message
+            let headers = message
                 .metadata
                 .headers
-                .get_or_insert_with(std::collections::HashMap::new)
-                .insert(
-                    crate::messenger::large_payload::RV_HEADER_KEY.to_string(),
-                    handle_str,
+                .get_or_insert_with(std::collections::HashMap::new);
+            headers.insert(
+                crate::messenger::large_payload::RV_HEADER_KEY.to_string(),
+                handle_str,
+            );
+            if let Some(at) = fetch_by {
+                let left = at.saturating_duration_since(tokio::time::Instant::now());
+                headers.insert(
+                    crate::messenger::large_payload::RV_BUDGET_HEADER_KEY.to_string(),
+                    crate::messenger::large_payload::budget_ms(left),
                 );
+            }
         }
 
         let (header, payload, message_type) = encode_outbound(message)?;
@@ -324,7 +338,7 @@ impl ActiveMessageClient {
             payload: bytes::Bytes::from(payload),
         };
 
-        let send_outcome = self.send_message(target, message, 0)?;
+        let send_outcome = self.send_message(target, message, 0, None)?;
 
         // Share a single handshake_timeout budget across both the admission
         // wait (if the frame was queued) and the response receive. A failed

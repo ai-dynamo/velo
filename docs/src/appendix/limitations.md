@@ -144,3 +144,23 @@ and the slowest peer's read rate, and give the drain its own time through
 `ShutdownPolicy::Timeout`.
 
 **Lifted by.** Not scheduled.
+
+## A fetch that gives up leaves the payload staged
+
+**What happens.** When a receiver gives up the fetch of a staged payload,
+the sender keeps the payload, and its read lock if it granted one, until the
+sender shuts down.
+
+**When.** A fetch that runs out of its deadline (the caller's `.timeout`, or
+`VeloBuilder::staged_fetch_timeout`), and a fetch cut by the receiver's
+teardown.
+
+**Why.** Only the receiver's `release` frees a transparently staged payload,
+and a chunked lease has no deadline on the sender's side. RDMA leases have
+one, and a reaper ends them.
+
+**Workaround.** None inside velo. The leak is one payload for each fetch
+that gives up, so it grows only while a peer keeps stalling.
+
+**Lifted by.** Not scheduled. It needs a deadline on chunked leases and on
+transparently staged payloads, held by the sender.

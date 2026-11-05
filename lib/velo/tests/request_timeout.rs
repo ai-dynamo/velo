@@ -207,8 +207,10 @@ fn stall_fetches_from(sender: &Velo, entered: Arc<Notify>, gate: Arc<Semaphore>)
 /// the slot, and the request's drain guard, until the sender answered or the
 /// receiver tore down. The slot arena is fixed size, so a sender that never
 /// answers takes one slot from the receiver for each request it sends.
+///
+/// The sender now sends what is left of the timeout with the staged handle,
+/// and the receiver drops the fetch when it runs out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "a stalled fetch of a staged request holds the receiver's response slot past the caller's timeout: the fetch has no deadline"]
 async fn a_stalled_fetch_releases_the_receivers_slot_at_the_callers_timeout() {
     let (client, server, echoes) = connected_pair(Arc::new(Semaphore::new(0))).await;
     let target = server.instance_id();
@@ -254,6 +256,67 @@ async fn a_stalled_fetch_releases_the_receivers_slot_at_the_callers_timeout() {
         1,
         "the handler ran on a request whose payload never arrived"
     );
+}
+
+/// The receiver's own bound ends a stalled fetch when the caller set no
+/// `.timeout`, and the caller hears why instead of waiting for ever. This is
+/// the bound for sends that carry none: fire-and-forget sends, calls without a
+/// timeout, and senders that predate the budget header.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_receivers_bound_ends_a_stalled_fetch_and_the_caller_hears_why() {
+    let (client, server, echoes) = connected_pair_with(
+        Arc::new(Semaphore::new(0)),
+        Velo::builder().staged_fetch_timeout(TIMEOUT),
+    )
+    .await;
+    let target = server.instance_id();
+    client
+        .unary("echo")
+        .unwrap()
+        .raw_payload(Bytes::from_static(b"warm"))
+        .timeout(BOUND)
+        .instance(target)
+        .send()
+        .await
+        .expect("echo answers");
+    wait_for_slots(&server, 0).await;
+
+    let entered = Arc::new(Notify::new());
+    let fetch_gate = Arc::new(Semaphore::new(0));
+    stall_fetches_from(&client, entered.clone(), fetch_gate.clone());
+
+    let started = Instant::now();
+    let call = client
+        .unary("echo")
+        .unwrap()
+        .raw_payload(Bytes::from(vec![0x5a; STAGED]))
+        .instance(target)
+        .send();
+    tokio::time::timeout(BOUND, entered.notified())
+        .await
+        .expect("the server began to fetch the staged payload");
+    let outcome = tokio::time::timeout(BOUND, call).await;
+    let elapsed = started.elapsed();
+    let released = settles_to(&server, 0).await;
+    fetch_gate.add_permits(1);
+
+    let err = outcome
+        .expect("the server's bound ended a call that had none")
+        .expect_err("the payload never arrived");
+    assert!(err.downcast_ref::<RequestTimeout>().is_none(), "{err:#}");
+    assert!(
+        format!("{err:#}").contains("did not finish within 200 ms"),
+        "{err:#}"
+    );
+    assert!(
+        elapsed >= TIMEOUT,
+        "the fetch ended early, after {elapsed:?}"
+    );
+    assert!(
+        released,
+        "the server kept the stalled fetch's response slot"
+    );
+    assert_eq!(echoes.load(Ordering::Acquire), 1);
 }
 
 /// Control for the stalled fetch: when the sender answers, a staged request
