@@ -137,12 +137,14 @@ impl ActiveMessageClient {
         }
     }
 
-    /// Send `message` to `target` on `lane`.
+    /// Send `message` to `target` on `lane`. Every send goes through here.
     ///
     /// `fetch_by` is the call's deadline, if it has one. When the payload is
     /// staged, what is left of it goes beside the handle, so the receiver
     /// stops fetching when the caller stops waiting
-    /// ([`RV_BUDGET_HEADER_KEY`](crate::messenger::large_payload::RV_BUDGET_HEADER_KEY)).
+    /// ([`RV_BUDGET_HEADER_KEY`](crate::messenger::large_payload::RV_BUDGET_HEADER_KEY)),
+    /// written by the encoder. No other budget reaches the wire, whatever
+    /// headers the send was given.
     pub(crate) fn send_message(
         &self,
         target: InstanceId,
@@ -157,21 +159,16 @@ impl ActiveMessageClient {
         {
             let staged_payload = std::mem::replace(&mut message.payload, bytes::Bytes::new());
             let handle_str = stager.stage(staged_payload);
-            let headers = message
+            message
                 .metadata
                 .headers
-                .get_or_insert_with(std::collections::HashMap::new);
-            headers.insert(
-                crate::messenger::large_payload::RV_HEADER_KEY.to_string(),
-                handle_str,
-            );
-            if let Some(at) = fetch_by {
-                let left = at.saturating_duration_since(tokio::time::Instant::now());
-                headers.insert(
-                    crate::messenger::large_payload::RV_BUDGET_HEADER_KEY.to_string(),
-                    crate::messenger::large_payload::budget_ms(left),
+                .get_or_insert_with(std::collections::HashMap::new)
+                .insert(
+                    crate::messenger::large_payload::RV_HEADER_KEY.to_string(),
+                    handle_str,
                 );
-            }
+            message.metadata.fetch_budget =
+                fetch_by.map(|at| at.saturating_duration_since(tokio::time::Instant::now()));
         }
 
         let (header, payload, message_type) = encode_outbound(message)?;

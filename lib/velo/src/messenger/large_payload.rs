@@ -67,7 +67,11 @@ pub const RV_HEADER_KEY: &str = "_rv";
 /// `.timeout`, to what is left of that timeout when the payload is staged. It
 /// is a duration, not an instant, because the two clocks are not the same
 /// clock. The receiver starts it when it takes the message off its queue, so
-/// its bound ends a little after the caller's, never before.
+/// its bound does not end before the caller's. How much later it ends depends
+/// on transit, queueing and scheduling, which nothing bounds.
+///
+/// The encoder owns this key: it writes the send's own budget and drops any
+/// other value it finds in the headers, whoever put it there.
 ///
 /// A separate header, because a receiver that does not know it parses the
 /// `_rv` value as a bare number and must keep doing so. Such a receiver
@@ -77,8 +81,9 @@ pub const RV_BUDGET_HEADER_KEY: &str = "_rv_budget_ms";
 
 /// The budget to send for a call that gives up `left` from now: whole
 /// milliseconds, rounded up from nanoseconds, so the receiver's bound cannot
-/// end before the caller's. Saturates at `u64::MAX`, the most a receiver
-/// parses.
+/// end before the caller's. Saturates at `u64::MAX` milliseconds, the most a
+/// receiver parses, so a longer `left` (over 584 million years) is sent
+/// short.
 pub(crate) fn budget_ms(left: Duration) -> String {
     let ms = left.as_nanos().div_ceil(1_000_000);
     u64::try_from(ms).unwrap_or(u64::MAX).to_string()
