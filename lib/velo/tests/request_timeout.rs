@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use velo::transports::tcp::{TcpTransport, TcpTransportBuilder};
 use velo::*;
 
@@ -45,11 +45,15 @@ fn new_transport() -> Arc<TcpTransport> {
 /// `held_sync` and `held_typed`, which answer only once `gate` gives them a
 /// permit.
 async fn connected_pair(gate: Arc<Semaphore>) -> (Velo, Velo, Arc<AtomicUsize>) {
-    let server = Velo::builder()
-        .add_transport(new_transport())
-        .build()
-        .await
-        .unwrap();
+    connected_pair_with(gate, Velo::builder()).await
+}
+
+/// [`connected_pair`], with the server built from `server`.
+async fn connected_pair_with(
+    gate: Arc<Semaphore>,
+    server: VeloBuilder,
+) -> (Velo, Velo, Arc<AtomicUsize>) {
+    let server = server.add_transport(new_transport()).build().await.unwrap();
     let echoes = Arc::new(AtomicUsize::new(0));
     let counter = echoes.clone();
     server
@@ -148,6 +152,133 @@ async fn wait_for_slots(client: &Velo, expected: usize) {
         "response slots stuck at {}, expected {expected}",
         client.response_slots_in_use()
     );
+}
+
+/// Whether `velo` gets back to `expected` response slots within [`BOUND`].
+/// Unlike [`wait_for_slots`] it does not panic, so a test can open a gate
+/// before it asserts, and a failure does not leave a handler waiting.
+async fn settles_to(velo: &Velo, expected: usize) -> bool {
+    tokio::time::timeout(BOUND, async {
+        while velo.response_slots_in_use() != expected {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// Over velo's staging threshold (256 KiB), so the sender stages the payload
+/// and the receiver fetches it before the handler runs.
+const STAGED: usize = 512 * 1024;
+
+/// Make every fetch of a payload that `sender` staged stall at its first step.
+///
+/// The receiver starts a fetch with an `_rv_acquire` call to the sender. This
+/// replaces the sender's `_rv_acquire` with one that signals `entered` and then
+/// waits for a permit from `gate`. That is how a sender that has stopped
+/// answering looks to the receiver, and the gate, not a sleep, decides how
+/// long it lasts.
+fn stall_fetches_from(sender: &Velo, entered: Arc<Notify>, gate: Arc<Semaphore>) {
+    sender
+        .messenger()
+        .register_streaming_handler(
+            Handler::unary_handler_async("_rv_acquire", move |_ctx| {
+                let (entered, gate) = (entered.clone(), gate.clone());
+                async move {
+                    entered.notify_one();
+                    gate.acquire().await.unwrap().forget();
+                    Ok(Some(Bytes::new()))
+                }
+            })
+            .build(),
+        )
+        .unwrap();
+}
+
+/// A staged request's fetch gives the receiver's response slot back when the
+/// caller's timeout runs out.
+///
+/// A payload over the staging threshold does not travel in the request. The
+/// sender stages it, and the receiver fetches it with unary calls of its own
+/// to the sender (`_rv_acquire`, then `_rv_pull`) before the handler runs.
+/// Each of those calls holds one of the receiver's response slots until the
+/// sender answers. When the sender stalls, the caller's `.timeout` ends the
+/// call on the caller's side, but nothing ended the fetch: the receiver kept
+/// the slot, and the request's drain guard, until the sender answered or the
+/// receiver tore down. The slot arena is fixed size, so a sender that never
+/// answers takes one slot from the receiver for each request it sends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "a stalled fetch of a staged request holds the receiver's response slot past the caller's timeout: the fetch has no deadline"]
+async fn a_stalled_fetch_releases_the_receivers_slot_at_the_callers_timeout() {
+    let (client, server, echoes) = connected_pair(Arc::new(Semaphore::new(0))).await;
+    let target = server.instance_id();
+    // A small call first, so the connection is up both ways and the fetch
+    // below is the only thing that can hold a slot on the server.
+    client
+        .unary("echo")
+        .unwrap()
+        .raw_payload(Bytes::from_static(b"warm"))
+        .timeout(BOUND)
+        .instance(target)
+        .send()
+        .await
+        .expect("echo answers");
+    wait_for_slots(&server, 0).await;
+
+    let entered = Arc::new(Notify::new());
+    let fetch_gate = Arc::new(Semaphore::new(0));
+    stall_fetches_from(&client, entered.clone(), fetch_gate.clone());
+
+    let started = Instant::now();
+    let call = client
+        .unary("echo")
+        .unwrap()
+        .raw_payload(Bytes::from(vec![0x5a; STAGED]))
+        .timeout(TIMEOUT)
+        .instance(target)
+        .send();
+    tokio::time::timeout(BOUND, entered.notified())
+        .await
+        .expect("the server began to fetch the staged payload");
+    expect_timeout(started, call).await;
+
+    let released = settles_to(&server, 0).await;
+    let held = server.response_slots_in_use();
+    fetch_gate.add_permits(1);
+    assert!(
+        released,
+        "the server still holds {held} response slot(s) for a fetch its caller gave up on"
+    );
+    assert_eq!(
+        echoes.load(Ordering::Acquire),
+        1,
+        "the handler ran on a request whose payload never arrived"
+    );
+}
+
+/// Control for the stalled fetch: when the sender answers, a staged request
+/// with a timeout gets the whole payload back, and neither side keeps a slot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_staged_request_with_a_timeout_answers_in_full() {
+    let (client, server, echoes) = connected_pair(Arc::new(Semaphore::new(0))).await;
+    let payload = Bytes::from((0..STAGED).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+    let reply = tokio::time::timeout(
+        BOUND,
+        client
+            .unary("echo")
+            .unwrap()
+            .raw_payload(payload.clone())
+            .timeout(BOUND)
+            .instance(server.instance_id())
+            .send(),
+    )
+    .await
+    .expect("echo answers")
+    .expect("echo succeeds");
+    assert_eq!(reply, payload);
+    assert_eq!(echoes.load(Ordering::Acquire), 1);
+    wait_for_slots(&server, 0).await;
+    wait_for_slots(&client, 0).await;
 }
 
 /// Sync, unary and typed unary to handlers that hold their reply all fail with
