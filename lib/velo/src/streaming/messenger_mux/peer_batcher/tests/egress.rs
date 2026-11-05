@@ -1046,4 +1046,9 @@ async fn a_slot_reused_behind_a_rendezvous_record_opens_on_the_receiver() {
         vec![oversized, cached_finalized().clone()]
     );
     assert!(old_rx.is_disconnected());
+    assert_eq!(
+        ingress.peer_bytes_used(from.peer),
+        0,
+        "the hold is released"
+    );
 }

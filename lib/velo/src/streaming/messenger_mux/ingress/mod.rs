@@ -175,20 +175,17 @@ struct PeerIngress {
     last_batch_seq: Option<u32>,
     slots: Vec<Option<IngressSlot>>,
     /// Slots whose sender has closed them and reused their index, while this
-    /// side still waits for records the close is deferred behind.
+    /// side still waits for a rendezvous record their close is deferred
+    /// behind. The record resolves outside the ordered lane, so the close and
+    /// the next stream's `OpenSlot` can arrive first, and that open moves the
+    /// old slot here. It finishes as it would have in the table, or ends with
+    /// its consumer, a fault, or its epoch.
     ///
-    /// A rendezvous record resolves outside the ordered lane, so the terminal
-    /// and `CloseSlot` behind it can arrive first and wait in the slot's hold.
-    /// The sender frees the index when it writes that close and can open its
-    /// next stream there at once. That `OpenSlot` moves the old slot here, by
-    /// its full id, and it finishes here as it would have in the table: the
-    /// missing record arrives, the hold drains, and the deferred close retires
-    /// it. A consumer gone, a fault, a new epoch, or shutdown also retire it.
-    ///
-    /// Not reconciled and given no credit: its sender has closed it and takes
-    /// no more. Usually empty, and searched only when a record's id does not
-    /// match its index's occupant. Every slot here claimed a bind this node
-    /// registered, so it is bounded as the table is.
+    /// Kept by full id. `open_slot` never lets one id be held twice, here or
+    /// in the table. Not reconciled and given no credit: its sender takes no
+    /// more. Usually empty, and searched only when a record's id does not
+    /// match its index's occupant. Bounded as the table is, because every slot
+    /// here claimed a bind this node registered.
     closing: Vec<IngressSlot>,
     /// The peer's byte budget, shared with its other lanes' tables.
     peer_bytes: Arc<SharedByteBudget>,
@@ -706,30 +703,34 @@ fn open_slot(
     // and the close rides this lane ahead of any reopen. So another slot at
     // this index is one of two things:
     //
-    // - Its close arrived and waits in its hold behind a rendezvous record that
-    //   has not resolved. The sender is done with it, and this open is
-    //   legitimate: the incumbent moves to `closing` below, once the bind is
-    //   known to be there, and finishes there.
-    // - No close has arrived. Either the sender opened over a slot it never
-    //   closed, or the close is inside a rendezvous batch with its terminal,
-    //   which happens only for a terminal larger than the eager limit (a
-    //   `TransportError` with a huge message). This side cannot tell the two
-    //   apart, so both are treated as a collision.
-    //   Retiring the incumbent to make room would silently kill a healthy
-    //   stream: its consumer would see the channel end with no `Dropped`, its
-    //   held bytes would stay charged to the peer budget, and the collision
-    //   would be invisible. So the *newcomer* is rejected instead, the
-    //   incumbent is untouched, and the bind stays registered for the opener
-    //   that is entitled to it.
-    let incumbent = state
+    // - Its close is here, waiting in its hold behind a rendezvous record that
+    //   has not resolved. The sender is done with it: it moves to `closing`
+    //   below, once the bind is known to be there, and finishes there.
+    // - No close is here. The sender opened over a slot it never closed, or
+    //   the close is inside a rendezvous batch with a terminal larger than the
+    //   eager limit; this side cannot tell which. Retiring the incumbent would
+    //   kill a healthy stream with no `Dropped` and leave its held bytes
+    //   charged, so the *newcomer* is rejected and the bind stays registered.
+    //
+    // `closing` can also hold this very id: the 8-bit generation came round
+    // while that slot still waits for a rendezvous record. A record names its
+    // slot by id alone, so the late record would reach the newcomer, and the
+    // newcomer's records already on the wire would reach the old slot. Both
+    // end: the old slot fails, with no reply because its sender closed it long
+    // ago, and the newcomer is rejected. So a full id is never held twice.
+    let wrapped = state.closing.iter().any(|slot| slot.id == id);
+    let incumbent_closed = state
         .slots
         .get(index)
         .and_then(Option::as_ref)
-        .filter(|incumbent| incumbent.id != id);
-    let displace = incumbent.is_some_and(IngressSlot::close_pending);
-    if incumbent.is_some() && !displace {
-        // The incumbent, not `id`, occupies this index — `id` itself names no
-        // entry in the table, so it goes to the reject lane.
+        .filter(|incumbent| incumbent.id != id)
+        .map(IngressSlot::close_pending);
+    if wrapped {
+        finish_close(state, id, CloseReason::ProtocolError, ctx.metrics, outcome);
+    }
+    let displace = incumbent_closed == Some(true);
+    if wrapped || incumbent_closed == Some(false) {
+        // `id` names no entry in the table, so it goes to the reject lane.
         outcome.replies.push(ReplyRecord::RejectSlot {
             slot: id,
             reason: CloseReason::ProtocolError,
