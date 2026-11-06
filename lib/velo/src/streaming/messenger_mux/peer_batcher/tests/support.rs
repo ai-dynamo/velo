@@ -46,6 +46,9 @@ pub(super) struct OwnedBatch {
     pub(super) header: BatchHeader,
     pub(super) encoded_len: usize,
     pub(super) records: Vec<OwnedRecord>,
+    /// The batch as it came off the wire, for a test that hands it on to a
+    /// real ingress table.
+    pub(super) payload: Bytes,
 }
 
 impl OwnedBatch {
@@ -74,6 +77,7 @@ impl OwnedBatch {
             header,
             encoded_len: payload.len(),
             records,
+            payload: payload.clone(),
         }
     }
 
@@ -249,10 +253,21 @@ impl Harness {
         session_id: u64,
         credit: u32,
     ) -> (flume::Sender<Vec<u8>>, SlotId) {
-        let (inlet, (slot, _)) = self
-            .open_inner(anchor_id, session_id, 512, SlotCredit::new(credit), None)
+        let (inlet, batch) = self
+            .open_credited_batch(anchor_id, session_id, credit)
             .await;
-        (inlet, slot)
+        (inlet, batch.records[0].slot)
+    }
+
+    /// As [`Self::open_credited`], returning the `OpenSlot` batch itself.
+    pub(super) async fn open_credited_batch(
+        &self,
+        anchor_id: u64,
+        session_id: u64,
+        credit: u32,
+    ) -> (flume::Sender<Vec<u8>>, OwnedBatch) {
+        self.open_inner(anchor_id, session_id, 512, SlotCredit::new(credit), None)
+            .await
     }
 
     /// As [`Self::open_credited`], with the slot holding a producer's
@@ -269,7 +284,7 @@ impl Harness {
         crate::streaming::control::SenderClosed,
     ) {
         let (lifecycle, closed) = watched_lifecycle();
-        let (inlet, (slot, _)) = self
+        let (inlet, batch) = self
             .open_inner(
                 anchor_id,
                 session_id,
@@ -278,7 +293,7 @@ impl Harness {
                 Some(lifecycle),
             )
             .await;
-        (inlet, slot, closed)
+        (inlet, batch.records[0].slot, closed)
     }
 
     /// As [`Self::open_with_header`], with a caller-chosen inlet depth — the
@@ -289,8 +304,10 @@ impl Harness {
         session_id: u64,
         depth: usize,
     ) -> (flume::Sender<Vec<u8>>, (SlotId, BatchHeader)) {
-        self.open_inner(anchor_id, session_id, depth, SlotCredit::new(0), None)
-            .await
+        let (inlet, batch) = self
+            .open_inner(anchor_id, session_id, depth, SlotCredit::new(0), None)
+            .await;
+        (inlet, (batch.records[0].slot, batch.header))
     }
 
     async fn open_inner(
@@ -300,7 +317,7 @@ impl Harness {
         depth: usize,
         credit: SlotCredit,
         lifecycle: Option<crate::streaming::control::SenderEntry>,
-    ) -> (flume::Sender<Vec<u8>>, (SlotId, BatchHeader)) {
+    ) -> (flume::Sender<Vec<u8>>, OwnedBatch) {
         let (inlet_tx, inlet_rx) = flume::bounded::<Vec<u8>>(depth);
         let (ack_tx, ack_rx) = tokio::sync::oneshot::channel();
         self.handle
@@ -331,7 +348,7 @@ impl Harness {
         let batch = self.next_batch().await;
         assert_eq!(batch.records.len(), 1, "OpenSlot is flushed on its own");
         assert_eq!(batch.records[0].kind, RecordType::OpenSlot);
-        (inlet_tx, (batch.records[0].slot, batch.header))
+        (inlet_tx, batch)
     }
 
     pub(super) async fn next_batch(&self) -> OwnedBatch {

@@ -23,7 +23,9 @@
 //! oversized record routed that way is not ordered against the eager batches
 //! around it. `frame_seq` carries the order proof and the per-slot hold is where
 //! an early record waits — bounded by the credit already granted and by the byte
-//! budget behind it. Overflow closes **that** slot and nothing else.
+//! budget behind it. Overflow closes **that** slot and nothing else. The same
+//! gap can keep a slot open after its sender has closed it and reused its
+//! index; [`PeerIngress::closing`] is where such a slot finishes.
 
 mod dirty;
 mod drain;
@@ -172,6 +174,19 @@ struct PeerIngress {
     epoch: Option<u64>,
     last_batch_seq: Option<u32>,
     slots: Vec<Option<IngressSlot>>,
+    /// Slots whose sender has closed them and reused their index, while this
+    /// side still waits for a rendezvous record their close is deferred
+    /// behind. The record resolves outside the ordered lane, so the close and
+    /// the next stream's `OpenSlot` can arrive first, and that open moves the
+    /// old slot here. It finishes as it would have in the table, or ends with
+    /// its consumer, a fault, or its epoch.
+    ///
+    /// Kept by full id. `open_slot` never lets one id be held twice, here or
+    /// in the table. Not reconciled and given no credit: its sender takes no
+    /// more. Usually empty, and searched only when a record's id does not
+    /// match its index's occupant. Bounded as the table is, because every slot
+    /// here claimed a bind this node registered.
+    closing: Vec<IngressSlot>,
     /// The peer's byte budget, shared with its other lanes' tables.
     peer_bytes: Arc<SharedByteBudget>,
     /// Slot indexes the pass being run must reconcile, in arrival order.
@@ -212,6 +227,7 @@ impl PeerIngress {
             epoch: None,
             last_batch_seq: None,
             slots: Vec::new(),
+            closing: Vec::new(),
             peer_bytes,
             touched: Vec::new(),
             dirty: Arc::new(DirtySlots::new()),
@@ -221,7 +237,7 @@ impl PeerIngress {
     }
 
     fn live(&self) -> usize {
-        self.slots.iter().filter(|entry| entry.is_some()).count()
+        self.slots.iter().filter(|entry| entry.is_some()).count() + self.closing.len()
     }
 }
 
@@ -275,20 +291,12 @@ impl IngressRegistry {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let entry = self.peers.get(&key)?;
         let mut state = lock(entry.value());
-        // Generation-checked, because `finish_close` is not: it takes the slot
-        // by dense index alone, and the peer may have recycled this one under a
-        // new generation since the caller learned the id. Retiring by index
-        // would then kill whichever healthy stream holds it now.
-        if state
-            .slots
-            .get(id.index() as usize)
-            .and_then(Option::as_ref)
-            .map(|slot| slot.id)
-            != Some(id)
-        {
-            return None;
-        }
-        let live = state.slots[id.index() as usize].as_ref()?;
+        // By full id: the peer may have recycled the index under a new
+        // generation since the caller learned the id, and retiring by index
+        // would kill whichever healthy stream holds it now. A slot in
+        // `closing` is found too; its reply names a generation the sender has
+        // already closed, and the sender drops it.
+        let live = checked_slot(&mut state, None, id)?;
         if session_id.is_some_and(|session| live.session_id != session) {
             return None;
         }
@@ -691,22 +699,38 @@ fn open_slot(
     }
     // Checked *before* the bind is consumed, and before anything is written.
     //
-    // A live slot at this index means the sender opened over an occupant this
-    // side has not seen closed — it cannot have come from the free list, which
-    // only yields an index after its `CloseSlot`. Retiring the incumbent to make
-    // room would silently kill a healthy stream: its consumer would see the
-    // channel end with no `Dropped`, its held bytes would stay charged to the
-    // peer budget, and the collision would be invisible. So the *newcomer* is
-    // rejected instead, the incumbent is untouched, and the bind stays
-    // registered for the opener that is entitled to it.
-    if state
+    // The sender frees an index only after it writes that slot's `CloseSlot`,
+    // and the close rides this lane ahead of any reopen. So another slot at
+    // this index is one of two things:
+    //
+    // - Its close is here, waiting in its hold behind a rendezvous record that
+    //   has not resolved. The sender is done with it: it moves to `closing`
+    //   below, once the bind is known to be there, and finishes there.
+    // - No close is here. The sender opened over a slot it never closed, or
+    //   the close is inside a rendezvous batch with a terminal larger than the
+    //   eager limit; this side cannot tell which. Retiring the incumbent would
+    //   kill a healthy stream with no `Dropped` and leave its held bytes
+    //   charged, so the *newcomer* is rejected and the bind stays registered.
+    //
+    // `closing` can also hold this very id: the 8-bit generation came round
+    // while that slot still waits for a rendezvous record. A record names its
+    // slot by id alone, so the late record would reach the newcomer, and the
+    // newcomer's records already on the wire would reach the old slot. Both
+    // end: the old slot fails, with no reply because its sender closed it long
+    // ago, and the newcomer is rejected. So a full id is never held twice.
+    let wrapped = state.closing.iter().any(|slot| slot.id == id);
+    let incumbent_closed = state
         .slots
         .get(index)
         .and_then(Option::as_ref)
-        .is_some_and(|incumbent| incumbent.id != id)
-    {
-        // The incumbent, not `id`, occupies this index — `id` itself names no
-        // entry in the table, so it goes to the reject lane.
+        .filter(|incumbent| incumbent.id != id)
+        .map(IngressSlot::close_pending);
+    if wrapped {
+        finish_close(state, id, CloseReason::ProtocolError, ctx.metrics, outcome);
+    }
+    let displace = incumbent_closed == Some(true);
+    if wrapped || incumbent_closed == Some(false) {
+        // `id` names no entry in the table, so it goes to the reject lane.
         outcome.replies.push(ReplyRecord::RejectSlot {
             slot: id,
             reason: CloseReason::ProtocolError,
@@ -741,6 +765,9 @@ fn open_slot(
 
     if state.slots.len() <= index {
         state.slots.resize_with(index + 1, || None);
+    }
+    if displace && let Some(incumbent) = state.slots[index].take() {
+        state.closing.push(incumbent);
     }
     // A re-`OpenSlot` for the *same* id is a duplicate, not a collision: the
     // guard above let it through, so it replaces the incumbent. It goes through
@@ -846,8 +873,7 @@ fn finish_close(
     metrics: Option<&MuxMetricsHandle>,
     outcome: &mut BatchOutcome,
 ) {
-    let index = id.index() as usize;
-    let Some(mut slot) = state.slots.get_mut(index).and_then(Option::take) else {
+    let Some(mut slot) = take_slot(state, id) else {
         return;
     };
     state.peer_bytes.release(slot.hold_bytes_used() as usize);
@@ -875,27 +901,33 @@ fn deliver(
     outcome: &mut BatchOutcome,
 ) {
     let id = record.slot;
-    let index = id.index() as usize;
-    if checked_slot(state, ctx.metrics, id).is_none() {
+    let Some(place) = find_slot(state, ctx.metrics, id) else {
         return;
-    }
+    };
 
     // Split the borrow by field: `apply_data` needs the peer budget alongside
     // the slot, and both live in `state`.
     let peer_bytes = &*state.peer_bytes;
-    let touched = &mut state.touched;
-    let Some(slot) = state.slots[index].as_mut() else {
-        return;
+    let slot = match place {
+        Place::Table => {
+            let Some(slot) = state.slots[id.index() as usize].as_mut() else {
+                return;
+            };
+            // Marked before the record is applied rather than after, so any
+            // record that reaches the slot counts, not only the ones that
+            // spend credit: one that parks in the reorder hold has spent
+            // credit that only a reconcile gives back and may release the
+            // whole hold later in this same batch, while a duplicate spends
+            // none — marking it anyway costs at worst one visit that takes a
+            // drain count of zero and returns.
+            if slot.mark_touched() {
+                state.touched.push(id.index());
+            }
+            slot
+        }
+        // Not marked: its sender has closed it, so it earns no credit.
+        Place::Closing(at) => &mut state.closing[at],
     };
-    // Marked before the record is applied rather than after, so any record
-    // that reaches the slot counts, not only the ones that spend credit: one
-    // that parks in the reorder hold has spent credit that only a reconcile
-    // gives back and may release the whole hold later in this same batch,
-    // while a duplicate spends none — marking it anyway costs at worst one
-    // visit that takes a drain count of zero and returns.
-    if slot.mark_touched() {
-        touched.push(id.index());
-    }
     let held_before = slot.held();
     let applied = slot.apply_data(record.frame_seq, body, peer_bytes);
     let held_after = slot.held();
@@ -949,29 +981,63 @@ fn fail_slot(
         .push(ReplyRecord::CloseSlot { slot: id, reason });
 }
 
-/// Look up a slot, rejecting a stale generation and an index that never opened.
+/// Where a slot is held.
+#[derive(Clone, Copy)]
+enum Place {
+    /// In the table, at its index.
+    Table,
+    /// In [`PeerIngress::closing`], at this position.
+    Closing(usize),
+}
+
+/// Find a slot by its full id, rejecting a stale generation and an index that
+/// never opened.
+///
+/// The table is read first, so a record for a live slot pays what it always
+/// did. `closing` is searched only when the id does not match the index's
+/// occupant.
+fn find_slot(state: &PeerIngress, metrics: Option<&MuxMetricsHandle>, id: SlotId) -> Option<Place> {
+    let occupant = state
+        .slots
+        .get(id.index() as usize)
+        .and_then(Option::as_ref)
+        .map(|slot| slot.id);
+    if occupant == Some(id) {
+        return Some(Place::Table);
+    }
+    if let Some(at) = state.closing.iter().position(|slot| slot.id == id) {
+        return Some(Place::Closing(at));
+    }
+    if let Some(metrics) = metrics {
+        // A different occupant is dense slot reuse caught by the generation
+        // tag. Without it this record would surface inside whichever stream
+        // now holds the index.
+        metrics.record_dropped(if occupant.is_some() {
+            MuxDropReason::Generation
+        } else {
+            MuxDropReason::ClosedSlot
+        });
+    }
+    None
+}
+
+/// As [`find_slot`], returning the slot.
 fn checked_slot<'a>(
     state: &'a mut PeerIngress,
     metrics: Option<&MuxMetricsHandle>,
     id: SlotId,
 ) -> Option<&'a mut IngressSlot> {
-    let index = id.index() as usize;
-    match state.slots.get_mut(index).and_then(Option::as_mut) {
-        Some(slot) if slot.id == id => Some(slot),
-        Some(_) => {
-            // Dense slot reuse caught by the generation tag. Without it this
-            // record would surface inside whichever stream now holds the index.
-            if let Some(metrics) = metrics {
-                metrics.record_dropped(MuxDropReason::Generation);
-            }
-            None
-        }
-        None => {
-            if let Some(metrics) = metrics {
-                metrics.record_dropped(MuxDropReason::ClosedSlot);
-            }
-            None
-        }
+    match find_slot(state, metrics, id)? {
+        Place::Table => state.slots[id.index() as usize].as_mut(),
+        Place::Closing(at) => state.closing.get_mut(at),
+    }
+}
+
+/// Take a slot out of the table or out of `closing`, by its full id.
+fn take_slot(state: &mut PeerIngress, id: SlotId) -> Option<IngressSlot> {
+    match find_slot(state, None, id)? {
+        Place::Table => state.slots[id.index() as usize].take(),
+        Place::Closing(at) => Some(state.closing.swap_remove(at)),
     }
 }
 

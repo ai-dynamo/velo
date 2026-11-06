@@ -250,6 +250,13 @@ impl IngressSlot {
         true
     }
 
+    /// Whether this slot's sender has closed it, with the close deferred
+    /// behind records still on their way. The sender may already have reused
+    /// the index.
+    pub(super) fn close_pending(&self) -> bool {
+        self.pending_close.is_some()
+    }
+
     /// The close deferred behind the hold, if the hold has since drained past
     /// its sequence.
     pub(super) fn due_close(&mut self) -> Option<CloseReason> {

@@ -44,6 +44,8 @@ QUIC and TCP can keep several lanes, each its own connection, to one peer. See [
 
 Streams through the mux spread over those lanes, and each stream stays on one lane. If the caller gives a key (`attach_anchor_keyed`, `prebind_anchor_keyed`), the receiver places the stream by that key, so streams with one key to one receiver share a lane. The key is a placement hint: the mux never orders records across streams. Without a key, the receiver uses the lane with the least load. See [Lanes](docs/src/concepts/batched-streaming.md#lanes).
 
+A stream item larger than the eager limit (256 KiB by default) goes through rendezvous, outside the order of its lane. A stream can therefore end, and free its mux slot, before the receiver has its last large item. The receiver keeps that stream open by its full slot id until the item arrives, and the next stream on that slot opens at once. See [Ordering is per slot](docs/src/concepts/batched-streaming.md#ordering-is-per-slot).
+
 The local ID in an anchor handle is random. The handle is all that a peer needs to attach to an anchor or open its mux slot, and velo does not authenticate peers, so a host that can reach a node cannot guess the handle of another request's stream. See [Streaming](docs/src/concepts/streaming.md).
 
 Build with `default-features = false` to omit distributed events, work queues, and built-in discovery services. The default `services` feature keeps those APIs available. Use `.mux_only()` to avoid an extra stream listener when all peers support the messenger mux. See [Services and mux-only mode](docs/src/guides/migrate-services.md).
