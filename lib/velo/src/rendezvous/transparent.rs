@@ -11,6 +11,7 @@
 //! otherwise it is the chunked pull it has always been.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::messenger::large_payload::{LargePayloadResolver, LargePayloadStager};
 use anyhow::Result;
@@ -95,11 +96,23 @@ impl LargePayloadStager for RendezvousStager {
 /// uses single-use handles (refcount = 1).
 pub struct RendezvousResolver {
     manager: Arc<RendezvousManager>,
+    fetch_timeout: Option<Duration>,
 }
 
 impl RendezvousResolver {
     pub fn new(manager: Arc<RendezvousManager>) -> Self {
-        Self { manager }
+        Self {
+            manager,
+            fetch_timeout: None,
+        }
+    }
+
+    /// Give up a fetch after `timeout`, even when the sender asked for more
+    /// or set no bound. `None`, the default, sets no bound of its own. See
+    /// [`VeloBuilder::staged_fetch_timeout`](crate::VeloBuilder::staged_fetch_timeout).
+    pub fn with_fetch_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.fetch_timeout = timeout;
+        self
     }
 }
 
@@ -116,5 +129,9 @@ impl LargePayloadResolver for RendezvousResolver {
             self.manager.release(handle, lease_id).await?;
             Ok(data)
         })
+    }
+
+    fn fetch_timeout(&self) -> Option<Duration> {
+        self.fetch_timeout
     }
 }

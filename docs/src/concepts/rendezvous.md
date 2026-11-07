@@ -138,6 +138,17 @@ The transparent stager runs inside the synchronous `send_message`. It uses only 
 
 The result: **a process whose only staging is transparent never maps an arena and never takes the RDMA path.** One explicit `register_data_pinned` call maps the first arena. After that, transparent payloads use it. Growing the pool from a send on a background task was rejected. A caller cannot reason about a message send that causes a 64 MiB pin.
 
+#### The fetch has a deadline
+
+The receiver fetches the payload with its own calls to the sender (`_rv_acquire`, then `_rv_pull`). Each call holds one of the receiver's response slots, and the request keeps its drain guard, until the fetch ends. A fetch with no deadline ends only when the sender answers. So a sender that stops answering took one slot from the receiver for each staged request, after its own caller had given up.
+
+The fetch now ends at the first of two bounds:
+
+- **The caller's.** A sync or unary call with `.timeout` sends what is left of it with the handle, in the `_rv_budget_ms` header, rounded up from nanoseconds to whole milliseconds. The receiver starts the bound when it takes the message off its queue, so it does not end before the caller's own timer. How much later it ends depends on transit, queueing and scheduling, which nothing bounds. When it runs out, the receiver drops the fetch and sends no reply: the caller has its `RequestTimeout` already, and a reply that raced the caller's timer would replace that with a different error. The encoder owns the header: it writes the send's own budget, and drops any other `_rv_budget_ms` in the headers, whether the caller, a forwarded handler context or a tracing propagator put it there. Handlers see the staging headers and can forward them, and a budget that a send did not set made a caller with no timer wait for ever.
+- **The receiver's.** `VeloBuilder::staged_fetch_timeout` bounds every fetch on this instance. It covers what carries no bound: fire-and-forget sends, calls without a timeout, and senders from before the header. When it runs out, a sync or unary caller gets an error reply that says the fetch did not finish in time.
+
+The bound is a duration and not an instant, because the two nodes do not share a clock. It is its own header because a receiver from before it reads the `_rv` value as a bare number. Such a receiver ignores the new header. The sender is not told when a fetch gives up. See [the limitation](../appendix/limitations.md#a-fetch-that-gives-up-leaves-the-payload-staged).
+
 ## Reading on the consumer
 
 - `get` GETs into a pool buffer on the consumer, then copies into `Bytes` so the pool space returns at once.
@@ -319,6 +330,7 @@ See [Shutdown and drain](shutdown.md) for the messenger half.
 | Knob | Set through | Default | Effect |
 |---|---|---|---|
 | `DEFAULT_THRESHOLD` | constant (the `Velo` builder uses it) | 256 KiB | Messenger payloads above this go through rendezvous. |
+| `staged_fetch_timeout` | `VeloBuilder` | `None` | The longest the receiver fetches a staged payload. A call's `.timeout` bounds it too. |
 | `DEFAULT_CHUNK_SIZE` | constant | 512 KiB | Chunk size of the chunked path. |
 | `rdma_min_bytes` | `RdmaRendezvousConfig` | 64 KiB | Pinned slots below this answer chunked. |
 | `enabled` | `RdmaRendezvousConfig` | `true` | The kill switch. |

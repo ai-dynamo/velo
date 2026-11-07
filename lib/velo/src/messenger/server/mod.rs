@@ -301,6 +301,10 @@ async fn create_message_handler(
 
                 if let Some(handle_str) = rv_handle_str {
                     if let Some(resolver) = large_payload_resolver.get() {
+                        let fetch_bound = crate::messenger::large_payload::fetch_bound(
+                            message.metadata.headers.as_ref(),
+                            resolver.fetch_timeout(),
+                        );
                         let resolver = Arc::clone(resolver);
                         let hub = hub.clone();
                         let handler_name = message.metadata.handler_name.clone();
@@ -320,6 +324,7 @@ async fn create_message_handler(
                             response_type,
                             headers,
                             handle_str,
+                            fetch_bound,
                             in_flight,
                             backend,
                         });
@@ -417,14 +422,17 @@ struct ResolveJob {
     response_type: crate::messenger::common::messages::ResponseType,
     headers: Option<std::collections::HashMap<String, String>>,
     handle_str: String,
+    /// When to give up the fetch. See [`resolve_within`].
+    fetch_bound: Option<crate::messenger::large_payload::FetchBound>,
     in_flight: Option<Arc<velo_ext::InFlightGuard>>,
     backend: Arc<VeloBackend>,
 }
 
 /// Resolve a large payload off the receive loop, then dispatch it.
 ///
-/// Ends at teardown. The pull waits on the payload's owner with no deadline
-/// of its own, and final Messenger drop does not complete a response wait,
+/// Ends at teardown, or when the fetch's bound runs out, whichever is first.
+/// A fetch with no bound waits on the payload's owner for as long as the
+/// owner takes, and final Messenger drop does not complete a response wait,
 /// so a task that outlived teardown would keep the backend, the resolver,
 /// and the message's drain guard for the life of the process.
 fn spawn_resolve(job: ResolveJob) -> tokio::task::JoinHandle<()> {
@@ -451,10 +459,19 @@ async fn resolve_and_dispatch(job: ResolveJob) {
         response_type,
         headers,
         handle_str,
+        fetch_bound,
         in_flight,
         backend,
     } = job;
-    match resolver.resolve(&handle_str).await {
+    let Some(resolved) = resolve_within(resolver.resolve(&handle_str), fetch_bound).await else {
+        tracing::debug!(
+            target: "crate::messenger::server",
+            handler = %handler_name,
+            "Gave up fetching a large payload at its caller's deadline"
+        );
+        return;
+    };
+    match resolved {
         Ok(resolved_payload) => {
             // Gone: the instance is being torn down,
             // and the message dies with its guard.
@@ -490,6 +507,36 @@ async fn resolve_and_dispatch(job: ResolveJob) {
                 .await;
             }
         }
+    }
+}
+
+/// Await `resolve` until `bound` runs out.
+///
+/// Running out drops the fetch, and with it the response slot of whichever
+/// call to the owner it was waiting on (`_rv_acquire` or `_rv_pull`), and the
+/// message is not dispatched. When the bound was the caller's own deadline
+/// this returns `None`: the caller has stopped waiting, so there is nothing
+/// to tell it. When it was the receiver's own, it returns the error the
+/// caller gets as its reply, so a sync or unary caller with a longer timeout,
+/// or none, hears that the fetch failed instead of waiting.
+///
+/// The owner is not told. If it had already granted the read lock, it keeps
+/// the lock and the staged payload until it tears down: a chunked lease has
+/// no deadline on the owner's side.
+async fn resolve_within(
+    resolve: impl std::future::Future<Output = anyhow::Result<Bytes>>,
+    bound: Option<crate::messenger::large_payload::FetchBound>,
+) -> Option<anyhow::Result<Bytes>> {
+    let Some(bound) = bound else {
+        return Some(resolve.await);
+    };
+    match tokio::time::timeout(bound.within, resolve).await {
+        Ok(resolved) => Some(resolved),
+        Err(_) if bound.callers => None,
+        Err(_) => Some(Err(anyhow::anyhow!(
+            "the fetch of the staged payload did not finish within {} ms",
+            bound.within.as_millis()
+        ))),
     }
 }
 
@@ -679,6 +726,7 @@ mod tests {
             response_type: crate::messenger::common::messages::ResponseType::Unary,
             headers: None,
             handle_str: "1".to_string(),
+            fetch_bound: None,
             in_flight: None,
             backend: Arc::clone(&backend),
         });

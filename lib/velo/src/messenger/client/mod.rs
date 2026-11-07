@@ -137,11 +137,20 @@ impl ActiveMessageClient {
         }
     }
 
+    /// Send `message` to `target` on `lane`. Every send goes through here.
+    ///
+    /// `fetch_by` is the call's deadline, if it has one. When the payload is
+    /// staged, what is left of it goes beside the handle, so the receiver
+    /// stops fetching when the caller stops waiting
+    /// ([`RV_BUDGET_HEADER_KEY`](crate::messenger::large_payload::RV_BUDGET_HEADER_KEY)),
+    /// written by the encoder. No other budget reaches the wire, whatever
+    /// headers the send was given.
     pub(crate) fn send_message(
         &self,
         target: InstanceId,
         mut message: ActiveMessage,
         lane: u16,
+        fetch_by: Option<tokio::time::Instant>,
     ) -> Result<SendOutcome> {
         // Transparent large payload staging: if payload exceeds threshold,
         // stage it via rendezvous and replace with a handle in the headers.
@@ -158,6 +167,8 @@ impl ActiveMessageClient {
                     crate::messenger::large_payload::RV_HEADER_KEY.to_string(),
                     handle_str,
                 );
+            message.metadata.fetch_budget =
+                fetch_by.map(|at| at.saturating_duration_since(tokio::time::Instant::now()));
         }
 
         let (header, payload, message_type) = encode_outbound(message)?;
@@ -324,7 +335,7 @@ impl ActiveMessageClient {
             payload: bytes::Bytes::from(payload),
         };
 
-        let send_outcome = self.send_message(target, message, 0)?;
+        let send_outcome = self.send_message(target, message, 0, None)?;
 
         // Share a single handshake_timeout budget across both the admission
         // wait (if the frame was queued) and the response receive. A failed
