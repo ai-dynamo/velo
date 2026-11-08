@@ -894,6 +894,9 @@ struct Reaper {
 /// In a UCX build with RDMA configured, the RDMA reaper sweeps the same
 /// deadlines; the two racing is harmless, because a lease is consumed once.
 pub(crate) fn ensure_reaper(store: &Arc<DataStore>) {
+    // Pairs with the fence in `sweep_while_pending`: either that sweep sees
+    // the deadline just set, or this swap sees the sweep has stopped.
+    std::sync::atomic::fence(Ordering::SeqCst);
     if store.reaper.running.swap(true, Ordering::AcqRel) {
         return;
     }
@@ -931,7 +934,10 @@ async fn sweep_while_pending(store: Weak<DataStore>, stop: tokio_util::sync::Can
         // A deadline set between the check above and the store, by a caller
         // that saw the flag still up, would wait for nobody. Look once more,
         // and keep running if one did; if that caller already started a new
-        // sweep, this one leaves it to that.
+        // sweep, this one leaves it to that. The fence pairs with the one in
+        // `ensure_reaper`: without both, this look and that caller's swap
+        // can each miss the other's write.
+        std::sync::atomic::fence(Ordering::SeqCst);
         if !store.has_pending_expiry() || store.reaper.running.swap(true, Ordering::AcqRel) {
             return;
         }
