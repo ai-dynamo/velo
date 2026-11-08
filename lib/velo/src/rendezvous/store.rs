@@ -214,6 +214,10 @@ pub enum LeaseOutcome {
     Unknown,
 }
 
+/// A test's code to run inside `DataStore::register_body`.
+#[cfg(test)]
+type RegisterHook = Box<dyn Fn(&DataStore) + Send + Sync>;
+
 /// Options for registering data.
 #[derive(Debug, Clone)]
 pub struct RegisterOptions {
@@ -270,6 +274,10 @@ pub struct DataStore {
     expiring: DashMap<u64, Instant>,
     /// Whether [`ensure_reaper`]'s sweep is running, and what stops it.
     reaper: Reaper,
+    /// Runs inside `register_body`, between its two inserts, so a test can
+    /// put a sweep in that window.
+    #[cfg(test)]
+    between_inserts: std::sync::OnceLock<RegisterHook>,
     /// Observability, for the decisions taken inside the handlers this store
     /// backs. `None` when the instance was built without metrics.
     metrics: Option<Arc<VeloMetrics>>,
@@ -304,6 +312,8 @@ impl DataStore {
             lease_deadlines: DashMap::new(),
             expiring: DashMap::new(),
             reaper: Reaper::default(),
+            #[cfg(test)]
+            between_inserts: std::sync::OnceLock::new(),
             metrics: None,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             rdma: std::sync::OnceLock::new(),
@@ -357,11 +367,6 @@ impl DataStore {
         let local_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let total_len = body.total_len();
         let ttl = opts.as_ref().and_then(|o| o.ttl);
-        // Before the slot, so the sweep never sees a slot that should expire
-        // and is not listed.
-        if let Some(ttl) = ttl {
-            self.expiring.insert(local_id, Instant::now() + ttl);
-        }
         self.slots.insert(
             local_id,
             DataSlot {
@@ -373,6 +378,17 @@ impl DataStore {
                 ttl,
             },
         );
+        #[cfg(test)]
+        if let Some(hook) = self.between_inserts.get() {
+            hook(self);
+        }
+        // After the slot. Listed first, a due expiry could be swept before
+        // its slot existed: the sweep would drop the listing and the slot
+        // would never be swept. A slot freed before it is listed leaves a
+        // listing with no slot, which the sweep drops at its deadline.
+        if let Some(ttl) = ttl {
+            self.expiring.insert(local_id, Instant::now() + ttl);
+        }
         local_id
     }
 
@@ -1346,5 +1362,35 @@ mod tests {
         ensure_reaper(&store);
         tokio::time::sleep(SWEEP_PERIOD * 3).await;
         assert!(store.metadata(id).is_some(), "a stopped reaper reaped");
+    }
+
+    /// A sweep that runs while a slot with a time-to-live is registered
+    /// cannot leave that slot unlisted.
+    ///
+    /// Registration lists the expiry and inserts the slot in two steps. A
+    /// sweep between them found a due listing with no slot behind it and
+    /// dropped the listing, and the slot that arrived next was never swept.
+    /// The payload of a call whose deadline had passed by the time it was
+    /// staged then stayed staged until the sender shut down.
+    #[test]
+    fn a_sweep_during_registration_cannot_unlist_the_slot() {
+        let store = DataStore::new();
+        let later = Instant::now() + Duration::from_secs(3600);
+        let _ = store
+            .between_inserts
+            .set(Box::new(move |store: &DataStore| {
+                store.sweep_expired(later);
+            }));
+        let id = store.register(
+            Bytes::from(vec![1u8; 16]),
+            Some(RegisterOptions::new().ttl(Duration::ZERO)),
+        );
+        assert_eq!(
+            store.sweep_expired(later),
+            (0, 1),
+            "the sweep during registration unlisted the slot"
+        );
+        assert!(store.metadata(id).is_none());
+        assert!(!store.has_pending_expiry());
     }
 }
