@@ -1,22 +1,23 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! The fetch budget on the wire, and the headers a handler can forward.
+//! The two staging headers, and the headers a handler can forward.
 //!
-//! A handler sees every header of its message, the staging headers included,
-//! and may pass them on in a send of its own. A budget belongs to the send
-//! that staged the payload. The receiver reads it as the caller's own deadline
-//! and gives up the fetch at that deadline without a reply, so a budget that a
-//! send did not set makes a caller with no timer wait for ever.
+//! A send that stages its payload carries the handle in `_rv` and, when the
+//! call has a `.timeout`, what is left of it in `_rv_budget_ms`. Both belong
+//! to that send. The receiver fetches the handle and gives up the fetch at
+//! the budget without a reply, so a handle or a budget that a send did not
+//! set makes the receiver fetch someone else's payload, or makes a caller
+//! with no timer wait for ever.
 //!
-//! An inherited budget reached the wire three ways: on a staged send without
-//! a timeout, on an eager send, and through a tracing propagator that writes
-//! headers after the send path had removed it. So these tests do not check
-//! the call's behaviour, which depends on what the receiver does with other
-//! headers. They decode the headers the encoder wrote, as they left the
-//! sender.
+//! A handler may pass its headers on in a send of its own, and a tracing
+//! propagator writes headers late in the send path. So the receiver takes
+//! both staging headers out of a staged message before its handler runs, and
+//! a staged send writes both itself, after the propagator. A budget without a
+//! handle means nothing to a receiver, so an eager send needs no such care.
 //!
-//! The nodes share an in-memory transport, so the tests need no ports.
+//! The nodes share an in-memory transport, so the tests need no ports. Some
+//! tests decode the headers as they left the sender.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -197,18 +198,13 @@ fn last_sent(sent: &Sent, handler: &str) -> HashMap<String, String> {
         .clone()
 }
 
-/// Check the budget on the wire: none when the send did not stage a payload
-/// under a timeout, and otherwise what is left of `timeout`, not the
-/// inherited one.
-fn assert_own_budget(
-    wire: &HashMap<String, String>,
-    staged: bool,
-    timeout: Option<Duration>,
-    row: &str,
-) {
+/// The budget on the wire of a send that staged its payload: what is left of
+/// its own `timeout`, or none without one, whatever budget its headers
+/// carried.
+fn assert_own_budget(wire: &HashMap<String, String>, timeout: Option<Duration>, row: &str) {
     let budget = wire.get("_rv_budget_ms");
     match timeout {
-        Some(timeout) if staged => {
+        Some(timeout) => {
             let ms: u64 = budget
                 .unwrap_or_else(|| panic!("{row}: no budget of its own on the wire"))
                 .parse()
@@ -219,7 +215,7 @@ fn assert_own_budget(
                 "{row}: sent {ms} ms, not what is left of its own timeout"
             );
         }
-        _ => assert_eq!(budget, None, "{row}: sent a budget it did not set"),
+        None => assert_eq!(budget, None, "{row}: sent a budget it did not set"),
     }
 }
 
@@ -230,128 +226,181 @@ enum Path {
     Fire,
 }
 
-/// On every send path, an inherited budget never reaches the wire. A send
-/// writes a budget of its own only when it stages its payload and has a
-/// `.timeout`; fire-and-forget sends have no timeout, so they never write one.
-/// Other forwarded headers pass through.
+const ROWS: [(Path, bool, Option<Duration>); 10] = [
+    (Path::Unary, false, None),
+    (Path::Unary, false, Some(TIMEOUT)),
+    (Path::Unary, true, None),
+    (Path::Unary, true, Some(TIMEOUT)),
+    (Path::Sync, false, None),
+    (Path::Sync, false, Some(TIMEOUT)),
+    (Path::Sync, true, None),
+    (Path::Sync, true, Some(TIMEOUT)),
+    (Path::Fire, false, None),
+    (Path::Fire, true, None),
+];
+
+const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Send `payload` with `headers` to `capture` (unary) or `capture_am` (sync
+/// and fire) on `path`, and return the handler it went to.
+async fn send(
+    client: &Velo,
+    target: InstanceId,
+    path: Path,
+    headers: HashMap<String, String>,
+    payload: Bytes,
+    timeout: Option<Duration>,
+) -> &'static str {
+    match path {
+        Path::Unary => {
+            let call = client.unary("capture").unwrap();
+            let call = call.instance(target).headers(headers).raw_payload(payload);
+            let call = match timeout {
+                Some(t) => call.timeout(t),
+                None => call,
+            };
+            call.send().await.unwrap();
+            "capture"
+        }
+        Path::Sync => {
+            let call = client.am_sync("capture_am").unwrap();
+            let call = call.instance(target).headers(headers).raw_payload(payload);
+            let call = match timeout {
+                Some(t) => call.timeout(t),
+                None => call,
+            };
+            call.send().await.unwrap();
+            "capture_am"
+        }
+        Path::Fire => {
+            client
+                .am_send("capture_am")
+                .unwrap()
+                .instance(target)
+                .headers(headers)
+                .raw_payload(payload)
+                .send()
+                .await
+                .unwrap();
+            "capture_am"
+        }
+    }
+}
+
+fn payload(staged: bool) -> Bytes {
+    if staged {
+        Bytes::from(vec![0x5a; 512 * 1024])
+    } else {
+        Bytes::from_static(b"eager")
+    }
+}
+
+/// On every send path, a handler sees the headers its caller set and neither
+/// staging header. Before, a staged message reached its handler with `_rv`,
+/// and with `_rv_budget_ms` under a timeout, so a handler that passed its
+/// headers on passed them too.
 #[tokio::test]
-async fn a_send_carries_only_a_budget_of_its_own() {
-    const TIMEOUT: Duration = Duration::from_secs(60);
+async fn a_handler_never_sees_the_staging_headers() {
+    let (client, server, mut seen, _sent) = capture_pair().await;
+    let target = server.instance_id();
+    let set = HashMap::from([("trace".to_string(), "kept".to_string())]);
+    for (path, staged, timeout) in ROWS {
+        send(&client, target, path, set.clone(), payload(staged), timeout).await;
+        let row = format!("{path:?}, staged={staged}, timeout={timeout:?}");
+        let headers = tokio::time::timeout(Duration::from_secs(5), seen.recv())
+            .await
+            .unwrap_or_else(|_| panic!("{row}: the handler did not run"))
+            .unwrap();
+        assert_eq!(headers, set, "{row}");
+    }
+}
+
+/// On every send path, a send that stages its payload carries its own handle
+/// and its own budget, or none, whatever its headers carried: a forwarded
+/// `_rv` or `_rv_budget_ms` never reaches the wire beside a staged payload.
+/// An eager send carries no handle. Other headers pass through.
+#[tokio::test]
+async fn a_staged_send_carries_only_its_own_staging_headers() {
     let (client, server, _seen, sent) = capture_pair().await;
     let target = server.instance_id();
     let inherited = HashMap::from([
         ("_rv_budget_ms".to_string(), "7".to_string()),
         ("trace".to_string(), "kept".to_string()),
     ]);
-    let eager = Bytes::from_static(b"eager");
-    let staged = Bytes::from(vec![0x5a; 512 * 1024]);
-    let rows = [
-        (Path::Unary, false, None),
-        (Path::Unary, false, Some(TIMEOUT)),
-        (Path::Unary, true, None),
-        (Path::Unary, true, Some(TIMEOUT)),
-        (Path::Sync, false, None),
-        (Path::Sync, false, Some(TIMEOUT)),
-        (Path::Sync, true, None),
-        (Path::Sync, true, Some(TIMEOUT)),
-        (Path::Fire, false, None),
-        (Path::Fire, true, None),
-    ];
-    for (path, is_staged, timeout) in rows {
-        let payload = if is_staged { &staged } else { &eager }.clone();
-        let headers = inherited.clone();
-        let handler = match path {
-            Path::Unary => {
-                let call = client.unary("capture").unwrap();
-                let call = call.instance(target).headers(headers).raw_payload(payload);
-                let call = match timeout {
-                    Some(t) => call.timeout(t),
-                    None => call,
-                };
-                call.send().await.unwrap();
-                "capture"
-            }
-            Path::Sync => {
-                let call = client.am_sync("capture_am").unwrap();
-                let call = call.instance(target).headers(headers).raw_payload(payload);
-                let call = match timeout {
-                    Some(t) => call.timeout(t),
-                    None => call,
-                };
-                call.send().await.unwrap();
-                "capture_am"
-            }
-            Path::Fire => {
-                client
-                    .am_send("capture_am")
-                    .unwrap()
-                    .instance(target)
-                    .headers(headers)
-                    .raw_payload(payload)
-                    .send()
-                    .await
-                    .unwrap();
-                "capture_am"
-            }
-        };
-        let row = format!("{path:?}, staged={is_staged}, timeout={timeout:?}");
+    for (path, staged, timeout) in ROWS {
+        let mut headers = inherited.clone();
+        if staged {
+            headers.insert("_rv".to_string(), "1".to_string());
+        }
+        let handler = send(&client, target, path, headers, payload(staged), timeout).await;
+        let row = format!("{path:?}, staged={staged}, timeout={timeout:?}");
         let wire = last_sent(&sent, handler);
         assert_eq!(wire.get("trace").map(String::as_str), Some("kept"), "{row}");
-        assert_eq!(wire.contains_key("_rv"), is_staged, "{row}");
-        assert_own_budget(&wire, is_staged, timeout, &row);
+        if staged {
+            let handle = wire
+                .get("_rv")
+                .unwrap_or_else(|| panic!("{row}: no handle"));
+            assert_ne!(handle, "1", "{row}: sent a handle it did not stage");
+            assert_own_budget(&wire, timeout, &row);
+        } else {
+            assert!(
+                !wire.contains_key("_rv"),
+                "{row}: an eager send carried a handle"
+            );
+        }
     }
 }
 
-/// An eager send that forwards a staged handle (`_rv`) is resolved as that
-/// handle.
+/// A handler that passes its headers on sends its own payload, eager or
+/// staged.
 ///
-/// The receiver treats any message with `_rv` as staged: it fetches the handle
-/// and replaces the payload with what it fetched. A forwarded handle has been
-/// fetched and released already, so the call fails with a resolution error
-/// and the handler never sees the payload that was sent. Were the handle still
-/// staged, the receiver would hand the handler that payload instead, and
-/// release it under its rightful consumer. This was so before the fetch
-/// deadline existed.
+/// Before, a handler that got a staged message saw its `_rv` and passed it
+/// on. The receiver of an eager send treats any message with `_rv` as
+/// staged, so it fetched the forwarded handle, which was already released,
+/// and the call failed with "rendezvous handle not found" instead of
+/// delivering the payload that was sent.
 #[tokio::test]
-#[ignore = "inherited _rv: an eager send that forwards a staged handle is resolved as that handle, not delivered"]
-async fn an_eager_send_that_forwards_a_staged_handle_delivers_its_own_payload() {
+async fn a_handler_that_forwards_its_headers_sends_its_own_payload() {
     let (client, server, mut seen, _sent) = capture_pair().await;
     let target = server.instance_id();
     client
         .unary("capture")
         .unwrap()
         .instance(target)
-        .raw_payload(Bytes::from(vec![0x5a; 512 * 1024]))
+        .headers(HashMap::from([("trace".to_string(), "kept".to_string())]))
+        .raw_payload(payload(true))
+        .timeout(TIMEOUT)
         .send()
         .await
         .unwrap();
     let forwarded = seen.recv().await.unwrap();
-    assert!(forwarded.contains_key("_rv"));
 
-    let reply = tokio::time::timeout(
-        Duration::from_secs(5),
-        client
-            .unary("echo")
-            .unwrap()
-            .instance(target)
-            .headers(forwarded)
-            .raw_payload(Bytes::from_static(b"mine"))
-            .send(),
-    )
-    .await
-    .expect("the forwarded call ended");
-    assert_eq!(
-        reply.expect("the eager payload was delivered"),
-        Bytes::from_static(b"mine")
-    );
+    for own in [
+        Bytes::from_static(b"mine"),
+        Bytes::from(vec![0xa5; 512 * 1024]),
+    ] {
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            client
+                .unary("echo")
+                .unwrap()
+                .instance(target)
+                .headers(forwarded.clone())
+                .raw_payload(own.clone())
+                .send(),
+        )
+        .await
+        .expect("the forwarded call ended")
+        .expect("the forwarded call succeeded");
+        assert_eq!(reply, own, "a {}-byte payload", own.len());
+    }
 }
 
-/// A tracing propagator writes headers after the send path has built the
-/// message. One that carries `_rv_budget_ms` in its context wrote an
-/// inherited budget back after the send path had removed it, so an untimed
-/// staged call lost its reply when the owner was slow. The encoder now owns
-/// the key: it drops any `_rv_budget_ms` it finds and writes only the send's
-/// own.
+/// A tracing propagator writes headers late in the send path. One that
+/// writes `_rv_budget_ms` must not put its budget beside a staged payload:
+/// an untimed staged call would lose its reply when the owner was slow. A
+/// staged send writes its staging headers after the propagator runs. On an
+/// eager send the propagated budget means nothing, and the call is answered.
 #[cfg(feature = "distributed-tracing")]
 mod tracing_budget {
     use super::*;
@@ -392,13 +441,10 @@ mod tracing_budget {
     }
 
     #[tokio::test]
-    async fn a_propagated_budget_never_reaches_the_wire() {
-        const TIMEOUT: Duration = Duration::from_secs(60);
+    async fn a_propagated_budget_never_reaches_the_wire_beside_a_staged_payload() {
         opentelemetry::global::set_text_map_propagator(BudgetPropagator);
         let (client, server, _seen, sent) = capture_pair().await;
-        let eager = Bytes::from_static(b"eager");
-        let staged = Bytes::from(vec![0x5a; 512 * 1024]);
-        for (is_staged, timeout) in [(false, None), (true, None), (true, Some(TIMEOUT))] {
+        for (staged, timeout) in [(false, None), (true, None), (true, Some(TIMEOUT))] {
             let call = {
                 let context =
                     opentelemetry::Context::current_with_value(ForwardedBudget("7".into()));
@@ -407,21 +453,23 @@ mod tracing_budget {
                     .unary("echo")
                     .unwrap()
                     .instance(server.instance_id())
-                    .raw_payload(if is_staged { &staged } else { &eager }.clone());
+                    .raw_payload(payload(staged));
                 match timeout {
                     Some(t) => call.timeout(t).send(),
                     None => call.send(),
                 }
             };
             call.await.unwrap();
-            let row = format!("staged={is_staged}, timeout={timeout:?}");
+            let row = format!("staged={staged}, timeout={timeout:?}");
             let wire = last_sent(&sent, "echo");
             assert_eq!(
                 wire.get("probe").map(String::as_str),
                 Some("injected"),
                 "{row}: the propagator did not run"
             );
-            assert_own_budget(&wire, is_staged, timeout, &row);
+            if staged {
+                assert_own_budget(&wire, timeout, &row);
+            }
         }
     }
 }

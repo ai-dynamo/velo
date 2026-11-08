@@ -5,12 +5,8 @@
 
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 use derive_builder::Builder;
-use serde::ser::{Serialize, SerializeMap, Serializer};
 use std::collections::HashMap;
-use std::time::Duration;
 use thiserror::Error;
-
-use crate::messenger::large_payload::{RV_BUDGET_HEADER_KEY, budget_ms};
 
 use super::responses::ResponseId;
 
@@ -52,14 +48,6 @@ pub(crate) struct MessageMetadata {
     pub handler_name: String,
     #[builder(default)]
     pub headers: Option<HashMap<String, String>>,
-    /// How long the receiver may fetch this message's staged payload: the
-    /// send's own budget, set only when it stages the payload of a call with
-    /// a `.timeout`. The encoder writes it as [`RV_BUDGET_HEADER_KEY`] and
-    /// drops any other value of that key in `headers`, so no other budget
-    /// reaches the wire. Not read from the wire: `None` on a decoded message,
-    /// whose budget stays in `headers`.
-    #[builder(default)]
-    pub fetch_budget: Option<Duration>,
 }
 
 impl MessageMetadata {
@@ -74,7 +62,6 @@ impl MessageMetadata {
             response_id,
             handler_name,
             headers,
-            fetch_budget: None,
         }
     }
 
@@ -89,7 +76,6 @@ impl MessageMetadata {
             response_id,
             handler_name,
             headers,
-            fetch_budget: None,
         }
     }
 
@@ -104,7 +90,6 @@ impl MessageMetadata {
             response_id,
             handler_name,
             headers,
-            fetch_budget: None,
         }
     }
 }
@@ -203,28 +188,17 @@ pub(crate) fn encode_active_message(
         return Err(EncodeError::HandlerNameTooLong(handler_name_len));
     }
 
-    // Validate and encode headers if present. The fetch budget is written
-    // here and nowhere else (see `WireHeaders`).
-    let budget = message.metadata.fetch_budget.map(budget_ms);
-    let headers_bytes = if message.metadata.headers.is_some() || budget.is_some() {
-        let headers = message.metadata.headers.as_ref();
-        // Validate per-header size (1KB max per value). A budget in `headers`
-        // is dropped, not written, so it is not checked either.
-        let mut drop_budget = false;
-        for (key, value) in headers.into_iter().flatten() {
-            if key == RV_BUDGET_HEADER_KEY {
-                drop_budget = true;
-            } else if value.len() > MAX_HEADER_VALUE_LEN {
+    // Validate and encode headers if present
+    let headers_bytes = if let Some(ref headers) = message.metadata.headers {
+        // Validate per-header size (1KB max per value)
+        for (key, value) in headers.iter() {
+            if value.len() > MAX_HEADER_VALUE_LEN {
                 return Err(EncodeError::HeaderValueTooLarge(key.clone(), value.len()));
             }
         }
 
         // Serialize headers to MessagePack
-        let msgpack_bytes = rmp_serde::to_vec(&WireHeaders {
-            headers,
-            drop_budget,
-            budget: budget.as_deref(),
-        })?;
+        let msgpack_bytes = rmp_serde::to_vec(headers)?;
 
         // Validate total size (16KB max)
         if msgpack_bytes.len() > MAX_HEADERS_LEN {
@@ -256,40 +230,6 @@ pub(crate) fn encode_active_message(
 
     let message_type = message.metadata.response_type.to_message_type();
     Ok((header.freeze(), message.payload, message_type))
-}
-
-/// The header map as it goes on the wire.
-///
-/// The fetch budget belongs to the send that staged the payload, but a
-/// handler sees the budget of its own message and can forward it, and a
-/// tracing propagator can write headers after the send path is done with
-/// them. A budget that a send did not set makes the receiver give up the
-/// fetch at another call's deadline, with no reply. So the encoder owns the
-/// key: it writes every header except [`RV_BUDGET_HEADER_KEY`], then the
-/// send's own budget if it has one. It serializes the same bytes as the map
-/// would, in the same order, so the envelope size is unchanged.
-struct WireHeaders<'a> {
-    headers: Option<&'a HashMap<String, String>>,
-    /// `headers` holds a budget, which is left out.
-    drop_budget: bool,
-    budget: Option<&'a str>,
-}
-
-impl Serialize for WireHeaders<'_> {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let len = self.headers.map_or(0, HashMap::len) - usize::from(self.drop_budget)
-            + usize::from(self.budget.is_some());
-        let mut map = serializer.serialize_map(Some(len))?;
-        for (key, value) in self.headers.into_iter().flatten() {
-            if !(self.drop_budget && key == RV_BUDGET_HEADER_KEY) {
-                map.serialize_entry(key, value)?;
-            }
-        }
-        if let Some(budget) = self.budget {
-            map.serialize_entry(RV_BUDGET_HEADER_KEY, budget)?;
-        }
-        map.end()
-    }
 }
 
 /// Largest entry count `rmp` writes with a bare `FixMap` marker.
@@ -504,7 +444,6 @@ pub(crate) fn decode_active_message(
             response_id,
             handler_name,
             headers,
-            fetch_budget: None,
         },
         payload,
     })

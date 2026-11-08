@@ -21,7 +21,16 @@
 //! the two. Without a deadline, a sender that stops answering keeps the
 //! receiver's response slot and the request's drain guard until it answers
 //! again, or until the receiver tears down.
+//!
+//! **The two staging headers belong to the send that staged.** The sender
+//! writes both ([`write_staging`]), and the receiver takes both out of the
+//! message before its handler runs ([`take_staging`]). A handler therefore
+//! never sees them, and cannot pass them on in a send of its own: a forwarded
+//! handle would make the next receiver fetch a payload that is not its
+//! message's, and a forwarded budget would make it give up at another call's
+//! deadline.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -70,8 +79,9 @@ pub const RV_HEADER_KEY: &str = "_rv";
 /// its bound does not end before the caller's. How much later it ends depends
 /// on transit, queueing and scheduling, which nothing bounds.
 ///
-/// The encoder owns this key: it writes the send's own budget and drops any
-/// other value it finds in the headers, whoever put it there.
+/// Like [`RV_HEADER_KEY`], it belongs to the send that staged: the sender
+/// writes it ([`write_staging`]) and the receiver takes it out before the
+/// handler runs ([`take_staging`]).
 ///
 /// A separate header, because a receiver that does not know it parses the
 /// `_rv` value as a bare number and must keep doing so. Such a receiver
@@ -89,6 +99,52 @@ pub(crate) fn budget_ms(left: Duration) -> String {
     u64::try_from(ms).unwrap_or(u64::MAX).to_string()
 }
 
+/// Write the staging headers of a send that staged its payload: its handle,
+/// and its `budget` if the call has one. A budget already in `headers` is
+/// removed when the send has none, so only the send's own goes on the wire.
+pub(crate) fn write_staging(
+    headers: &mut Option<HashMap<String, String>>,
+    handle: String,
+    budget: Option<Duration>,
+) {
+    let headers = headers.get_or_insert_with(HashMap::new);
+    headers.insert(RV_HEADER_KEY.to_string(), handle);
+    match budget {
+        Some(left) => {
+            headers.insert(RV_BUDGET_HEADER_KEY.to_string(), budget_ms(left));
+        }
+        None => {
+            headers.remove(RV_BUDGET_HEADER_KEY);
+        }
+    }
+}
+
+/// The staging headers of one inbound message.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Staging {
+    /// The staged payload's handle.
+    pub(crate) handle: String,
+    /// The caller's budget as sent, read by [`fetch_bound`].
+    pub(crate) budget: Option<String>,
+}
+
+/// Take the staging headers out of an inbound message's `headers`.
+///
+/// `None` for a message without a handle, whose headers are left as they
+/// are: a budget without a handle means nothing. A staged message whose
+/// headers are left empty gets `None`, as an eager message without headers
+/// has. One map lookup for a message that was not staged, as a read of the
+/// handle would cost.
+pub(crate) fn take_staging(headers: &mut Option<HashMap<String, String>>) -> Option<Staging> {
+    let map = headers.as_mut()?;
+    let handle = map.remove(RV_HEADER_KEY)?;
+    let budget = map.remove(RV_BUDGET_HEADER_KEY);
+    if map.is_empty() {
+        *headers = None;
+    }
+    Some(Staging { handle, budget })
+}
+
 /// How long a receiver may fetch one staged payload, and whose bound it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct FetchBound {
@@ -100,16 +156,12 @@ pub(crate) struct FetchBound {
     pub(crate) callers: bool,
 }
 
-/// The fetch bound for one staged message: the sender's budget from
-/// `headers`, or the receiver's `own` bound, whichever is smaller. On a tie
-/// the bound is the caller's. A budget that does not parse counts as absent,
-/// as it would on a receiver that does not know the header.
-pub(crate) fn fetch_bound(
-    headers: Option<&std::collections::HashMap<String, String>>,
-    own: Option<Duration>,
-) -> Option<FetchBound> {
-    let sent = headers
-        .and_then(|h| h.get(RV_BUDGET_HEADER_KEY))
+/// The fetch bound for one staged message: the caller's `budget` as sent, or
+/// the receiver's `own` bound, whichever is smaller. On a tie the bound is
+/// the caller's. A budget that does not parse counts as absent, as it would
+/// on a receiver that does not know the header.
+pub(crate) fn fetch_bound(budget: Option<&str>, own: Option<Duration>) -> Option<FetchBound> {
+    let sent = budget
         .and_then(|ms| ms.parse::<u64>().ok())
         .map(Duration::from_millis);
     let bound = |within, callers| FetchBound { within, callers };
@@ -123,11 +175,6 @@ pub(crate) fn fetch_bound(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-
-    fn budget(ms: &str) -> HashMap<String, String> {
-        HashMap::from([(RV_BUDGET_HEADER_KEY.to_string(), ms.to_string())])
-    }
 
     fn callers(ms: u64) -> Option<FetchBound> {
         Some(FetchBound {
@@ -147,16 +194,13 @@ mod tests {
     fn the_fetch_bound_is_the_smaller_of_the_two() {
         let ms = Duration::from_millis;
         assert_eq!(fetch_bound(None, None), None);
-        assert_eq!(fetch_bound(Some(&HashMap::new()), None), None);
-        assert_eq!(fetch_bound(Some(&budget("200")), None), callers(200));
+        assert_eq!(fetch_bound(Some(""), None), None);
+        assert_eq!(fetch_bound(Some("200"), None), callers(200));
         assert_eq!(fetch_bound(None, Some(ms(50))), receivers(50));
-        assert_eq!(
-            fetch_bound(Some(&budget("200")), Some(ms(50))),
-            receivers(50)
-        );
-        assert_eq!(fetch_bound(Some(&budget("20")), Some(ms(50))), callers(20));
-        assert_eq!(fetch_bound(Some(&budget("50")), Some(ms(50))), callers(50));
-        assert_eq!(fetch_bound(Some(&budget("0")), None), callers(0));
+        assert_eq!(fetch_bound(Some("200"), Some(ms(50))), receivers(50));
+        assert_eq!(fetch_bound(Some("20"), Some(ms(50))), callers(20));
+        assert_eq!(fetch_bound(Some("50"), Some(ms(50))), callers(50));
+        assert_eq!(fetch_bound(Some("0"), None), callers(0));
     }
 
     /// A budget this receiver cannot read is treated as no budget, so a
@@ -164,11 +208,8 @@ mod tests {
     #[test]
     fn a_budget_that_does_not_parse_counts_as_absent() {
         let ms = Duration::from_millis;
-        assert_eq!(fetch_bound(Some(&budget("soon")), None), None);
-        assert_eq!(
-            fetch_bound(Some(&budget("-1")), Some(ms(50))),
-            receivers(50)
-        );
+        assert_eq!(fetch_bound(Some("soon"), None), None);
+        assert_eq!(fetch_bound(Some("-1"), Some(ms(50))), receivers(50));
     }
 
     /// The budget rounds up from nanoseconds, never below what is left.
@@ -197,5 +238,86 @@ mod tests {
     #[test]
     fn the_budget_saturates_at_what_a_receiver_parses() {
         assert_eq!(budget_ms(Duration::MAX), u64::MAX.to_string());
+    }
+
+    fn map(entries: &[(&str, &str)]) -> HashMap<String, String> {
+        entries
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The receiver takes both staging headers out, leaves the caller's own,
+    /// and leaves a message without a handle as it is: a budget alone means
+    /// nothing and is an ordinary header.
+    #[test]
+    fn take_staging_takes_both_staging_headers_and_nothing_else() {
+        let mut none = None;
+        assert_eq!(take_staging(&mut none), None);
+
+        let eager = map(&[(RV_BUDGET_HEADER_KEY, "7"), ("trace", "t")]);
+        let mut headers = Some(eager.clone());
+        assert_eq!(take_staging(&mut headers), None);
+        assert_eq!(headers, Some(eager));
+
+        let mut headers = Some(map(&[
+            (RV_HEADER_KEY, "42"),
+            (RV_BUDGET_HEADER_KEY, "7"),
+            ("trace", "t"),
+        ]));
+        assert_eq!(
+            take_staging(&mut headers),
+            Some(Staging {
+                handle: "42".into(),
+                budget: Some("7".into()),
+            })
+        );
+        assert_eq!(headers, Some(map(&[("trace", "t")])));
+
+        let mut headers = Some(map(&[(RV_HEADER_KEY, "42")]));
+        assert_eq!(
+            take_staging(&mut headers),
+            Some(Staging {
+                handle: "42".into(),
+                budget: None,
+            })
+        );
+        assert_eq!(
+            headers, None,
+            "left empty, as an eager message without headers"
+        );
+    }
+
+    /// The sender writes its own handle, and its own budget or none: a handle
+    /// or a budget the headers already carried is replaced or removed.
+    #[test]
+    fn write_staging_writes_only_the_sends_own() {
+        let mut headers = None;
+        write_staging(&mut headers, "42".into(), None);
+        assert_eq!(headers, Some(map(&[(RV_HEADER_KEY, "42")])));
+
+        let inherited = map(&[
+            (RV_HEADER_KEY, "1"),
+            (RV_BUDGET_HEADER_KEY, "7"),
+            ("trace", "t"),
+        ]);
+        let mut headers = Some(inherited.clone());
+        write_staging(&mut headers, "42".into(), None);
+        assert_eq!(headers, Some(map(&[(RV_HEADER_KEY, "42"), ("trace", "t")])));
+
+        let mut headers = Some(inherited);
+        write_staging(
+            &mut headers,
+            "42".into(),
+            Some(Duration::from_micros(1_500)),
+        );
+        assert_eq!(
+            headers,
+            Some(map(&[
+                (RV_HEADER_KEY, "42"),
+                (RV_BUDGET_HEADER_KEY, "2"),
+                ("trace", "t")
+            ]))
+        );
     }
 }

@@ -390,9 +390,6 @@ pub struct MessageBuilder {
     // How long a sync or unary call may wait for its answer. `None` waits
     // until the remote answers or the send fails. Fire sends ignore it.
     timeout: Option<Duration>,
-    // The instant that timeout ends, fixed when the call is sent. A staged
-    // payload carries what is left of it to the receiver.
-    fetch_by: Option<tokio::time::Instant>,
 }
 
 /// Translate a synchronous fast-path `send_message` result into a
@@ -560,7 +557,6 @@ impl MessageBuilder {
             await_capacity: false,
             lane: 0,
             timeout: None,
-            fetch_by: None,
         }
     }
 
@@ -625,11 +621,9 @@ impl MessageBuilder {
     }
 
     /// The call's deadline, fixed now: before slot acquisition and the send,
-    /// so the timeout covers both. The send carries it as `fetch_by`.
-    fn deadline(&mut self) -> Option<Deadline> {
-        let deadline = self.timeout.and_then(Deadline::starting_now);
-        self.fetch_by = deadline.as_ref().map(Deadline::at);
-        deadline
+    /// so the timeout covers both.
+    fn deadline(&self) -> Option<Deadline> {
+        self.timeout.and_then(Deadline::starting_now)
     }
 
     fn resolve_target(&self) -> Result<InstanceId, ResolveError> {
@@ -691,6 +685,7 @@ impl MessageBuilder {
         kind: SlowPathKind,
         response_id: ResponseId,
         message_type: MsgType,
+        fetch_by: Option<tokio::time::Instant>,
     ) -> oneshot::Receiver<AdmissionReport> {
         let (report_tx, report_rx) = oneshot::channel();
         let slow_path = SlowPath {
@@ -702,7 +697,7 @@ impl MessageBuilder {
             response_id,
             message_type,
             lane: self.lane,
-            fetch_by: self.fetch_by,
+            fetch_by,
         };
 
         tokio::spawn(async move {
@@ -726,6 +721,7 @@ impl MessageBuilder {
         target_result: Result<InstanceId, ResolveError>,
         awaiter: ResponseAwaiter,
         message_type: MsgType,
+        fetch_by: Option<tokio::time::Instant>,
     ) -> Dispatched {
         let worker_id = self.target_worker;
         let response_id = awaiter.response_id();
@@ -742,12 +738,17 @@ impl MessageBuilder {
                 };
                 stage_from_send(
                     self.client
-                        .send_message(target, message, self.lane, self.fetch_by),
+                        .send_message(target, message, self.lane, fetch_by),
                     awaiter,
                 )
             }
             Ok(target) => Dispatched::detached(
-                self.spawn_slow_path(SlowPathKind::Handshake(target), response_id, message_type),
+                self.spawn_slow_path(
+                    SlowPathKind::Handshake(target),
+                    response_id,
+                    message_type,
+                    fetch_by,
+                ),
                 awaiter,
             ),
             Err(ResolveError::UnresolvedPeer) => {
@@ -763,6 +764,7 @@ impl MessageBuilder {
                         SlowPathKind::Discovery(worker_id),
                         response_id,
                         message_type,
+                        fetch_by,
                     ),
                     awaiter,
                 )
@@ -788,7 +790,14 @@ impl MessageBuilder {
     /// send into the result, because there waiting is exactly what the caller
     /// asked for and spawning a task per waiting send would remove the
     /// backpressure it wanted.
-    fn make_stage(self, message_type: MsgType) -> SendStage {
+    ///
+    /// `fetch_by` is the call's deadline, if it has one. A staged payload
+    /// carries what is left of it to the receiver.
+    fn make_stage(
+        self,
+        message_type: MsgType,
+        fetch_by: Option<tokio::time::Instant>,
+    ) -> SendStage {
         let target_result = match self.resolve_target() {
             Err(ResolveError::Other(e)) => return SendStage::failed(e),
             other => other,
@@ -796,12 +805,12 @@ impl MessageBuilder {
 
         match self.acquire() {
             Acquisition::Allocated(awaiter) => {
-                SendStage::Dispatched(self.dispatch(target_result, awaiter, message_type))
+                SendStage::Dispatched(self.dispatch(target_result, awaiter, message_type, fetch_by))
             }
             Acquisition::Deferred(backpressure) => {
                 let deferred = Box::pin(async move {
                     let awaiter = backpressure.await;
-                    self.dispatch(target_result, awaiter, message_type)
+                    self.dispatch(target_result, awaiter, message_type, fetch_by)
                 });
                 SendStage::Acquiring(deferred)
             }
@@ -816,33 +825,33 @@ impl MessageBuilder {
     /// not drive it.
     pub fn fire(self) -> FireResult {
         FireResult {
-            stage: self.make_stage(MsgType::Fire),
+            stage: self.make_stage(MsgType::Fire, None),
         }
     }
 
-    pub fn sync(mut self) -> SyncResult {
+    pub fn sync(self) -> SyncResult {
         let deadline = self.deadline();
         SyncResult {
-            stage: self.make_stage(MsgType::Sync),
+            stage: self.make_stage(MsgType::Sync, deadline.as_ref().map(Deadline::at)),
             deadline,
         }
     }
 
-    pub fn unary(mut self) -> UnaryResult {
+    pub fn unary(self) -> UnaryResult {
         let deadline = self.deadline();
         UnaryResult {
-            stage: self.make_stage(MsgType::Unary),
+            stage: self.make_stage(MsgType::Unary, deadline.as_ref().map(Deadline::at)),
             deadline,
         }
     }
 
-    pub fn typed<R>(mut self) -> TypedUnaryResult<R>
+    pub fn typed<R>(self) -> TypedUnaryResult<R>
     where
         R: DeserializeOwned + Send + 'static,
     {
         let deadline = self.deadline();
         TypedUnaryResult {
-            stage: self.make_stage(MsgType::Unary),
+            stage: self.make_stage(MsgType::Unary, deadline.as_ref().map(Deadline::at)),
             deadline,
             _marker: std::marker::PhantomData,
         }

@@ -263,7 +263,7 @@ async fn create_message_handler(
         let in_flight = Some(Arc::new(guard));
 
         match decode_active_message(header, payload) {
-            Ok(message) => {
+            Ok(mut message) => {
                 let Some(system) = held.get(|| hub.system()) else {
                     break;
                 };
@@ -291,26 +291,27 @@ async fn create_message_handler(
                     "Received active message"
                 );
 
-                // Check for transparent rendezvous header: if present, spawn
-                // an async task to resolve the payload before dispatching.
-                // This keeps the hot path fast for normal (non-rendezvous) messages.
-                let rv_handle_str = message.metadata.headers.as_ref().and_then(|h| {
-                    h.get(crate::messenger::large_payload::RV_HEADER_KEY)
-                        .cloned()
-                });
+                // A staged payload is fetched in a task of its own before
+                // dispatch. Its staging headers come out of the message here,
+                // so its handler never sees them and cannot pass them on (see
+                // `large_payload::take_staging`). A message that was not
+                // staged pays one map lookup, and none without headers.
+                let staging =
+                    crate::messenger::large_payload::take_staging(&mut message.metadata.headers);
 
-                if let Some(handle_str) = rv_handle_str {
+                if let Some(staging) = staging {
                     if let Some(resolver) = large_payload_resolver.get() {
                         let fetch_bound = crate::messenger::large_payload::fetch_bound(
-                            message.metadata.headers.as_ref(),
+                            staging.budget.as_deref(),
                             resolver.fetch_timeout(),
                         );
                         let resolver = Arc::clone(resolver);
                         let hub = hub.clone();
-                        let handler_name = message.metadata.handler_name.clone();
+                        let handler_name = std::mem::take(&mut message.metadata.handler_name);
                         let message_id = message.metadata.response_id;
                         let response_type = message.metadata.response_type;
-                        let headers = message.metadata.headers.clone();
+                        let headers = message.metadata.headers.take();
+                        let handle_str = staging.handle;
                         // The resolve waits on the payload's owner, so the
                         // task must not hold the Messenger across it: that
                         // would keep its final drop, and teardown, from ever
@@ -364,6 +365,7 @@ async fn create_message_handler(
                     payload: message.payload,
                     response_type: message.metadata.response_type,
                     headers: message.metadata.headers,
+                    staged: false,
                     in_flight,
                 };
 
@@ -483,6 +485,7 @@ async fn resolve_and_dispatch(job: ResolveJob) {
                 payload: resolved_payload,
                 response_type,
                 headers,
+                staged: true,
                 in_flight,
             };
             hub.dispatch_message(&handler_name, call, &system);
