@@ -251,6 +251,7 @@ impl Batcher {
             return;
         }
         let id = slot.id;
+        let session = slot.session_id;
         let seq = slot.take_seq();
         let close_seq = terminal.then(|| slot.take_seq());
         // A terminal sent alone retires its stream with its own admission.
@@ -261,7 +262,11 @@ impl Batcher {
 
         // The receiver resolves this record before it reads it. If it refuses
         // the payload for its size, these name the one stream to end.
-        let headers = Some(super::super::singleton_headers(self.writer.epoch(), id));
+        let headers = Some(super::super::singleton_headers(
+            self.writer.epoch(),
+            id,
+            session,
+        ));
         if !self.fire_singleton(id, FenceSkip::Never, retire, headers, |encoder| {
             encoder.push_data(id, seq, &bytes)?;
             match close_seq {

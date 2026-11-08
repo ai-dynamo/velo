@@ -213,7 +213,7 @@ async fn a_stale_payload_refusal_spares_a_stream_in_a_new_epoch() {
     assert_eq!(mux.core.ingress.live_slot_ids(key), vec![id]);
 
     // The resolver retains these headers while it waits for the first item's owner.
-    let headers = singleton_headers(1, id);
+    let headers = singleton_headers(1, id, 11);
     let refused = RefusedPayload {
         sender: key.peer,
         headers: Some(&headers),
@@ -255,7 +255,7 @@ async fn a_refusal_after_cancel_spares_a_reused_id_in_the_same_epoch() {
     let mut open = BatchEncoder::new(1, 0, key.lane);
     open.push_open_slot(id, 0, 7, 11).expect("first open");
     mux.core.deliver_batch(key, &open.finish().freeze());
-    let headers = singleton_headers(1, id);
+    let headers = singleton_headers(1, id, 11);
     let refused = RefusedPayload {
         sender: key.peer,
         headers: Some(&headers),
@@ -338,7 +338,7 @@ async fn a_payload_refusal_ends_an_anchor_with_a_terminal_in_the_hold() {
         .expect("first item arrives");
     assert!(matches!(first, Some(Ok(StreamFrame::Item(7)))));
 
-    let headers = singleton_headers(1, id);
+    let headers = singleton_headers(1, id, ticket.routing_session_id);
     node.mux.core.refuse_singleton(
         key,
         &RefusedPayload {

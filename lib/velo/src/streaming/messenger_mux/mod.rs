@@ -149,8 +149,9 @@ pub(crate) use self::lane_choice::LaneReservation;
 /// re-deriving the one value negotiation is keyed on.
 pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
 
-/// The header a singleton batch carries: the sender's epoch and the full id of
-/// the slot its one data record belongs to, as `<epoch>:<slot>`.
+/// The header a singleton batch carries: the sender's epoch, the full id of
+/// the slot its one data record belongs to, and the routing session the slot
+/// was opened with, as `<epoch>:<slot>:<session>`.
 ///
 /// A singleton is staged, and the receiver resolves it before it reads it. A
 /// receiver that refuses the payload for its size
@@ -160,32 +161,46 @@ pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
 /// is looked up only in the table of the (peer, lane) the batch came from, so
 /// a sender can end only its own streams.
 ///
-/// The epoch is there because a resolve can outlive its epoch: a batcher
-/// replaced in the meantime reuses slot ids, and a refusal by id alone would
-/// end the replacement's stream.
+/// A resolve can outlive its stream, so the header must name that stream's
+/// lifetime and no other. A slot id does not: a replaced batcher reuses ids,
+/// and within one epoch a cancelled slot's index is reused and its eight-bit
+/// generation wraps. The session is the receiver's own `u64`, unique on its
+/// node and never reused, and the receiver checks it, with the epoch and the
+/// id, under the slot table's lock.
 const SINGLETON_SLOT_HEADER: &str = "_mux_slot";
 
-/// The headers of a singleton batch for slot `id` in `epoch`. One small map
-/// per staged record, which is over the eager budget by definition.
+/// The headers of a singleton batch for slot `id`, opened with `session`, in
+/// `epoch`. One small map per staged record, which is over the eager budget
+/// by definition.
 fn singleton_headers(
     epoch: u64,
     id: protocol::SlotId,
+    session: u64,
 ) -> std::collections::HashMap<String, String> {
     std::collections::HashMap::from([(
         SINGLETON_SLOT_HEADER.to_string(),
-        format!("{epoch}:{}", id.raw()),
+        format!("{epoch}:{}:{session}", id.raw()),
     )])
 }
 
-/// The epoch and slot a refused singleton named, if its headers name them.
-fn singleton_slot(
+/// The one stream a refused singleton was for.
+pub(crate) struct SingletonRecord {
+    pub(crate) epoch: u64,
+    pub(crate) slot: protocol::SlotId,
+    pub(crate) session: u64,
+}
+
+/// The stream a refused singleton named, if its headers name one in full.
+fn singleton_record(
     headers: Option<&std::collections::HashMap<String, String>>,
-) -> Option<(u64, protocol::SlotId)> {
-    let (epoch, raw) = headers?.get(SINGLETON_SLOT_HEADER)?.split_once(':')?;
-    Some((
-        epoch.parse().ok()?,
-        protocol::SlotId::from_raw(raw.parse().ok()?),
-    ))
+) -> Option<SingletonRecord> {
+    let mut parts = headers?.get(SINGLETON_SLOT_HEADER)?.split(':');
+    let record = SingletonRecord {
+        epoch: parts.next()?.parse().ok()?,
+        slot: protocol::SlotId::from_raw(parts.next()?.parse().ok()?),
+        session: parts.next()?.parse().ok()?,
+    };
+    parts.next().is_none().then_some(record)
 }
 
 /// Attempts `connect` makes before giving up on a batcher that keeps retiring
@@ -610,7 +625,7 @@ impl MuxCore {
         if self.tasks.is_stopped() {
             return;
         }
-        let Some((epoch, slot)) = singleton_slot(refused.headers) else {
+        let Some(record) = singleton_record(refused.headers) else {
             tracing::warn!(
                 peer = %key.peer,
                 "messenger mux: a refused singleton named no slot; its stream ends by its watchdog"
@@ -623,9 +638,9 @@ impl MuxCore {
         else {
             return;
         };
-        let Some(reply) =
-            self.ingress
-                .refuse_record(key, epoch, slot, frame, self.metrics.as_ref())
+        let Some(reply) = self
+            .ingress
+            .refuse_record(key, &record, frame, self.metrics.as_ref())
         else {
             return;
         };

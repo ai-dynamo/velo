@@ -1034,7 +1034,12 @@ fn a_payload_refusal_replaces_a_terminal_waiting_in_the_hold() {
     ))
     .expect("error frame");
 
-    let reply = registry.refuse_record(peer(), 1, id, error.clone(), None);
+    let record = crate::streaming::messenger_mux::SingletonRecord {
+        epoch: 1,
+        slot: id,
+        session: SESSION,
+    };
+    let reply = registry.refuse_record(peer(), &record, error.clone(), None);
 
     assert_eq!(
         reply,

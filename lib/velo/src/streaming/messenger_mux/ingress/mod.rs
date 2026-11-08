@@ -331,24 +331,30 @@ impl IngressRegistry {
     /// The owner is told `ProtocolError`, as for a hold overflow, so its
     /// producer stops. Other slots from the peer are not touched.
     ///
-    /// `None` when no such slot is here, by its full id, in `epoch`: the
-    /// sender's epoch when it sent the record.
+    /// `None` unless `record` names a live slot here exactly: its epoch, its
+    /// full id, and the routing session it was opened with. The session is
+    /// what tells one lifetime of an id from another; an id recurs, within an
+    /// epoch too, once a cancelled slot's index is reused and its generation
+    /// wraps.
     pub(crate) fn refuse_record(
         &self,
         key: PeerLane,
-        epoch: u64,
-        id: SlotId,
+        record: &super::SingletonRecord,
         frame: Vec<u8>,
         metrics: Option<&MuxMetricsHandle>,
     ) -> Option<ReplyRecord> {
         let entry = self.peers.get(&key)?;
         let mut state = lock(entry.value());
-        // Checked under the table's lock, as `accept_epoch` checks a batch: a
-        // resolve can outlive its epoch, and a slot id is reused in the next.
-        if state.epoch != Some(epoch) {
+        // Checked under the table's lock, as `accept_epoch` checks a batch and
+        // `close_consumer_gone` a session: a resolve can outlive its stream.
+        if state.epoch != Some(record.epoch) {
             return None;
         }
+        let id = record.slot;
         let slot = checked_slot(&mut state, metrics, id)?;
+        if slot.session_id != record.session {
+            return None;
+        }
         slot.inject_error(frame);
         let mut outcome = BatchOutcome::default();
         let reason = CloseReason::ProtocolError;
