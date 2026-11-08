@@ -331,16 +331,23 @@ impl IngressRegistry {
     /// The owner is told `ProtocolError`, as for a hold overflow, so its
     /// producer stops. Other slots from the peer are not touched.
     ///
-    /// `None` when no such slot is here, by its full id.
+    /// `None` when no such slot is here, by its full id, in `epoch`: the
+    /// sender's epoch when it sent the record.
     pub(crate) fn refuse_record(
         &self,
         key: PeerLane,
+        epoch: u64,
         id: SlotId,
         frame: Vec<u8>,
         metrics: Option<&MuxMetricsHandle>,
     ) -> Option<ReplyRecord> {
         let entry = self.peers.get(&key)?;
         let mut state = lock(entry.value());
+        // Checked under the table's lock, as `accept_epoch` checks a batch: a
+        // resolve can outlive its epoch, and a slot id is reused in the next.
+        if state.epoch != Some(epoch) {
+            return None;
+        }
         let slot = checked_slot(&mut state, metrics, id)?;
         slot.inject_error(frame);
         let mut outcome = BatchOutcome::default();

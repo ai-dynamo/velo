@@ -149,8 +149,8 @@ pub(crate) use self::lane_choice::LaneReservation;
 /// re-deriving the one value negotiation is keyed on.
 pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
 
-/// The header a singleton batch carries: the full id of the slot its one data
-/// record belongs to.
+/// The header a singleton batch carries: the sender's epoch and the full id of
+/// the slot its one data record belongs to, as `<epoch>:<slot>`.
 ///
 /// A singleton is staged, and the receiver resolves it before it reads it. A
 /// receiver that refuses the payload for its size
@@ -159,20 +159,33 @@ pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
 /// that never closes until its watchdog. The id is the sender's word, but it
 /// is looked up only in the table of the (peer, lane) the batch came from, so
 /// a sender can end only its own streams.
+///
+/// The epoch is there because a resolve can outlive its epoch: a batcher
+/// replaced in the meantime reuses slot ids, and a refusal by id alone would
+/// end the replacement's stream.
 const SINGLETON_SLOT_HEADER: &str = "_mux_slot";
 
-/// The headers of a singleton batch for slot `id`. One small map per staged
-/// record, which is over the eager budget by definition.
-fn singleton_headers(id: protocol::SlotId) -> std::collections::HashMap<String, String> {
-    std::collections::HashMap::from([(SINGLETON_SLOT_HEADER.to_string(), id.raw().to_string())])
+/// The headers of a singleton batch for slot `id` in `epoch`. One small map
+/// per staged record, which is over the eager budget by definition.
+fn singleton_headers(
+    epoch: u64,
+    id: protocol::SlotId,
+) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([(
+        SINGLETON_SLOT_HEADER.to_string(),
+        format!("{epoch}:{}", id.raw()),
+    )])
 }
 
-/// The slot a refused singleton named, if its headers name one.
+/// The epoch and slot a refused singleton named, if its headers name them.
 fn singleton_slot(
     headers: Option<&std::collections::HashMap<String, String>>,
-) -> Option<protocol::SlotId> {
-    let raw = headers?.get(SINGLETON_SLOT_HEADER)?.parse().ok()?;
-    Some(protocol::SlotId::from_raw(raw))
+) -> Option<(u64, protocol::SlotId)> {
+    let (epoch, raw) = headers?.get(SINGLETON_SLOT_HEADER)?.split_once(':')?;
+    Some((
+        epoch.parse().ok()?,
+        protocol::SlotId::from_raw(raw.parse().ok()?),
+    ))
 }
 
 /// Attempts `connect` makes before giving up on a batcher that keeps retiring
@@ -597,7 +610,7 @@ impl MuxCore {
         if self.tasks.is_stopped() {
             return;
         }
-        let Some(slot) = singleton_slot(refused.headers) else {
+        let Some((epoch, slot)) = singleton_slot(refused.headers) else {
             tracing::warn!(
                 peer = %key.peer,
                 "messenger mux: a refused singleton named no slot; its stream ends by its watchdog"
@@ -610,9 +623,9 @@ impl MuxCore {
         else {
             return;
         };
-        let Some(reply) = self
-            .ingress
-            .refuse_record(key, slot, frame, self.metrics.as_ref())
+        let Some(reply) =
+            self.ingress
+                .refuse_record(key, epoch, slot, frame, self.metrics.as_ref())
         else {
             return;
         };

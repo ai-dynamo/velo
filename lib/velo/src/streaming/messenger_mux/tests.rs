@@ -213,7 +213,7 @@ async fn a_stale_payload_refusal_spares_a_stream_in_a_new_epoch() {
     assert_eq!(mux.core.ingress.live_slot_ids(key), vec![id]);
 
     // The resolver retains these headers while it waits for the first item's owner.
-    let headers = singleton_headers(id);
+    let headers = singleton_headers(1, id);
     let refused = RefusedPayload {
         sender: key.peer,
         headers: Some(&headers),
@@ -272,7 +272,7 @@ async fn a_payload_refusal_ends_an_anchor_with_a_terminal_in_the_hold() {
         .expect("first item arrives");
     assert!(matches!(first, Some(Ok(StreamFrame::Item(7)))));
 
-    let headers = singleton_headers(id);
+    let headers = singleton_headers(1, id);
     node.mux.core.refuse_singleton(
         key,
         &RefusedPayload {

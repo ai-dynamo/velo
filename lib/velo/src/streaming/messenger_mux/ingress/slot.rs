@@ -349,13 +349,18 @@ impl IngressSlot {
     }
 
     /// Inject a `TransportError` frame as this slot's terminal: the record
-    /// this node refused, unread, for its size. Spends the terminal reserve, as
-    /// [`inject_dropped`](Self::inject_dropped) does, so the close that follows
-    /// appends no `Dropped` behind it.
+    /// this node refused, unread, for its size. The caller retires the slot
+    /// next.
+    ///
+    /// Always sent, even when the terminal reserve is spent. A terminal that
+    /// overtook the refused record waits in the hold and has spent the reserve
+    /// there, and it is dropped with the slot; without this frame the consumer
+    /// would get no terminal at all, and its anchor would wait. The buffer has
+    /// room: it is `C + 1` deep, and a terminal in the hold takes none of it.
+    /// The reserve is spent here when it is still free, so the close that
+    /// follows appends no `Dropped` behind the error.
     pub(super) fn inject_error(&mut self, frame: Vec<u8>) -> bool {
-        if self.account.admit(CreditClass::Terminal).is_err() {
-            return false;
-        }
+        let _ = self.account.admit(CreditClass::Terminal);
         self.frame_tx.try_send(frame).is_ok()
     }
 
