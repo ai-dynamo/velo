@@ -758,6 +758,13 @@ impl RendezvousManager {
     /// For local handles: DashMap lookup + `Bytes::clone()` (cheap refcount bump).
     /// For remote handles: receiver-driven pull via `_rv_acquire` + `_rv_pull` AMs.
     pub async fn get(&self, handle: DataHandle) -> Result<(Bytes, u64)> {
+        self.get_within(handle, u64::MAX).await
+    }
+
+    /// [`get`](Self::get), refusing a remote payload over `limit` bytes before
+    /// anything of its size is allocated (see `Consumer::get_within`). A local
+    /// handle is not checked: its bytes are already in this process.
+    pub(crate) async fn get_within(&self, handle: DataHandle, limit: u64) -> Result<(Bytes, u64)> {
         let started = Instant::now();
         let (target_worker, local_id) = handle.unpack();
         let result = if target_worker == self.worker_id {
@@ -773,7 +780,7 @@ impl RendezvousManager {
                 .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
             Ok((data, lease.disarm()))
         } else {
-            consumer::Consumer::get(self, handle).await
+            consumer::Consumer::get_within(self, handle, limit).await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {

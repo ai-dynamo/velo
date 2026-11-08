@@ -21,6 +21,7 @@ use crate::messenger::common::events::{EventType, Outcome, encode_event_header};
 use crate::messenger::common::messages::ResponseType;
 use crate::messenger::common::responses::ResponseId;
 use crate::messenger::handlers::{OrderedConfig, OrderingKey, OverflowPolicy};
+use crate::messenger::large_payload::{RefusalHook, RefusedPayload};
 use crate::messenger::server::lanes::{LaneObserver, LaneRouter, LaneRouterConfig};
 
 /// Context passed to handlers during dispatch.
@@ -521,6 +522,10 @@ pub(crate) struct DispatcherHub {
 
     /// Notifies waiters when `system` has been set
     system_ready: tokio::sync::Notify,
+
+    /// Hooks run when a payload staged for the named handler is refused for
+    /// its size. Written once per handler at startup, read only on a refusal.
+    refusals: DashMap<String, RefusalHook>,
 }
 
 impl DispatcherHub {
@@ -531,6 +536,7 @@ impl DispatcherHub {
             backend,
             system: OnceLock::new(),
             system_ready: tokio::sync::Notify::new(),
+            refusals: DashMap::new(),
         }
     }
 
@@ -571,6 +577,25 @@ impl DispatcherHub {
             .iter()
             .map(|entry| entry.key().clone())
             .collect()
+    }
+
+    /// Run `hook` when a payload staged for `handler_name` is refused for its
+    /// size.
+    pub(crate) fn on_refused(&self, handler_name: &str, hook: RefusalHook) {
+        self.refusals.insert(handler_name.to_string(), hook);
+    }
+
+    /// Tell `handler_name`'s refusal hook, if it has one, that a payload
+    /// staged for it was refused.
+    pub(crate) fn refused(&self, handler_name: &str, refused: &RefusedPayload<'_>) {
+        // Cloned out so the hook does not run under the map's shard lock.
+        let hook = self
+            .refusals
+            .get(handler_name)
+            .map(|entry| Arc::clone(entry.value()));
+        if let Some(hook) = hook {
+            hook(refused);
+        }
     }
 
     /// Dispatch a message to the appropriate handler

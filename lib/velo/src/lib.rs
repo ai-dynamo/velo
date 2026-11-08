@@ -315,6 +315,8 @@ pub struct VeloBuilder {
     reservation_config: crate::streaming::ReservationConfig,
     mux_only: bool,
     metrics: Option<Arc<VeloMetrics>>,
+    /// See [`staged_payload_max`](Self::staged_payload_max).
+    staged_payload_max: Option<usize>,
     /// The concrete UCX transport, kept beside the type-erased one so the
     /// registration layer can reach its RMA endpoint. `Arc<dyn Transport>`
     /// cannot be downcast, and adding an RDMA accessor to the `velo-ext` trait
@@ -342,6 +344,7 @@ impl VeloBuilder {
             reservation_config: Default::default(),
             mux_only: false,
             metrics: None,
+            staged_payload_max: None,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             ucx_transport: None,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -453,6 +456,24 @@ impl VeloBuilder {
     /// Set the peer discovery backend.
     pub fn discovery(mut self, discovery: Arc<dyn PeerDiscovery>) -> Self {
         self.inner = self.inner.discovery(discovery);
+        self
+    }
+
+    /// The largest payload, in bytes, this node takes from a peer by
+    /// rendezvous. Unset, nothing bounds it but the owner's word.
+    ///
+    /// A payload over the eager threshold (256 KiB) is staged by its sender and
+    /// pulled by this node before its handler runs. The pull checks the size the
+    /// owner states before it allocates anything, and refuses a larger payload:
+    /// the staged copy is released on its owner, and the message is lost. A
+    /// request that expects a reply gets an error that names both sizes. A
+    /// stream item on the messenger mux ends its own stream with a
+    /// `StreamError::TransportError` that names both sizes, and the stream's
+    /// producer is told to stop; other streams from the same peer go on. A
+    /// payload under the eager threshold is never staged, so this does not
+    /// bound it: the transport's frame limit does.
+    pub fn staged_payload_max(mut self, bytes: usize) -> Self {
+        self.staged_payload_max = Some(bytes);
         self
     }
 
@@ -592,9 +613,11 @@ impl VeloBuilder {
         let stager = Arc::new(crate::rendezvous::RendezvousStager::new(Arc::clone(
             &rendezvous_manager,
         )));
-        let resolver = Arc::new(crate::rendezvous::RendezvousResolver::new(Arc::clone(
-            &rendezvous_manager,
-        )));
+        let resolver = crate::rendezvous::RendezvousResolver::new(Arc::clone(&rendezvous_manager));
+        let resolver = Arc::new(match self.staged_payload_max {
+            Some(limit) => resolver.with_limit(limit),
+            None => resolver,
+        });
         messenger.set_large_payload_support(stager, resolver);
 
         // Build the RDMA registration layer, if a UCX transport was

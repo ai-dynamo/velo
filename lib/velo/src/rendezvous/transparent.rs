@@ -95,11 +95,22 @@ impl LargePayloadStager for RendezvousStager {
 /// uses single-use handles (refcount = 1).
 pub struct RendezvousResolver {
     manager: Arc<RendezvousManager>,
+    limit: u64,
 }
 
 impl RendezvousResolver {
     pub fn new(manager: Arc<RendezvousManager>) -> Self {
-        Self { manager }
+        Self {
+            manager,
+            limit: u64::MAX,
+        }
+    }
+
+    /// Refuse a payload over `limit` bytes before anything of its size is
+    /// allocated. The refusal releases the staged payload on its owner.
+    pub fn with_limit(mut self, limit: usize) -> Self {
+        self.limit = u64::try_from(limit).unwrap_or(u64::MAX);
+        self
     }
 }
 
@@ -111,7 +122,7 @@ impl LargePayloadResolver for RendezvousResolver {
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid rendezvous handle: {e}"))?;
             let handle = crate::DataHandle::from_u128(raw);
-            let (data, lease_id) = self.manager.get(handle).await?;
+            let (data, lease_id) = self.manager.get_within(handle, self.limit).await?;
             // Auto-release: transparent staging uses refcount=1
             self.manager.release(handle, lease_id).await?;
             Ok(data)

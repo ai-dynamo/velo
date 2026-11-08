@@ -841,7 +841,7 @@ impl Batcher {
         // `docs/src/operations/response-plane-performance.md` rather than a
         // fix owed here.
         let seq = self.open_seq(id);
-        self.fire_singleton(id, FenceSkip::IfAdmitted, None, |encoder| {
+        self.fire_singleton(id, FenceSkip::IfAdmitted, None, None, |encoder| {
             encoder.push_open_slot(id, seq, anchor_id, session_id)
         });
         let _ = ack.send(Ok(()));
@@ -906,9 +906,10 @@ impl Batcher {
         id: SlotId,
         skip: FenceSkip,
         retire: Option<RetireGuard>,
+        headers: Option<std::collections::HashMap<String, String>>,
         write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
     ) -> bool {
-        let Some(fire) = self.writer.dispatch_singleton(write) else {
+        let Some(fire) = self.writer.dispatch_singleton(write, headers) else {
             self.epoch_death();
             return false;
         };

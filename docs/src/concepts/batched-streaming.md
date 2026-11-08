@@ -187,6 +187,12 @@ The generation in a slot id has 8 bits. After 256 streams on one index, the send
 
 Two other designs were rejected. The sender could keep an index until the receiver acknowledges the close, but that adds a record to every stream. The lane could wait for each rendezvous record before it handles later batches, but then every stream from the peer on that lane waits behind one large transfer.
 
+### A record refused for its size
+
+A receiver built with `VeloBuilder::staged_payload_max` refuses a staged batch that states more bytes than that, before it allocates them ([Rendezvous](rendezvous.md#the-receivers-limit)). It never reads the batch, so it cannot learn from the batch which slot the record was for. Each singleton batch therefore carries its slot's full id in a header, `_mux_slot`. On a refusal, ingress finds that slot in the table of the (peer, lane) the batch came from, gives its consumer a `TransportError` that names both sizes as the terminal, retires the slot, and answers the sender `CloseSlot` with `ProtocolError`, as for a hold overflow. The producer's next send fails. Other slots are not touched.
+
+The slot ends at once. It does not wait for records ahead of the refused one that are still on their way, because the stream has already failed. Without the header, the slot would keep a gap that never closes, and its consumer would wait for the stream watchdog. The id is the sender's word, but it is looked up only among that sender's own slots, so a sender can end only its own streams.
+
 Batches from one peer on one lane must not be reordered. The worker writes each `OpenSlot` in its own batch. A `Data` batch that overtakes it finds no slot and is dropped as `closed_slot`. The slot then opens with its sequence past the lost record, which silently truncates the head of the stream.
 
 ### Opening a slot

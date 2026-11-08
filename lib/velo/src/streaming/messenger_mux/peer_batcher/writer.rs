@@ -241,6 +241,7 @@ impl BatchWriter {
     pub(super) fn dispatch_singleton(
         &mut self,
         write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
+        headers: Option<std::collections::HashMap<String, String>>,
     ) -> Option<FireResult> {
         let batch_seq = self.take_batch_seq();
         let mut encoder = if self.encoder.is_none() {
@@ -276,6 +277,10 @@ impl BatchWriter {
                 if let Some(metrics) = &self.metrics {
                     metrics.batch_sent(by_type);
                 }
+                let builder = match headers {
+                    Some(headers) => builder.headers(headers),
+                    None => builder,
+                };
                 Some(
                     builder
                         .raw_payload(payload)

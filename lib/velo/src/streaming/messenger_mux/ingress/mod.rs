@@ -321,6 +321,34 @@ impl IngressRegistry {
         })
     }
 
+    /// End the one stream whose staged record this node refused, unread, for
+    /// its size, and report the close its owner is owed.
+    ///
+    /// The consumer gets `frame` (a `TransportError` that names both sizes) as
+    /// its terminal, then the slot retires. It does not wait for records ahead
+    /// of the refused one that are still on their way: the stream has failed,
+    /// and a gap that never closes would leave it open until its watchdog.
+    /// The owner is told `ProtocolError`, as for a hold overflow, so its
+    /// producer stops. Other slots from the peer are not touched.
+    ///
+    /// `None` when no such slot is here, by its full id.
+    pub(crate) fn refuse_record(
+        &self,
+        key: PeerLane,
+        id: SlotId,
+        frame: Vec<u8>,
+        metrics: Option<&MuxMetricsHandle>,
+    ) -> Option<ReplyRecord> {
+        let entry = self.peers.get(&key)?;
+        let mut state = lock(entry.value());
+        let slot = checked_slot(&mut state, metrics, id)?;
+        slot.inject_error(frame);
+        let mut outcome = BatchOutcome::default();
+        let reason = CloseReason::ProtocolError;
+        finish_close(&mut state, id, reason, metrics, &mut outcome);
+        (outcome.closed > 0).then_some(ReplyRecord::CloseSlot { slot: id, reason })
+    }
+
     /// This (peer, lane)'s pending-wake flag, created on first use.
     ///
     /// Lives on the registry rather than in `PeerIngress` so a draining consumer

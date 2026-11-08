@@ -434,6 +434,18 @@ impl Messenger {
         self.handlers.register_internal_handler(handler)
     }
 
+    /// Run `hook` when a payload staged for `handler_name` is refused for its
+    /// size (`VeloBuilder::staged_payload_max`). A request that expects a
+    /// reply gets the refusal as an error; a fire-and-forget message has only
+    /// this to tell its handler that it was lost.
+    pub(crate) fn on_payload_refused(
+        &self,
+        handler_name: &str,
+        hook: crate::messenger::large_payload::RefusalHook,
+    ) {
+        self.server.hub().on_refused(handler_name, hook);
+    }
+
     /// Enable transparent large payload support.
     ///
     /// After calling this, payloads exceeding the stager's threshold are automatically

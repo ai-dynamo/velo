@@ -41,6 +41,7 @@
 
 use std::sync::Arc;
 
+use crate::messenger::large_payload::PayloadTooLarge;
 use crate::messenger::{
     ActiveMessageClient, AmSendBuilder, Messenger, TypedUnaryBuilder, UnaryBuilder,
 };
@@ -95,6 +96,21 @@ impl Consumer {
     /// offered, and returns owned bytes. The read lock remains held until
     /// `detach()` or `release()` is called.
     pub async fn get(manager: &RendezvousManager, handle: DataHandle) -> Result<(Bytes, u64)> {
+        Self::get_within(manager, handle, u64::MAX).await
+    }
+
+    /// [`get`](Self::get), refusing a payload of more than `limit` bytes
+    /// before anything of its size is allocated.
+    ///
+    /// The size checked is the one the owner states in its acquire answer:
+    /// `total_len` on the chunked path, the descriptor's length on the RDMA
+    /// path. A refusal releases the handle, which is single-use where a limit
+    /// is set, and fails with [`PayloadTooLarge`].
+    pub(crate) async fn get_within(
+        manager: &RendezvousManager,
+        handle: DataHandle,
+        limit: u64,
+    ) -> Result<(Bytes, u64)> {
         let client = &manager.client()?;
         let target_worker = handle.worker_id();
         let response = acquire(client, handle, rdma_offer(manager, target_worker)).await?;
@@ -114,17 +130,13 @@ impl Consumer {
                     total_len,
                     chunk_size,
                     chunk_count,
+                    limit,
                 )
                 .await
                 {
                     Ok(data) => Ok((data.freeze(), lease_id)),
                     Err(e) => {
-                        // Best-effort cleanup: release read lock to prevent owner-side leak
-                        if let Err(cleanup_err) = detach(client, handle, lease_id).await {
-                            tracing::warn!(
-                                "Failed to detach lease {lease_id} after pull failure: {cleanup_err}"
-                            );
-                        }
+                        abandon(client, handle, lease_id, &e).await;
                         Err(e)
                     }
                 }
@@ -136,6 +148,17 @@ impl Consumer {
                 lease_timeout_ms,
             } => {
                 let descriptor = with_descriptor_hook(manager, descriptor);
+                // Checked here rather than left to the chunked fallback: the
+                // fallback would refuse too, but only after a detach and a
+                // second acquire, and it would count the refusal as an RDMA
+                // path failure.
+                if let Some(len) = descriptor_len(&descriptor)
+                    && len > limit
+                {
+                    let refused = PayloadTooLarge { len, limit }.into();
+                    abandon(client, handle, lease_id, &refused).await;
+                    return Err(refused);
+                }
                 match rdma_pull(manager, handle, lease_id, &descriptor, lease_timeout_ms).await {
                     // One copy out of registered memory, so the caller holds an
                     // ordinary `Bytes` with no relationship to the pool and the
@@ -143,13 +166,13 @@ impl Consumer {
                     // that skips this copy.
                     Ok(buf) => Ok((Bytes::copy_from_slice(&buf), lease_id)),
                     Err(reason) => {
-                        fallback_chunked(manager, client, handle, lease_id, reason).await
+                        fallback_chunked(manager, client, handle, lease_id, reason, limit).await
                     }
                 }
             }
             #[cfg(not(all(target_os = "linux", feature = "ucx")))]
             AcquireResponse::Rdma { lease_id, .. } => {
-                unsolicited_rdma(client, handle, lease_id).await
+                unsolicited_rdma(client, handle, lease_id, limit).await
             }
         }
     }
@@ -186,7 +209,8 @@ impl Consumer {
                         // registry that has gone away. Guard it, or the failure
                         // strands a chunked lease the reaper cannot reclaim.
                         let (data, lease_id) =
-                            fallback_chunked(manager, client, handle, lease_id, reason).await?;
+                            fallback_chunked(manager, client, handle, lease_id, reason, u64::MAX)
+                                .await?;
                         let lease = manager.lease_guard(handle, lease_id, Some(client));
                         let buf = copy_into_pool(manager, &data).await?;
                         Ok((buf, lease.disarm()))
@@ -207,6 +231,7 @@ impl Consumer {
                     total_len,
                     chunk_size,
                     chunk_count,
+                    u64::MAX,
                 )
                 .await
                 {
@@ -292,7 +317,8 @@ impl Consumer {
                     Ok(()) => Ok(lease_id),
                     Err(reason) => {
                         let (data, lease_id) =
-                            fallback_chunked(manager, client, handle, lease_id, reason).await?;
+                            fallback_chunked(manager, client, handle, lease_id, reason, u64::MAX)
+                                .await?;
                         // `write_chunk` refuses a destination too small for the
                         // payload, and that refusal must not take the fresh
                         // lease with it.
@@ -304,7 +330,7 @@ impl Consumer {
             }
             #[cfg(not(all(target_os = "linux", feature = "ucx")))]
             AcquireResponse::Rdma { lease_id, .. } => {
-                let (data, lease_id) = unsolicited_rdma(client, handle, lease_id).await?;
+                let (data, lease_id) = unsolicited_rdma(client, handle, lease_id, u64::MAX).await?;
                 let lease = manager.lease_guard(handle, lease_id, Some(client));
                 dest.write_chunk(0, &data)?;
                 Ok(lease.disarm())
@@ -400,6 +426,32 @@ async fn detach(
     Consumer::detach_request(client, handle, lease_id)?
         .send()
         .await
+}
+
+/// Give up a lease after a failed pull.
+///
+/// A payload refused for its size is released, not detached: only the
+/// transparent resolver sets a limit, its handles are single-use, and a
+/// detached one would keep the payload on its owner with nobody left to take
+/// it. Any other failure detaches, so the read lock does not leak on the
+/// owner. Best effort: a failure to send is logged.
+async fn abandon(
+    client: &Arc<ActiveMessageClient>,
+    handle: DataHandle,
+    lease_id: u64,
+    error: &anyhow::Error,
+) {
+    let sent = if error.downcast_ref::<PayloadTooLarge>().is_some() {
+        match Consumer::release_request(client, handle, lease_id) {
+            Ok(release) => release.send().await,
+            Err(e) => Err(e),
+        }
+    } else {
+        detach(client, handle, lease_id).await
+    };
+    if let Err(e) = sent {
+        tracing::warn!(%handle, lease = lease_id, error = %e, "rendezvous: could not give up a lease after a failed pull");
+    }
 }
 
 /// Send one `_rv_acquire`, carrying `offer` if there is one.
@@ -633,6 +685,15 @@ async fn rdma_pull_into(
         .map_err(|e| RdmaFallback::new(RdmaPathReason::GetFailed, e.to_string()))
 }
 
+/// The length a descriptor states, or `None` when it does not decode: the
+/// transfer then falls back to the chunked path, which checks its own length.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+fn descriptor_len(descriptor: &[u8]) -> Option<u64> {
+    crate::rendezvous::descriptor::RdmaDescriptor::decode(descriptor)
+        .ok()
+        .map(|desc| desc.len)
+}
+
 /// Decode a descriptor and check it against this instance's backend.
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 fn decode_for<'a>(
@@ -855,6 +916,7 @@ async fn fallback_chunked(
     handle: DataHandle,
     lease_id: u64,
     fallback: RdmaFallback,
+    limit: u64,
 ) -> Result<(Bytes, u64)> {
     let store = manager.data_store();
     store.record_path(fallback.reason);
@@ -872,7 +934,7 @@ async fn fallback_chunked(
     if let Err(e) = detach(client, handle, lease_id).await {
         tracing::warn!(%handle, error = %e, "rendezvous: could not detach before falling back");
     }
-    chunked_only(client, handle).await
+    chunked_only(client, handle, limit).await
 }
 
 /// An owner answered `Rdma` to an acquire that carried no offer.
@@ -885,6 +947,7 @@ async fn unsolicited_rdma(
     client: &Arc<ActiveMessageClient>,
     handle: DataHandle,
     lease_id: u64,
+    limit: u64,
 ) -> Result<(Bytes, u64)> {
     tracing::warn!(
         %handle,
@@ -894,7 +957,7 @@ async fn unsolicited_rdma(
     if let Err(e) = detach(client, handle, lease_id).await {
         tracing::warn!(%handle, error = %e, "rendezvous: could not detach before falling back");
     }
-    chunked_only(client, handle).await
+    chunked_only(client, handle, limit).await
 }
 
 /// Acquire with no offer and pull the chunks.
@@ -906,6 +969,7 @@ async fn unsolicited_rdma(
 async fn chunked_only(
     client: &Arc<ActiveMessageClient>,
     handle: DataHandle,
+    limit: u64,
 ) -> Result<(Bytes, u64)> {
     let target_worker = handle.worker_id();
     match acquire(client, handle, None).await? {
@@ -923,16 +987,13 @@ async fn chunked_only(
                 total_len,
                 chunk_size,
                 chunk_count,
+                limit,
             )
             .await
             {
                 Ok(data) => Ok((data.freeze(), lease_id)),
                 Err(e) => {
-                    if let Err(cleanup_err) = detach(client, handle, lease_id).await {
-                        tracing::warn!(
-                            "Failed to detach lease {lease_id} after pull failure: {cleanup_err}"
-                        );
-                    }
+                    abandon(client, handle, lease_id, &e).await;
                     Err(e)
                 }
             }
@@ -969,7 +1030,9 @@ async fn copy_into_pool(
     Ok(buf)
 }
 
-/// Pull all chunks for a chunked transfer into a `BytesMut` buffer.
+/// Pull all chunks for a chunked transfer into a `BytesMut` buffer, refusing
+/// a `total_len` over `limit` before the buffer is allocated: the length is
+/// the owner's word, and nothing else bounds it.
 async fn pull_chunks(
     client: &Arc<ActiveMessageClient>,
     target_worker: WorkerId,
@@ -977,7 +1040,15 @@ async fn pull_chunks(
     total_len: u64,
     chunk_size: u32,
     chunk_count: u32,
+    limit: u64,
 ) -> Result<BytesMut> {
+    if total_len > limit {
+        return Err(PayloadTooLarge {
+            len: total_len,
+            limit,
+        }
+        .into());
+    }
     let mut buf = BytesMut::with_capacity(total_len as usize);
     buf.resize(total_len as usize, 0);
 

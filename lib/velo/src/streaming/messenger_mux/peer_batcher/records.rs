@@ -259,7 +259,10 @@ impl Batcher {
             .flatten()
             .map(|entry| RetireGuard::new(entry.closed));
 
-        if !self.fire_singleton(id, FenceSkip::Never, retire, |encoder| {
+        // The receiver resolves this record before it reads it. If it refuses
+        // the payload for its size, these name the one stream to end.
+        let headers = Some(super::super::singleton_headers(id));
+        if !self.fire_singleton(id, FenceSkip::Never, retire, headers, |encoder| {
             encoder.push_data(id, seq, &bytes)?;
             match close_seq {
                 Some(close_seq) => {

@@ -348,6 +348,17 @@ impl IngressSlot {
         self.frame_tx.try_send(cached_dropped().clone()).is_ok()
     }
 
+    /// Inject a `TransportError` frame as this slot's terminal: the record
+    /// this node refused, unread, for its size. Spends the terminal reserve, as
+    /// [`inject_dropped`](Self::inject_dropped) does, so the close that follows
+    /// appends no `Dropped` behind it.
+    pub(super) fn inject_error(&mut self, frame: Vec<u8>) -> bool {
+        if self.account.admit(CreditClass::Terminal).is_err() {
+            return false;
+        }
+        self.frame_tx.try_send(frame).is_ok()
+    }
+
     /// Bytes this slot has reserved from the peer budget, for release on close.
     pub(super) fn hold_bytes_used(&self) -> u64 {
         self.hold_bytes.used()

@@ -67,14 +67,17 @@ async fn open_slot_batch_seq_stays_contiguous_across_failures() {
         if n % 3 == 0 {
             assert!(
                 writer
-                    .dispatch_singleton(|_| Err(EncodeError::BatchFull))
+                    .dispatch_singleton(|_| Err(EncodeError::BatchFull), None)
                     .is_none(),
                 "a refused encode dispatches nothing"
             );
         }
         let slot = SlotId::from_raw(n);
         let fire = writer
-            .dispatch_singleton(|encoder| encoder.push_open_slot(slot, 0, u64::from(n), 1))
+            .dispatch_singleton(
+                |encoder| encoder.push_open_slot(slot, 0, u64::from(n), 1),
+                None,
+            )
             .expect("the open dispatches");
         fire.await.expect("admitted");
     }
