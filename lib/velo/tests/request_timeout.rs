@@ -14,12 +14,16 @@
 //! answering. A handler that never returns would keep the server's drain
 //! waiting at teardown, and the test would hang instead of fail.
 
+#[path = "support/staged_fetch.rs"]
+mod staged_fetch;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{Notify, Semaphore};
+use staged_fetch::{Stall, released_within, stall_fetches};
+use tokio::sync::Semaphore;
 use velo::transports::tcp::{TcpTransport, TcpTransportBuilder};
 use velo::*;
 
@@ -171,30 +175,6 @@ async fn settles_to(velo: &Velo, expected: usize) -> bool {
 /// and the receiver fetches it before the handler runs.
 const STAGED: usize = 512 * 1024;
 
-/// Make every fetch of a payload that `sender` staged stall at its first step.
-///
-/// The receiver starts a fetch with an `_rv_acquire` call to the sender. This
-/// replaces the sender's `_rv_acquire` with one that signals `entered` and then
-/// waits for a permit from `gate`. That is how a sender that has stopped
-/// answering looks to the receiver, and the gate, not a sleep, decides how
-/// long it lasts.
-fn stall_fetches_from(sender: &Velo, entered: Arc<Notify>, gate: Arc<Semaphore>) {
-    sender
-        .messenger()
-        .register_streaming_handler(
-            Handler::unary_handler_async("_rv_acquire", move |_ctx| {
-                let (entered, gate) = (entered.clone(), gate.clone());
-                async move {
-                    entered.notify_one();
-                    gate.acquire().await.unwrap().forget();
-                    Ok(Some(Bytes::new()))
-                }
-            })
-            .build(),
-        )
-        .unwrap();
-}
-
 /// A staged request's fetch gives the receiver's response slot back when the
 /// caller's timeout runs out.
 ///
@@ -227,9 +207,8 @@ async fn a_stalled_fetch_releases_the_receivers_slot_at_the_callers_timeout() {
         .expect("echo answers");
     wait_for_slots(&server, 0).await;
 
-    let entered = Arc::new(Notify::new());
-    let fetch_gate = Arc::new(Semaphore::new(0));
-    stall_fetches_from(&client, entered.clone(), fetch_gate.clone());
+    let stall = Stall::new();
+    stall_fetches(&client, &stall);
 
     let started = Instant::now();
     let call = client
@@ -239,14 +218,14 @@ async fn a_stalled_fetch_releases_the_receivers_slot_at_the_callers_timeout() {
         .timeout(TIMEOUT)
         .instance(target)
         .send();
-    tokio::time::timeout(BOUND, entered.notified())
+    tokio::time::timeout(BOUND, stall.entered.notified())
         .await
         .expect("the server began to fetch the staged payload");
     expect_timeout(started, call).await;
 
     let released = settles_to(&server, 0).await;
     let held = server.response_slots_in_use();
-    fetch_gate.add_permits(1);
+    stall.gate.add_permits(1);
     assert!(
         released,
         "the server still holds {held} response slot(s) for a fetch its caller gave up on"
@@ -281,9 +260,8 @@ async fn the_receivers_bound_ends_a_stalled_fetch_and_the_caller_hears_why() {
         .expect("echo answers");
     wait_for_slots(&server, 0).await;
 
-    let entered = Arc::new(Notify::new());
-    let fetch_gate = Arc::new(Semaphore::new(0));
-    stall_fetches_from(&client, entered.clone(), fetch_gate.clone());
+    let stall = Stall::new();
+    stall_fetches(&client, &stall);
 
     let started = Instant::now();
     let call = client
@@ -292,13 +270,13 @@ async fn the_receivers_bound_ends_a_stalled_fetch_and_the_caller_hears_why() {
         .raw_payload(Bytes::from(vec![0x5a; STAGED]))
         .instance(target)
         .send();
-    tokio::time::timeout(BOUND, entered.notified())
+    tokio::time::timeout(BOUND, stall.entered.notified())
         .await
         .expect("the server began to fetch the staged payload");
     let outcome = tokio::time::timeout(BOUND, call).await;
     let elapsed = started.elapsed();
     let released = settles_to(&server, 0).await;
-    fetch_gate.add_permits(1);
+    stall.gate.add_permits(1);
 
     let err = outcome
         .expect("the server's bound ended a call that had none")
@@ -317,6 +295,88 @@ async fn the_receivers_bound_ends_a_stalled_fetch_and_the_caller_hears_why() {
         "the server kept the stalled fetch's response slot"
     );
     assert_eq!(echoes.load(Ordering::Acquire), 1);
+}
+
+/// A staged call that timed out leaves nothing staged on its sender, even
+/// while the sender has not answered the fetch at all.
+///
+/// When the fetch had no bound, the receiver kept waiting on a slow sender,
+/// then pulled and released, and the payload was freed. With the bound, the
+/// receiver drops the fetch at the caller's deadline and tells the sender
+/// nothing, so a payload whose fetch never got a lease stayed staged until
+/// the sender shut down: one payload for each call that timed out. Its
+/// time-to-live, the caller's own deadline, now frees it, and the late
+/// acquire finds nothing to lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_timed_out_staged_call_leaves_nothing_staged_on_a_slow_sender() {
+    let (client, server, _echoes) = connected_pair(Arc::new(Semaphore::new(0))).await;
+    let stall = Stall::new();
+    stall_fetches(&client, &stall);
+
+    let started = Instant::now();
+    let call = client
+        .unary("echo")
+        .unwrap()
+        .raw_payload(Bytes::from(vec![0x5a; STAGED]))
+        .timeout(TIMEOUT)
+        .instance(server.instance_id())
+        .send();
+    tokio::time::timeout(BOUND, stall.entered.notified())
+        .await
+        .expect("the server began to fetch the staged payload");
+    expect_timeout(started, call).await;
+
+    let staged = stall.asked()[0];
+    let released = released_within(&client, staged, BOUND).await;
+    // The sender catches up, after the assertion's wait.
+    stall.gate.add_permits(1);
+    assert!(
+        released,
+        "the sender still holds the payload of a call that timed out"
+    );
+}
+
+/// A fetch that the receiver's own bound ended leaves nothing staged on a
+/// slow sender.
+///
+/// The call has no timeout, so its payload has no time-to-live. The fetch
+/// asks the sender for a lease deadline of its bound, so the lease the slow
+/// sender grants after the receiver gave up ends once no pull renews it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_fetch_ended_by_the_receivers_bound_leaves_nothing_staged_on_a_slow_sender() {
+    let (client, server, _echoes) = connected_pair_with(
+        Arc::new(Semaphore::new(0)),
+        Velo::builder().staged_fetch_timeout(TIMEOUT),
+    )
+    .await;
+    let stall = Stall::new();
+    stall_fetches(&client, &stall);
+
+    let call = client
+        .unary("echo")
+        .unwrap()
+        .raw_payload(Bytes::from(vec![0x5a; STAGED]))
+        .instance(server.instance_id())
+        .send();
+    tokio::time::timeout(BOUND, stall.entered.notified())
+        .await
+        .expect("the server began to fetch the staged payload");
+    tokio::time::timeout(BOUND, call)
+        .await
+        .expect("the server's bound ended the call")
+        .expect_err("the payload never arrived");
+    let staged = stall.asked()[0];
+    assert!(
+        staged_fetch::still_staged(&client, staged),
+        "freed before its lease was granted: this test is not about the lease"
+    );
+
+    // The sender catches up, and grants a lease to a fetch that is gone.
+    stall.gate.add_permits(1);
+    assert!(
+        released_within(&client, staged, BOUND).await,
+        "the sender still holds a payload whose fetch its receiver gave up"
+    );
 }
 
 /// Control for the stalled fetch: when the sender answers, a staged request

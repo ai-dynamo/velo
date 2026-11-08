@@ -43,7 +43,11 @@ use futures::future::BoxFuture;
 /// exceeds [`threshold()`](LargePayloadStager::threshold).
 pub trait LargePayloadStager: Send + Sync {
     /// Stage the payload and return a handle string to embed in the `_rv` header.
-    fn stage(&self, payload: Bytes) -> String;
+    ///
+    /// `ttl` is what is left of the call's timeout, if it has one. Past it the
+    /// caller has given up, so the payload may be dropped whether or not a
+    /// receiver ever fetched it.
+    fn stage(&self, payload: Bytes, ttl: Option<Duration>) -> String;
 
     /// Minimum payload size (in bytes) to trigger staging.
     /// Payloads smaller than this are sent inline as usual.
@@ -57,7 +61,11 @@ pub trait LargePayloadStager: Send + Sync {
 /// (since transparent mode uses single-use staging).
 pub trait LargePayloadResolver: Send + Sync {
     /// Fetch the full payload from the handle string and release the remote slot.
-    fn resolve(&self, handle_str: &str) -> BoxFuture<'_, Result<Bytes>>;
+    ///
+    /// `within` is the fetch's bound, if it has one. The caller drops the
+    /// future when it runs out and tells the owner nothing, so the owner
+    /// should be asked to end, by then, whatever the fetch leaves behind.
+    fn resolve(&self, handle_str: &str, within: Option<Duration>) -> BoxFuture<'_, Result<Bytes>>;
 
     /// The longest this receiver lets one fetch run, whatever the sender
     /// asked for. `None` sets no bound of its own.

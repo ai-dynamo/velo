@@ -3218,7 +3218,7 @@ mod tests {
         called: std::sync::atomic::AtomicBool,
     }
     impl crate::messenger::large_payload::LargePayloadStager for NeverResolves {
-        fn stage(&self, _: bytes::Bytes) -> String {
+        fn stage(&self, _: bytes::Bytes, _: Option<std::time::Duration>) -> String {
             unreachable!("the test sends nothing large")
         }
         fn threshold(&self) -> usize {
@@ -3226,7 +3226,11 @@ mod tests {
         }
     }
     impl crate::messenger::large_payload::LargePayloadResolver for NeverResolves {
-        fn resolve(&self, _: &str) -> futures::future::BoxFuture<'_, anyhow::Result<bytes::Bytes>> {
+        fn resolve(
+            &self,
+            _: &str,
+            _: Option<std::time::Duration>,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<bytes::Bytes>> {
             self.called.store(true, std::sync::atomic::Ordering::SeqCst);
             Box::pin(std::future::pending())
         }

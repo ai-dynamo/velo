@@ -173,7 +173,9 @@ impl ActiveMessageClient {
                 let payload = std::mem::take(&mut message.payload);
                 let budget =
                     fetch_by.map(|at| at.saturating_duration_since(tokio::time::Instant::now()));
-                Some((stager.stage(payload), budget))
+                // The budget is also the payload's time-to-live here: once
+                // the caller has given up, nobody waits for it.
+                Some((stager.stage(payload, budget), budget))
             }
             _ => None,
         };

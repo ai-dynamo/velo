@@ -474,7 +474,9 @@ async fn resolve_and_dispatch(job: ResolveJob) {
         in_flight,
         backend,
     } = job;
-    let Some(resolved) = resolve_within(resolver.resolve(&handle_str), fetch_bound).await else {
+    let within = fetch_bound.map(|bound| bound.within);
+    let Some(resolved) = resolve_within(resolver.resolve(&handle_str, within), fetch_bound).await
+    else {
         tracing::debug!(
             target: "crate::messenger::server",
             handler = %handler_name,
@@ -714,7 +716,11 @@ mod tests {
     /// wait.
     struct NeverResolves;
     impl crate::messenger::large_payload::LargePayloadResolver for NeverResolves {
-        fn resolve(&self, _: &str) -> futures::future::BoxFuture<'_, anyhow::Result<Bytes>> {
+        fn resolve(
+            &self,
+            _: &str,
+            _: Option<std::time::Duration>,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<Bytes>> {
             Box::pin(std::future::pending())
         }
     }

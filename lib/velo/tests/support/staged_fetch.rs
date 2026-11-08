@@ -7,20 +7,21 @@
 //! message. The sender stages it, and the receiver fetches it with an
 //! `_rv_acquire` call to the sender, then `_rv_pull` calls. [`stall_fetches`]
 //! replaces the owner's `_rv_acquire` with one that waits for a permit, then
-//! grants the same chunked lease the real handler grants. So a gate, not a
-//! sleep, decides how long the owner looks unresponsive, and a stalled fetch
-//! that is let through completes for real. A test can then see what each side
-//! still holds.
+//! does what the real handler does. So a gate, not a sleep, decides how long
+//! the owner looks unresponsive, and a stalled fetch that is let through
+//! completes for real, or, if its receiver gave up, leaves the lease it would
+//! leave. A test can then see what each side still holds.
 //!
-//! Included with `#[path]` by the test binaries that use it.
+//! Included with `#[path]` by the test binaries that use it, which need the
+//! `test-helpers` feature.
 
 #![allow(dead_code)]
 
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{Notify, Semaphore};
-use velo::rendezvous::protocol::{AcquireResponse, RvAcquireRequest};
-use velo::rendezvous::store::DEFAULT_CHUNK_SIZE;
+use velo::rendezvous::handlers::acquire_lease;
+use velo::rendezvous::protocol::RvAcquireRequest;
 use velo::{Handler, TypedContext, Velo};
 
 /// What a stalled owner saw, and the gate that holds it.
@@ -49,7 +50,7 @@ impl Stall {
 }
 
 /// Stall every fetch of a payload that `owner` staged until `stall.gate`
-/// lets it through, then grant the real chunked lease.
+/// lets it through, then answer as the real handler does.
 pub fn stall_fetches(owner: &Velo, stall: &Stall) {
     let store = Arc::clone(owner.rendezvous_manager().data_store());
     let stall = stall.clone();
@@ -66,22 +67,7 @@ pub fn stall_fetches(owner: &Velo, stall: &Stall) {
                         stall.asked.lock().unwrap().push(local_id);
                         stall.entered.notify_one();
                         stall.gate.acquire().await?.forget();
-                        let lease_id = store
-                            .acquire_read_lock(local_id)
-                            .ok_or_else(|| anyhow::anyhow!("handle {local_id} not found"))?;
-                        let total_len = store
-                            .get_total_len(local_id)
-                            .ok_or_else(|| anyhow::anyhow!("slot {local_id} vanished"))?;
-                        let (transfer_id, chunk_size, chunk_count) = store
-                            .create_transfer(local_id, lease_id, DEFAULT_CHUNK_SIZE)
-                            .ok_or_else(|| anyhow::anyhow!("slot {local_id} vanished"))?;
-                        Ok(AcquireResponse::Ready {
-                            lease_id,
-                            transfer_id,
-                            total_len,
-                            chunk_size,
-                            chunk_count,
-                        })
+                        acquire_lease(&store, &ctx.input, ctx.headers.as_ref())
                     }
                 },
             )
@@ -97,4 +83,15 @@ pub fn still_staged(owner: &Velo, local_id: u64) -> bool {
         .data_store()
         .get_total_len(local_id)
         .is_some()
+}
+
+/// Whether `owner` lets go of the staged payload `local_id` within `within`.
+pub async fn released_within(owner: &Velo, local_id: u64, within: std::time::Duration) -> bool {
+    tokio::time::timeout(within, async {
+        while still_staged(owner, local_id) {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
 }
