@@ -240,6 +240,72 @@ async fn a_stale_payload_refusal_spares_a_stream_in_a_new_epoch() {
     assert_eq!(mux.core.ingress.live_slot_ids(key), vec![id]);
 }
 
+/// Cancel can retire a slot while its resolve still runs. Its eight-bit
+/// generation can wrap before that resolve's refusal arrives.
+#[tokio::test]
+async fn a_refusal_after_cancel_spares_a_reused_id_in_the_same_epoch() {
+    use crate::messenger::large_payload::PayloadTooLarge;
+    use protocol::{BatchEncoder, CloseReason, SlotId};
+
+    let node = prebinding_node(test_config(), None).await;
+    let mux = &node.mux;
+    let key = lane0(WorkerId::from_u64(0xABCD));
+    let id = SlotId::new(0, 0).expect("slot id");
+    let first = bind_slot(mux, 7, 11).await;
+    let mut open = BatchEncoder::new(1, 0, key.lane);
+    open.push_open_slot(id, 0, 7, 11).expect("first open");
+    mux.core.deliver_batch(key, &open.finish().freeze());
+    let headers = singleton_headers(1, id);
+    let refused = RefusedPayload {
+        sender: key.peer,
+        headers: Some(&headers),
+        too_large: PayloadTooLarge {
+            len: 64 << 20,
+            limit: 1 << 20,
+        },
+    };
+    assert!(
+        mux.core
+            .ingress
+            .close_consumer_gone(key, id, None, Some(11))
+            .is_some()
+    );
+    assert!(first.is_disconnected(), "cancel retired the first stream");
+
+    for generation in 1..=u8::MAX {
+        let session = 11 + u64::from(generation);
+        let consumer = bind_slot(mux, 7, session).await;
+        let next_id = SlotId::new(0, generation).expect("slot id");
+        let mut batch = BatchEncoder::new(1, u32::from(generation), key.lane);
+        batch.push_open_slot(next_id, 0, 7, session).expect("open");
+        batch
+            .push_data(next_id, 1, cached_finalized())
+            .expect("terminal");
+        batch
+            .push_close_slot(next_id, 2, CloseReason::TerminalSent)
+            .expect("close");
+        mux.core.deliver_batch(key, &batch.finish().freeze());
+        assert_eq!(consumer.recv().await, *cached_finalized());
+        assert!(consumer.is_disconnected());
+    }
+
+    let replacement = bind_slot(mux, 7, 267).await;
+    let mut open = BatchEncoder::new(1, 256, key.lane);
+    open.push_open_slot(id, 0, 7, 267)
+        .expect("replacement open");
+    open.push_data(id, 1, &item(7)).expect("replacement item");
+    mux.core.deliver_batch(key, &open.finish().freeze());
+    assert_eq!(replacement.recv().await, item(7));
+
+    mux.core.refuse_singleton(key, &refused);
+
+    assert!(
+        !replacement.is_disconnected(),
+        "the cancelled stream's refusal closed a later stream after generation wrap"
+    );
+    assert_eq!(mux.core.ingress.live_slot_ids(key), vec![id]);
+}
+
 /// A terminal held behind a refused item must not leave the anchor waiting.
 #[tokio::test]
 async fn a_payload_refusal_ends_an_anchor_with_a_terminal_in_the_hold() {
