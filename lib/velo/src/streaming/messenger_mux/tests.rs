@@ -185,6 +185,61 @@ async fn bind_slot(mux: &MessengerMuxTransport, anchor_id: u64, session_id: u64)
     BoundSlot { rx, drain }
 }
 
+/// A staged item can finish resolving after its batcher's epoch ends.
+/// Its refusal must not end a stream that reuses the id in the next epoch.
+#[tokio::test]
+async fn a_stale_payload_refusal_spares_a_stream_in_a_new_epoch() {
+    use crate::messenger::large_payload::PayloadTooLarge;
+    use protocol::{BatchEncoder, SlotId};
+
+    let messenger = Messenger::builder()
+        .add_transport(tcp_transport())
+        .build()
+        .await
+        .expect("messenger");
+    let mux = MessengerMuxTransport::new(
+        messenger,
+        test_config(),
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("mux");
+    let key = lane0(WorkerId::from_u64(0xABCD));
+    let id = SlotId::new(0, 0).expect("slot id");
+    let first = bind_slot(&mux, 7, 11).await;
+    let mut open = BatchEncoder::new(1, 0, key.lane);
+    open.push_open_slot(id, 0, 7, 11).expect("first open");
+    mux.core.deliver_batch(key, &open.finish().freeze());
+    assert_eq!(mux.core.ingress.live_slot_ids(key), vec![id]);
+
+    // The resolver retains these headers while it waits for the first item's owner.
+    let headers = singleton_headers(id);
+    let refused = RefusedPayload {
+        sender: key.peer,
+        headers: Some(&headers),
+        too_large: PayloadTooLarge {
+            len: 64 << 20,
+            limit: 1 << 20,
+        },
+    };
+    let replacement = bind_slot(&mux, 7, 12).await;
+    let mut open = BatchEncoder::new(2, 0, key.lane);
+    open.push_open_slot(id, 0, 7, 12).expect("replacement open");
+    open.push_data(id, 1, &item(7)).expect("replacement item");
+    mux.core.deliver_batch(key, &open.finish().freeze());
+    assert!(first.is_disconnected(), "the first epoch has ended");
+    assert_eq!(replacement.recv().await, item(7));
+
+    mux.core.refuse_singleton(key, &refused);
+
+    assert!(
+        !replacement.is_disconnected(),
+        "the first epoch's refused item closed the replacement stream: {:?}",
+        replacement.rx.try_recv()
+    );
+    assert_eq!(mux.core.ingress.live_slot_ids(key), vec![id]);
+}
+
 async fn eventually(mut predicate: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
