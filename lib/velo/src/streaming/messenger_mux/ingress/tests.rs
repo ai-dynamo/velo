@@ -1013,6 +1013,45 @@ fn a_terminal_close_defers_behind_records_still_in_the_hold() {
     assert_eq!(registry.live_slots(peer()), 0);
 }
 
+/// A terminal can overtake a staged item and spend the terminal reserve in the hold.
+/// Refusing that item must still deliver the size error to its consumer.
+#[test]
+fn a_payload_refusal_replaces_a_terminal_waiting_in_the_hold() {
+    let (registry, consumer, config) = bound();
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+    let payload = batch(1, 1, |encoder| {
+        encoder.push_data(id, 2, cached_finalized()).unwrap();
+        encoder
+            .push_close_slot(id, 3, CloseReason::TerminalSent)
+            .unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(outcome.closed, 0, "seq 1 has not resolved");
+    assert!(consumer.pump().is_empty());
+    let error = rmp_serde::to_vec(&crate::streaming::StreamFrame::<()>::TransportError(
+        "refused a staged stream item: a payload of 67108864 bytes is over this node's limit of 1048576 bytes".into(),
+    ))
+    .expect("error frame");
+
+    let reply = registry.refuse_record(peer(), id, error.clone(), None);
+
+    assert_eq!(
+        reply,
+        Some(ReplyRecord::CloseSlot {
+            slot: id,
+            reason: CloseReason::ProtocolError,
+        })
+    );
+    assert_eq!(registry.live_slots(peer()), 0);
+    assert!(consumer.rx.is_disconnected());
+    assert_eq!(
+        consumer.pump(),
+        vec![error],
+        "the size error must survive a terminal that overtook the refused item"
+    );
+}
+
 /// Index 0 at generation 0, ended behind a rendezvous record that has not
 /// resolved, and index 0 at generation 1 opened over it with one record
 /// delivered. Returns the two consumers, old stream first.

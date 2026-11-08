@@ -240,6 +240,62 @@ async fn a_stale_payload_refusal_spares_a_stream_in_a_new_epoch() {
     assert_eq!(mux.core.ingress.live_slot_ids(key), vec![id]);
 }
 
+/// A terminal held behind a refused item must not leave the anchor waiting.
+#[tokio::test]
+async fn a_payload_refusal_ends_an_anchor_with_a_terminal_in_the_hold() {
+    use crate::messenger::large_payload::PayloadTooLarge;
+    use protocol::{BatchEncoder, CloseReason, SlotId};
+
+    let node = prebinding_node(test_config(), None).await;
+    let mut anchor = node.manager.create_anchor::<u32>();
+    let (_, anchor_id) = anchor.handle().unpack();
+    let ticket = node
+        .manager
+        .prebind_anchor(anchor.handle())
+        .expect("ticket");
+    let key = lane0(WorkerId::from_u64(0xABCD));
+    let id = SlotId::new(0, 0).expect("slot id");
+    let mut batch = BatchEncoder::new(1, 0, key.lane);
+    batch
+        .push_open_slot(id, 0, anchor_id, ticket.routing_session_id)
+        .expect("open");
+    batch.push_data(id, 1, &item(7)).expect("first item");
+    batch
+        .push_data(id, 3, cached_finalized())
+        .expect("terminal ahead of seq 2");
+    batch
+        .push_close_slot(id, 4, CloseReason::TerminalSent)
+        .expect("close");
+    node.mux.core.deliver_batch(key, &batch.finish().freeze());
+    let first = tokio::time::timeout(Duration::from_secs(1), anchor.next())
+        .await
+        .expect("first item arrives");
+    assert!(matches!(first, Some(Ok(StreamFrame::Item(7)))));
+
+    let headers = singleton_headers(id);
+    node.mux.core.refuse_singleton(
+        key,
+        &RefusedPayload {
+            sender: key.peer,
+            headers: Some(&headers),
+            too_large: PayloadTooLarge {
+                len: 64 << 20,
+                limit: 1 << 20,
+            },
+        },
+    );
+    assert_eq!(node.mux.core.ingress.live_slots(key), 0);
+
+    let terminal = tokio::time::timeout(Duration::from_secs(1), anchor.next())
+        .await
+        .expect("the refused item must end the anchor even when its terminal arrived first");
+    let Some(Err(crate::streaming::StreamError::TransportError(why))) = terminal else {
+        panic!("expected the size error, got {terminal:?}");
+    };
+    assert!(why.contains("67108864"), "{why}");
+    assert!(why.contains("1048576"), "{why}");
+}
+
 async fn eventually(mut predicate: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
