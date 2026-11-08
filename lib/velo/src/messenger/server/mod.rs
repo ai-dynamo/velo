@@ -534,9 +534,8 @@ async fn resolve_and_dispatch(job: ResolveJob) {
 /// caller gets as its reply, so a sync or unary caller with a longer timeout,
 /// or none, hears that the fetch failed instead of waiting.
 ///
-/// The owner is not told. If it had already granted the read lock, it keeps
-/// the lock and the staged payload until it tears down: a chunked lease has
-/// no deadline on the owner's side.
+/// The owner is not told. The resolver asked it for a lease deadline of the
+/// same bound, so the owner ends a lease nobody pulls on its own.
 async fn resolve_within(
     resolve: impl std::future::Future<Output = anyhow::Result<Bytes>>,
     bound: Option<crate::messenger::large_payload::FetchBound>,

@@ -145,49 +145,22 @@ and the slowest peer's read rate, and give the drain its own time through
 
 **Lifted by.** Not scheduled.
 
-## A fetch that gives up leaves the payload staged
+## A staged payload without a deadline can stay staged
 
-**What happens.** When a receiver gives up the fetch of a staged payload,
-the sender keeps the payload, and its read lock if it granted one, until the
-sender shuts down. This holds for a chunked fetch, and for a fetch given up
-before the sender granted any lease. An RDMA lease is the exception: past
-its deadline, the sender's reaper force-releases it, which drops the lock and
-the reference and frees the payload.
+**What happens.** The sender keeps a staged payload until the sender shuts
+down when nobody fetches and releases it, and nothing gives it a deadline.
 
-**When.** A fetch that runs out of its deadline (the caller's `.timeout`, or
-`VeloBuilder::staged_fetch_timeout`), and a fetch cut by the receiver's
-teardown.
+**When.** The message of a send without a `.timeout` never reaches a
+receiver, or the receiver stops before it releases the payload. Also a fetch
+that gives up against a sender from before the `_rv_lease_ms` header.
 
-**Why.** Without an RDMA lease, only the receiver's `release` frees a
-transparently staged payload, and a chunked lease has no deadline on the
-sender's side.
+**Why.** Only the receiver's `release` frees a transparently staged payload.
+A time-to-live comes only from a call's `.timeout`, and a chunked lease gets a
+deadline only when a fetch with a bound asks for one.
 
-**Workaround.** None inside velo. The leak is one payload for each fetch
-that gives up, so it grows only while a peer keeps stalling.
+**Workaround.** Give large calls a `.timeout`. It gives their payloads a
+time-to-live.
 
-**Lifted by.** Not scheduled. It needs a deadline on chunked leases and on
-transparently staged payloads, held by the sender.
-
-## A forwarded staged handle is fetched again
-
-**What happens.** A send whose headers carry `_rv`, the handle of a staged
-payload, is treated as staged by the receiver, even when its own payload went
-inline. The receiver fetches that handle and hands the result to the handler
-in place of the payload that was sent. A handle that was already fetched fails
-the call with a resolution error. A handle that is still staged is fetched and
-released, so its rightful consumer loses it.
-
-**When.** A handler copies the headers of a staged message into a send of its
-own.
-
-**Why.** Only the receiver reads `_rv`, and the sender does not remove one
-that it did not write. The encoder drops a fetch budget, `_rv_budget_ms`,
-that the send did not set, for this reason.
-
-**Workaround.** Do not forward `_rv` (or any header that starts with `_rv`)
-from a handler's headers.
-
-**Lifted by.** Not scheduled. The ignored test
-`an_eager_send_that_forwards_a_staged_handle_delivers_its_own_payload` in
-`lib/velo/tests/staged_budget_forwarding.rs` shows it; removing `_rv` on
-every send that does not stage, as the budget is dropped, would lift it.
+**Lifted by.** Not scheduled. A default time-to-live for transparently staged
+payloads would lift it, but it would also fail a fetch that is slower than
+that time.
