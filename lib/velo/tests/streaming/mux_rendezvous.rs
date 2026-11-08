@@ -169,3 +169,54 @@ async fn a_stream_opened_behind_a_stalled_staged_item_delivers() {
     );
     assert_eq!(a_end, Ok(None), "stream A did not end cleanly");
 }
+
+/// The receiver's own fetch bound does not drop a stream item.
+///
+/// `VeloBuilder::staged_fetch_timeout` ends a fetch that runs out, with no
+/// reply. A stream item is a fire-and-forget batch, so the mux never learned
+/// that the item was gone: the records after it waited in the hold, and the
+/// consumer got `SenderDropped` from the stream watchdog about 15 s later,
+/// while its producer was still attached. The producer also kept the item
+/// staged. A slow item is late, not lost, and the stream watchdog already
+/// decides when a stream is dead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_receivers_fetch_bound_does_not_drop_a_stream_item() {
+    const BOUND: Duration = Duration::from_millis(100);
+    let consumer = node(Velo::builder().staged_fetch_timeout(BOUND)).await;
+    let producer = node(Velo::builder()).await;
+    introduce(&producer, &consumer).await;
+    let stall = Stall::new();
+    stall_fetches(&producer.velo, &stall);
+
+    let mut anchor = consumer.velo.create_anchor::<Vec<u8>>();
+    let tx = producer
+        .velo
+        .attach_anchor::<Vec<u8>>(transfer(anchor.handle()))
+        .await
+        .expect("attach");
+    tx.send(vec![0x5a; STAGED])
+        .await
+        .expect("send the staged item");
+    tx.send(vec![1, 2, 3]).await.expect("send the next item");
+    tx.finalize().expect("finalize");
+    tokio::time::timeout(PATIENCE, stall.entered.notified())
+        .await
+        .expect("the consumer began to fetch the staged item");
+    // Past the receiver's bound, on purpose.
+    tokio::time::sleep(BOUND * 3).await;
+    stall.gate.add_permits(1);
+
+    assert_eq!(
+        next(&mut anchor)
+            .await
+            .map(|item| item.map(|item| item.len())),
+        Ok(Some(STAGED)),
+        "the staged item was dropped at the receiver's fetch bound"
+    );
+    assert_eq!(next(&mut anchor).await, Ok(Some(vec![1, 2, 3])));
+    assert_eq!(
+        next(&mut anchor).await,
+        Ok(None),
+        "the stream did not end cleanly"
+    );
+}

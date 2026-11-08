@@ -301,9 +301,18 @@ async fn create_message_handler(
 
                 if let Some(staging) = staging {
                     if let Some(resolver) = large_payload_resolver.get() {
+                        // The receiver's own bound skips a stream batch.
+                        // Dropping one loses its records with no word to the
+                        // mux, and the stream watchdog already ends a stream
+                        // whose sender has gone.
+                        let own = resolver.fetch_timeout().filter(|_| {
+                            !crate::streaming::messenger_mux::is_batch_handler(
+                                &message.metadata.handler_name,
+                            )
+                        });
                         let fetch_bound = crate::messenger::large_payload::fetch_bound(
                             staging.budget.as_deref(),
-                            resolver.fetch_timeout(),
+                            own,
                         );
                         let resolver = Arc::clone(resolver);
                         let hub = hub.clone();

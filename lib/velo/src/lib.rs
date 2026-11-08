@@ -480,8 +480,11 @@ impl VeloBuilder {
     ///
     /// When it runs out, the fetch is dropped, its response slot is released,
     /// the handler does not run, and a sync or unary caller gets an error
-    /// reply. The sender is not told, and keeps the payload staged until it
-    /// tears down.
+    /// reply.
+    ///
+    /// It does not apply to the items of a stream. Dropping one would lose it
+    /// with no word to the stream, whose consumer would see its sender as
+    /// gone; the stream's own watchdog decides that.
     ///
     /// Unset by default: the fetch then has only the sender's bound, if any.
     pub fn staged_fetch_timeout(mut self, timeout: std::time::Duration) -> Self {
