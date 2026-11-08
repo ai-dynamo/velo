@@ -303,6 +303,9 @@ impl RendezvousManager {
                 runtime: messenger.runtime().clone(),
             })
             .map_err(|_| anyhow::anyhow!("register_handlers called twice"))?;
+        // The sweep of deadlines and time-to-live starts on this runtime, so
+        // a payload staged by a send from outside any runtime is still swept.
+        self.store.set_runtime(messenger.runtime().clone());
 
         Ok(())
     }

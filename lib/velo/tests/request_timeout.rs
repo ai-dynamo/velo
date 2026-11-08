@@ -177,7 +177,6 @@ const STAGED: usize = 512 * 1024;
 
 /// A timed send created outside Tokio must still free its staged payload at expiry.
 #[test]
-#[ignore = "F1: staging outside Tokio starts no reaper, so the timed payload stays staged"]
 fn a_staged_send_created_outside_tokio_still_expires_on_its_owner() {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(4)

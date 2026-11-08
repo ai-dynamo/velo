@@ -865,6 +865,12 @@ impl DataStore {
         !self.lease_deadlines.is_empty() || !self.expiring.is_empty()
     }
 
+    /// The runtime [`ensure_reaper`] starts the sweep on. Set once; a second
+    /// call is ignored.
+    pub(crate) fn set_runtime(&self, runtime: tokio::runtime::Handle) {
+        let _ = self.reaper.runtime.set(runtime);
+    }
+
     /// Stop the reaper, for good. Called when the instance shuts down.
     #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
     pub(crate) fn stop_reaper(&self) {
@@ -876,11 +882,15 @@ impl DataStore {
 /// deadline a lease or a slot can live.
 const SWEEP_PERIOD: Duration = Duration::from_millis(100);
 
-/// Whether the sweep task is running, and what stops it.
+/// Whether the sweep task is running, what stops it, and where it runs.
 #[derive(Default)]
 struct Reaper {
     running: AtomicBool,
     stop: tokio_util::sync::CancellationToken,
+    /// The instance's runtime, set by `RendezvousManager::register_handlers`.
+    /// A send can stage a payload from a thread outside any runtime, and the
+    /// sweep must still start for it.
+    runtime: std::sync::OnceLock<tokio::runtime::Handle>,
 }
 
 /// Make sure a task sweeps `store` while a lease deadline or a time-to-live
@@ -888,8 +898,9 @@ struct Reaper {
 ///
 /// The task exits when nothing is pending, so an instance that stages nothing
 /// with a deadline arms no timer at all. It holds the store weakly, so it
-/// never keeps a dropped instance alive. Outside a Tokio runtime it does
-/// nothing, and the deadline waits for the next call made inside one.
+/// never keeps a dropped instance alive. It runs on the instance's runtime
+/// ([`DataStore::set_runtime`]), or else on the caller's. With neither, it
+/// does not start, and the deadline waits for the next call that has one.
 ///
 /// In a UCX build with RDMA configured, the RDMA reaper sweeps the same
 /// deadlines; the two racing is harmless, because a lease is consumed once.
@@ -900,9 +911,15 @@ pub(crate) fn ensure_reaper(store: &Arc<DataStore>) {
     if store.reaper.running.swap(true, Ordering::AcqRel) {
         return;
     }
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        store.reaper.running.store(false, Ordering::Release);
-        return;
+    let runtime = match store.reaper.runtime.get() {
+        Some(runtime) => runtime.clone(),
+        None => match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                store.reaper.running.store(false, Ordering::Release);
+                return;
+            }
+        },
     };
     let weak = Arc::downgrade(store);
     let stop = store.reaper.stop.clone();
