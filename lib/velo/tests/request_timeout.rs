@@ -175,6 +175,44 @@ async fn settles_to(velo: &Velo, expected: usize) -> bool {
 /// and the receiver fetches it before the handler runs.
 const STAGED: usize = 512 * 1024;
 
+/// A timed send created outside Tokio must still free its staged payload at expiry.
+#[test]
+#[ignore = "F1: staging outside Tokio starts no reaper, so the timed payload stays staged"]
+fn a_staged_send_created_outside_tokio_still_expires_on_its_owner() {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(4)
+        .enable_all()
+        .build()
+        .unwrap();
+    let (client, server, _) = runtime.block_on(connected_pair(Arc::new(Semaphore::new(0))));
+    let stall = Stall::new();
+    stall_fetches(&client, &stall);
+    assert!(tokio::runtime::Handle::try_current().is_err());
+
+    let started = Instant::now();
+    let call = client
+        .unary("echo")
+        .unwrap()
+        .raw_payload(Bytes::from(vec![0x5a; STAGED]))
+        .timeout(TIMEOUT)
+        .instance(server.instance_id())
+        .send();
+
+    runtime.block_on(async {
+        tokio::time::timeout(BOUND, stall.entered.notified())
+            .await
+            .expect("the receiver began fetching");
+        expect_timeout(started, call).await;
+        let staged = stall.asked()[0];
+        let released = released_within(&client, staged, Duration::from_secs(1)).await;
+        stall.gate.add_permits(1);
+        assert!(
+            released,
+            "a timed staged send created outside Tokio left its payload on the owner"
+        );
+    });
+}
+
 /// A staged request's fetch gives the receiver's response slot back when the
 /// caller's timeout runs out.
 ///
