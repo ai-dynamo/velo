@@ -456,13 +456,16 @@ fn windowed(window: Duration, on_complete: bool, at_bytes: Option<usize>) -> Mux
 /// 3.1 ms (the window plus timer rounding) on every first token. A record
 /// staged right behind a write still waits one window from that write, so a
 /// stream faster than the window stays at one write per window.
+///
+/// The first record is sent right after the open. The `OpenSlot` is a write,
+/// but it carries no data, so it does not start the spacing. When it did, a
+/// stream whose first token came less than a window after its open waited
+/// until a window after the open.
 #[tokio::test(flavor = "multi_thread")]
 async fn on_complete_writes_a_lone_slot_at_once_but_once_per_window() {
     const WINDOW: Duration = Duration::from_secs(1);
     let harness = harness(windowed(WINDOW, true, None)).await;
     let (inlet, _) = harness.open_credited(1, 1, CREDIT).await;
-    // The `OpenSlot` was a write. Let a window pass since it.
-    tokio::time::sleep(WINDOW + Duration::from_millis(100)).await;
 
     let sent = Instant::now();
     inlet.send(item(0)).expect("stage a record");
@@ -482,6 +485,40 @@ async fn on_complete_writes_a_lone_slot_at_once_but_once_per_window() {
         batch.records.len(),
         1,
         "and goes one window after the first"
+    );
+}
+
+/// An application flush with nothing staged does not hold the next record.
+///
+/// `Velo::flush_batch` kicks every batcher on the node, and the run loop
+/// flushes on a kick whether or not anything is staged. That flush writes
+/// nothing, but it used to restart the `on_complete` spacing. So after one
+/// call, the next record of a lone stream on every idle lane waited up to a
+/// window: 951 ms of a 1 s window here. Only a write that carried data starts
+/// the spacing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_empty_kick_does_not_hold_a_lone_record() {
+    const WINDOW: Duration = Duration::from_secs(1);
+    let harness = harness(windowed(WINDOW, true, None)).await;
+    let (inlet, _) = harness.open_credited(1, 1, CREDIT).await;
+    // A window after the open, so only the kick could hold the record.
+    tokio::time::sleep(WINDOW + Duration::from_millis(100)).await;
+
+    harness.flush_batch();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        harness.try_next_batch().is_none(),
+        "nothing was staged, so the kick wrote nothing"
+    );
+
+    let sent = Instant::now();
+    inlet.send(item(0)).expect("stage a record");
+    let batch = harness.next_batch().await;
+    assert_eq!(batch.records.len(), 1);
+    assert!(
+        sent.elapsed() < WINDOW / 2,
+        "the kick carried no data, so it must not hold the record; took {:?}",
+        sent.elapsed()
     );
 }
 
