@@ -149,12 +149,12 @@ pub(crate) use self::lane_choice::LaneReservation;
 /// re-deriving the one value negotiation is keyed on.
 pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
 
-/// The header a singleton batch carries: the sender's epoch, the full id of
-/// the slot its one data record belongs to, and the routing session the slot
-/// was opened with, as `<epoch>:<slot>:<session>`.
+/// The header a staged singleton batch carries: the sender's epoch, the full
+/// id of the slot its one data record belongs to, and the routing session the
+/// slot was opened with, as `<epoch>:<slot>:<session>`.
 ///
-/// A singleton is staged, and the receiver resolves it before it reads it. A
-/// receiver that refuses the payload for its size
+/// The receiver resolves a staged singleton before it reads it. A receiver
+/// that refuses the payload for its size
 /// (`VeloBuilder::staged_payload_max`) never reads the record, so this is
 /// what lets it end that one stream. Without it the stream would keep a gap
 /// that never closes until its watchdog. The id is the sender's word, but it
