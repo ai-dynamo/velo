@@ -362,6 +362,90 @@ async fn a_payload_refusal_ends_an_anchor_with_a_terminal_in_the_hold() {
     assert!(why.contains("1048576"), "{why}");
 }
 
+/// An eager open can be queued while the detached resolver refuses its first item.
+/// The refusal must follow that open through the ordered lane.
+#[tokio::test]
+#[ignore = "F1: a refusal bypasses the ordered lane and is lost before its queued OpenSlot runs"]
+async fn a_payload_refusal_ends_a_stream_whose_open_is_queued() {
+    use crate::messenger::common::messages::ResponseType;
+    use crate::messenger::common::responses::ResponseId;
+    use crate::messenger::large_payload::PayloadTooLarge;
+    use crate::messenger::server::{DispatcherHub, InboundCall};
+    use protocol::{BatchEncoder, SlotId};
+
+    let node = prebinding_node(test_config(), None).await;
+    let mut anchor = node.manager.create_anchor::<u32>();
+    let (_, anchor_id) = anchor.handle().unpack();
+    let ticket = node
+        .manager
+        .prebind_anchor(anchor.handle())
+        .expect("ticket");
+    let message_id = ResponseId::from_u128(1);
+    let key = lane0(WorkerId::from_u64(message_id.worker_id()));
+    let id = SlotId::new(0, 0).expect("slot id");
+    let core = Arc::clone(&node.mux.core);
+    let handler = Handler::am_handler_async(key.lane.handler_name(), move |ctx: Context| {
+        let core = Arc::clone(&core);
+        async move {
+            core.deliver_batch(key, &ctx.payload);
+            Ok(())
+        }
+    })
+    .ordered()
+    .build();
+    let hub = DispatcherHub::new(Arc::clone(node.messenger.backend()));
+    hub.set_system(Arc::clone(&node.messenger)).expect("system");
+    hub.handlers_arc()
+        .insert(key.lane.handler_name().to_string(), handler.dispatcher);
+    let core = Arc::clone(&node.mux.core);
+    hub.on_refused(
+        key.lane.handler_name(),
+        Arc::new(move |refused| core.refuse_singleton(key, refused)),
+    );
+    let mut open = BatchEncoder::new(1, 0, key.lane);
+    open.push_open_slot(id, 0, anchor_id, ticket.routing_session_id)
+        .expect("open");
+    hub.dispatch_message(
+        key.lane.handler_name(),
+        InboundCall {
+            message_id,
+            payload: open.finish().freeze(),
+            response_type: ResponseType::FireAndForget,
+            headers: None,
+            staged: false,
+            in_flight: None,
+        },
+        &node.messenger,
+    );
+    assert_eq!(node.mux.core.ingress.live_slots(key), 0);
+
+    // No yield: the open is queued, as when the resolver runs on another worker.
+    let headers = singleton_headers(1, id, ticket.routing_session_id);
+    hub.refused(
+        key.lane.handler_name(),
+        &RefusedPayload {
+            sender: key.peer,
+            headers: Some(&headers),
+            too_large: PayloadTooLarge {
+                len: 64 << 20,
+                limit: 1 << 20,
+            },
+        },
+    );
+
+    let terminal = tokio::time::timeout(Duration::from_secs(1), anchor.next())
+        .await
+        .expect("a refusal must survive an OpenSlot already queued on its ordered lane");
+    assert!(
+        matches!(
+            terminal,
+            Some(Err(crate::streaming::StreamError::TransportError(_)))
+        ),
+        "expected the size error, got {terminal:?}"
+    );
+    assert_eq!(node.mux.core.ingress.live_slots(key), 0);
+}
+
 async fn eventually(mut predicate: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
     while tokio::time::Instant::now() < deadline {
