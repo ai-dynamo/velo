@@ -620,7 +620,9 @@ impl MuxCore {
     /// fault that carries the same news to it otherwise rides on the next
     /// record it sends.
     /// End the stream whose singleton this node refused for its size, with a
-    /// `TransportError` that names both sizes, and tell its producer to stop.
+    /// `TransportError` that names both sizes, and tell its producer to cancel
+    /// it. When its `OpenSlot` has not been applied yet, the refusal waits on
+    /// the stream's bind (see [`IngressRegistry::refuse_record`]).
     fn refuse_singleton(&self, key: PeerLane, refused: &RefusedPayload<'_>) {
         if self.tasks.is_stopped() {
             return;
@@ -638,10 +640,13 @@ impl MuxCore {
         else {
             return;
         };
-        let Some(reply) = self
-            .ingress
-            .refuse_record(key, &record, frame, self.metrics.as_ref())
-        else {
+        let Some(reply) = self.ingress.refuse_record(
+            key,
+            &record,
+            frame,
+            self.metrics.as_ref(),
+            self.config.peer_byte_budget,
+        ) else {
             return;
         };
         if let Some(metrics) = &self.metrics {

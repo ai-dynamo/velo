@@ -1056,7 +1056,6 @@ async fn a_slot_reused_behind_a_rendezvous_record_opens_on_the_receiver() {
 /// A refusal's reply can wait in transit while its producer reuses the slot id.
 /// The reply must stop only the session whose payload was refused.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "F2: a delayed size-refusal CloseSlot carries no session and closes a reused slot id"]
 async fn a_delayed_payload_refusal_reply_spares_a_reused_slot() {
     use crate::streaming::messenger_mux::flow_control::slot_buffer_depth;
     use crate::streaming::messenger_mux::ingress::{DrainSignal, IngressRegistry, handle_batch};
@@ -1111,6 +1110,7 @@ async fn a_delayed_payload_refusal_reply_spares_a_reused_slot() {
             },
             error.clone(),
             None,
+            config.peer_byte_budget,
         )
         .expect("the refusal owes its producer a reply");
     assert_eq!(old_rx.try_recv().ok(), Some(error));
@@ -1140,11 +1140,17 @@ async fn a_delayed_payload_refusal_reply_spares_a_reused_slot() {
     apply(&harness.next_batch().await);
     assert_eq!(replacement_rx.try_recv().ok(), Some(item(7)));
 
-    let ReplyRecord::CloseSlot { slot, reason } = reply else {
-        panic!("unexpected refusal reply: {reply:?}");
-    };
+    // Applied as the producer applies each kind of reply when it arrives.
     hooks.pause();
-    harness.handle.peer_closed(slot, reason);
+    match reply {
+        ReplyRecord::CloseSlot { slot, reason } => harness.handle.peer_closed(slot, reason),
+        ReplyRecord::LifecycleSlot {
+            slot,
+            session_id,
+            cancel,
+        } => harness.handle.peer_stopped(slot, session_id, cancel),
+        other => panic!("unexpected refusal reply: {other:?}"),
+    }
     hooks.wait_until_parked().await;
     assert_eq!(
         harness.handle.pending_control(),

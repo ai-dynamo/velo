@@ -365,7 +365,6 @@ async fn a_payload_refusal_ends_an_anchor_with_a_terminal_in_the_hold() {
 /// An eager open can be queued while the detached resolver refuses its first item.
 /// The refusal must follow that open through the ordered lane.
 #[tokio::test]
-#[ignore = "F1: a refusal bypasses the ordered lane and is lost before its queued OpenSlot runs"]
 async fn a_payload_refusal_ends_a_stream_whose_open_is_queued() {
     use crate::messenger::common::messages::ResponseType;
     use crate::messenger::common::responses::ResponseId;

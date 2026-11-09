@@ -1039,13 +1039,20 @@ fn a_payload_refusal_replaces_a_terminal_waiting_in_the_hold() {
         slot: id,
         session: SESSION,
     };
-    let reply = registry.refuse_record(peer(), &record, error.clone(), None);
+    let reply = registry.refuse_record(
+        peer(),
+        &record,
+        error.clone(),
+        None,
+        config.peer_byte_budget,
+    );
 
     assert_eq!(
         reply,
-        Some(ReplyRecord::CloseSlot {
+        Some(ReplyRecord::LifecycleSlot {
             slot: id,
-            reason: CloseReason::ProtocolError,
+            session_id: SESSION,
+            cancel: true,
         })
     );
     assert_eq!(registry.live_slots(peer()), 0);

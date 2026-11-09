@@ -91,6 +91,22 @@ struct BindEntry {
     /// load until the bind leaves this table by any path. A claim hands the
     /// count over to the slot's own, on this same lane.
     lane: LaneReservation,
+    /// A size refusal for this stream that arrived before its `OpenSlot` was
+    /// applied ([`IngressRegistry::refuse_record`]); `open_slot` applies it.
+    refused: Option<PendingRefusal>,
+}
+
+/// A size refusal parked on a bind until the stream's `OpenSlot` claims it.
+///
+/// It names the (peer, lane), epoch and slot id its singleton came with, so
+/// it ends only that stream: an `OpenSlot` from elsewhere that claims the
+/// bind does not match it.
+struct PendingRefusal {
+    key: PeerLane,
+    epoch: u64,
+    slot: SlotId,
+    /// The `TransportError` the consumer gets as its terminal.
+    frame: Vec<u8>,
 }
 
 impl Drop for BindEntry {
@@ -322,44 +338,88 @@ impl IngressRegistry {
     }
 
     /// End the one stream whose staged record this node refused, unread, for
-    /// its size, and report the close its owner is owed.
+    /// its size, and report the reply its producer is owed.
     ///
     /// The consumer gets `frame` (a `TransportError` that names both sizes) as
     /// its terminal, then the slot retires. It does not wait for records ahead
     /// of the refused one that are still on their way: the stream has failed,
     /// and a gap that never closes would leave it open until its watchdog.
-    /// The owner is told `ProtocolError`, as for a hold overflow, so its
-    /// producer stops. Other slots from the peer are not touched.
+    /// Other slots from the peer are not touched.
     ///
-    /// `None` unless `record` names a live slot here exactly: its epoch, its
-    /// full id, and the routing session it was opened with. The session is
-    /// what tells one lifetime of an id from another; an id recurs, within an
-    /// epoch too, once a cancelled slot's index is reused and its generation
-    /// wraps.
+    /// The producer is told to cancel the stream by its session
+    /// (`LifecycleSlot`), not by its slot id alone (`CloseSlot`). The reply
+    /// can arrive after the producer has reused the id, and a session names
+    /// one stream and no other.
+    ///
+    /// The refusal comes from the resolver, not along the ordered lane, so it
+    /// can arrive while the stream's `OpenSlot` still waits on that lane.
+    /// Then the slot is not open here, but its bind is waiting, and the
+    /// refusal is parked on the bind for `open_slot` to apply. This table's
+    /// lock, which `open_slot` holds when it claims a bind, keeps the claim
+    /// from falling between this look and the mark. `peer_byte_budget` sizes
+    /// the table if no batch from this peer has made one yet.
+    ///
+    /// `None` unless `record` names a live slot here exactly, now: its epoch,
+    /// its full id, and the routing session it was opened with. The session
+    /// is what tells one lifetime of an id from another; an id recurs, within
+    /// an epoch too, once a cancelled slot's index is reused and its
+    /// generation wraps.
     pub(crate) fn refuse_record(
         &self,
         key: PeerLane,
         record: &super::SingletonRecord,
         frame: Vec<u8>,
         metrics: Option<&MuxMetricsHandle>,
+        peer_byte_budget: u64,
     ) -> Option<ReplyRecord> {
+        if !self.peers.contains_key(&key) {
+            let peer_bytes = self.peer_budget(key.peer, peer_byte_budget);
+            self.peers
+                .entry(key)
+                .or_insert_with(|| Mutex::new(PeerIngress::new(peer_bytes)));
+        }
         let entry = self.peers.get(&key)?;
         let mut state = lock(entry.value());
         // Checked under the table's lock, as `accept_epoch` checks a batch and
         // `close_consumer_gone` a session: a resolve can outlive its stream.
-        if state.epoch != Some(record.epoch) {
-            return None;
+        match state.epoch {
+            Some(epoch) if epoch > record.epoch => return None,
+            Some(epoch) if epoch == record.epoch => {
+                if let Some(slot) = checked_slot(&mut state, None, record.slot)
+                    && slot.session_id == record.session
+                {
+                    slot.inject_error(frame);
+                    let mut outcome = BatchOutcome::default();
+                    let reason = CloseReason::ProtocolError;
+                    finish_close(&mut state, record.slot, reason, metrics, &mut outcome);
+                    return (outcome.closed > 0).then_some(ReplyRecord::LifecycleSlot {
+                        slot: record.slot,
+                        session_id: record.session,
+                        cancel: true,
+                    });
+                }
+            }
+            // No batch yet, or an older epoch: this epoch's `OpenSlot` is
+            // still on its way.
+            Some(_) | None => {}
         }
-        let id = record.slot;
-        let slot = checked_slot(&mut state, metrics, id)?;
-        if slot.session_id != record.session {
-            return None;
+        // A session is unique on this node, so one bind at most has it.
+        let waiting = self
+            .binds
+            .iter()
+            .find(|bind| bind.key().1 == record.session)
+            .map(|bind| *bind.key());
+        if let Some(waiting) = waiting
+            && let Some(mut bind) = self.binds.get_mut(&waiting)
+        {
+            bind.refused = Some(PendingRefusal {
+                key,
+                epoch: record.epoch,
+                slot: record.slot,
+                frame,
+            });
         }
-        slot.inject_error(frame);
-        let mut outcome = BatchOutcome::default();
-        let reason = CloseReason::ProtocolError;
-        finish_close(&mut state, id, reason, metrics, &mut outcome);
-        (outcome.closed > 0).then_some(ReplyRecord::CloseSlot { slot: id, reason })
+        None
     }
 
     /// This (peer, lane)'s pending-wake flag, created on first use.
@@ -411,6 +471,7 @@ impl IngressRegistry {
                 frame_tx,
                 drain,
                 lane,
+                refused: None,
             },
         );
     }
@@ -782,7 +843,7 @@ fn open_slot(
         return;
     }
 
-    let Some((_, bind)) = ctx.registry.binds.remove(&(anchor_id, session_id)) else {
+    let Some((_, mut bind)) = ctx.registry.binds.remove(&(anchor_id, session_id)) else {
         // The reverse race: an `OpenSlot` for a pair that was never registered,
         // or whose accept window expired. It must **not** fail the peer — reply
         // and discard that slot's records. This `OpenSlot` was never admitted
@@ -860,6 +921,25 @@ fn open_slot(
     slot.session_id = session_id;
     state.slots[index] = Some(slot);
     outcome.opened += 1;
+    // A size refusal that overtook this `OpenSlot` on its way here, parked on
+    // the bind by `IngressRegistry::refuse_record`. It ends this stream only
+    // if it came with this (peer, lane), this epoch and this id.
+    if let Some(refusal) = bind.refused.take()
+        && refusal.key == ctx.key
+        && refusal.slot == id
+        && state.epoch == Some(refusal.epoch)
+    {
+        if let Some(slot) = state.slots[index].as_mut() {
+            slot.inject_error(refusal.frame);
+        }
+        finish_close(state, id, CloseReason::ProtocolError, ctx.metrics, outcome);
+        outcome.replies.push(ReplyRecord::LifecycleSlot {
+            slot: id,
+            session_id,
+            cancel: true,
+        });
+        return;
+    }
     if lifecycle == drain::Lifecycle::Cancelled {
         finish_close(state, id, CloseReason::UnknownSlot, ctx.metrics, outcome);
         outcome.replies.push(ReplyRecord::LifecycleSlot {
