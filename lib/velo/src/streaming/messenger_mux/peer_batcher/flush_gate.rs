@@ -52,6 +52,30 @@
 //!
 //! [`MuxConfig::reply_linger`]: super::super::MuxConfig::reply_linger
 //!
+//! ## Going before the window: a complete batch, a full batch
+//!
+//! A linger window runs from the batch's oldest record, so a record that is
+//! alone on its lane waits the whole window for company that will not come. Two
+//! opt-in conditions end the wait when waiting cannot help:
+//!
+//! - [`AutoFlush::on_complete`]: every live slot already has a data record in
+//!   the batch. More waiting could only add a second record from one of them.
+//!   The batch then goes at the later of its oldest record and one window
+//!   after the last write, which keeps a single fast stream at one write per
+//!   window. Counting slots needs the batcher's slot table, which this gate
+//!   does not have: the batcher marks each slot with [`FlushGate::batch_gen`]
+//!   when it stages for it, and passes the live count in a [`FlushContext`].
+//! - [`AutoFlush::at_bytes`]: the batch has reached a size past which batching
+//!   saves no packets.
+//!
+//! Neither is a reason for the idle-lane rule "write at once when the lane has
+//! been quiet": a forward pass's records reach the batcher over a fraction of a
+//! millisecond, so that rule writes the first of them alone and the rest a
+//! window later, which is two writes per pass where the window made one.
+//!
+//! [`AutoFlush::on_complete`]: super::super::AutoFlush::on_complete
+//! [`AutoFlush::at_bytes`]: super::super::AutoFlush::at_bytes
+//!
 //! ## The kick, and why it outlives a clamp
 //!
 //! `flush_batch()` arrives as coalesced control and sets [`FlushGate::kick`].
@@ -122,6 +146,30 @@ pub(super) struct FlushGate {
     /// rather than a second count alongside `staged`, because nothing here
     /// needs the magnitude — only whether the batch is still pure.
     non_reply_staged: bool,
+    /// When this batcher last wrote a batch.
+    ///
+    /// Only tracked under [`AutoFlush::on_complete`] with a linger window,
+    /// the one place that reads it: a complete batch may go early, but no
+    /// sooner than one window after this.
+    ///
+    /// [`AutoFlush::on_complete`]: super::super::AutoFlush::on_complete
+    last_write: Option<Instant>,
+    /// Names the open batch, so a slot can tell whether it already has a record
+    /// in it ([`Self::batch_gen`]). Starts at 1 so that a new slot, marked 0,
+    /// is never taken to be in the first batch.
+    batch_gen: u64,
+    /// Distinct slots with a data record in the open batch.
+    slots_in_batch: usize,
+}
+
+/// What the batcher knows at the moment of a flush decision and this gate
+/// does not: how many slots could still add to the batch, and how big it is.
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct FlushContext {
+    /// Slots open on this (peer, lane).
+    pub(super) live_slots: usize,
+    /// Encoded size of the open batch, header included.
+    pub(super) batch_bytes: usize,
 }
 
 impl FlushGate {
@@ -140,7 +188,29 @@ impl FlushGate {
             reply_linger,
             replies_since: None,
             non_reply_staged: false,
+            last_write: None,
+            batch_gen: 1,
+            slots_in_batch: 0,
         }
+    }
+
+    /// The open batch's name, for [`Self::stage_data`]'s caller to mark the
+    /// slot it stages for.
+    pub(super) const fn batch_gen(&self) -> u64 {
+        self.batch_gen
+    }
+
+    /// As [`Self::stage`], for one slot's data records. `first_for_slot` says
+    /// the slot had no record in this batch yet, which is what
+    /// [`AutoFlush::on_complete`](super::super::AutoFlush::on_complete) counts.
+    pub(super) fn stage_data(&mut self, count: usize, first_for_slot: bool) {
+        if count == 0 {
+            return;
+        }
+        if first_for_slot {
+            self.slots_in_batch += 1;
+        }
+        self.stage(count);
     }
 
     /// Note `count` records appended to the open batch.
@@ -214,10 +284,14 @@ impl FlushGate {
     /// not only a `linger` one. Written as `deadline().is_some_and(..)`
     /// rather than re-deriving the two clocks by hand, so the two functions
     /// cannot drift out of agreement about which one binds.
-    pub(super) fn should_flush(&self) -> bool {
+    pub(super) fn should_flush(&self, ctx: FlushContext) -> bool {
         self.urgent
             || (self.policy.on_admission() && !self.replies_only())
-            || self.deadline().is_some_and(|due| due <= Instant::now())
+            || self
+                .policy
+                .at_bytes()
+                .is_some_and(|bytes| self.staged > 0 && ctx.batch_bytes >= bytes)
+            || self.deadline(ctx).is_some_and(|due| due <= Instant::now())
     }
 
     /// When the open batch is due, for the batcher's select to park on.
@@ -227,9 +301,18 @@ impl FlushGate {
     /// A reply's own due time and the policy window are independent clocks —
     /// a batch may be running both at once — so this is the earlier of the
     /// two that are actually armed, not one replacing the other.
-    pub(super) fn deadline(&self) -> Option<Instant> {
+    ///
+    /// A complete batch (see [`Self::complete`]) is due at the later of its
+    /// oldest record and one window after the last write. That is never later
+    /// than the plain window, because the last write came before the oldest
+    /// record.
+    pub(super) fn deadline(&self, ctx: FlushContext) -> Option<Instant> {
         let reply_due = self.replies_since.map(|since| since + self.reply_linger);
         let policy_due = match (self.since, self.linger_window()) {
+            (Some(since), Some(window)) if self.complete(ctx) => Some(
+                self.last_write
+                    .map_or(since, |last| since.max(last + window)),
+            ),
             (Some(since), Some(window)) => Some(since + window),
             _ => None,
         };
@@ -253,8 +336,21 @@ impl FlushGate {
         self.replies_since.is_some() && !self.non_reply_staged
     }
 
+    /// Whether the batch holds a data record from every live slot, under a
+    /// policy that lets such a batch go early.
+    ///
+    /// Credit replies and closes do not count, so a replies-only batch is never
+    /// complete. `>=` rather than `==` because a slot can close while its record
+    /// is still staged; its close is urgent and writes the batch anyway.
+    fn complete(&self, ctx: FlushContext) -> bool {
+        self.policy.on_complete() && ctx.live_slots > 0 && self.slots_in_batch >= ctx.live_slots
+    }
+
     /// The open batch was written.
     pub(super) fn cleared(&mut self) {
+        if self.policy.on_complete() && self.linger_window().is_some() {
+            self.last_write = Some(Instant::now());
+        }
         self.forget_staged();
     }
 
@@ -286,6 +382,8 @@ impl FlushGate {
         self.since = None;
         self.replies_since = None;
         self.non_reply_staged = false;
+        self.slots_in_batch = 0;
+        self.batch_gen = self.batch_gen.wrapping_add(1);
     }
 
     const fn linger_window(&self) -> Option<Duration> {
@@ -309,6 +407,12 @@ mod tests {
     use super::super::super::AutoFlush;
     use super::*;
 
+    /// Context for the tests of rules that do not read it.
+    const CTX: FlushContext = FlushContext {
+        live_slots: 0,
+        batch_bytes: 0,
+    };
+
     fn gate(policy: FlushPolicy) -> FlushGate {
         FlushGate::new(policy, Duration::ZERO, None)
     }
@@ -321,24 +425,35 @@ mod tests {
         FlushPolicy::Auto(AutoFlush {
             on_admission,
             max_linger,
+            ..AutoFlush::default()
         })
     }
 
     #[test]
     fn auto_on_admission_writes_whatever_it_has() {
         let mut gate = gate(FlushPolicy::default());
-        assert!(gate.should_flush(), "an empty wake still ends in a flush");
+        assert!(
+            gate.should_flush(CTX),
+            "an empty wake still ends in a flush"
+        );
         gate.stage(1);
-        assert!(gate.should_flush());
-        assert_eq!(gate.deadline(), None, "and never runs a timer");
+        assert!(gate.should_flush(CTX));
+        assert_eq!(gate.deadline(CTX), None, "and never runs a timer");
     }
 
     #[test]
     fn manual_holds_ordinary_records() {
         let mut gate = gate(FlushPolicy::Manual);
         gate.stage(32);
-        assert!(!gate.should_flush(), "manual means the application decides");
-        assert_eq!(gate.deadline(), None, "and there is no window to rescue it");
+        assert!(
+            !gate.should_flush(CTX),
+            "manual means the application decides"
+        );
+        assert_eq!(
+            gate.deadline(CTX),
+            None,
+            "and there is no window to rescue it"
+        );
     }
 
     #[test]
@@ -347,7 +462,7 @@ mod tests {
         gate.stage(4);
         gate.stage_urgent(1);
         assert!(
-            gate.should_flush(),
+            gate.should_flush(CTX),
             "a close or a terminal moves whatever the policy says"
         );
     }
@@ -358,13 +473,13 @@ mod tests {
         let mut gate = gate_with_reply_linger(FlushPolicy::default(), window);
         gate.stage_reply(1);
         assert!(
-            !gate.should_flush(),
+            !gate.should_flush(CTX),
             "on_admission does not write a batch that holds only credit replies"
         );
-        let due = gate.deadline().expect("the reply window is running");
+        let due = gate.deadline(CTX).expect("the reply window is running");
         gate.stage_reply(3);
         assert_eq!(
-            gate.deadline(),
+            gate.deadline(CTX),
             Some(due),
             "later replies join the window the first started"
         );
@@ -386,7 +501,7 @@ mod tests {
         gate.stage_reply(1);
         gate.stage(1);
         assert!(
-            gate.deadline().is_some(),
+            gate.deadline(CTX).is_some(),
             "a record joining must not cancel the reply's window"
         );
 
@@ -396,7 +511,7 @@ mod tests {
         gate.stage(1);
         gate.stage_reply(1);
         assert!(
-            gate.deadline().is_some(),
+            gate.deadline(CTX).is_some(),
             "a reply joining a non-empty batch must still start one"
         );
     }
@@ -414,16 +529,16 @@ mod tests {
     fn on_admission_writes_a_mixed_batch_at_once() {
         let mut gate = gate_with_reply_linger(FlushPolicy::default(), Duration::from_millis(50));
         gate.stage_reply(1);
-        assert!(!gate.should_flush(), "replies-only still waits");
-        let reply_due = gate.deadline().expect("the reply window is running");
+        assert!(!gate.should_flush(CTX), "replies-only still waits");
+        let reply_due = gate.deadline(CTX).expect("the reply window is running");
 
         gate.stage(1);
         assert!(
-            gate.should_flush(),
+            gate.should_flush(CTX),
             "on_admission writes the mixed batch at once, reply included"
         );
         assert_eq!(
-            gate.deadline(),
+            gate.deadline(CTX),
             Some(reply_due),
             "the reply's own window is not cancelled by the data record — \
              should_flush is true for an independent reason (on_admission), \
@@ -440,7 +555,7 @@ mod tests {
         gate.stage_reply(1);
         gate.stage(1);
         assert!(
-            !gate.should_flush(),
+            !gate.should_flush(CTX),
             "data joining under Manual must not cut the reply's wait short"
         );
     }
@@ -453,7 +568,7 @@ mod tests {
         gate.stage_reply(2);
         gate.stage_urgent(1);
         assert!(
-            gate.should_flush(),
+            gate.should_flush(CTX),
             "a close moves the replies staged before it"
         );
     }
@@ -468,7 +583,7 @@ mod tests {
         let before = Instant::now();
         let mut gate = gate_with_reply_linger(auto(false, Some(policy_window)), reply_linger);
         gate.stage_reply(1);
-        let due = gate.deadline().expect("a window is running");
+        let due = gate.deadline(CTX).expect("a window is running");
         assert!(
             due <= before + Duration::from_millis(25),
             "deadline() must take the shorter of the two windows, not just the \
@@ -482,11 +597,11 @@ mod tests {
         let mut gate = gate(FlushPolicy::Manual);
         gate.stage_reply(1);
         assert!(
-            gate.should_flush(),
+            gate.should_flush(CTX),
             "the pre-window behaviour: a reply moves at once"
         );
         assert!(
-            gate.deadline().is_some_and(|due| due <= Instant::now()),
+            gate.deadline(CTX).is_some_and(|due| due <= Instant::now()),
             "a zero window is due immediately rather than unset — should_flush \
              is already true either way, so the batcher never waits on this"
         );
@@ -497,8 +612,8 @@ mod tests {
         let mut gate = gate_with_reply_linger(FlushPolicy::Manual, Duration::from_millis(50));
         gate.stage_reply(1);
         gate.cleared();
-        assert_eq!(gate.deadline(), None);
-        assert!(!gate.should_flush());
+        assert_eq!(gate.deadline(CTX), None);
+        assert!(!gate.should_flush(CTX));
     }
 
     #[test]
@@ -519,16 +634,16 @@ mod tests {
     #[test]
     fn a_linger_window_runs_from_the_oldest_staged_record() {
         let mut gate = gate(auto(false, Some(Duration::from_millis(50))));
-        assert_eq!(gate.deadline(), None, "nothing staged, nothing due");
+        assert_eq!(gate.deadline(CTX), None, "nothing staged, nothing due");
         gate.stage(1);
-        let first = gate.deadline().expect("a window is running");
+        let first = gate.deadline(CTX).expect("a window is running");
         gate.stage(1);
         assert_eq!(
-            gate.deadline(),
+            gate.deadline(CTX),
             Some(first),
             "the second record does not restart the window the first started"
         );
-        assert!(!gate.should_flush(), "and it has not elapsed yet");
+        assert!(!gate.should_flush(CTX), "and it has not elapsed yet");
     }
 
     #[test]
@@ -536,8 +651,8 @@ mod tests {
         let mut gate = gate(auto(false, Some(Duration::from_millis(50))));
         gate.stage(1);
         gate.cleared();
-        assert_eq!(gate.deadline(), None);
-        assert!(!gate.should_flush(), "an empty batch is never due");
+        assert_eq!(gate.deadline(CTX), None);
+        assert!(!gate.should_flush(CTX), "an empty batch is never due");
     }
 
     #[test]
@@ -546,8 +661,149 @@ mod tests {
         gate.stage_urgent(8);
         gate.discarded();
         assert!(
-            !gate.should_flush(),
+            !gate.should_flush(CTX),
             "an epoch death takes the urgency with the records it applied to"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // on_complete and at_bytes
+    // -----------------------------------------------------------------------
+
+    const WINDOW: Duration = Duration::from_millis(50);
+
+    fn windowed(on_complete: bool, at_bytes: Option<usize>) -> FlushPolicy {
+        FlushPolicy::Auto(AutoFlush {
+            on_admission: false,
+            max_linger: Some(WINDOW),
+            on_complete,
+            at_bytes,
+        })
+    }
+
+    const fn live(live_slots: usize) -> FlushContext {
+        FlushContext {
+            live_slots,
+            batch_bytes: 0,
+        }
+    }
+
+    /// A gate that wrote a batch and then saw nothing for `quiet`.
+    async fn written_then_quiet(policy: FlushPolicy, quiet: Duration) -> FlushGate {
+        let mut gate = gate(policy);
+        gate.stage_data(1, true);
+        gate.cleared();
+        tokio::time::advance(quiet).await;
+        gate
+    }
+
+    /// The c1 case: one stream on the lane, and its record arrives long after
+    /// the last write. Nothing else can join the batch, so the record goes at
+    /// once instead of waiting the window alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_complete_batch_on_a_quiet_lane_is_due_at_once() {
+        let mut gate = written_then_quiet(windowed(true, None), WINDOW * 3).await;
+        gate.stage_data(1, true);
+        assert!(
+            gate.should_flush(live(1)),
+            "the only live slot is in the batch"
+        );
+        assert_eq!(gate.deadline(live(1)), Some(Instant::now()));
+    }
+
+    /// Before the first write there is no spacing to keep.
+    #[tokio::test(start_paused = true)]
+    async fn a_complete_batch_before_any_write_is_due_at_once() {
+        let mut gate = gate(windowed(true, None));
+        gate.stage_data(1, true);
+        assert!(gate.should_flush(live(1)));
+    }
+
+    /// A stream that sends faster than the window still gets one write per
+    /// window: a complete batch staged right behind a write waits until one
+    /// window after that write. That is still sooner than the plain window,
+    /// which would run from this batch's own oldest record.
+    #[tokio::test(start_paused = true)]
+    async fn a_complete_batch_waits_one_window_from_the_last_write() {
+        let mut gate = gate(windowed(true, None));
+        gate.stage_data(1, true);
+        gate.cleared();
+        let written = Instant::now();
+        tokio::time::advance(WINDOW / 5).await;
+
+        gate.stage_data(1, true);
+        let staged = Instant::now();
+        assert!(!gate.should_flush(live(1)), "one write per window, at most");
+        assert_eq!(gate.deadline(live(1)), Some(written + WINDOW));
+        assert!(
+            written + WINDOW < staged + WINDOW,
+            "never later than the plain window"
+        );
+
+        tokio::time::advance(WINDOW - WINDOW / 5).await;
+        assert!(gate.should_flush(live(1)));
+    }
+
+    /// Many streams on a lane: while one has nothing staged, the batch is not
+    /// complete and the window runs from the oldest record, however quiet the
+    /// lane was. This is what keeps a busy lane, where some streams are always
+    /// in prefill or between turns, at one write per window. A second record
+    /// from a slot already in the batch does not count as another slot.
+    #[tokio::test(start_paused = true)]
+    async fn an_incomplete_batch_keeps_the_full_window() {
+        let mut gate = written_then_quiet(windowed(true, None), WINDOW * 3).await;
+        gate.stage_data(1, true);
+        let staged = Instant::now();
+        gate.stage_data(1, false);
+        assert!(
+            !gate.should_flush(live(2)),
+            "one of two live slots has nothing staged"
+        );
+        assert_eq!(gate.deadline(live(2)), Some(staged + WINDOW));
+    }
+
+    /// The condition is opt-in: without it, a lone record waits the window as it
+    /// always did.
+    #[tokio::test(start_paused = true)]
+    async fn without_on_complete_a_lone_record_waits_the_window() {
+        let mut gate = written_then_quiet(windowed(false, None), WINDOW * 3).await;
+        gate.stage_data(1, true);
+        let staged = Instant::now();
+        assert!(!gate.should_flush(live(1)));
+        assert_eq!(gate.deadline(live(1)), Some(staged + WINDOW));
+    }
+
+    /// A credit reply is not a slot's record, so a batch holding only replies is
+    /// never complete; it keeps its own reply window.
+    #[tokio::test(start_paused = true)]
+    async fn credit_replies_alone_never_make_a_batch_complete() {
+        let reply_linger = Duration::from_millis(20);
+        let mut gate = gate_with_reply_linger(windowed(true, None), reply_linger);
+        gate.stage_reply(1);
+        let staged = Instant::now();
+        assert!(!gate.should_flush(live(1)));
+        assert_eq!(gate.deadline(live(1)), Some(staged + reply_linger));
+    }
+
+    /// Past a segment's worth of bytes, batching saves no packets, so a batch at
+    /// `at_bytes` goes without waiting for the window. An empty batch is never
+    /// due by size, even though its header alone has a length.
+    #[test]
+    fn a_batch_at_the_byte_threshold_is_due_at_once() {
+        let at = |batch_bytes| FlushContext {
+            live_slots: 4,
+            batch_bytes,
+        };
+        let mut gate = gate(windowed(false, Some(1000)));
+        assert!(
+            !gate.should_flush(at(1000)),
+            "nothing staged, nothing to write"
+        );
+        gate.stage_data(1, true);
+        assert!(
+            !gate.should_flush(at(999)),
+            "below the threshold the window applies"
+        );
+        assert!(gate.should_flush(at(1000)));
     }
 }
