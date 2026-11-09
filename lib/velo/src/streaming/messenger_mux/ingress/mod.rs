@@ -91,9 +91,12 @@ struct BindEntry {
     /// load until the bind leaves this table by any path. A claim hands the
     /// count over to the slot's own, on this same lane.
     lane: LaneReservation,
-    /// A size refusal for this stream that arrived before its `OpenSlot` was
-    /// applied ([`IngressRegistry::refuse_record`]); `open_slot` applies it.
-    refused: Option<PendingRefusal>,
+    /// Size refusals naming this stream that arrived before its `OpenSlot`
+    /// was applied ([`IngressRegistry::refuse_record`]), at most one per
+    /// (peer, lane). `open_slot` applies only the one from its own (peer,
+    /// lane): a session is not secret, so a refusal from another peer must
+    /// neither replace nor block it.
+    refused: Vec<PendingRefusal>,
 }
 
 /// A size refusal parked on a bind until the stream's `OpenSlot` claims it.
@@ -412,12 +415,16 @@ impl IngressRegistry {
         if let Some(waiting) = waiting
             && let Some(mut bind) = self.binds.get_mut(&waiting)
         {
-            bind.refused = Some(PendingRefusal {
+            let refusal = PendingRefusal {
                 key,
                 epoch: record.epoch,
                 slot: record.slot,
                 frame,
-            });
+            };
+            match bind.refused.iter_mut().find(|parked| parked.key == key) {
+                Some(parked) => *parked = refusal,
+                None => bind.refused.push(refusal),
+            }
         }
         None
     }
@@ -471,7 +478,7 @@ impl IngressRegistry {
                 frame_tx,
                 drain,
                 lane,
-                refused: None,
+                refused: Vec::new(),
             },
         );
     }
@@ -924,11 +931,11 @@ fn open_slot(
     // A size refusal that overtook this `OpenSlot` on its way here, parked on
     // the bind by `IngressRegistry::refuse_record`. It ends this stream only
     // if it came with this (peer, lane), this epoch and this id.
-    if let Some(refusal) = bind.refused.take()
-        && refusal.key == ctx.key
-        && refusal.slot == id
-        && state.epoch == Some(refusal.epoch)
-    {
+    let mine = bind.refused.iter().position(|refusal| {
+        refusal.key == ctx.key && refusal.slot == id && state.epoch == Some(refusal.epoch)
+    });
+    if let Some(mine) = mine {
+        let refusal = bind.refused.swap_remove(mine);
         if let Some(slot) = state.slots[index].as_mut() {
             slot.inject_error(refusal.frame);
         }

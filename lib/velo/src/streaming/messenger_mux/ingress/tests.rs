@@ -1064,9 +1064,41 @@ fn a_payload_refusal_replaces_a_terminal_waiting_in_the_hold() {
     );
 }
 
+/// A refusal waiting for its own open still ends its stream when another
+/// peer named the same session first. Keeping only the first refusal would
+/// let that peer block it.
+#[test]
+fn a_refusal_waiting_for_its_open_survives_another_peer_naming_it_first() {
+    let (registry, consumer, config) = bound();
+    let id = slot(0, 0);
+    let record = crate::streaming::messenger_mux::SingletonRecord {
+        epoch: 1,
+        slot: id,
+        session: SESSION,
+    };
+    let error = rmp_serde::to_vec(&crate::streaming::StreamFrame::<()>::TransportError(
+        "refused a staged stream item: 67108864 exceeds 1048576".into(),
+    ))
+    .unwrap();
+    let stranger = PeerLane::new(WorkerId::from_u64(PEER + 1), LaneIndex::ZERO);
+    for from in [stranger, peer()] {
+        assert!(
+            registry
+                .refuse_record(from, &record, error.clone(), None, config.peer_byte_budget)
+                .is_none()
+        );
+    }
+
+    let outcome = open(&registry, &config, id, 1);
+    assert_eq!(
+        outcome.closed, 1,
+        "the refusal waiting for this open was lost"
+    );
+    assert_eq!(consumer.pump(), vec![error]);
+}
+
 /// Another peer's header must not erase a refusal waiting for its own open.
 #[test]
-#[ignore = "F3: another peer can overwrite a refusal parked on an unclaimed bind"]
 fn another_peers_refusal_preserves_a_refusal_waiting_for_its_open() {
     let (registry, consumer, config) = bound();
     let id = slot(0, 0);
