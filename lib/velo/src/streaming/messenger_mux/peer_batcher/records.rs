@@ -264,14 +264,10 @@ impl Batcher {
             .flatten()
             .map(|entry| RetireGuard::new(entry.closed));
 
-        // The receiver resolves this record before it reads it. If it refuses
-        // the payload for its size, these name the one stream to end.
-        let headers = Some(super::super::singleton_headers(
-            self.writer.epoch(),
-            id,
-            session,
-        ));
-        if !self.fire_singleton(id, FenceSkip::Never, retire, headers, |encoder| {
+        // The receiver resolves a staged record before it reads it. If it
+        // refuses the payload for its size, the session names the one stream
+        // to end (see `BatchWriter::dispatch_singleton`).
+        if !self.fire_singleton(id, FenceSkip::Never, retire, Some(session), |encoder| {
             encoder.push_data(id, seq, &bytes)?;
             match close_seq {
                 Some(close_seq) => {

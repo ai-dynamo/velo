@@ -906,10 +906,11 @@ impl Batcher {
         id: SlotId,
         skip: FenceSkip,
         retire: Option<RetireGuard>,
-        headers: Option<std::collections::HashMap<String, String>>,
+        session: Option<u64>,
         write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
     ) -> bool {
-        let Some(fire) = self.writer.dispatch_singleton(write, headers) else {
+        let stream = session.map(|session| (id, session));
+        let Some(fire) = self.writer.dispatch_singleton(write, stream) else {
             self.epoch_death();
             return false;
         };

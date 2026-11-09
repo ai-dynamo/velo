@@ -731,7 +731,6 @@ async fn a_singleton_at_the_eager_frame_limit_reaches_its_peer() {
 /// An inline singleton carries no refusal headers. Its producer uses at most
 /// seven allocations after warm-up, regardless of the routing session's width.
 #[tokio::test]
-#[ignore = "F5: inline singletons allocate refusal headers that the writer discards"]
 async fn an_inline_singleton_allocates_no_refusal_headers() {
     use futures::FutureExt;
 
