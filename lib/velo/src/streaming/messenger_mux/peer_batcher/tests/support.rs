@@ -690,7 +690,6 @@ impl Drop for StalledHarness {
 /// A messenger without a stager can send a singleton up to its transport's
 /// frame limit. Adding the mux's refusal header must not lose that record.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "F4: the refusal header pushes an eager singleton over the transport frame limit"]
 async fn a_singleton_at_the_eager_frame_limit_reaches_its_peer() {
     let harness = harness(MuxConfig::default()).await;
     let (inlet, id) = harness.open_credited(1, 1, 2).await;

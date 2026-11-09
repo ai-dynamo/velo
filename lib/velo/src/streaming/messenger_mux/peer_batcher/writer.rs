@@ -282,9 +282,13 @@ impl BatchWriter {
                 if let Some(metrics) = &self.metrics {
                     metrics.batch_sent(by_type);
                 }
+                // Only a staged singleton can be refused, so only it carries
+                // the headers that name its stream. An inline one may already
+                // be at the transport's frame limit, with no room for them.
+                let staged = self.messenger.client().stager_for(payload.len()).is_some();
                 let builder = match headers {
-                    Some(headers) => builder.headers(headers),
-                    None => builder,
+                    Some(headers) if staged => builder.headers(headers),
+                    _ => builder,
                 };
                 Some(
                     builder
