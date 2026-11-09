@@ -111,7 +111,9 @@ fn serve_acquire(
     // Granted late, after it gave up, this lease would hold the slot until
     // this owner tears down; with a deadline, the reaper ends it once no pull
     // renews it.
-    if let Some(timeout) = lease_timeout {
+    if let Some(timeout) =
+        lease_timeout.filter(|t| std::time::Instant::now().checked_add(*t).is_some())
+    {
         store.set_lease_deadline(lease_id, local_id, timeout);
         ensure_reaper(store);
     }
