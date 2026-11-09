@@ -686,3 +686,45 @@ impl Drop for StalledHarness {
         self.cancel.cancel();
     }
 }
+
+/// A messenger without a stager can send a singleton up to its transport's
+/// frame limit. Adding the mux's refusal header must not lose that record.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "F4: the refusal header pushes an eager singleton over the transport frame limit"]
+async fn a_singleton_at_the_eager_frame_limit_reaches_its_peer() {
+    let harness = harness(MuxConfig::default()).await;
+    let (inlet, id) = harness.open_credited(1, 1, 2).await;
+    let budget = harness._sender.effective_eager_payload(
+        harness._capture.instance_id(),
+        LaneIndex::ZERO.handler_name(),
+        None,
+    );
+    let frame_len = budget - BATCH_HEADER_LEN - record_encoded_len(0).unwrap();
+    let mut item = crate::streaming::ByteItemBuilder::with_capacity(frame_len);
+    item.buffer().resize(frame_len, 7);
+    let frame = item.finish().expect("valid byte item").into_vec();
+
+    let mut control = BatchEncoder::new(1, 1, LaneIndex::ZERO);
+    control.push_data(id, 1, &frame).expect("control record");
+    let control = control.finish().freeze();
+    assert_eq!(control.len(), budget);
+    harness
+        ._sender
+        .am_send_streaming(LaneIndex::ZERO.handler_name())
+        .unwrap()
+        .raw_payload(control)
+        .worker(harness.key.peer)
+        .send()
+        .await
+        .expect("the same record fits without the refusal header");
+    let control = harness.next_batch().await;
+    assert_eq!(control.records[0].data, frame);
+
+    inlet.send(frame.clone()).expect("queue singleton");
+    let payload = tokio::time::timeout(Duration::from_secs(2), harness.batches.recv_async())
+        .await
+        .expect("a singleton that fits the eager frame limit must reach its peer")
+        .expect("capture channel");
+    let received = OwnedBatch::decode(&payload);
+    assert_eq!(received.records[0].data, frame);
+}
