@@ -551,11 +551,22 @@ impl DataStore {
     /// would leak with the read lock and the slot would be immortal. That
     /// compounding leak is what the reaper exists to prevent (D8).
     ///
-    /// Returns the slot the lease held, or `None` if the lease had already been
-    /// ended by a detach or release that raced the reaper.
+    /// Returns whether it ended the lease: `false` if a detach or release that
+    /// raced the reaper had already ended it.
+    ///
+    /// A lease that is already gone has its deadline dropped. Ending a lease
+    /// drops its deadline, so one left behind was set after the lease ended:
+    /// the `_rv_acquire` handler sets it after creating the transfer, and a
+    /// slot whose time-to-live runs out in between ends the lease first. Kept,
+    /// it would hold the sweep running for the life of the process.
     pub(crate) fn force_release_lease(&self, lease_id: u64, local_id: u64) -> bool {
-        if self.consume_lease(lease_id, local_id) != LeaseOutcome::Consumed {
-            return false;
+        match self.consume_lease(lease_id, local_id) {
+            LeaseOutcome::Consumed => {}
+            LeaseOutcome::Unknown => {
+                self.lease_deadlines.remove(&lease_id);
+                return false;
+            }
+            LeaseOutcome::Mismatch { .. } => return false,
         }
         self.release_read_lock(local_id);
         self.remove_transfers_by_lease(lease_id);
@@ -1392,5 +1403,44 @@ mod tests {
         );
         assert!(store.metadata(id).is_none());
         assert!(!store.has_pending_expiry());
+    }
+
+    /// A deadline set for a lease that its slot's time-to-live already ended
+    /// is dropped by the next sweep that finds it due, and the sweep can stop.
+    ///
+    /// The `_rv_acquire` handler takes the lease, creates the transfer, and
+    /// only then sets the deadline. When the slot expires between the
+    /// transfer and the deadline, `expire_slot` ends the lease first, and
+    /// the deadline set after it names a lease that is gone. The sweep left
+    /// such a deadline in place for good, so it never stopped: ten wakes a
+    /// second until the owner shut down. This replays the handler's steps
+    /// with the expiry between them.
+    #[test]
+    fn a_deadline_for_a_lease_that_expiry_ended_is_dropped() {
+        let store = DataStore::new();
+        let id = store.register(
+            Bytes::from(vec![1u8; 4096]),
+            Some(RegisterOptions::new().ttl(Duration::ZERO)),
+        );
+        let lease = store.acquire_read_lock(id).unwrap();
+        store.create_transfer(id, lease, 1024).unwrap();
+        assert_eq!(
+            store.sweep_expired(Instant::now()),
+            (0, 1),
+            "the slot expires"
+        );
+        store.set_lease_deadline(lease, id, Duration::ZERO);
+        assert!(store.has_pending_expiry());
+
+        let later = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            store.sweep_expired(later),
+            (0, 0),
+            "a lease that is gone is not counted as reaped"
+        );
+        assert!(
+            !store.has_pending_expiry(),
+            "the deadline of a lease that is gone keeps the sweep running"
+        );
     }
 }
