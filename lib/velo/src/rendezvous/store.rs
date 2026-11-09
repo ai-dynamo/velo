@@ -386,8 +386,10 @@ impl DataStore {
         // its slot existed: the sweep would drop the listing and the slot
         // would never be swept. A slot freed before it is listed leaves a
         // listing with no slot, which the sweep drops at its deadline.
-        if let Some(ttl) = ttl {
-            self.expiring.insert(local_id, Instant::now() + ttl);
+        if let Some(ttl) = ttl
+            && let Some(at) = Instant::now().checked_add(ttl)
+        {
+            self.expiring.insert(local_id, at);
         }
         local_id
     }
