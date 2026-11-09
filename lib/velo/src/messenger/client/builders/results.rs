@@ -101,6 +101,11 @@ impl Deadline {
         })
     }
 
+    /// The instant the call gives up.
+    pub(super) fn at(&self) -> Instant {
+        self.at
+    }
+
     /// Whether the timer has been made, which the first poll does.
     #[cfg(test)]
     pub(super) fn is_armed(&self) -> bool {

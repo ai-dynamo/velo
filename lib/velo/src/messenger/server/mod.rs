@@ -263,7 +263,7 @@ async fn create_message_handler(
         let in_flight = Some(Arc::new(guard));
 
         match decode_active_message(header, payload) {
-            Ok(message) => {
+            Ok(mut message) => {
                 let Some(system) = held.get(|| hub.system()) else {
                     break;
                 };
@@ -291,22 +291,36 @@ async fn create_message_handler(
                     "Received active message"
                 );
 
-                // Check for transparent rendezvous header: if present, spawn
-                // an async task to resolve the payload before dispatching.
-                // This keeps the hot path fast for normal (non-rendezvous) messages.
-                let rv_handle_str = message.metadata.headers.as_ref().and_then(|h| {
-                    h.get(crate::messenger::large_payload::RV_HEADER_KEY)
-                        .cloned()
-                });
+                // A staged payload is fetched in a task of its own before
+                // dispatch. Its staging headers come out of the message here,
+                // so its handler never sees them and cannot pass them on (see
+                // `large_payload::take_staging`). A message that was not
+                // staged pays one map lookup, and none without headers.
+                let staging =
+                    crate::messenger::large_payload::take_staging(&mut message.metadata.headers);
 
-                if let Some(handle_str) = rv_handle_str {
+                if let Some(staging) = staging {
                     if let Some(resolver) = large_payload_resolver.get() {
+                        // The receiver's own bound skips a stream batch.
+                        // Dropping one loses its records with no word to the
+                        // mux, and the stream watchdog already ends a stream
+                        // whose sender has gone.
+                        let own = resolver.fetch_timeout().filter(|_| {
+                            !crate::streaming::messenger_mux::is_batch_handler(
+                                &message.metadata.handler_name,
+                            )
+                        });
+                        let fetch_bound = crate::messenger::large_payload::fetch_bound(
+                            staging.budget.as_deref(),
+                            own,
+                        );
                         let resolver = Arc::clone(resolver);
                         let hub = hub.clone();
-                        let handler_name = message.metadata.handler_name.clone();
+                        let handler_name = std::mem::take(&mut message.metadata.handler_name);
                         let message_id = message.metadata.response_id;
                         let response_type = message.metadata.response_type;
-                        let headers = message.metadata.headers.clone();
+                        let headers = message.metadata.headers.take();
+                        let handle_str = staging.handle;
                         // The resolve waits on the payload's owner, so the
                         // task must not hold the Messenger across it: that
                         // would keep its final drop, and teardown, from ever
@@ -320,6 +334,7 @@ async fn create_message_handler(
                             response_type,
                             headers,
                             handle_str,
+                            fetch_bound,
                             in_flight,
                             backend,
                         });
@@ -359,6 +374,7 @@ async fn create_message_handler(
                     payload: message.payload,
                     response_type: message.metadata.response_type,
                     headers: message.metadata.headers,
+                    staged: false,
                     in_flight,
                 };
 
@@ -417,14 +433,17 @@ struct ResolveJob {
     response_type: crate::messenger::common::messages::ResponseType,
     headers: Option<std::collections::HashMap<String, String>>,
     handle_str: String,
+    /// When to give up the fetch. See [`resolve_within`].
+    fetch_bound: Option<crate::messenger::large_payload::FetchBound>,
     in_flight: Option<Arc<velo_ext::InFlightGuard>>,
     backend: Arc<VeloBackend>,
 }
 
 /// Resolve a large payload off the receive loop, then dispatch it.
 ///
-/// Ends at teardown. The pull waits on the payload's owner with no deadline
-/// of its own, and final Messenger drop does not complete a response wait,
+/// Ends at teardown, or when the fetch's bound runs out, whichever is first.
+/// A fetch with no bound waits on the payload's owner for as long as the
+/// owner takes, and final Messenger drop does not complete a response wait,
 /// so a task that outlived teardown would keep the backend, the resolver,
 /// and the message's drain guard for the life of the process.
 fn spawn_resolve(job: ResolveJob) -> tokio::task::JoinHandle<()> {
@@ -451,10 +470,21 @@ async fn resolve_and_dispatch(job: ResolveJob) {
         response_type,
         headers,
         handle_str,
+        fetch_bound,
         in_flight,
         backend,
     } = job;
-    match resolver.resolve(&handle_str).await {
+    let within = fetch_bound.map(|bound| bound.within);
+    let Some(resolved) = resolve_within(resolver.resolve(&handle_str, within), fetch_bound).await
+    else {
+        tracing::debug!(
+            target: "crate::messenger::server",
+            handler = %handler_name,
+            "Gave up fetching a large payload at its caller's deadline"
+        );
+        return;
+    };
+    match resolved {
         Ok(resolved_payload) => {
             // Gone: the instance is being torn down,
             // and the message dies with its guard.
@@ -466,6 +496,7 @@ async fn resolve_and_dispatch(job: ResolveJob) {
                 payload: resolved_payload,
                 response_type,
                 headers,
+                staged: true,
                 in_flight,
             };
             hub.dispatch_message(&handler_name, call, &system);
@@ -503,6 +534,35 @@ async fn resolve_and_dispatch(job: ResolveJob) {
                 .await;
             }
         }
+    }
+}
+
+/// Await `resolve` until `bound` runs out.
+///
+/// Running out drops the fetch, and with it the response slot of whichever
+/// call to the owner it was waiting on (`_rv_acquire` or `_rv_pull`), and the
+/// message is not dispatched. When the bound was the caller's own deadline
+/// this returns `None`: the caller has stopped waiting, so there is nothing
+/// to tell it. When it was the receiver's own, it returns the error the
+/// caller gets as its reply, so a sync or unary caller with a longer timeout,
+/// or none, hears that the fetch failed instead of waiting.
+///
+/// The owner is not told. The resolver asked it for a lease deadline of the
+/// same bound, so the owner ends a lease nobody pulls on its own.
+async fn resolve_within(
+    resolve: impl std::future::Future<Output = anyhow::Result<Bytes>>,
+    bound: Option<crate::messenger::large_payload::FetchBound>,
+) -> Option<anyhow::Result<Bytes>> {
+    let Some(bound) = bound else {
+        return Some(resolve.await);
+    };
+    match tokio::time::timeout(bound.within, resolve).await {
+        Ok(resolved) => Some(resolved),
+        Err(_) if bound.callers => None,
+        Err(_) => Some(Err(anyhow::anyhow!(
+            "the fetch of the staged payload did not finish within {} ms",
+            bound.within.as_millis()
+        ))),
     }
 }
 
@@ -668,7 +728,11 @@ mod tests {
     /// wait.
     struct NeverResolves;
     impl crate::messenger::large_payload::LargePayloadResolver for NeverResolves {
-        fn resolve(&self, _: &str) -> futures::future::BoxFuture<'_, anyhow::Result<Bytes>> {
+        fn resolve(
+            &self,
+            _: &str,
+            _: Option<std::time::Duration>,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<Bytes>> {
             Box::pin(std::future::pending())
         }
     }
@@ -692,6 +756,7 @@ mod tests {
             response_type: crate::messenger::common::messages::ResponseType::Unary,
             headers: None,
             handle_str: "1".to_string(),
+            fetch_bound: None,
             in_flight: None,
             backend: Arc::clone(&backend),
         });

@@ -15,8 +15,8 @@ use super::flow_control::{DEFAULT_PEER_BYTE_BUDGET, DEFAULT_SLOT_BYTE_BUDGET};
 /// Conditions on which an [`FlushPolicy::Auto`] batcher writes itself.
 ///
 /// A struct rather than more enum variants because these compose: a batcher may
-/// hold both, and `docs/src/concepts/batched-streaming.md`'s original "opportunistic" and "windowed"
-/// policies are the two of them taken one at a time.
+/// hold several, and `docs/src/concepts/batched-streaming.md`'s original "opportunistic" and "windowed"
+/// policies are the first two taken one at a time.
 ///
 /// Deliberately **not** `#[non_exhaustive]`, for the same reason [`MuxConfig`]
 /// is not: that attribute forbids `AutoFlush { on_admission: false,
@@ -44,6 +44,30 @@ pub struct AutoFlush {
     /// `docs/src/concepts/batched-streaming.md` specifies: a batch forms for up to `w` and then goes,
     /// trading up to `w` of latency for packing. `None` is no timer at all.
     pub max_linger: Option<Duration>,
+    /// Also write once every live slot on this (peer, lane) has a record in
+    /// the batch, but not sooner than `max_linger` after the last write.
+    ///
+    /// Waiting can only add records from slots that are not in the batch yet.
+    /// When every slot is already in it, the wait buys nothing until those
+    /// slots send again, which for a token stream is a forward pass away. A
+    /// single stream on a lane is the common case: without this, each of its
+    /// records waits the whole window alone. With many slots, some are always
+    /// idle (in prefill, or between turns), so the batch is never complete and
+    /// the window applies as before. A pass is never split: the early write
+    /// carries a record from every live slot.
+    ///
+    /// The `max_linger` spacing keeps writes at no more than one per window
+    /// when one stream sends faster than the window. Needs `max_linger`;
+    /// without a window there is nothing to cut short.
+    pub on_complete: bool,
+    /// Also write once the staged batch is this many bytes.
+    ///
+    /// Batching saves packets only until a batch fills a transport segment;
+    /// past that, waiting adds latency and saves only write calls. Unlike
+    /// [`MuxConfig::max_batch_bytes`], this does not change which records go
+    /// through rendezvous: a single record larger than it is still sent eagerly
+    /// in a batch of its own.
+    pub at_bytes: Option<usize>,
 }
 
 impl Default for AutoFlush {
@@ -51,6 +75,8 @@ impl Default for AutoFlush {
         Self {
             on_admission: true,
             max_linger: None,
+            on_complete: false,
+            at_bytes: None,
         }
     }
 }
@@ -61,6 +87,21 @@ impl AutoFlush {
     #[must_use]
     pub const fn with_max_linger(mut self, window: Duration) -> Self {
         self.max_linger = Some(window);
+        self
+    }
+
+    /// Write a batch early once every live slot has a record in it; see
+    /// [`Self::on_complete`].
+    #[must_use]
+    pub const fn with_on_complete(mut self) -> Self {
+        self.on_complete = true;
+        self
+    }
+
+    /// Write a batch once it reaches `bytes`; see [`Self::at_bytes`].
+    #[must_use]
+    pub const fn with_at_bytes(mut self, bytes: usize) -> Self {
+        self.at_bytes = Some(bytes);
         self
     }
 }
@@ -120,6 +161,22 @@ impl FlushPolicy {
         match self {
             Self::Auto(auto) => auto.on_admission,
             Self::Manual => false,
+        }
+    }
+
+    /// Whether a batch holding a record from every live slot may go early.
+    pub(crate) const fn on_complete(self) -> bool {
+        match self {
+            Self::Auto(auto) => auto.on_complete,
+            Self::Manual => false,
+        }
+    }
+
+    /// The staged size at which a batch goes, if any.
+    pub(crate) const fn at_bytes(self) -> Option<usize> {
+        match self {
+            Self::Auto(auto) => auto.at_bytes,
+            Self::Manual => None,
         }
     }
 }

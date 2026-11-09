@@ -394,9 +394,22 @@ Senders stage records, and the peer batcher decides when to write. The policies 
 |---|---|---|---|
 | `Auto { on_admission: true }` | End of every wake, after the batcher takes everything already queued | None (up to `reply_linger` for a batch of only credit replies) | Yes |
 | `Auto { on_admission: false, max_linger: Some(w) }` | Up to `w` after the oldest staged record | Up to `w` | No |
+| ... with `on_complete: true` | Also when every live slot on the lane has a record in the batch, but not sooner than `w` after the last write | None for a lone stream whose records are more than `w` apart | No |
+| ... with `at_bytes: Some(n)` | Also when the batch reaches `n` bytes | None for a batch that reaches `n` | No |
 | `Manual` | `Velo::flush_batch()` | Set by the caller. A pending credit reply takes the batch out after `reply_linger`. | No |
 
-`AutoFlush` is a struct, not more enum variants, because its two conditions compose. A batcher can hold both. `on_admission` is named for its mechanism. A flush parks until the transport admits it, so "at the end of every wake" means "as soon as the peer took the last batch". The default cannot make latency worse. The batcher never waits for work that has not arrived. It only takes everything that is already queued.
+`AutoFlush` is a struct, not more enum variants, because its conditions compose. A batcher can hold several. `on_admission` is named for its mechanism. A flush parks until the transport admits it, so "at the end of every wake" means "as soon as the peer took the last batch". The default cannot make latency worse. The batcher never waits for work that has not arrived. It only takes everything that is already queued.
+
+### Ending the window early
+
+A linger window runs from the oldest record in the batch. A record that is alone on its lane therefore waits the whole window for records that will not come. On a serving worker with one request in flight and a 2 ms window, every token reached the frontend 3.1 ms later than without the mux: the window, plus about 1 ms of timer rounding. Two optional conditions end the wait when more waiting cannot help:
+
+- **`on_complete`.** Every live slot on the lane already has a data record in the batch. More waiting could only add a second record from one of them, and for a token stream that is a forward pass away. The batch goes at the later of its oldest record and one window after the last write. The second bound keeps a stream that sends faster than the window at one write per window. On a busy lane, some slots are always idle (in prefill, or between turns), so the batch is never complete and the window applies as before. Credit replies and closes do not count toward it.
+- **`at_bytes`.** The batch has reached a size past which batching saves no packets, about one transport segment. This is not `max_batch_bytes`: that cap is also the eager limit, and a record larger than it goes through rendezvous. `at_bytes` only ends the wait.
+
+The rejected alternative wrote a batch at once whenever the lane had been quiet for a window. A forward pass reaches the batcher over a fraction of a millisecond, so that rule writes the first records of a pass alone and the rest a window later: two writes per pass where the window made one. `on_complete` cannot split a pass, because its early write carries a record from every live slot.
+
+In the same serving deployment, measured with a 2 ms window at 96 and 1,882 concurrent requests, worker batches averaged 1.4 to 3.1 records and 120 to 410 bytes, with a 99th percentile of 7 to 16 records. An `at_bytes` of one segment binds only on that tail.
 
 Two conditions write a batch under every policy:
 

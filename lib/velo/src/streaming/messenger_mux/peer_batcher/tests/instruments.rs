@@ -54,6 +54,7 @@ fn auto(on_admission: bool, max_linger: Option<Duration>) -> MuxConfig {
         flush_policy: FlushPolicy::Auto(AutoFlush {
             on_admission,
             max_linger,
+            ..AutoFlush::default()
         }),
         ..MuxConfig::default()
     }

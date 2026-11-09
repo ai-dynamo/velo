@@ -63,6 +63,10 @@ pub(crate) struct InboundCall {
     pub payload: Bytes,
     pub response_type: ResponseType,
     pub headers: Option<std::collections::HashMap<String, String>>,
+    /// The payload was staged and fetched before dispatch, outside the order
+    /// the messages arrived in. Its staging headers are already gone from
+    /// `headers`, so this is how a dispatcher knows.
+    pub staged: bool,
     /// See [`HandlerContext::in_flight`].
     pub in_flight: Option<Arc<velo_ext::InFlightGuard>>,
 }
@@ -403,11 +407,7 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
         // dispatching (see `create_message_handler`), so two rendezvous
         // messages from one sender can reach us out of order. Ordered mode
         // cannot restore that; warn once so it is not silently surprising.
-        if call
-            .headers
-            .as_ref()
-            .is_some_and(|h| h.contains_key(crate::messenger::large_payload::RV_HEADER_KEY))
-        {
+        if call.staged {
             self.rendezvous_warning.call_once(|| {
                 warn!(
                     target: "crate::messenger::dispatcher",
@@ -845,6 +845,7 @@ mod tests {
             payload: Bytes::new(),
             response_type: ResponseType::FireAndForget,
             headers: None,
+            staged: false,
             in_flight: None,
         };
 

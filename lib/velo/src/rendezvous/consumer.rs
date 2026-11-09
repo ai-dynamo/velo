@@ -96,24 +96,36 @@ impl Consumer {
     /// offered, and returns owned bytes. The read lock remains held until
     /// `detach()` or `release()` is called.
     pub async fn get(manager: &RendezvousManager, handle: DataHandle) -> Result<(Bytes, u64)> {
-        Self::get_within(manager, handle, u64::MAX).await
+        Self::get_within(manager, handle, u64::MAX, None).await
     }
 
-    /// [`get`](Self::get), refusing a payload of more than `limit` bytes
-    /// before anything of its size is allocated.
+    /// As [`get`](Self::get), for a consumer that may give up and say
+    /// nothing, as the messenger's resolver does.
     ///
-    /// The size checked is the one the owner states in its acquire answer:
-    /// `total_len` on the chunked path, the descriptor's length on the RDMA
-    /// path. A refusal releases the handle, which is single-use where a limit
-    /// is set, and fails with [`PayloadTooLarge`].
+    /// It refuses a payload of more than `limit` bytes before anything of its
+    /// size is allocated. The size checked is the one the owner states in its
+    /// acquire answer: `total_len` on the chunked path, the descriptor's
+    /// length on the RDMA path. A refusal releases the handle, which is
+    /// single-use where a limit is set, and fails with [`PayloadTooLarge`].
+    ///
+    /// It asks the owner to end a chunked lease that no pull renews within
+    /// `lease_timeout`. A lease this call still holds when it returns is
+    /// reaped once `lease_timeout` passes, so release it at once.
     pub(crate) async fn get_within(
         manager: &RendezvousManager,
         handle: DataHandle,
         limit: u64,
+        lease_timeout: Option<std::time::Duration>,
     ) -> Result<(Bytes, u64)> {
         let client = &manager.client()?;
         let target_worker = handle.worker_id();
-        let response = acquire(client, handle, rdma_offer(manager, target_worker)).await?;
+        let response = acquire(
+            client,
+            handle,
+            rdma_offer(manager, target_worker),
+            lease_timeout,
+        )
+        .await?;
 
         match response {
             AcquireResponse::Ready {
@@ -166,7 +178,16 @@ impl Consumer {
                     // that skips this copy.
                     Ok(buf) => Ok((Bytes::copy_from_slice(&buf), lease_id)),
                     Err(reason) => {
-                        fallback_chunked(manager, client, handle, lease_id, reason, limit).await
+                        fallback_chunked(
+                            manager,
+                            client,
+                            handle,
+                            lease_id,
+                            reason,
+                            limit,
+                            lease_timeout,
+                        )
+                        .await
                     }
                 }
             }
@@ -192,7 +213,7 @@ impl Consumer {
     ) -> Result<(crate::rendezvous::rdma::PinnedBuf, u64)> {
         let client = &manager.client()?;
         let target_worker = handle.worker_id();
-        let response = acquire(client, handle, rdma_offer(manager, target_worker)).await?;
+        let response = acquire(client, handle, rdma_offer(manager, target_worker), None).await?;
 
         match response {
             AcquireResponse::Rdma {
@@ -208,9 +229,16 @@ impl Consumer {
                         // below can still fail — a pool under pressure, a
                         // registry that has gone away. Guard it, or the failure
                         // strands a chunked lease the reaper cannot reclaim.
-                        let (data, lease_id) =
-                            fallback_chunked(manager, client, handle, lease_id, reason, u64::MAX)
-                                .await?;
+                        let (data, lease_id) = fallback_chunked(
+                            manager,
+                            client,
+                            handle,
+                            lease_id,
+                            reason,
+                            u64::MAX,
+                            None,
+                        )
+                        .await?;
                         let lease = manager.lease_guard(handle, lease_id, Some(client));
                         let buf = copy_into_pool(manager, &data).await?;
                         Ok((buf, lease.disarm()))
@@ -264,7 +292,7 @@ impl Consumer {
     ) -> Result<u64> {
         let client = &manager.client()?;
         let target_worker = handle.worker_id();
-        let response = acquire(client, handle, rdma_offer(manager, target_worker)).await?;
+        let response = acquire(client, handle, rdma_offer(manager, target_worker), None).await?;
 
         match response {
             AcquireResponse::Ready {
@@ -316,9 +344,16 @@ impl Consumer {
                 {
                     Ok(()) => Ok(lease_id),
                     Err(reason) => {
-                        let (data, lease_id) =
-                            fallback_chunked(manager, client, handle, lease_id, reason, u64::MAX)
-                                .await?;
+                        let (data, lease_id) = fallback_chunked(
+                            manager,
+                            client,
+                            handle,
+                            lease_id,
+                            reason,
+                            u64::MAX,
+                            None,
+                        )
+                        .await?;
                         // `write_chunk` refuses a destination too small for the
                         // payload, and that refusal must not take the fresh
                         // lease with it.
@@ -454,21 +489,25 @@ async fn abandon(
     }
 }
 
-/// Send one `_rv_acquire`, carrying `offer` if there is one.
+/// Send one `_rv_acquire`, carrying `offer` if there is one, and asking for a
+/// chunked lease deadline of `lease_timeout` if there is one.
 async fn acquire(
     client: &Arc<ActiveMessageClient>,
     handle: DataHandle,
     offer: Option<RdmaOffer>,
+    lease_timeout: Option<std::time::Duration>,
 ) -> Result<AcquireResponse> {
-    let response: AcquireResponse =
+    let mut call =
         TypedUnaryBuilder::<AcquireResponse>::new_unchecked(Arc::clone(client), "_rv_acquire")
             .payload(&RvAcquireRequest {
                 handle: RvHandleWire::from_handle(handle),
                 rdma: offer,
             })?
-            .worker(handle.worker_id())
-            .send()
-            .await?;
+            .worker(handle.worker_id());
+    if let Some(timeout) = lease_timeout {
+        call = call.headers(crate::rendezvous::protocol::lease_timeout_headers(timeout));
+    }
+    let response: AcquireResponse = call.send().await?;
     Ok(response)
 }
 
@@ -917,6 +956,7 @@ async fn fallback_chunked(
     lease_id: u64,
     fallback: RdmaFallback,
     limit: u64,
+    lease_timeout: Option<std::time::Duration>,
 ) -> Result<(Bytes, u64)> {
     let store = manager.data_store();
     store.record_path(fallback.reason);
@@ -934,7 +974,7 @@ async fn fallback_chunked(
     if let Err(e) = detach(client, handle, lease_id).await {
         tracing::warn!(%handle, error = %e, "rendezvous: could not detach before falling back");
     }
-    chunked_only(client, handle, limit).await
+    chunked_only(client, handle, limit, lease_timeout).await
 }
 
 /// An owner answered `Rdma` to an acquire that carried no offer.
@@ -957,7 +997,7 @@ async fn unsolicited_rdma(
     if let Err(e) = detach(client, handle, lease_id).await {
         tracing::warn!(%handle, error = %e, "rendezvous: could not detach before falling back");
     }
-    chunked_only(client, handle, limit).await
+    chunked_only(client, handle, limit, None).await
 }
 
 /// Acquire with no offer and pull the chunks.
@@ -970,9 +1010,10 @@ async fn chunked_only(
     client: &Arc<ActiveMessageClient>,
     handle: DataHandle,
     limit: u64,
+    lease_timeout: Option<std::time::Duration>,
 ) -> Result<(Bytes, u64)> {
     let target_worker = handle.worker_id();
-    match acquire(client, handle, None).await? {
+    match acquire(client, handle, None, lease_timeout).await? {
         AcquireResponse::Ready {
             lease_id,
             transfer_id,

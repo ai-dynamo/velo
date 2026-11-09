@@ -38,7 +38,7 @@ Batched streams give each stream a window of 32 records in flight by default. A 
 
 Application authors depend on `velo` only. `velo-hub` builds one service that is the peer discovery for an application and hosts extensions. It takes the workspace version and requires `velo` and `velo-hub-ext` with a caret on it. See [The hub](docs/src/concepts/hub.md), [Workspace crates](docs/src/development/architecture.md), and [Versioning](docs/src/development/versioning.md).
 
-Streams to one peer can share its connection through the messenger mux. What the mux costs a serving frontend, and how that was measured, is in [Response-plane performance](docs/src/operations/response-plane-performance.md).
+Streams to one peer can share its connection through the messenger mux. What the mux costs a serving frontend, and how that was measured, is in [Response-plane performance](docs/src/operations/response-plane-performance.md). Under a linger window, a batch can also go once every live stream on its lane has a record in it, or once it reaches a set size. See [Ending the window early](docs/src/concepts/batched-streaming.md#ending-the-window-early).
 
 QUIC and TCP can keep several lanes, each its own connection, to one peer. See [TCP lanes](docs/src/concepts/transports.md#tcp-lanes) and [QUIC lanes](docs/src/operations/quic-performance.md#lanes).
 

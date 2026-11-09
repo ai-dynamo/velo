@@ -14,12 +14,14 @@
 //! assertions are the decoded wire bytes rather than an accounting mirror.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::super::super::{AutoFlush, FlushPolicy};
 use super::support::{Harness, RECV_TIMEOUT, harness, harness_with_hooks, item};
 use crate::streaming::messenger_mux::MuxConfig;
-use crate::streaming::messenger_mux::protocol::{CloseReason, RecordType, SlotId};
+use crate::streaming::messenger_mux::protocol::{
+    BATCH_HEADER_LEN, CloseReason, RecordType, SlotId, record_encoded_len,
+};
 use crate::streaming::sender::cached_finalized;
 
 /// Credit generous enough that nothing in this file parks on it — these tests
@@ -38,6 +40,7 @@ fn auto(on_admission: bool, max_linger: Option<Duration>) -> MuxConfig {
         flush_policy: FlushPolicy::Auto(AutoFlush {
             on_admission,
             max_linger,
+            ..AutoFlush::default()
         }),
         ..MuxConfig::default()
     }
@@ -429,6 +432,106 @@ async fn an_auto_window_writes_without_a_kick() {
         .await
         .expect("the window must fire on its own");
     assert_eq!(batch.records.len(), 3);
+    assert_eq!(harness.staged(), 0.0);
+}
+
+/// The windowed policy with the early-write conditions.
+fn windowed(window: Duration, on_complete: bool, at_bytes: Option<usize>) -> MuxConfig {
+    MuxConfig {
+        flush_policy: FlushPolicy::Auto(AutoFlush {
+            on_admission: false,
+            max_linger: Some(window),
+            on_complete,
+            at_bytes,
+        }),
+        ..MuxConfig::default()
+    }
+}
+
+/// A lone stream does not wait the window for company that cannot come.
+///
+/// The case `on_complete` exists for: one slot on the lane (a single request
+/// in flight), with records further apart than the window. Without it, each
+/// record waits the whole window alone, which at a 2 ms window measured as
+/// 3.1 ms (the window plus timer rounding) on every first token. A record
+/// staged right behind a write still waits one window from that write, so a
+/// stream faster than the window stays at one write per window.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_complete_writes_a_lone_slot_at_once_but_once_per_window() {
+    const WINDOW: Duration = Duration::from_secs(1);
+    let harness = harness(windowed(WINDOW, true, None)).await;
+    let (inlet, _) = harness.open_credited(1, 1, CREDIT).await;
+    // The `OpenSlot` was a write. Let a window pass since it.
+    tokio::time::sleep(WINDOW + Duration::from_millis(100)).await;
+
+    let sent = Instant::now();
+    inlet.send(item(0)).expect("stage a record");
+    let batch = harness.next_batch().await;
+    assert_eq!(batch.records.len(), 1);
+    assert!(
+        sent.elapsed() < WINDOW / 2,
+        "the only live slot is in the batch, so it goes at once; took {:?}",
+        sent.elapsed()
+    );
+
+    inlet.send(item(1)).expect("stage a second record");
+    harness.await_staged(1).await;
+    assert_nothing_written(&harness).await;
+    let batch = harness.next_batch().await;
+    assert_eq!(
+        batch.records.len(),
+        1,
+        "and goes one window after the first"
+    );
+}
+
+/// With two slots on the lane, a record from one of them waits: the other may
+/// still send, so the batch is not complete. Once both have a record in it, it
+/// goes at once, as one write, without waiting for the window.
+#[tokio::test(flavor = "multi_thread")]
+async fn on_complete_waits_for_every_live_slot() {
+    const WINDOW: Duration = Duration::from_secs(1);
+    let harness = harness(windowed(WINDOW, true, None)).await;
+    let (a, _) = harness.open_credited(1, 1, CREDIT).await;
+    let (b, _) = harness.open_credited(2, 2, CREDIT).await;
+    tokio::time::sleep(WINDOW + Duration::from_millis(100)).await;
+
+    let first = Instant::now();
+    a.send(item(0)).expect("stage on a");
+    harness.await_staged(1).await;
+    assert_nothing_written(&harness).await;
+
+    b.send(item(1)).expect("stage on b");
+    let batch = harness.next_batch().await;
+    assert_eq!(batch.records.len(), 2, "one record from each slot");
+    assert_eq!(batch.slots().len(), 2);
+    assert!(
+        first.elapsed() < WINDOW,
+        "the batch went when it was complete, not when a's window ran out; took {:?}",
+        first.elapsed()
+    );
+}
+
+/// A batch that reaches `at_bytes` goes without waiting for the window and
+/// without a kick. Below it, the window still holds the batch.
+#[tokio::test(flavor = "multi_thread")]
+async fn at_bytes_writes_a_batch_that_reached_it() {
+    let record = record_encoded_len(item(0).len()).expect("a small record");
+    let threshold = BATCH_HEADER_LEN + 4 * record;
+    let harness = harness(windowed(Duration::from_secs(30), false, Some(threshold))).await;
+    let (inlet, _) = harness.open_credited(1, 1, CREDIT).await;
+
+    for n in 0..3u32 {
+        inlet.send(item(n)).expect("stage a record");
+    }
+    harness.await_staged(3).await;
+    assert_nothing_written(&harness).await;
+
+    inlet
+        .send(item(3))
+        .expect("stage the record that reaches the threshold");
+    let batch = harness.next_batch().await;
+    assert_eq!(batch.records.len(), 4);
     assert_eq!(harness.staged(), 0.0);
 }
 

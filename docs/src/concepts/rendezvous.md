@@ -77,7 +77,7 @@ The owner answers `AcquireResponse::Rdma` only if every check below passes. The 
 
 Check 7 comes after the facts about the configuration and the slot, so `draining` counts only the acquires that the drain changed. A heap-staged slot on a draining owner still counts as `not_pinned`. Check 8 catches an external region that was deregistered under the slot.
 
-Only a lease answered with a descriptor gets a deadline. Chunked leases have no deadline.
+A lease answered with a descriptor always gets a deadline. A chunked lease gets one only when its consumer asks for it (see [What a fetch that gives up leaves behind](#what-a-fetch-that-gives-up-leaves-behind)).
 
 ### What the consumer offers
 
@@ -137,6 +137,34 @@ The messenger stages any payload above 256 KiB through rendezvous and replaces i
 The transparent stager runs inside the synchronous `send_message`. It uses only arenas that the pool has already mapped. It never maps a new arena, because mapping is an `ibv_reg_mr` whose cost is linear in size. A send must not stall on that.
 
 The result: **a process whose only staging is transparent never maps an arena and never takes the RDMA path.** One explicit `register_data_pinned` call maps the first arena. After that, transparent payloads use it. Growing the pool from a send on a background task was rejected. A caller cannot reason about a message send that causes a 64 MiB pin.
+
+#### The fetch has a deadline
+
+The receiver fetches the payload with its own calls to the sender (`_rv_acquire`, then `_rv_pull`). Each call holds one of the receiver's response slots, and the request keeps its drain guard, until the fetch ends. A fetch with no deadline ends only when the sender answers. So a sender that stops answering took one slot from the receiver for each staged request, after its own caller had given up.
+
+The fetch now ends at the first of two bounds:
+
+- **The caller's.** A sync or unary call with `.timeout` sends what is left of it with the handle, in the `_rv_budget_ms` header, rounded up from nanoseconds to whole milliseconds. The receiver starts the bound when it takes the message off its queue, so it does not end before the caller's own timer. How much later it ends depends on transit, queueing and scheduling, which nothing bounds. When it runs out, the receiver drops the fetch and sends no reply: the caller has its `RequestTimeout` already, and a reply that raced the caller's timer would replace that with a different error.
+- **The receiver's.** `VeloBuilder::staged_fetch_timeout` bounds every fetch on this instance. It covers what carries no bound: fire-and-forget sends, calls without a timeout, and senders from before the header. When it runs out, a sync or unary caller gets an error reply that says the fetch did not finish in time. It does not apply to the items of a stream. A stream item over the threshold is a fire-and-forget batch, so a dropped fetch lost the item with no word to the stream. Its consumer got `SenderDropped` from the stream watchdog about 15 s later, while the producer was still attached.
+
+The bound is a duration and not an instant, because the two nodes do not share a clock. It is its own header because a receiver from before it reads the `_rv` value as a bare number. Such a receiver ignores the new header.
+
+#### The staging headers belong to the send that staged
+
+The receiver takes `_rv` and `_rv_budget_ms` out of a staged message before its handler runs, so a handler never sees them. A handler that passes its headers on in a send of its own therefore passes neither. A forwarded handle made the next receiver fetch a payload that was not its message's. A forwarded budget made it give up at another call's deadline.
+
+A staged send writes both headers itself, after the tracing propagator, so the ones on the wire are its own. A budget without a handle means nothing to a receiver, so an eager send needs no such care. An encoder that owned the budget key was rejected: it compared every header key of every send with `_rv_budget_ms`, and it left a forwarded `_rv` in place.
+
+#### What a fetch that gives up leaves behind
+
+The receiver tells the sender nothing when it gives up a fetch. A slow sender then grants a lease that nobody pulls or releases, and a payload whose fetch never got a lease stays staged. Two things end both on the sender:
+
+- **A time-to-live.** A staged payload whose call has a `.timeout` gets that deadline as its `RegisterOptions::ttl`. Past it, the slot is freed with every lease on it, whether or not a consumer is still reading. The caller has given up by then.
+- **A chunked lease deadline.** A fetch with a bound sends an `_rv_lease_ms` header with its `_rv_acquire`. The owner ends the lease when no `_rv_pull` renews it within that time. An owner from before the header ignores it. An acquire without the header, from an older consumer or from a public `get`, gets a lease with no deadline, as before. A `get` caller can still hold its lease after the last pull.
+
+A sweep in the store enforces both, every 100 ms. It starts when a deadline or a time-to-live is set, and it exits when none is left, so an instance that stages nothing with a deadline arms no timer. A UCX instance stops it at shutdown, together with the RDMA reaper.
+
+The lease deadline is a header, not a field of `RvAcquireRequest`, because a new public field breaks code that builds the request. A message from the receiver that abandons the fetch was rejected. Before `_rv_acquire` returns, the receiver has no lease to name, and a lost message still leaves the payload staged. What still stays staged is in [the limitation](../appendix/limitations.md#a-staged-payload-without-a-deadline-can-stay-staged).
 
 ### The receiver's limit
 
@@ -334,6 +362,7 @@ See [Shutdown and drain](shutdown.md) for the messenger half.
 | Knob | Set through | Default | Effect |
 |---|---|---|---|
 | `DEFAULT_THRESHOLD` | constant (the `Velo` builder uses it) | 256 KiB | Messenger payloads above this go through rendezvous. |
+| `staged_fetch_timeout` | `VeloBuilder` | `None` | The longest the receiver fetches a staged payload. A call's `.timeout` bounds it too. Stream items are exempt. |
 | `DEFAULT_CHUNK_SIZE` | constant | 512 KiB | Chunk size of the chunked path. |
 | `staged_payload_max` | `VeloBuilder` | `None` | The largest payload this node takes from a peer by rendezvous. Checked before anything of its size is allocated. |
 | `rdma_min_bytes` | `RdmaRendezvousConfig` | 64 KiB | Pinned slots below this answer chunked. |
@@ -385,7 +414,7 @@ This series is the only honest answer to "did the RDMA path run", because the ch
 
 - **PUT in the other direction.** The owner writes into a consumer-supplied buffer, flushes, and sends a completion message. The current decoder refuses any non-zero `flags`, and `RdmaOffer` carries backend names but no version. A direction flag is therefore not additive: every current peer refuses it and falls back to chunked during a mixed-version window. Either a version field in the offer ships one release ahead, or the rollout accepts chunked fallback everywhere in that window.
 - **A goodbye message before an idle close.** It removes the Messages and pings that a peer loses after the endpoint reaper closes our endpoint to it.
-- **A deadline for chunked leases.** A consumer's `LeaseGuard` releases a chunked lease on every error path except one. That path is a release that cannot spawn because the runtime is shutting down. Nothing on the owner reclaims that lease. `RegisterOptions::ttl` is stored on the slot, but nothing enforces it.
+- **A deadline for every chunked lease.** A chunked lease has a deadline only when its consumer asks for one. A consumer's `LeaseGuard` releases a chunked lease on every error path except one. That path is a release that cannot spawn because the runtime is shutting down. Nothing on the owner reclaims that lease, unless its slot has a time-to-live.
 - **A consumer-side unpacked-rkey cache.** It removes both halves of the stale-key safety argument at once. An rkey outlives its operation, and the owner no longer revalidates each transfer. It is a safety change, not a profile-driven optimization.
 - **Register-in-place for large owned buffers.** It needs an explicit API. Registering arbitrary caller `Bytes` by default is unsound: provenance is unknown and UCX pins past the caller's range.
 - **Metrics:** an arena-utilization gauge, and a Prometheus series for endpoints closed by the idle reaper (the count exists only as an internal atomic).
