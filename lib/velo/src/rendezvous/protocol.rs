@@ -44,8 +44,49 @@
 //! makes the response undeserializable. The tests below cover the behaviour
 //! rather than the attributes, which is why the `u64` case fails when the
 //! attribute goes and the `Option` case does not.
+//!
+//! # One header
+//!
+//! A consumer whose fetch has a bound sends [`RV_LEASE_HEADER_KEY`] with its
+//! `_rv_acquire`, asking the owner to end a chunked lease that no pull renews
+//! for that long. It is a header, not a field of [`RvAcquireRequest`], so that
+//! the request type stays as it is for code that builds one. The skew story is
+//! the same: an old owner ignores a header it does not know and grants the
+//! lease it always granted, and an acquire without the header, from an old
+//! consumer or a new one without a bound, gets a lease with no deadline.
+
+use std::collections::HashMap;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+
+/// Header on an `_rv_acquire` call: end a chunked lease that no `_rv_pull`
+/// renews within this many milliseconds, as a decimal string.
+///
+/// The messenger's resolver sends its fetch bound. It gives up at that bound
+/// and tells the owner nothing, so without a deadline the owner would keep
+/// the payload, and the read lock, until it tears down. Absent, or not a
+/// number, means no deadline: what every acquire meant before the header. An
+/// RDMA lease has its own deadline and ignores this one.
+pub const RV_LEASE_HEADER_KEY: &str = "_rv_lease_ms";
+
+/// The lease deadline an `_rv_acquire` call asks for, from its headers.
+pub(crate) fn requested_lease_timeout(
+    headers: Option<&HashMap<String, String>>,
+) -> Option<Duration> {
+    headers?
+        .get(RV_LEASE_HEADER_KEY)?
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_millis)
+}
+
+/// The headers that ask for a lease deadline of `timeout`, rounded up to
+/// whole milliseconds so the owner never ends a lease before it was asked to.
+pub(crate) fn lease_timeout_headers(timeout: Duration) -> HashMap<String, String> {
+    let ms = u64::try_from(timeout.as_nanos().div_ceil(1_000_000)).unwrap_or(u64::MAX);
+    HashMap::from([(RV_LEASE_HEADER_KEY.to_string(), ms.to_string())])
+}
 
 // ---------------------------------------------------------------------------
 // Metadata
@@ -319,6 +360,22 @@ mod tests {
             serde_json::from_slice(&new).expect("an old owner must still parse a new acquire");
         assert_eq!(old.handle.hi, 7);
         assert_eq!(old.handle.lo, 42);
+    }
+
+    /// A lease deadline asked for in the header reads back as asked, rounded
+    /// up to whole milliseconds. No header, or one that does not parse, asks
+    /// for none, so a malformed header cannot fail an acquire.
+    #[test]
+    fn the_lease_header_asks_for_a_deadline_or_for_none() {
+        let asked = lease_timeout_headers(Duration::from_micros(199_400));
+        assert_eq!(
+            requested_lease_timeout(Some(&asked)),
+            Some(Duration::from_millis(200))
+        );
+        assert_eq!(requested_lease_timeout(None), None);
+        assert_eq!(requested_lease_timeout(Some(&HashMap::new())), None);
+        let malformed = HashMap::from([(RV_LEASE_HEADER_KEY.to_string(), "soon".to_string())]);
+        assert_eq!(requested_lease_timeout(Some(&malformed)), None);
     }
 
     /// An explicit `null` is the same as absent: a consumer with the RDMA path

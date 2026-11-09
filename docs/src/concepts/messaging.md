@@ -50,6 +50,8 @@ The clock starts at `send()`. It covers the wait for a response slot, discovery,
 
 At expiry, the call gives back its response slot, also when the caller keeps the result. A reply that arrives later is discarded. The remote can still run the handler. A call without `.timeout` makes no timer.
 
+When the request's payload is staged, the timeout also bounds the receiver's fetch of it. At expiry the receiver gives up the fetch and its response slot, the handler does not run, and the sender frees the payload. See [Transparent staging](rendezvous.md#the-fetch-has-a-deadline).
+
 A remote that forgot the caller never answers. The remote sends a reply through its own peer table, not back over the connection of the request. So a call to a remote that called `unregister_peer` on the caller waits until its timeout, and without a timeout it waits for ever.
 
 ## Handlers

@@ -14,12 +14,13 @@
 //! - [`create_rv_lease_renew_handler`]: pushes an RDMA lease's deadline out
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::rendezvous::protocol::{
     AcquireResponse, RvAcquireRequest, RvDetachRequest, RvLeaseRenewRequest, RvMetadataRequest,
-    RvPullRequest, RvRefRequest, RvReleaseRequest,
+    RvPullRequest, RvRefRequest, RvReleaseRequest, requested_lease_timeout,
 };
-use crate::rendezvous::store::{DEFAULT_CHUNK_SIZE, DataStore, LeaseOutcome};
+use crate::rendezvous::store::{DEFAULT_CHUNK_SIZE, DataStore, LeaseOutcome, ensure_reaper};
 
 /// Build the `_rv_metadata` handler: returns [`DataMetadata`](crate::rendezvous::protocol::DataMetadata)
 /// without acquiring a read lock.
@@ -49,45 +50,80 @@ pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::messenger::Han
     crate::messenger::Handler::typed_unary(
         "_rv_acquire",
         move |ctx: crate::messenger::TypedContext<RvAcquireRequest>| {
-            let handle = ctx.input.handle.to_handle();
-            let (_, local_id) = handle.unpack();
-
-            // Acquire read lock
-            let lease_id = store
-                .acquire_read_lock(local_id)
-                .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
-
-            let total_len = store
-                .get_total_len(local_id)
-                .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
-
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
-            if let Some(response) = rdma_response(
-                &store,
-                local_id,
-                lease_id,
-                total_len,
-                ctx.input.rdma.as_ref(),
-                ctx.msg.backend().shutdown_state().is_draining(),
-            ) {
-                return Ok(response);
-            }
-
-            // Always use chunked transfer (even for 1 chunk) to avoid
-            // JSON-encoding binary data in the typed-unary response.
-            let (transfer_id, chunk_size, chunk_count) = store
-                .create_transfer(local_id, lease_id, DEFAULT_CHUNK_SIZE)
-                .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
-            Ok(AcquireResponse::Ready {
-                lease_id,
-                transfer_id,
-                total_len,
-                chunk_size,
-                chunk_count,
-            })
+            let draining = ctx.msg.backend().shutdown_state().is_draining();
+            let lease_timeout = requested_lease_timeout(ctx.headers.as_ref());
+            serve_acquire(&store, &ctx.input, lease_timeout, draining)
         },
     )
     .build()
+}
+
+/// What the `_rv_acquire` handler does with a call's `request` and `headers`,
+/// for a test that wraps the handler, for example to stall it. It answers as
+/// an owner that is not draining.
+#[cfg(feature = "test-helpers")]
+pub fn acquire_lease(
+    store: &Arc<DataStore>,
+    request: &RvAcquireRequest,
+    headers: Option<&std::collections::HashMap<String, String>>,
+) -> anyhow::Result<AcquireResponse> {
+    serve_acquire(store, request, requested_lease_timeout(headers), false)
+}
+
+fn serve_acquire(
+    store: &Arc<DataStore>,
+    request: &RvAcquireRequest,
+    lease_timeout: Option<Duration>,
+    draining: bool,
+) -> anyhow::Result<AcquireResponse> {
+    let handle = request.handle.to_handle();
+    let (_, local_id) = handle.unpack();
+
+    // Acquire read lock
+    let lease_id = store
+        .acquire_read_lock(local_id)
+        .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
+
+    let total_len = store
+        .get_total_len(local_id)
+        .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
+
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    if let Some(response) = rdma_response(
+        store,
+        local_id,
+        lease_id,
+        total_len,
+        request.rdma.as_ref(),
+        draining,
+    ) {
+        return Ok(response);
+    }
+    #[cfg(not(all(target_os = "linux", feature = "ucx")))]
+    let _ = draining;
+
+    // Always use chunked transfer (even for 1 chunk) to avoid
+    // JSON-encoding binary data in the typed-unary response.
+    let (transfer_id, chunk_size, chunk_count) = store
+        .create_transfer(local_id, lease_id, DEFAULT_CHUNK_SIZE)
+        .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
+    // A consumer whose fetch has a bound gives up at it and says nothing.
+    // Granted late, after it gave up, this lease would hold the slot until
+    // this owner tears down; with a deadline, the reaper ends it once no pull
+    // renews it.
+    if let Some(timeout) =
+        lease_timeout.filter(|t| std::time::Instant::now().checked_add(*t).is_some())
+    {
+        store.set_lease_deadline(lease_id, local_id, timeout);
+        ensure_reaper(store);
+    }
+    Ok(AcquireResponse::Ready {
+        lease_id,
+        transfer_id,
+        total_len,
+        chunk_size,
+        chunk_count,
+    })
 }
 
 /// Decide whether this acquire can be answered with an RDMA descriptor.
@@ -208,7 +244,7 @@ pub fn create_rv_pull_handler(store: Arc<DataStore>) -> crate::messenger::Handle
         "_rv_pull",
         move |ctx: crate::messenger::Context| -> crate::messenger::UnifiedResponse {
             let req: RvPullRequest = serde_json::from_slice(&ctx.payload)?;
-            match store.get_chunk(req.transfer_id, req.chunk_index) {
+            match store.pull_chunk(req.transfer_id, req.chunk_index) {
                 Some(chunk) => Ok(Some(chunk)),
                 None => anyhow::bail!(
                     "chunk not found: transfer_id={}, chunk_index={}",

@@ -93,14 +93,28 @@ pub(crate) fn finalize_outbound_headers(headers: &mut Option<HashMap<String, Str
     let _ = headers;
 }
 
-/// Turn an outbound message into wire bytes: finalize its headers, then encode.
+/// A staged payload's handle, and the budget its call has left, if any.
+pub(crate) type Staged = (String, Option<Duration>);
+
+/// Turn an outbound message into wire bytes: finalize its headers, write its
+/// staging headers if its payload was staged, then encode.
 ///
 /// The single place a client-side send becomes a frame, so there is no second
-/// path where the headers and the budget could drift apart.
+/// path where the headers and the budget could drift apart. The staging
+/// headers go after the propagator, so the ones on the wire are this send's
+/// own whatever the propagator wrote.
 pub(crate) fn encode_outbound(
     mut message: ActiveMessage,
+    staged: Option<Staged>,
 ) -> Result<(bytes::Bytes, bytes::Bytes, crate::transports::MessageType), EncodeError> {
     finalize_outbound_headers(&mut message.metadata.headers);
+    if let Some((handle, budget)) = staged {
+        crate::messenger::large_payload::write_staging(
+            &mut message.metadata.headers,
+            handle,
+            budget,
+        );
+    }
     message.encode()
 }
 
@@ -137,30 +151,36 @@ impl ActiveMessageClient {
         }
     }
 
+    /// Send `message` to `target` on `lane`. Every send goes through here.
+    ///
+    /// `fetch_by` is the call's deadline, if it has one. When the payload is
+    /// staged, what is left of it goes beside the handle
+    /// ([`RV_BUDGET_HEADER_KEY`](crate::messenger::large_payload::RV_BUDGET_HEADER_KEY)),
+    /// so the receiver stops fetching when the caller stops waiting. No other
+    /// handle or budget goes beside a staged payload, whatever headers the
+    /// send was given.
     pub(crate) fn send_message(
         &self,
         target: InstanceId,
         mut message: ActiveMessage,
         lane: u16,
+        fetch_by: Option<tokio::time::Instant>,
     ) -> Result<SendOutcome> {
-        // Transparent large payload staging: if payload exceeds threshold,
-        // stage it via rendezvous and replace with a handle in the headers.
-        if let Some(stager) = self.large_payload_stager.get()
-            && message.payload.len() > stager.threshold()
-        {
-            let staged_payload = std::mem::replace(&mut message.payload, bytes::Bytes::new());
-            let handle_str = stager.stage(staged_payload);
-            message
-                .metadata
-                .headers
-                .get_or_insert_with(std::collections::HashMap::new)
-                .insert(
-                    crate::messenger::large_payload::RV_HEADER_KEY.to_string(),
-                    handle_str,
-                );
-        }
+        // Transparent large payload staging: a payload over the threshold is
+        // staged, and the message carries its handle instead.
+        let staged = match self.large_payload_stager.get() {
+            Some(stager) if message.payload.len() > stager.threshold() => {
+                let payload = std::mem::take(&mut message.payload);
+                let budget =
+                    fetch_by.map(|at| at.saturating_duration_since(tokio::time::Instant::now()));
+                // The budget is also the payload's time-to-live here: once
+                // the caller has given up, nobody waits for it.
+                Some((stager.stage(payload, budget), budget))
+            }
+            _ => None,
+        };
 
-        let (header, payload, message_type) = encode_outbound(message)?;
+        let (header, payload, message_type) = encode_outbound(message, staged)?;
 
         #[cfg(feature = "distributed-tracing")]
         {
@@ -324,7 +344,7 @@ impl ActiveMessageClient {
             payload: bytes::Bytes::from(payload),
         };
 
-        let send_outcome = self.send_message(target, message, 0)?;
+        let send_outcome = self.send_message(target, message, 0, None)?;
 
         // Share a single handshake_timeout budget across both the admission
         // wait (if the frame was queued) and the response receive. A failed
