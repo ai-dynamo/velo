@@ -44,7 +44,7 @@
 //! reading. A staged message whose call has a timeout uses it: once the caller
 //! has given up, the payload has no reader worth waiting for.
 //!
-//! Both are enforced by [`ensure_reaper`], which runs only while a deadline or
+//! Both are enforced by `ensure_reaper`, which runs only while a deadline or
 //! a time-to-live is pending.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
