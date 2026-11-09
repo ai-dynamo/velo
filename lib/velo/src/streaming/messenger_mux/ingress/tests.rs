@@ -1064,6 +1064,63 @@ fn a_payload_refusal_replaces_a_terminal_waiting_in_the_hold() {
     );
 }
 
+/// Another peer's header must not erase a refusal waiting for its own open.
+#[test]
+#[ignore = "F3: another peer can overwrite a refusal parked on an unclaimed bind"]
+fn another_peers_refusal_preserves_a_refusal_waiting_for_its_open() {
+    let (registry, consumer, config) = bound();
+    let id = slot(0, 0);
+    let record = crate::streaming::messenger_mux::SingletonRecord {
+        epoch: 1,
+        slot: id,
+        session: SESSION,
+    };
+    let error = rmp_serde::to_vec(&crate::streaming::StreamFrame::<()>::TransportError(
+        "refused a staged stream item: 67108864 exceeds 1048576".into(),
+    ))
+    .unwrap();
+    assert!(
+        registry
+            .refuse_record(
+                peer(),
+                &record,
+                error.clone(),
+                None,
+                config.peer_byte_budget
+            )
+            .is_none()
+    );
+    let stranger = PeerLane::new(WorkerId::from_u64(PEER + 1), LaneIndex::ZERO);
+    assert!(
+        registry
+            .refuse_record(
+                stranger,
+                &record,
+                error.clone(),
+                None,
+                config.peer_byte_budget,
+            )
+            .is_none()
+    );
+
+    let outcome = open(&registry, &config, id, 1);
+    assert_eq!(
+        outcome.closed, 1,
+        "another peer's refusal erased the refusal waiting for this OpenSlot"
+    );
+    assert_eq!(consumer.pump(), vec![error]);
+    assert_eq!(registry.live_slots(peer()), 0);
+    assert!(consumer.rx.is_disconnected());
+    assert_eq!(
+        outcome.replies,
+        vec![ReplyRecord::LifecycleSlot {
+            slot: id,
+            session_id: SESSION,
+            cancel: true,
+        }]
+    );
+}
+
 /// Index 0 at generation 0, ended behind a rendezvous record that has not
 /// resolved, and index 0 at generation 1 opened over it with one record
 /// delivered. Returns the two consumers, old stream first.
