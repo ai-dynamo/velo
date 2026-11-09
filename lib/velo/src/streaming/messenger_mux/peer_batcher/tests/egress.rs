@@ -1052,3 +1052,112 @@ async fn a_slot_reused_behind_a_rendezvous_record_opens_on_the_receiver() {
         "the hold is released"
     );
 }
+
+/// A refusal's reply can wait in transit while its producer reuses the slot id.
+/// The reply must stop only the session whose payload was refused.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "F2: a delayed size-refusal CloseSlot carries no session and closes a reused slot id"]
+async fn a_delayed_payload_refusal_reply_spares_a_reused_slot() {
+    use crate::streaming::messenger_mux::flow_control::slot_buffer_depth;
+    use crate::streaming::messenger_mux::ingress::{DrainSignal, IngressRegistry, handle_batch};
+    use crate::streaming::messenger_mux::lane_choice::LaneReservation;
+    use crate::streaming::messenger_mux::{LaneIndex, SingletonRecord};
+
+    let config = MuxConfig::default();
+    let hooks = Arc::new(TestHooks::default());
+    let harness = harness_with_hooks(config.clone(), Some(Arc::clone(&hooks))).await;
+    let ingress = IngressRegistry::default();
+    let from = PeerLane::new(velo_ext::WorkerId::from_u64(1), LaneIndex::ZERO);
+    let (wake, _wakes) = flume::unbounded();
+    let bind = |session: u64| {
+        let (tx, rx) = flume::bounded(slot_buffer_depth(config.initial_credit));
+        ingress.register_bind(
+            1,
+            session,
+            tx,
+            Arc::new(DrainSignal::new(wake.clone())),
+            LaneReservation::uncounted(LaneIndex::ZERO),
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        );
+        rx
+    };
+    let apply = |batch: &OwnedBatch| handle_batch(&ingress, &config, None, from, &batch.payload);
+    let old_rx = bind(1);
+    let (old_inlet, old_open) = harness
+        .open_credited_batch(1, 1, config.initial_credit)
+        .await;
+    let original = old_open.records[0].slot;
+    apply(&old_open);
+    let oversized = rmp_serde::to_vec(&crate::streaming::StreamFrame::Item(vec![7u8; 512 * 1024]))
+        .expect("oversized item");
+    old_inlet.send(oversized).expect("queue oversized");
+    old_inlet
+        .send(cached_finalized().clone())
+        .expect("queue terminal");
+    let unresolved = harness.next_batch().await;
+    assert_eq!(unresolved.records.len(), 1);
+    apply(&harness.next_batch().await);
+    let error = rmp_serde::to_vec(&crate::streaming::StreamFrame::<()>::TransportError(
+        "payload over limit".into(),
+    ))
+    .expect("error frame");
+    let reply = ingress
+        .refuse_record(
+            from,
+            &SingletonRecord {
+                epoch: old_open.header.peer_epoch,
+                slot: original,
+                session: 1,
+            },
+            error.clone(),
+            None,
+        )
+        .expect("the refusal owes its producer a reply");
+    assert_eq!(old_rx.try_recv().ok(), Some(error));
+    assert_eq!(ingress.live_slots(from), 0);
+
+    // Keep the reply in transit while 255 other streams complete at this index.
+    for session in 2..=256 {
+        let rx = bind(session);
+        let (inlet, open) = harness
+            .open_credited_batch(1, session, config.initial_credit)
+            .await;
+        assert_eq!(open.records[0].slot.index(), original.index());
+        assert_eq!(apply(&open).opened, 1);
+        inlet
+            .send(cached_finalized().clone())
+            .expect("queue terminal");
+        assert_eq!(apply(&harness.next_batch().await).closed, 1);
+        assert_eq!(rx.try_recv().ok(), Some(cached_finalized().clone()));
+    }
+    let replacement_rx = bind(257);
+    let (replacement, open) = harness
+        .open_credited_batch(1, 257, config.initial_credit)
+        .await;
+    assert_eq!(open.records[0].slot, original, "the full id wrapped");
+    assert_eq!(apply(&open).opened, 1);
+    replacement.send(item(7)).expect("replacement sends");
+    apply(&harness.next_batch().await);
+    assert_eq!(replacement_rx.try_recv().ok(), Some(item(7)));
+
+    let ReplyRecord::CloseSlot { slot, reason } = reply else {
+        panic!("unexpected refusal reply: {reply:?}");
+    };
+    hooks.pause();
+    harness.handle.peer_closed(slot, reason);
+    hooks.wait_until_parked().await;
+    assert_eq!(
+        harness.handle.pending_control(),
+        0,
+        "the reply was consumed"
+    );
+    let live = harness
+        .handle
+        .live_slots
+        .load(std::sync::atomic::Ordering::Relaxed);
+    hooks.release();
+    assert_eq!(
+        live, 1,
+        "the old session's size-refusal reply closed the replacement after slot generation wrap"
+    );
+}
