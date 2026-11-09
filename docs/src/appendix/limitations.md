@@ -144,3 +144,23 @@ and the slowest peer's read rate, and give the drain its own time through
 `ShutdownPolicy::Timeout`.
 
 **Lifted by.** Not scheduled.
+
+## A staged payload without a deadline can stay staged
+
+**What happens.** The sender keeps a staged payload until the sender shuts
+down when nobody fetches and releases it, and nothing gives it a deadline.
+
+**When.** The message of a send without a `.timeout` never reaches a
+receiver, or the receiver stops before it releases the payload. Also a fetch
+that gives up against a sender from before the `_rv_lease_ms` header.
+
+**Why.** Only the receiver's `release` frees a transparently staged payload.
+A time-to-live comes only from a call's `.timeout`, and a chunked lease gets a
+deadline only when a fetch with a bound asks for one.
+
+**Workaround.** Give large calls a `.timeout`. It gives their payloads a
+time-to-live.
+
+**Lifted by.** Not scheduled. A default time-to-live for transparently staged
+payloads would lift it, but it would also fail a fetch that is slower than
+that time.

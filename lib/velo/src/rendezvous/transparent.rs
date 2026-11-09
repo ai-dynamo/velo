@@ -11,6 +11,7 @@
 //! otherwise it is the chunked pull it has always been.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::messenger::large_payload::{LargePayloadResolver, LargePayloadStager};
 use anyhow::Result;
@@ -75,11 +76,15 @@ impl LargePayloadStager for RendezvousStager {
     /// `get` + `release` before the handler sees the payload, which is what
     /// keeps transparent mode invisible to handler code — and it is why a
     /// transparently staged slot has refcount 1 and a single reader.
-    fn stage(&self, payload: Bytes) -> String {
+    fn stage(&self, payload: Bytes, ttl: Option<Duration>) -> String {
+        let opts = ttl.map(|ttl| crate::rendezvous::RegisterOptions::new().ttl(ttl));
         #[cfg(all(target_os = "linux", feature = "ucx"))]
-        let handle = self.manager.register_data_pinned_sync(payload);
+        let handle = self.manager.register_data_pinned_sync(payload, opts);
         #[cfg(not(all(target_os = "linux", feature = "ucx")))]
-        let handle = self.manager.register_data(payload);
+        let handle = match opts {
+            Some(opts) => self.manager.register_data_with(payload, opts),
+            None => self.manager.register_data(payload),
+        };
         // Encode handle as u128 decimal string for header transport
         handle.as_u128().to_string()
     }
@@ -95,26 +100,45 @@ impl LargePayloadStager for RendezvousStager {
 /// uses single-use handles (refcount = 1).
 pub struct RendezvousResolver {
     manager: Arc<RendezvousManager>,
+    fetch_timeout: Option<Duration>,
 }
 
 impl RendezvousResolver {
     pub fn new(manager: Arc<RendezvousManager>) -> Self {
-        Self { manager }
+        Self {
+            manager,
+            fetch_timeout: None,
+        }
+    }
+
+    /// Give up a fetch after `timeout`, even when the sender asked for more
+    /// or set no bound. `None`, the default, sets no bound of its own. See
+    /// [`VeloBuilder::staged_fetch_timeout`](crate::VeloBuilder::staged_fetch_timeout).
+    pub fn with_fetch_timeout(mut self, timeout: Option<Duration>) -> Self {
+        self.fetch_timeout = timeout;
+        self
     }
 }
 
 impl LargePayloadResolver for RendezvousResolver {
-    fn resolve(&self, handle_str: &str) -> BoxFuture<'_, Result<Bytes>> {
+    /// With a bound, the owner is asked to end the lease once no pull renews
+    /// it within that bound: the fetch is dropped at the bound with no word
+    /// to the owner, which would otherwise keep the payload staged.
+    fn resolve(&self, handle_str: &str, within: Option<Duration>) -> BoxFuture<'_, Result<Bytes>> {
         let handle_str = handle_str.to_string();
         Box::pin(async move {
             let raw: u128 = handle_str
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid rendezvous handle: {e}"))?;
             let handle = crate::DataHandle::from_u128(raw);
-            let (data, lease_id) = self.manager.get(handle).await?;
+            let (data, lease_id) = self.manager.get_within(handle, within).await?;
             // Auto-release: transparent staging uses refcount=1
             self.manager.release(handle, lease_id).await?;
             Ok(data)
         })
+    }
+
+    fn fetch_timeout(&self) -> Option<Duration> {
+        self.fetch_timeout
     }
 }

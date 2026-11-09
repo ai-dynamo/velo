@@ -303,6 +303,9 @@ impl RendezvousManager {
                 runtime: messenger.runtime().clone(),
             })
             .map_err(|_| anyhow::anyhow!("register_handlers called twice"))?;
+        // The sweep of deadlines and time-to-live starts on this runtime, so
+        // a payload staged by a send from outside any runtime is still swept.
+        self.store.set_runtime(messenger.runtime().clone());
 
         Ok(())
     }
@@ -347,7 +350,11 @@ impl RendezvousManager {
     fn stage(&self, body: store::SlotBody, opts: Option<RegisterOptions>) -> DataHandle {
         let started = Instant::now();
         let data_len = body.total_len() as usize;
+        let expires = opts.as_ref().is_some_and(|o| o.ttl.is_some());
         let local_id = self.store.register_body(body, opts);
+        if expires {
+            store::ensure_reaper(&self.store);
+        }
         if let Some(m) = &self.metrics {
             m.record_rendezvous_operation(
                 RendezvousOp::Register,
@@ -444,7 +451,11 @@ impl RendezvousManager {
     /// and rejected — a message send that side-effects a 64 MiB pin on a
     /// detached task is not something a caller can reason about.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
-    pub(crate) fn register_data_pinned_sync(&self, data: Bytes) -> DataHandle {
+    pub(crate) fn register_data_pinned_sync(
+        &self,
+        data: Bytes,
+        opts: Option<RegisterOptions>,
+    ) -> DataHandle {
         use crate::observability::RdmaPathReason;
         if !data.is_empty()
             && let Some(ctx) = self.store.rdma()
@@ -455,13 +466,13 @@ impl RendezvousManager {
                 buf.copy_from_slice(&data);
                 return self.stage(
                     store::SlotBody::Pinned(pinned::PinnedSlot::from_pool(buf, ctx.backend)),
-                    None,
+                    opts,
                 );
             } else {
                 self.store.record_path(RdmaPathReason::PoolExhausted);
             }
         }
-        self.register_data(data)
+        self.stage(store::SlotBody::InMemory(data), opts)
     }
 
     /// Stage a range of memory the caller registered, without copying it.
@@ -622,16 +633,17 @@ impl RendezvousManager {
     /// Called by `Velo::graceful_shutdown` immediately before the registration
     /// sweep, and it does two things.
     ///
-    /// **The reaper stops.** It force-releases leases and drops the pinned
-    /// staging under them, and doing that while the sweep walks regions and
-    /// arenas would have two tasks taking the same memory apart from opposite
-    /// ends. Cancelling is not a join — a tick already in progress may still
-    /// finish — and that overlap is benign: both paths end a lease through the
-    /// same store operations, which are individually atomic, and the sweep
-    /// tolerates a slot disappearing underneath it because that is exactly what
-    /// it is trying to make happen.
+    /// **The reapers stop**: the RDMA one, and the store's sweep of chunked
+    /// lease deadlines and time-to-live. They force-release leases and drop
+    /// the pinned staging under them, and doing that while the sweep walks
+    /// regions and arenas would have two tasks taking the same memory apart
+    /// from opposite ends. Cancelling is not a join — a tick already in
+    /// progress may still finish — and that overlap is benign: both paths end
+    /// a lease through the same store operations, which are individually
+    /// atomic, and the sweep tolerates a slot disappearing underneath it
+    /// because that is exactly what it is trying to make happen.
     ///
-    /// The same task also sweeps the arena pool, and *that* overlap is closed
+    /// The RDMA reaper also sweeps the arena pool, and *that* overlap is closed
     /// rather than tolerated: `RdmaRegistry::reclaim_idle_arenas` holds an
     /// admission ticket for its whole run, so the registry's own gate refuses a
     /// reclaim that starts after the sweep and its drain waits out one already
@@ -667,6 +679,7 @@ impl RendezvousManager {
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub(crate) fn shutdown(&self) {
         self.reaper_shutdown.cancel();
+        self.store.stop_reaper();
         let (demoted, dropped) = self.store.demote_pinned_slots();
         if demoted != 0 || dropped != 0 {
             tracing::debug!(
@@ -758,6 +771,17 @@ impl RendezvousManager {
     /// For local handles: DashMap lookup + `Bytes::clone()` (cheap refcount bump).
     /// For remote handles: receiver-driven pull via `_rv_acquire` + `_rv_pull` AMs.
     pub async fn get(&self, handle: DataHandle) -> Result<(Bytes, u64)> {
+        self.get_within(handle, None).await
+    }
+
+    /// As [`get`](Self::get), asking a remote owner to end a chunked lease
+    /// that no pull renews within `lease_timeout`. See
+    /// [`Consumer::get_within`](consumer::Consumer::get_within).
+    pub(crate) async fn get_within(
+        &self,
+        handle: DataHandle,
+        lease_timeout: Option<std::time::Duration>,
+    ) -> Result<(Bytes, u64)> {
         let started = Instant::now();
         let (target_worker, local_id) = handle.unpack();
         let result = if target_worker == self.worker_id {
@@ -773,7 +797,7 @@ impl RendezvousManager {
                 .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
             Ok((data, lease.disarm()))
         } else {
-            consumer::Consumer::get(self, handle).await
+            consumer::Consumer::get_within(self, handle, lease_timeout).await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {

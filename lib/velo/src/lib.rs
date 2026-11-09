@@ -315,6 +315,7 @@ pub struct VeloBuilder {
     reservation_config: crate::streaming::ReservationConfig,
     mux_only: bool,
     metrics: Option<Arc<VeloMetrics>>,
+    staged_fetch_timeout: Option<std::time::Duration>,
     /// The concrete UCX transport, kept beside the type-erased one so the
     /// registration layer can reach its RMA endpoint. `Arc<dyn Transport>`
     /// cannot be downcast, and adding an RDMA accessor to the `velo-ext` trait
@@ -342,6 +343,7 @@ impl VeloBuilder {
             reservation_config: Default::default(),
             mux_only: false,
             metrics: None,
+            staged_fetch_timeout: None,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             ucx_transport: None,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -460,6 +462,33 @@ impl VeloBuilder {
     pub fn metrics(mut self, metrics: Arc<VeloMetrics>) -> Self {
         self.inner = self.inner.metrics(metrics.clone());
         self.metrics = Some(metrics);
+        self
+    }
+
+    /// Bound how long this instance fetches a staged payload before it gives
+    /// up on the message.
+    ///
+    /// A message whose payload is over the staging threshold (256 KiB) does
+    /// not carry the payload. The sender stages it, and this instance fetches
+    /// it from the sender before the handler runs. The fetch holds one of this
+    /// instance's response slots and the message's drain guard until it ends.
+    ///
+    /// A sync or unary call with a `.timeout` already bounds the fetch: the
+    /// sender sends what is left of it with the message. This bound covers the
+    /// rest: fire-and-forget sends, calls without a timeout, and senders that
+    /// do not send a bound. When both are present the smaller one applies.
+    ///
+    /// When it runs out, the fetch is dropped, its response slot is released,
+    /// the handler does not run, and a sync or unary caller gets an error
+    /// reply.
+    ///
+    /// It does not apply to the items of a stream. Dropping one would lose it
+    /// with no word to the stream, whose consumer would see its sender as
+    /// gone; the stream's own watchdog decides that.
+    ///
+    /// Unset by default: the fetch then has only the sender's bound, if any.
+    pub fn staged_fetch_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.staged_fetch_timeout = Some(timeout);
         self
     }
 
@@ -592,9 +621,10 @@ impl VeloBuilder {
         let stager = Arc::new(crate::rendezvous::RendezvousStager::new(Arc::clone(
             &rendezvous_manager,
         )));
-        let resolver = Arc::new(crate::rendezvous::RendezvousResolver::new(Arc::clone(
-            &rendezvous_manager,
-        )));
+        let resolver = Arc::new(
+            crate::rendezvous::RendezvousResolver::new(Arc::clone(&rendezvous_manager))
+                .with_fetch_timeout(self.staged_fetch_timeout),
+        );
         messenger.set_large_payload_support(stager, resolver);
 
         // Build the RDMA registration layer, if a UCX transport was
@@ -3095,6 +3125,7 @@ mod tests {
                     payload: bytes::Bytes::from_static(b"not json"),
                     response_type: crate::messenger::common::messages::ResponseType::Unary,
                     headers: None,
+                    staged: false,
                     in_flight: None,
                 },
                 &messenger,
@@ -3149,6 +3180,7 @@ mod tests {
                     payload: bytes::Bytes::from_static(b"1"),
                     response_type: crate::messenger::common::messages::ResponseType::Unary,
                     headers: None,
+                    staged: false,
                     in_flight: None,
                 },
                 &messenger,
@@ -3186,7 +3218,7 @@ mod tests {
         called: std::sync::atomic::AtomicBool,
     }
     impl crate::messenger::large_payload::LargePayloadStager for NeverResolves {
-        fn stage(&self, _: bytes::Bytes) -> String {
+        fn stage(&self, _: bytes::Bytes, _: Option<std::time::Duration>) -> String {
             unreachable!("the test sends nothing large")
         }
         fn threshold(&self) -> usize {
@@ -3194,7 +3226,11 @@ mod tests {
         }
     }
     impl crate::messenger::large_payload::LargePayloadResolver for NeverResolves {
-        fn resolve(&self, _: &str) -> futures::future::BoxFuture<'_, anyhow::Result<bytes::Bytes>> {
+        fn resolve(
+            &self,
+            _: &str,
+            _: Option<std::time::Duration>,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<bytes::Bytes>> {
             self.called.store(true, std::sync::atomic::Ordering::SeqCst);
             Box::pin(std::future::pending())
         }
@@ -3316,6 +3352,7 @@ mod tests {
                     payload: bytes::Bytes::from(payload),
                     response_type: crate::messenger::common::messages::ResponseType::FireAndForget,
                     headers: None,
+                    staged: false,
                     in_flight: None,
                 },
                 &messenger,

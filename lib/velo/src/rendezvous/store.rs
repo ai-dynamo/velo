@@ -25,17 +25,30 @@
 //! Bifurcating the two — a pinned slot that refuses non-RDMA readers — was an
 //! earlier version's worst property, and this store never reintroduces it.
 //!
-//! # Lease deadlines are for RDMA leases only
+//! # Which leases have a deadline
 //!
-//! A chunked transfer is visible to the owner: every chunk is an inbound
-//! request, and an abandoned transfer stops making them. An RDMA GET is issued
-//! by the *consumer's* NIC and the owner sees nothing at all, so an RDMA lease
-//! carries a deadline and a reaper force-releases it (D8). Chunked leases keep
-//! their existing no-deadline behaviour deliberately: giving them one would
-//! change the semantics of a path this store does not otherwise touch.
+//! An RDMA GET is issued by the *consumer's* NIC and the owner sees nothing at
+//! all, so an RDMA lease carries a deadline and a reaper force-releases it
+//! (D8). A chunked lease has one only when its consumer asks for one in its
+//! acquire, and each pull renews it. The messenger's resolver asks when its
+//! fetch has a bound: it gives up at that bound, sends nothing to say so, and
+//! the lease would otherwise hold the slot until the owner tears down. A
+//! consumer that does not ask, such as one of the public `get` calls, keeps
+//! the no-deadline lease it always had, so a lease it holds after its last
+//! pull is never reaped.
+//!
+//! # Time-to-live
+//!
+//! A slot registered with [`RegisterOptions::ttl`] is freed when its time is
+//! up, with every lease on it ended, whether or not a consumer is still
+//! reading. A staged message whose call has a timeout uses it: once the caller
+//! has given up, the payload has no reader worth waiting for.
+//!
+//! Both are enforced by [`ensure_reaper`], which runs only while a deadline or
+//! a time-to-live is pending.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -142,7 +155,7 @@ pub(crate) struct DataSlot {
     /// When this slot was created.
     #[allow(dead_code)]
     pub created_at: Instant,
-    /// Optional time-to-live. Stored, but nothing reaps on it yet.
+    /// Optional time-to-live. Enforced through [`DataStore::expiring`].
     #[allow(dead_code)]
     pub ttl: Option<Duration>,
 }
@@ -166,7 +179,6 @@ pub(crate) struct TransferState {
 #[derive(Clone, Copy, Debug)]
 struct LeaseDeadline {
     /// The slot the lease holds a read lock on.
-    #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
     local_id: u64,
     /// When the owner stops waiting.
     expires_at: Instant,
@@ -202,11 +214,19 @@ pub enum LeaseOutcome {
     Unknown,
 }
 
+/// A test's code to run inside `DataStore::register_body`.
+#[cfg(test)]
+type RegisterHook = Box<dyn Fn(&DataStore) + Send + Sync>;
+
 /// Options for registering data.
 #[derive(Debug, Clone)]
 pub struct RegisterOptions {
-    /// Optional time-to-live for the staged data. It is stored with the slot,
-    /// but it is not enforced yet: nothing reaps a slot when it expires.
+    /// Optional time-to-live for the staged data. When it is up, the slot is
+    /// freed and every lease on it ended, whether or not a consumer is still
+    /// reading. Enforced by the instance's reaper, which a registration
+    /// through [`RendezvousManager`](crate::RendezvousManager) starts; a
+    /// [`DataStore`] used on its own enforces it only through
+    /// [`DataStore::sweep_expired`].
     pub ttl: Option<Duration>,
 }
 
@@ -244,15 +264,22 @@ pub struct DataStore {
     next_lease_id: AtomicU64,
     /// Outstanding leases: lease_id → local_id. Consumed on detach/release.
     active_leases: DashMap<u64, u64>,
-    /// Deadlines for the leases that carry one — RDMA leases only. Entries are
-    /// removed by the same [`consume_lease`](Self::consume_lease) that ends the
-    /// lease, so a deadline never outlives the thing it bounds.
+    /// Deadlines for the leases that carry one: RDMA leases, and chunked
+    /// leases whose consumer asked for one. Entries are removed by the same
+    /// [`consume_lease`](Self::consume_lease) that ends the lease, so a
+    /// deadline never outlives the thing it bounds.
     lease_deadlines: DashMap<u64, LeaseDeadline>,
+    /// When each slot registered with a time-to-live expires. Only those
+    /// slots are here, so the reaper never walks the whole table.
+    expiring: DashMap<u64, Instant>,
+    /// Whether [`ensure_reaper`]'s sweep is running, and what stops it.
+    reaper: Reaper,
+    /// Runs inside `register_body`, between its two inserts, so a test can
+    /// put a sweep in that window.
+    #[cfg(test)]
+    between_inserts: std::sync::OnceLock<RegisterHook>,
     /// Observability, for the decisions taken inside the handlers this store
     /// backs. `None` when the instance was built without metrics.
-    ///
-    /// Only the RDMA path reads it today, hence the conditional allow.
-    #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
     metrics: Option<Arc<VeloMetrics>>,
     /// The RDMA registry and policy, once they exist.
     ///
@@ -283,6 +310,10 @@ impl DataStore {
             next_lease_id: AtomicU64::new(1),
             active_leases: DashMap::new(),
             lease_deadlines: DashMap::new(),
+            expiring: DashMap::new(),
+            reaper: Reaper::default(),
+            #[cfg(test)]
+            between_inserts: std::sync::OnceLock::new(),
             metrics: None,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             rdma: std::sync::OnceLock::new(),
@@ -298,7 +329,6 @@ impl DataStore {
     }
 
     /// The metrics handle, if this instance was built with one.
-    #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
     pub(crate) fn metrics(&self) -> Option<&Arc<VeloMetrics>> {
         self.metrics.as_ref()
     }
@@ -348,6 +378,19 @@ impl DataStore {
                 ttl,
             },
         );
+        #[cfg(test)]
+        if let Some(hook) = self.between_inserts.get() {
+            hook(self);
+        }
+        // After the slot. Listed first, a due expiry could be swept before
+        // its slot existed: the sweep would drop the listing and the slot
+        // would never be swept. A slot freed before it is listed leaves a
+        // listing with no slot, which the sweep drops at its deadline.
+        if let Some(ttl) = ttl
+            && let Some(at) = Instant::now().checked_add(ttl)
+        {
+            self.expiring.insert(local_id, at);
+        }
         local_id
     }
 
@@ -454,13 +497,8 @@ impl DataStore {
 
     /// Give a lease a deadline, after which the reaper force-releases it.
     ///
-    /// Only RDMA leases get one: see the module docs.
-    // Without the RDMA path nothing ever sets a deadline, so this is unused
-    // there. Kept unconditional rather than scattered with `#[cfg]`:
-    // `_rv_lease_renew` is registered in *every* build, so the store has to be
-    // able to answer it in every build, and a store whose shape depended on a
-    // feature flag is the readability cost this refactor exists to remove.
-    #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
+    /// RDMA leases, and chunked leases whose consumer asked: see the module
+    /// docs.
     pub(crate) fn set_lease_deadline(&self, lease_id: u64, local_id: u64, timeout: Duration) {
         self.lease_deadlines.insert(
             lease_id,
@@ -494,7 +532,6 @@ impl DataStore {
     /// forced release that follows removes from `lease_deadlines`,
     /// `active_leases`, `transfers` and `slots`, and doing any of that while a
     /// `DashMap` iterator holds a shard lock deadlocks rather than fails.
-    #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
     pub(crate) fn expired_leases(&self, now: Instant) -> Vec<(u64, u64)> {
         self.lease_deadlines
             .iter()
@@ -516,12 +553,22 @@ impl DataStore {
     /// would leak with the read lock and the slot would be immortal. That
     /// compounding leak is what the reaper exists to prevent (D8).
     ///
-    /// Returns the slot the lease held, or `None` if the lease had already been
-    /// ended by a detach or release that raced the reaper.
-    #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
+    /// Returns whether it ended the lease: `false` if a detach or release that
+    /// raced the reaper had already ended it.
+    ///
+    /// A lease that is already gone has its deadline dropped. Ending a lease
+    /// drops its deadline, so one left behind was set after the lease ended:
+    /// the `_rv_acquire` handler sets it after creating the transfer, and a
+    /// slot whose time-to-live runs out in between ends the lease first. Kept,
+    /// it would hold the sweep running for the life of the process.
     pub(crate) fn force_release_lease(&self, lease_id: u64, local_id: u64) -> bool {
-        if self.consume_lease(lease_id, local_id) != LeaseOutcome::Consumed {
-            return false;
+        match self.consume_lease(lease_id, local_id) {
+            LeaseOutcome::Consumed => {}
+            LeaseOutcome::Unknown => {
+                self.lease_deadlines.remove(&lease_id);
+                return false;
+            }
+            LeaseOutcome::Mismatch { .. } => return false,
         }
         self.release_read_lock(local_id);
         self.remove_transfers_by_lease(lease_id);
@@ -606,18 +653,25 @@ impl DataStore {
     /// registration's lifetime depend on where that `Bytes` ended up. Removing
     /// the slot drops the staging, which is the whole point of removing it.
     pub fn remove(&self, local_id: u64) -> Option<Bytes> {
-        self.slots
-            .remove(&local_id)
-            .and_then(|(_, slot)| slot.body.to_bytes())
+        let (_, slot) = self.slots.remove(&local_id)?;
+        if slot.ttl.is_some() {
+            self.expiring.remove(&local_id);
+        }
+        slot.body.to_bytes()
     }
 
     /// Try to free a slot if both refcount and read_lock_count are zero.
     pub fn try_free(&self, local_id: u64) {
         // Use entry API to avoid TOCTOU: only remove if both counters are zero.
-        self.slots.remove_if(&local_id, |_, slot| {
+        let freed = self.slots.remove_if(&local_id, |_, slot| {
             slot.refcount.load(Ordering::Relaxed) == 0
                 && slot.read_lock_count.load(Ordering::Relaxed) == 0
         });
+        if let Some((_, slot)) = freed
+            && slot.ttl.is_some()
+        {
+            self.expiring.remove(&local_id);
+        }
     }
 
     /// Get the data bytes for a slot (for inline responses or local fast-path).
@@ -679,6 +733,16 @@ impl DataStore {
         let end = (offset + transfer.chunk_size as u64).min(slot.total_len);
 
         slot.body.read_at(offset, (end - offset) as usize)
+    }
+
+    /// Serve one chunk to a consumer, and renew its lease's deadline if the
+    /// lease has one: a consumer that is still pulling is still reading.
+    pub(crate) fn pull_chunk(&self, transfer_id: u64, chunk_index: u32) -> Option<Bytes> {
+        let chunk = self.get_chunk(transfer_id, chunk_index)?;
+        if let Some(lease_id) = self.transfers.get(&transfer_id).map(|t| t.lease_id) {
+            self.renew_lease(lease_id);
+        }
+        Some(chunk)
     }
 
     /// Remove a completed transfer.
@@ -767,6 +831,162 @@ impl DataStore {
     /// Remove all transfers associated with a given lease ID.
     pub fn remove_transfers_by_lease(&self, lease_id: u64) {
         self.transfers.retain(|_, state| state.lease_id != lease_id);
+    }
+
+    /// End what is past its time at `now`: leases past their deadline, and
+    /// slots past their time-to-live.
+    ///
+    /// Returns `(leases, slots)`, the leases force-released and the slots
+    /// freed by expiry. A slot that a lease's release frees counts as a lease.
+    pub fn sweep_expired(&self, now: Instant) -> (usize, usize) {
+        let mut leases = 0;
+        for (lease_id, local_id) in self.expired_leases(now) {
+            if self.force_release_lease(lease_id, local_id) {
+                leases += 1;
+            }
+        }
+        // Collected first, as `expired_leases` is: freeing a slot touches
+        // the maps this iterator would be holding a shard of.
+        let due: Vec<u64> = self
+            .expiring
+            .iter()
+            .filter(|entry| *entry.value() <= now)
+            .map(|entry| *entry.key())
+            .collect();
+        let mut slots = 0;
+        for local_id in due {
+            if self.expire_slot(local_id) {
+                slots += 1;
+            }
+        }
+        (leases, slots)
+    }
+
+    /// Free a slot whose time-to-live is up, and end every lease on it.
+    ///
+    /// The leases go with it, deadlines and transfers included, so that a
+    /// lease granted to a consumer that has since given up holds nothing. A
+    /// consumer still reading gets "chunk not found", and its later release
+    /// finds no lease, which is a no-op.
+    fn expire_slot(&self, local_id: u64) -> bool {
+        self.expiring.remove(&local_id);
+        if self.slots.remove(&local_id).is_none() {
+            return false;
+        }
+        let mut ended = Vec::new();
+        self.active_leases.retain(|lease_id, held| {
+            if *held == local_id {
+                ended.push(*lease_id);
+                false
+            } else {
+                true
+            }
+        });
+        for lease_id in ended {
+            self.lease_deadlines.remove(&lease_id);
+            self.remove_transfers_by_lease(lease_id);
+        }
+        true
+    }
+
+    /// Whether a lease deadline or a time-to-live is pending.
+    fn has_pending_expiry(&self) -> bool {
+        !self.lease_deadlines.is_empty() || !self.expiring.is_empty()
+    }
+
+    /// The runtime [`ensure_reaper`] starts the sweep on. Set once; a second
+    /// call is ignored.
+    pub(crate) fn set_runtime(&self, runtime: tokio::runtime::Handle) {
+        let _ = self.reaper.runtime.set(runtime);
+    }
+
+    /// Stop the reaper, for good. Called when the instance shuts down.
+    #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
+    pub(crate) fn stop_reaper(&self) {
+        self.reaper.stop.cancel();
+    }
+}
+
+/// How often the reaper sweeps while something is pending: how long past its
+/// deadline a lease or a slot can live.
+const SWEEP_PERIOD: Duration = Duration::from_millis(100);
+
+/// Whether the sweep task is running, what stops it, and where it runs.
+#[derive(Default)]
+struct Reaper {
+    running: AtomicBool,
+    stop: tokio_util::sync::CancellationToken,
+    /// The instance's runtime, set by `RendezvousManager::register_handlers`.
+    /// A send can stage a payload from a thread outside any runtime, and the
+    /// sweep must still start for it.
+    runtime: std::sync::OnceLock<tokio::runtime::Handle>,
+}
+
+/// Make sure a task sweeps `store` while a lease deadline or a time-to-live
+/// is pending. Call it after setting either.
+///
+/// The task exits when nothing is pending, so an instance that stages nothing
+/// with a deadline arms no timer at all. It holds the store weakly, so it
+/// never keeps a dropped instance alive. It runs on the instance's runtime
+/// ([`DataStore::set_runtime`]), or else on the caller's. With neither, it
+/// does not start, and the deadline waits for the next call that has one.
+///
+/// In a UCX build with RDMA configured, the RDMA reaper sweeps the same
+/// deadlines; the two racing is harmless, because a lease is consumed once.
+pub(crate) fn ensure_reaper(store: &Arc<DataStore>) {
+    // Pairs with the fence in `sweep_while_pending`: either that sweep sees
+    // the deadline just set, or this swap sees the sweep has stopped.
+    std::sync::atomic::fence(Ordering::SeqCst);
+    if store.reaper.running.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let runtime = match store.reaper.runtime.get() {
+        Some(runtime) => runtime.clone(),
+        None => match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                store.reaper.running.store(false, Ordering::Release);
+                return;
+            }
+        },
+    };
+    let weak = Arc::downgrade(store);
+    let stop = store.reaper.stop.clone();
+    runtime.spawn(sweep_while_pending(weak, stop));
+}
+
+async fn sweep_while_pending(store: Weak<DataStore>, stop: tokio_util::sync::CancellationToken) {
+    loop {
+        tokio::select! {
+            () = stop.cancelled() => return,
+            () = tokio::time::sleep(SWEEP_PERIOD) => {}
+        }
+        let Some(store) = store.upgrade() else { return };
+        let (leases, slots) = store.sweep_expired(Instant::now());
+        if leases + slots != 0 {
+            tracing::debug!(
+                leases,
+                slots,
+                "rendezvous: ended staged payloads past their deadline"
+            );
+            if let Some(m) = store.metrics() {
+                m.set_rendezvous_active_slots(store.slots.len());
+            }
+        }
+        if store.has_pending_expiry() {
+            continue;
+        }
+        store.reaper.running.store(false, Ordering::Release);
+        // A deadline set between the check above and the store, by a caller
+        // that saw the flag still up, would wait for nobody. Look once more,
+        // and keep running if one did; if that caller already started a new
+        // sweep, this one leaves it to that. The fence pairs with the one in
+        // `ensure_reaper`: without both, this look and that caller's swap
+        // can each miss the other's write.
+        std::sync::atomic::fence(Ordering::SeqCst);
+        if !store.has_pending_expiry() || store.reaper.running.swap(true, Ordering::AcqRel) {
+            return;
+        }
     }
 }
 
@@ -994,6 +1214,235 @@ mod tests {
         assert!(
             !store.force_release_lease(lease, id),
             "a lease is force-released at most once"
+        );
+    }
+
+    /// A chunked lease with a deadline lives while its consumer pulls, and is
+    /// reaped once the pulls stop. This is the lease of a fetch that gave up
+    /// at its bound without a word: without the deadline, it held the slot
+    /// until the owner tore down.
+    #[test]
+    fn a_chunked_lease_deadline_is_renewed_by_pulls_and_reaped_without_them() {
+        let store = DataStore::new();
+        let id = store.register(Bytes::from(vec![7u8; 4096]), None);
+        let lease = store.acquire_read_lock(id).unwrap();
+        let (transfer, _, _) = store.create_transfer(id, lease, 1024).unwrap();
+        let granted = Instant::now();
+        store.set_lease_deadline(lease, id, Duration::from_millis(100));
+
+        // A pull at least 60 ms after the grant pushes the deadline past
+        // granted + 160 ms, so a sweep at granted + 130 ms, which would reap
+        // the lease as granted, finds nothing due.
+        std::thread::sleep(Duration::from_millis(60));
+        assert!(store.pull_chunk(transfer, 0).is_some());
+        assert_eq!(
+            store.sweep_expired(granted + Duration::from_millis(130)),
+            (0, 0),
+            "a pull renews the deadline"
+        );
+
+        let (leases, slots) = store.sweep_expired(Instant::now() + Duration::from_secs(1));
+        assert_eq!((leases, slots), (1, 0));
+        assert!(
+            store.metadata(id).is_none(),
+            "the reaped lease freed the slot"
+        );
+        assert!(
+            store.get_chunk(transfer, 1).is_none(),
+            "its transfer is gone"
+        );
+        assert!(!store.has_pending_expiry());
+    }
+
+    /// A lease without a deadline, as a public `get` takes, is never reaped,
+    /// however long its holder keeps it after the last pull.
+    #[test]
+    fn a_lease_without_a_deadline_is_never_reaped() {
+        let store = DataStore::new();
+        let id = store.register(Bytes::from(vec![7u8; 4096]), None);
+        let lease = store.acquire_read_lock(id).unwrap();
+        let (transfer, _, _) = store.create_transfer(id, lease, 4096).unwrap();
+        assert!(store.pull_chunk(transfer, 0).is_some());
+        assert_eq!(
+            store.sweep_expired(Instant::now() + Duration::from_secs(3600)),
+            (0, 0)
+        );
+        assert_eq!(store.lease_slot(lease), Some(id));
+    }
+
+    /// A slot past its time-to-live is freed with every lease on it, deadlines
+    /// and transfers included, whether or not anyone fetched it. The late
+    /// release of a lease it ended is a no-op.
+    #[test]
+    fn a_slot_past_its_time_to_live_is_freed_with_every_lease_on_it() {
+        let store = DataStore::new();
+        let ttl = RegisterOptions::new().ttl(Duration::from_millis(100));
+        let unread = store.register(Bytes::from(vec![1u8; 4096]), Some(ttl.clone()));
+        let read = store.register(Bytes::from(vec![2u8; 4096]), Some(ttl));
+        let kept = store.register(Bytes::from(vec![3u8; 4096]), None);
+        let lease = store.acquire_read_lock(read).unwrap();
+        let (transfer, _, _) = store.create_transfer(read, lease, 1024).unwrap();
+        store.set_lease_deadline(lease, read, Duration::from_secs(3600));
+
+        assert_eq!(store.sweep_expired(Instant::now()), (0, 0), "not yet due");
+        let due = Instant::now() + Duration::from_millis(200);
+        assert_eq!(store.sweep_expired(due), (0, 2));
+        assert!(store.metadata(unread).is_none());
+        assert!(store.metadata(read).is_none());
+        assert!(store.metadata(kept).is_some(), "a slot without a ttl stays");
+        assert_eq!(store.lease_slot(lease), None, "the lease on it ended");
+        assert_eq!(store.deadline_count(), 0, "with its deadline");
+        assert!(store.get_chunk(transfer, 0).is_none(), "and its transfer");
+        assert_eq!(store.consume_lease(lease, read), LeaseOutcome::Unknown);
+        assert!(!store.has_pending_expiry());
+    }
+
+    /// A slot freed by its release, before its time-to-live, leaves nothing
+    /// for the reaper to look at, so the reaper can stop.
+    #[test]
+    fn a_slot_released_before_its_time_to_live_leaves_no_expiry_behind() {
+        let store = DataStore::new();
+        let ttl = RegisterOptions::new().ttl(Duration::from_secs(3600));
+        let id = store.register(Bytes::from(vec![1u8; 4096]), Some(ttl));
+        assert!(store.has_pending_expiry());
+        let lease = store.acquire_read_lock(id).unwrap();
+        assert_eq!(store.consume_lease(lease, id), LeaseOutcome::Consumed);
+        store.release_read_lock(id);
+        assert!(store.ref_decrement(id));
+        store.try_free(id);
+        assert!(store.metadata(id).is_none());
+        assert!(!store.has_pending_expiry());
+
+        let removed = store.register(
+            Bytes::from(vec![1u8; 16]),
+            Some(RegisterOptions::new().ttl(Duration::from_secs(3600))),
+        );
+        assert!(store.remove(removed).is_some());
+        assert!(!store.has_pending_expiry());
+    }
+
+    /// Poll `done` until it holds, for at most five seconds.
+    async fn eventually(done: impl Fn() -> bool) -> bool {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !done() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    /// The reaper sweeps while something is pending and stops when nothing
+    /// is, so an instance that stages nothing with a deadline arms no timer.
+    /// A deadline set after it stopped starts it again.
+    ///
+    /// Real time, not a paused clock: expiry is measured on `std`'s clock,
+    /// which a paused Tokio clock does not move.
+    #[tokio::test]
+    async fn the_reaper_runs_only_while_something_is_pending() {
+        let store = Arc::new(DataStore::new());
+        let ttl = || Some(RegisterOptions::new().ttl(Duration::from_millis(20)));
+        let first = store.register(Bytes::from(vec![1u8; 16]), ttl());
+        ensure_reaper(&store);
+        assert!(store.reaper.running.load(Ordering::Acquire));
+        assert!(
+            eventually(|| store.metadata(first).is_none()).await,
+            "reaped at its ttl"
+        );
+        assert!(
+            eventually(|| !store.reaper.running.load(Ordering::Acquire)).await,
+            "the reaper stopped with nothing pending"
+        );
+
+        let second = store.register(Bytes::from(vec![2u8; 16]), ttl());
+        ensure_reaper(&store);
+        assert!(
+            eventually(|| store.metadata(second).is_none()).await,
+            "a second reaper ran"
+        );
+        assert!(eventually(|| !store.reaper.running.load(Ordering::Acquire)).await);
+    }
+
+    /// A stopped reaper does not run again, which is what shutdown needs.
+    #[tokio::test]
+    async fn a_stopped_reaper_stays_stopped() {
+        let store = Arc::new(DataStore::new());
+        let id = store.register(
+            Bytes::from(vec![1u8; 16]),
+            Some(RegisterOptions::new().ttl(Duration::from_millis(1))),
+        );
+        store.stop_reaper();
+        ensure_reaper(&store);
+        tokio::time::sleep(SWEEP_PERIOD * 3).await;
+        assert!(store.metadata(id).is_some(), "a stopped reaper reaped");
+    }
+
+    /// A sweep that runs while a slot with a time-to-live is registered
+    /// cannot leave that slot unlisted.
+    ///
+    /// Registration lists the expiry and inserts the slot in two steps. A
+    /// sweep between them found a due listing with no slot behind it and
+    /// dropped the listing, and the slot that arrived next was never swept.
+    /// The payload of a call whose deadline had passed by the time it was
+    /// staged then stayed staged until the sender shut down.
+    #[test]
+    fn a_sweep_during_registration_cannot_unlist_the_slot() {
+        let store = DataStore::new();
+        let later = Instant::now() + Duration::from_secs(3600);
+        let _ = store
+            .between_inserts
+            .set(Box::new(move |store: &DataStore| {
+                store.sweep_expired(later);
+            }));
+        let id = store.register(
+            Bytes::from(vec![1u8; 16]),
+            Some(RegisterOptions::new().ttl(Duration::ZERO)),
+        );
+        assert_eq!(
+            store.sweep_expired(later),
+            (0, 1),
+            "the sweep during registration unlisted the slot"
+        );
+        assert!(store.metadata(id).is_none());
+        assert!(!store.has_pending_expiry());
+    }
+
+    /// A deadline set for a lease that its slot's time-to-live already ended
+    /// is dropped by the next sweep that finds it due, and the sweep can stop.
+    ///
+    /// The `_rv_acquire` handler takes the lease, creates the transfer, and
+    /// only then sets the deadline. When the slot expires between the
+    /// transfer and the deadline, `expire_slot` ends the lease first, and
+    /// the deadline set after it names a lease that is gone. The sweep left
+    /// such a deadline in place for good, so it never stopped: ten wakes a
+    /// second until the owner shut down. This replays the handler's steps
+    /// with the expiry between them.
+    #[test]
+    fn a_deadline_for_a_lease_that_expiry_ended_is_dropped() {
+        let store = DataStore::new();
+        let id = store.register(
+            Bytes::from(vec![1u8; 4096]),
+            Some(RegisterOptions::new().ttl(Duration::ZERO)),
+        );
+        let lease = store.acquire_read_lock(id).unwrap();
+        store.create_transfer(id, lease, 1024).unwrap();
+        assert_eq!(
+            store.sweep_expired(Instant::now()),
+            (0, 1),
+            "the slot expires"
+        );
+        store.set_lease_deadline(lease, id, Duration::ZERO);
+        assert!(store.has_pending_expiry());
+
+        let later = Instant::now() + Duration::from_secs(1);
+        assert_eq!(
+            store.sweep_expired(later),
+            (0, 0),
+            "a lease that is gone is not counted as reaped"
+        );
+        assert!(
+            !store.has_pending_expiry(),
+            "the deadline of a lease that is gone keeps the sweep running"
         );
     }
 }
