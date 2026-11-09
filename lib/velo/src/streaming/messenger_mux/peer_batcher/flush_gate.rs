@@ -65,8 +65,8 @@
 //!   window. Counting slots needs the batcher's slot table, which this gate
 //!   does not have: the batcher marks each slot with [`FlushGate::batch_gen`]
 //!   when it stages for it, and passes the live count in a [`FlushContext`].
-//! - [`AutoFlush::at_bytes`]: the batch has reached a size past which batching
-//!   saves no packets.
+//! - [`AutoFlush::at_bytes`]: the batch has reached about one transport
+//!   segment, past which a longer wait saves at most one partly filled packet.
 //!
 //! Neither is a reason for the idle-lane rule "write at once when the lane has
 //! been quiet": a forward pass's records reach the batcher over a fraction of a
@@ -793,8 +793,8 @@ mod tests {
         assert_eq!(gate.deadline(live(1)), Some(staged + reply_linger));
     }
 
-    /// Past a segment's worth of bytes, batching saves no packets, so a batch at
-    /// `at_bytes` goes without waiting for the window. An empty batch is never
+    /// Past about a segment's worth of bytes, a longer wait saves little, so a
+    /// batch at `at_bytes` goes without waiting for the window. An empty batch is never
     /// due by size, even though its header alone has a length.
     #[test]
     fn a_batch_at_the_byte_threshold_is_due_at_once() {

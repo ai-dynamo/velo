@@ -84,7 +84,7 @@ CAUTION: Under `Manual`, call `flush_batch()` after every pass. Without the call
 If you want batching with a time limit, use `FlushPolicy::Auto(AutoFlush { on_admission: false, max_linger: Some(window), ..Default::default() })`. The batcher then holds a batch for up to `window` after its oldest record. Two optional conditions end the wait early:
 
 - Set `on_complete: true` when a lane often carries a single stream, such as a serving worker at low concurrency. The batch then goes once every live slot on the lane has a record in it, but not sooner than `window` after the last write. Without it, each record of a lone stream waits the whole window.
-- Set `at_bytes: Some(n)` to write a batch once it reaches `n` bytes. Choose `n` near one transport segment of payload (1,448 bytes at MTU 1500, 8,948 at MTU 9000). A larger batch saves no packets. Unlike `max_batch_bytes`, it does not send larger records through rendezvous.
+- Set `at_bytes: Some(n)` to write a batch once it reaches `n` bytes. Choose `n` near one transport segment of payload (1,448 bytes at MTU 1500, 8,948 at MTU 9000). Past that, a longer wait saves at most one partly filled packet per write, and adds latency. Unlike `max_batch_bytes`, it does not send larger records through rendezvous.
 
 See [Ending the window early](../concepts/batched-streaming.md#ending-the-window-early).
 
