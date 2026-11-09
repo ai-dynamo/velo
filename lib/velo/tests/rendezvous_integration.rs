@@ -478,3 +478,109 @@ async fn a_draining_owner_serves_get_but_refuses_a_new_consumer() {
     assert_eq!(data.len(), 1024 * 1024);
     pair.consumer.release(handle, lease).await.unwrap();
 }
+
+// ---------------------------------------------------------------------------
+// An owner whose chunk metadata does not fit the size it states
+// ---------------------------------------------------------------------------
+
+/// Make `owner` answer every acquire with `chunk_count` chunks of
+/// `chunk_size` bytes for a payload of `total_len` bytes, and every pull with
+/// `chunk`. A buggy or hostile owner states these; nothing makes them agree.
+fn answer_acquires_with(
+    owner: &Velo,
+    total_len: u64,
+    chunk_size: u32,
+    chunk_count: u32,
+    chunk: &'static [u8],
+) {
+    use velo::rendezvous::protocol::{AcquireResponse, RvAcquireRequest};
+    owner
+        .messenger()
+        .register_streaming_handler(
+            Handler::typed_unary(
+                "_rv_acquire",
+                move |_ctx: TypedContext<RvAcquireRequest>| {
+                    Ok(AcquireResponse::Ready {
+                        lease_id: 1,
+                        transfer_id: 1,
+                        total_len,
+                        chunk_size,
+                        chunk_count,
+                    })
+                },
+            )
+            .build(),
+        )
+        .unwrap();
+    owner
+        .messenger()
+        .register_streaming_handler(
+            Handler::unary_handler("_rv_pull", move |_ctx| Ok(Some(Bytes::from_static(chunk))))
+                .build(),
+        )
+        .unwrap();
+}
+
+/// A `get` from an owner whose chunks do not fit the size it states fails
+/// with an error. It used to index past the buffer it had sized from
+/// `total_len` and panic in the caller's task: three chunks of one byte for
+/// a one-byte payload put the third chunk at offset 2 of a one-byte buffer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_get_refuses_chunks_that_do_not_fit_the_stated_size() {
+    let pair = VeloPair::new().await;
+    let handle = pair
+        .owner
+        .rendezvous_manager()
+        .register_data(Bytes::from_static(b"x"));
+    for (total_len, chunk_size, chunk_count, chunk) in [
+        (1, 1, 3, &b"x"[..]),
+        (1, 0, 1, &b"x"[..]),
+        (8, 4, 2, &b"xyz"[..]),
+        (8, 4, 2, &b"xyzwv"[..]),
+    ] {
+        answer_acquires_with(&pair.owner, total_len, chunk_size, chunk_count, chunk);
+        let got = tokio::spawn({
+            let consumer = pair.consumer.clone();
+            async move { consumer.rendezvous_manager().get(handle).await }
+        })
+        .await;
+        let row = format!(
+            "{chunk_count} chunks of {chunk_size} for {total_len} bytes, each {} bytes",
+            chunk.len()
+        );
+        let outcome = got.unwrap_or_else(|panic| panic!("{row}: the get panicked: {panic}"));
+        assert!(outcome.is_err(), "{row}: the get succeeded");
+    }
+}
+
+/// A staged request whose owner states chunks that do not fit its payload
+/// gets an error reply, and does not wait out its timeout: the receiver's
+/// fetch used to panic, and nothing answered the caller.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_staged_request_from_an_owner_with_bad_chunks_gets_an_error() {
+    let pair = VeloPair::new().await;
+    pair.consumer
+        .register_handler(Handler::unary_handler("echo", |ctx| Ok(Some(ctx.payload))).build())
+        .unwrap();
+    pair.owner
+        .messenger()
+        .available_handlers(pair.consumer.instance_id())
+        .await
+        .unwrap();
+    answer_acquires_with(&pair.owner, 1, 1, 3, b"x");
+
+    let err = pair
+        .owner
+        .unary("echo")
+        .unwrap()
+        .raw_payload(Bytes::from(vec![0x5a; 512 * 1024]))
+        .timeout(Duration::from_secs(5))
+        .instance(pair.consumer.instance_id())
+        .send()
+        .await
+        .expect_err("the payload cannot be fetched");
+    assert!(
+        err.downcast_ref::<RequestTimeout>().is_none(),
+        "the receiver never answered: {err:#}"
+    );
+}

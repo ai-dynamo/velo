@@ -1074,6 +1074,39 @@ async fn copy_into_pool(
 /// Pull all chunks for a chunked transfer into a `BytesMut` buffer, refusing
 /// a `total_len` over `limit` before the buffer is allocated: the length is
 /// the owner's word, and nothing else bounds it.
+/// Refuse chunk metadata that does not fit the size the owner states.
+///
+/// The owner states all three in its acquire answer, and an owner splits a
+/// payload into exactly `total_len.div_ceil(chunk_size)` chunks. Any other
+/// count would make the pull index past the buffer sized from `total_len`,
+/// or pull without end.
+fn check_chunks(total_len: u64, chunk_size: u32, chunk_count: u32) -> Result<()> {
+    let fits = match chunk_size {
+        0 => total_len == 0 && chunk_count == 0,
+        size => total_len.div_ceil(u64::from(size)) == u64::from(chunk_count),
+    };
+    if !fits {
+        anyhow::bail!(
+            "the owner stated {chunk_count} chunks of {chunk_size} bytes for a payload of {total_len} bytes"
+        );
+    }
+    Ok(())
+}
+
+/// Refuse a chunk that is not the length its place in the payload gives it:
+/// `chunk_size`, or what is left for the last one. A short chunk would leave
+/// a gap of zeros, and a long one would run past the payload.
+fn check_chunk(total_len: u64, chunk_size: u32, chunk_index: u32, len: usize) -> Result<()> {
+    let offset = u64::from(chunk_index) * u64::from(chunk_size);
+    let expected = u64::from(chunk_size).min(total_len.saturating_sub(offset));
+    if len as u64 != expected {
+        anyhow::bail!(
+            "the owner sent {len} bytes for chunk {chunk_index}, which is {expected} bytes long"
+        );
+    }
+    Ok(())
+}
+
 async fn pull_chunks(
     client: &Arc<ActiveMessageClient>,
     target_worker: WorkerId,
@@ -1090,6 +1123,7 @@ async fn pull_chunks(
         }
         .into());
     }
+    check_chunks(total_len, chunk_size, chunk_count)?;
     let mut buf = BytesMut::with_capacity(total_len as usize);
     buf.resize(total_len as usize, 0);
 
@@ -1108,8 +1142,8 @@ async fn pull_chunks(
             .await?;
 
         let offset = chunk_index as usize * chunk_size as usize;
-        let end = (offset + chunk_bytes.len()).min(total_len as usize);
-        buf[offset..end].copy_from_slice(&chunk_bytes[..end - offset]);
+        check_chunk(total_len, chunk_size, chunk_index, chunk_bytes.len())?;
+        buf[offset..offset + chunk_bytes.len()].copy_from_slice(&chunk_bytes);
     }
 
     Ok(buf)
@@ -1120,11 +1154,12 @@ async fn pull_chunks_into(
     client: &Arc<ActiveMessageClient>,
     target_worker: WorkerId,
     transfer_id: u64,
-    _total_len: u64,
+    total_len: u64,
     chunk_size: u32,
     chunk_count: u32,
     dest: &mut impl RendezvousWrite,
 ) -> Result<()> {
+    check_chunks(total_len, chunk_size, chunk_count)?;
     for chunk_index in 0..chunk_count {
         let req = RvPullRequest {
             transfer_id,
@@ -1139,6 +1174,7 @@ async fn pull_chunks_into(
             .await?;
 
         let offset = chunk_index as usize * chunk_size as usize;
+        check_chunk(total_len, chunk_size, chunk_index, chunk_bytes.len())?;
         dest.write_chunk(offset, &chunk_bytes)?;
     }
 
