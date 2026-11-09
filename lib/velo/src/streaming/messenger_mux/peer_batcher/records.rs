@@ -199,6 +199,7 @@ impl Batcher {
         let id = slot.id;
         let seq = slot.take_seq();
         let close_seq = terminal.then(|| slot.take_seq());
+        let first_for_slot = slot.mark_batch(self.gate.batch_gen());
 
         // `emit_data` opened the batch, and nothing between that and here can
         // have flushed it.
@@ -218,7 +219,7 @@ impl Batcher {
                 // flush the finalizing producer may never make.
                 self.gate.stage_urgent(2);
             }
-            None => self.gate.stage(1),
+            None => self.gate.stage_data(1, first_for_slot),
         }
 
         if terminal {

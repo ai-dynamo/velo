@@ -73,7 +73,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use self::control::{ControlInbox, DrainedControl, OwnedControl, PeerControl};
-use self::flush_gate::{FlushGate, linger_until};
+use self::flush_gate::{FlushContext, FlushGate, linger_until};
 pub(crate) use self::slot_stream::AllocError;
 use self::slot_stream::{EgressSlots, SlotItem, SlotStream};
 #[cfg(test)]
@@ -467,7 +467,7 @@ impl Batcher {
         probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let control = Arc::clone(&self.control);
         loop {
-            let deadline = self.gate.deadline();
+            let deadline = self.gate.deadline(self.flush_context());
             let work = tokio::select! {
                 biased;
                 () = cancel.cancelled() => break,
@@ -540,7 +540,7 @@ impl Batcher {
 
             let kicked = self.gate.take_kick();
 
-            if kicked || self.stopping || self.gate.should_flush() {
+            if kicked || self.stopping || self.gate.should_flush(self.flush_context()) {
                 self.flush().await;
             }
             if self.stopping {
@@ -1052,6 +1052,14 @@ impl Batcher {
 
     fn fits(&self, bytes: usize, records: u16) -> bool {
         self.writer.fits(bytes, records)
+    }
+
+    /// What the flush gate needs from the slot table and the writer.
+    fn flush_context(&self) -> FlushContext {
+        FlushContext {
+            live_slots: self.slots.live(),
+            batch_bytes: self.writer.staged_len(),
+        }
     }
 
     /// Write the staged batch, failing the epoch if it is never admitted.

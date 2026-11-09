@@ -283,6 +283,10 @@ pub(super) struct EgressSlot {
     /// Whether the slot is currently withholding for want of credit, so the
     /// starvation meter ticks once per episode rather than once per record.
     starved: bool,
+    /// The last batch (by [`FlushGate::batch_gen`]) this slot staged data into.
+    ///
+    /// [`FlushGate::batch_gen`]: super::flush_gate::FlushGate::batch_gen
+    batch_mark: u64,
 }
 
 /// A slot that dies still holding its producer's lifecycle never wrote the
@@ -303,6 +307,14 @@ impl EgressSlot {
     /// `MuxConfig::async_open_ack`) fences this slot.
     pub(super) const fn is_fenced(&self) -> bool {
         self.fenced
+    }
+
+    /// Record that this slot is staging data into batch `batch_gen`, and
+    /// whether it is the slot's first record in that batch.
+    pub(super) const fn mark_batch(&mut self, batch_gen: u64) -> bool {
+        let first = self.batch_mark != batch_gen;
+        self.batch_mark = batch_gen;
+        first
     }
 
     /// Whether a record offered now has to be withheld rather than sent.
@@ -458,6 +470,7 @@ impl EgressSlots {
             gate,
             fenced: false,
             starved: false,
+            batch_mark: 0,
         });
         self.live += 1;
         Ok((id, stream))

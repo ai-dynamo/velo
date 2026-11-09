@@ -164,6 +164,11 @@ impl BatchWriter {
         self.encoder.as_mut()
     }
 
+    /// Encoded size of the staged batch, header included; 0 when none is open.
+    pub(super) fn staged_len(&self) -> usize {
+        self.encoder.as_ref().map_or(0, BatchEncoder::encoded_len)
+    }
+
     /// The cap for the next batch to this peer.
     ///
     /// The eager budget is asked here, on the batcher's task, because

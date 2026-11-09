@@ -234,6 +234,7 @@ async fn flush_batch_forces_a_write_under_auto() {
     let policy = FlushPolicy::Auto(AutoFlush {
         on_admission: false,
         max_linger: Some(UNREACHABLE_WINDOW),
+        ..AutoFlush::default()
     });
     let producer = node(Some(mux(policy))).await;
     let consumer = node(Some(mux(policy))).await;
