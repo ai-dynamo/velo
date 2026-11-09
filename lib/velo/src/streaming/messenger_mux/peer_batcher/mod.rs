@@ -1105,6 +1105,18 @@ impl Batcher {
     // -----------------------------------------------------------------------
 
     fn close_local(&mut self, index: u32) {
+        // Not every close writes the batch: a close from the receiver and a
+        // cancelled consumer write nothing. A slot that leaves with a record
+        // in the batch must stop counting toward a complete batch, or one
+        // record from another slot would make it look complete.
+        let batch = self.gate.batch_gen();
+        if self
+            .slots
+            .get_mut(index)
+            .is_some_and(|slot| slot.in_batch(batch))
+        {
+            self.gate.slot_left_batch();
+        }
         if let Some(withheld) = self.slots.close(index) {
             self.account_closed(slot_stream::Closed { slots: 1, withheld });
         }

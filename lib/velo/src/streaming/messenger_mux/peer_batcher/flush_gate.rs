@@ -200,6 +200,13 @@ impl FlushGate {
         self.batch_gen
     }
 
+    /// A slot with a data record in the open batch closed. It no longer counts
+    /// toward a complete batch: it is not live, and the batch must not go
+    /// early because of a record from a slot that is gone.
+    pub(super) fn slot_left_batch(&mut self) {
+        self.slots_in_batch = self.slots_in_batch.saturating_sub(1);
+    }
+
     /// As [`Self::stage`], for one slot's data records. `first_for_slot` says
     /// the slot had no record in this batch yet, which is what
     /// [`AutoFlush::on_complete`](super::super::AutoFlush::on_complete) counts.
@@ -340,8 +347,9 @@ impl FlushGate {
     /// policy that lets such a batch go early.
     ///
     /// Credit replies and closes do not count, so a replies-only batch is never
-    /// complete. `>=` rather than `==` because a slot can close while its record
-    /// is still staged; its close is urgent and writes the batch anyway.
+    /// complete. A slot that closes leaves the count
+    /// ([`Self::slot_left_batch`]), so the two sides stay equal; `>=` only
+    /// keeps a miscount from holding a batch back.
     fn complete(&self, ctx: FlushContext) -> bool {
         self.policy.on_complete() && ctx.live_slots > 0 && self.slots_in_batch >= ctx.live_slots
     }

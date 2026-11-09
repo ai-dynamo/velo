@@ -512,6 +512,41 @@ async fn on_complete_waits_for_every_live_slot() {
     );
 }
 
+/// A slot that closes with its record still in the batch stops counting
+/// toward a complete batch.
+///
+/// The receiver closes `a` after its record is staged. Neither that close nor
+/// a cancelled consumer writes anything to the batch, so nothing writes it
+/// at once. The batch still held `a` in its count of slots with a record, so
+/// one record from `b` made it look complete beside the two slots left live,
+/// and it went early without `c`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_slot_closed_after_staging_does_not_complete_the_batch() {
+    const WINDOW: Duration = Duration::from_secs(1);
+    let harness = harness(windowed(WINDOW, true, None)).await;
+    let (a, a_slot) = harness.open_credited(1, 1, CREDIT).await;
+    let (b, _) = harness.open_credited(2, 2, CREDIT).await;
+    let (_c, _) = harness.open_credited(3, 3, CREDIT).await;
+    tokio::time::sleep(WINDOW + Duration::from_millis(100)).await;
+
+    a.send(item(0)).expect("stage on a");
+    harness.await_staged(1).await;
+    harness.handle.peer_closed(a_slot, CloseReason::UnknownSlot);
+    super::support::eventually(|| {
+        harness
+            .handle
+            .live_slots
+            .load(std::sync::atomic::Ordering::Relaxed)
+            == 2
+    })
+    .await;
+
+    b.send(item(1)).expect("stage on b");
+    assert_nothing_written(&harness).await;
+    let batch = harness.next_batch().await;
+    assert_eq!(batch.records.len(), 2, "a's record and b's, at the window");
+}
+
 /// A batch that reaches `at_bytes` goes without waiting for the window and
 /// without a kick. Below it, the window still holds the batch.
 #[tokio::test(flavor = "multi_thread")]

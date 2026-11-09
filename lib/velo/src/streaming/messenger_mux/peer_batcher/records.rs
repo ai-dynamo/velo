@@ -199,7 +199,10 @@ impl Batcher {
         let id = slot.id;
         let seq = slot.take_seq();
         let close_seq = terminal.then(|| slot.take_seq());
-        let first_for_slot = slot.mark_batch(self.gate.batch_gen());
+        // Marked only for a record the gate counts: a terminal goes as an
+        // urgent pair, and `close_local` must not take back what was never
+        // counted.
+        let first_for_slot = !terminal && slot.mark_batch(self.gate.batch_gen());
 
         // `emit_data` opened the batch, and nothing between that and here can
         // have flushed it.
