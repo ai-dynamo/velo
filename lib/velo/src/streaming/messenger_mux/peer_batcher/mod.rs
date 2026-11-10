@@ -841,7 +841,7 @@ impl Batcher {
         // `docs/src/operations/response-plane-performance.md` rather than a
         // fix owed here.
         let seq = self.open_seq(id);
-        self.fire_singleton(id, FenceSkip::IfAdmitted, None, |encoder| {
+        self.fire_singleton(id, FenceSkip::IfAdmitted, None, None, |encoder| {
             encoder.push_open_slot(id, seq, anchor_id, session_id)
         });
         let _ = ack.send(Ok(()));
@@ -906,9 +906,11 @@ impl Batcher {
         id: SlotId,
         skip: FenceSkip,
         retire: Option<RetireGuard>,
+        session: Option<u64>,
         write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
     ) -> bool {
-        let Some(fire) = self.writer.dispatch_singleton(write) else {
+        let stream = session.map(|session| (id, session));
+        let Some(fire) = self.writer.dispatch_singleton(write, stream) else {
             self.epoch_death();
             return false;
         };
@@ -1104,6 +1106,18 @@ impl Batcher {
     // -----------------------------------------------------------------------
 
     fn close_local(&mut self, index: u32) {
+        // Not every close writes the batch: a close from the receiver and a
+        // cancelled consumer write nothing. A slot that leaves with a record
+        // in the batch must stop counting toward a complete batch, or one
+        // record from another slot would make it look complete.
+        let batch = self.gate.batch_gen();
+        if self
+            .slots
+            .get_mut(index)
+            .is_some_and(|slot| slot.in_batch(batch))
+        {
+            self.gate.slot_left_batch();
+        }
         if let Some(withheld) = self.slots.close(index) {
             self.account_closed(slot_stream::Closed { slots: 1, withheld });
         }

@@ -168,8 +168,8 @@ impl ActiveMessageClient {
     ) -> Result<SendOutcome> {
         // Transparent large payload staging: a payload over the threshold is
         // staged, and the message carries its handle instead.
-        let staged = match self.large_payload_stager.get() {
-            Some(stager) if message.payload.len() > stager.threshold() => {
+        let staged = match self.stager_for(message.payload.len()) {
+            Some(stager) => {
                 let payload = std::mem::take(&mut message.payload);
                 let budget =
                     fetch_by.map(|at| at.saturating_duration_since(tokio::time::Instant::now()));
@@ -177,7 +177,7 @@ impl ActiveMessageClient {
                 // the caller has given up, nobody waits for it.
                 Some((stager.stage(payload, budget), budget))
             }
-            _ => None,
+            None => None,
         };
 
         let (header, payload, message_type) = encode_outbound(message, staged)?;
@@ -253,6 +253,18 @@ impl ActiveMessageClient {
                 .map(|stager| stager.threshold()),
             envelope_overhead(handler_name, headers, injected.as_ref()),
         )
+    }
+
+    /// The stager that takes a payload of `len` bytes, if a send of that size
+    /// is staged. The one place the staging decision is made, so a caller
+    /// that needs to know before it sends (the mux) agrees with the send.
+    pub(crate) fn stager_for(
+        &self,
+        len: usize,
+    ) -> Option<&Arc<dyn crate::messenger::large_payload::LargePayloadStager>> {
+        self.large_payload_stager
+            .get()
+            .filter(|stager| len > stager.threshold())
     }
 
     /// Register a peer in the client peer registry (internal use)

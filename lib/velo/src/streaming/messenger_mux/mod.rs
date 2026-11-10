@@ -127,6 +127,7 @@ use self::flow_control::NegotiatedLimits;
 use self::ingress::IngressRegistry;
 use self::lane_choice::LaneLoad;
 use self::peer_batcher::{BatcherHandle, BatcherMap, OpenRejected, OpenSlotRequest};
+use crate::messenger::large_payload::RefusedPayload;
 use crate::messenger::{Context, Handler, Messenger};
 use crate::observability::{MuxMetricsHandle, VeloMetrics};
 use crate::streaming::deadline::DeadlineQueue;
@@ -147,6 +148,60 @@ pub(crate) use self::lane_choice::LaneReservation;
 /// is compared against — a caller that had to spell the string itself would be
 /// re-deriving the one value negotiation is keyed on.
 pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
+
+/// The header a staged singleton batch carries: the sender's epoch, the full
+/// id of the slot its one data record belongs to, and the routing session the
+/// slot was opened with, as `<epoch>:<slot>:<session>`.
+///
+/// The receiver resolves a staged singleton before it reads it. A receiver
+/// that refuses the payload for its size
+/// (`VeloBuilder::staged_payload_max`) never reads the record, so this is
+/// what lets it end that one stream. Without it the stream would keep a gap
+/// that never closes until its watchdog. The id is the sender's word, but it
+/// is looked up only in the table of the (peer, lane) the batch came from, so
+/// a sender can end only its own streams.
+///
+/// A resolve can outlive its stream, so the header must name that stream's
+/// lifetime and no other. A slot id does not: a replaced batcher reuses ids,
+/// and within one epoch a cancelled slot's index is reused and its eight-bit
+/// generation wraps. The session is the receiver's own `u64`, unique on its
+/// node and never reused, and the receiver checks it, with the epoch and the
+/// id, under the slot table's lock.
+const SINGLETON_SLOT_HEADER: &str = "_mux_slot";
+
+/// The headers of a singleton batch for slot `id`, opened with `session`, in
+/// `epoch`. One small map per staged record, which is over the eager budget
+/// by definition.
+fn singleton_headers(
+    epoch: u64,
+    id: protocol::SlotId,
+    session: u64,
+) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([(
+        SINGLETON_SLOT_HEADER.to_string(),
+        format!("{epoch}:{}:{session}", id.raw()),
+    )])
+}
+
+/// The one stream a refused singleton was for.
+pub(crate) struct SingletonRecord {
+    pub(crate) epoch: u64,
+    pub(crate) slot: protocol::SlotId,
+    pub(crate) session: u64,
+}
+
+/// The stream a refused singleton named, if its headers name one in full.
+fn singleton_record(
+    headers: Option<&std::collections::HashMap<String, String>>,
+) -> Option<SingletonRecord> {
+    let mut parts = headers?.get(SINGLETON_SLOT_HEADER)?.split(':');
+    let record = SingletonRecord {
+        epoch: parts.next()?.parse().ok()?,
+        slot: protocol::SlotId::from_raw(parts.next()?.parse().ok()?),
+        session: parts.next()?.parse().ok()?,
+    };
+    parts.next().is_none().then_some(record)
+}
 
 /// Attempts `connect` makes before giving up on a batcher that keeps retiring
 /// underneath it. Two is already generous — losing the race twice requires two
@@ -391,6 +446,15 @@ impl MessengerMuxTransport {
             // Records and credit of open streams: see
             // `register_drain_exempt_handler`.
             messenger.register_drain_exempt_handler(handler)?;
+            let refusal_core = Arc::downgrade(&core);
+            messenger.on_payload_refused(
+                lane.handler_name(),
+                Arc::new(move |refused: &RefusedPayload<'_>| {
+                    if let Some(core) = refusal_core.upgrade() {
+                        core.refuse_singleton(PeerLane::new(refused.sender, lane), refused);
+                    }
+                }),
+            );
         }
 
         sweep::spawn_sweep(&core);
@@ -555,6 +619,45 @@ impl MuxCore {
     /// sends none. The reply is what that idle producer needs, since the
     /// fault that carries the same news to it otherwise rides on the next
     /// record it sends.
+    /// End the stream whose singleton this node refused for its size, with a
+    /// `TransportError` that names both sizes, and tell its producer to cancel
+    /// it. When its `OpenSlot` has not been applied yet, the refusal waits on
+    /// the stream's bind (see [`IngressRegistry::refuse_record`]).
+    fn refuse_singleton(&self, key: PeerLane, refused: &RefusedPayload<'_>) {
+        if self.tasks.is_stopped() {
+            return;
+        }
+        let Some(record) = singleton_record(refused.headers) else {
+            tracing::warn!(
+                peer = %key.peer,
+                "messenger mux: a refused singleton named no slot; its stream ends by its watchdog"
+            );
+            return;
+        };
+        let why = format!("refused a staged stream item: {}", refused.too_large);
+        let Ok(frame) =
+            rmp_serde::to_vec(&crate::streaming::StreamFrame::<()>::TransportError(why))
+        else {
+            return;
+        };
+        let Some(reply) = self.ingress.refuse_record(
+            key,
+            &record,
+            frame,
+            self.metrics.as_ref(),
+            self.config.peer_byte_budget,
+        ) else {
+            return;
+        };
+        if let Some(metrics) = &self.metrics {
+            metrics.slot_closed();
+        }
+        let Ok(batcher) = self.batcher(key) else {
+            return;
+        };
+        self.send_replies(&batcher, key, &[reply]);
+    }
+
     fn close_claimed_slot(&self, key: PeerLane, slot: protocol::SlotId, session_id: Option<u64>) {
         // Task submission uses the service runtime, including calls from Drop
         // on a plain thread or a different runtime.

@@ -686,3 +686,130 @@ impl Drop for StalledHarness {
         self.cancel.cancel();
     }
 }
+
+/// A messenger without a stager can send a singleton up to its transport's
+/// frame limit. Adding the mux's refusal header must not lose that record.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_singleton_at_the_eager_frame_limit_reaches_its_peer() {
+    let harness = harness(MuxConfig::default()).await;
+    let (inlet, id) = harness.open_credited(1, 1, 2).await;
+    let budget = harness._sender.effective_eager_payload(
+        harness._capture.instance_id(),
+        LaneIndex::ZERO.handler_name(),
+        None,
+    );
+    let frame_len = budget - BATCH_HEADER_LEN - record_encoded_len(0).unwrap();
+    let mut item = crate::streaming::ByteItemBuilder::with_capacity(frame_len);
+    item.buffer().resize(frame_len, 7);
+    let frame = item.finish().expect("valid byte item").into_vec();
+
+    let mut control = BatchEncoder::new(1, 1, LaneIndex::ZERO);
+    control.push_data(id, 1, &frame).expect("control record");
+    let control = control.finish().freeze();
+    assert_eq!(control.len(), budget);
+    harness
+        ._sender
+        .am_send_streaming(LaneIndex::ZERO.handler_name())
+        .unwrap()
+        .raw_payload(control)
+        .worker(harness.key.peer)
+        .send()
+        .await
+        .expect("the same record fits without the refusal header");
+    let control = harness.next_batch().await;
+    assert_eq!(control.records[0].data, frame);
+
+    inlet.send(frame.clone()).expect("queue singleton");
+    let payload = tokio::time::timeout(Duration::from_secs(2), harness.batches.recv_async())
+        .await
+        .expect("a singleton that fits the eager frame limit must reach its peer")
+        .expect("capture channel");
+    let received = OwnedBatch::decode(&payload);
+    assert_eq!(received.records[0].data, frame);
+}
+
+/// An inline singleton carries no refusal headers. Its producer uses at most
+/// seven allocations after warm-up, regardless of the routing session's width.
+#[tokio::test]
+async fn an_inline_singleton_allocates_no_refusal_headers() {
+    use futures::FutureExt;
+
+    let (sender, capture, batches) = capture_pair().await;
+    let key = PeerLane::new(capture.instance_id().worker_id(), LaneIndex::ZERO);
+    let config = MuxConfig::default();
+    let tasks = crate::streaming::tasks::StreamTasks::default();
+    let control = Arc::new(ControlInbox::new(None));
+    let (opens, _open_rx) = flume::bounded(1);
+    let handle = Arc::new(BatcherHandle {
+        opens,
+        control: Arc::clone(&control),
+        live_slots: AtomicUsize::new(1),
+        idle_ticks: AtomicU32::new(0),
+        retired: AtomicBool::new(false),
+    });
+    let mut batcher = Batcher {
+        tasks: tasks.clone(),
+        key,
+        metrics: None,
+        handle,
+        epochs: Arc::new(AtomicU64::new(2)),
+        batchers: Arc::default(),
+        ingress: Arc::default(),
+        cancel: tasks.cancellation_token(),
+        control,
+        gate: FlushGate::new(config.flush_policy, config.reply_linger, None),
+        writer: BatchWriter::new(Arc::clone(&sender), key, config.clone(), None, 1),
+        slots: EgressSlots::default(),
+        streams: SelectAll::new(),
+        stopping: false,
+        teardown_complete: false,
+        async_open_ack: false,
+        staged_credit: Vec::new(),
+        retire_on_flush: Vec::new(),
+        hooks: None,
+    };
+    let (_inlet, rx) = flume::bounded(1);
+    let (id, stream) = batcher
+        .slots
+        .allocate(rx, SlotCredit::new(32), config.slot_byte_budget)
+        .expect("slot");
+    batcher.streams.push(stream);
+    let mut item = crate::streaming::ByteItemBuilder::with_capacity(128 * 1024);
+    item.buffer().resize(128 * 1024, 7);
+    let frame = item.finish().unwrap().into_vec();
+    assert!(frame.len() > config.max_batch_bytes);
+    assert!(
+        sender.effective_eager_payload(capture.instance_id(), key.lane.handler_name(), None)
+            > frame.len() + 64
+    );
+
+    let mut counts = Vec::new();
+    for session in [1, u64::MAX, 1, u64::MAX, 1, u64::MAX] {
+        let slot = batcher.slots.get_mut(id.index()).unwrap();
+        slot.session_id = session;
+        slot.unfence();
+        let bytes = frame.clone();
+        let (done, allocations) = crate::test_alloc::allocations_in(|| {
+            batcher.on_frame(id.index(), bytes).now_or_never()
+        });
+        assert!(
+            done.is_some(),
+            "an eager singleton does not await admission"
+        );
+        let payload = tokio::time::timeout(RECV_TIMEOUT, batches.recv_async())
+            .await
+            .expect("inline batch arrives")
+            .expect("capture");
+        assert_eq!(OwnedBatch::decode(&payload).records[0].data, frame);
+        while tasks.len() != 0 {
+            tokio::task::yield_now().await;
+        }
+        counts.push(allocations);
+    }
+    batcher.teardown_complete = true;
+    eprintln!("inline singleton allocations: {counts:?}");
+    assert!(
+        counts[2..].iter().all(|&count| count <= 7),
+        "an inline singleton exceeds its allocation budget of 7: {counts:?}"
+    );
+}

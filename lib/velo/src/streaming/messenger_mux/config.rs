@@ -53,8 +53,9 @@ pub struct AutoFlush {
     /// single stream on a lane is the common case: without this, each of its
     /// records waits the whole window alone. With many slots, some are always
     /// idle (in prefill, or between turns), so the batch is never complete and
-    /// the window applies as before. A pass is never split: the early write
-    /// carries a record from every live slot.
+    /// the window applies as before. The early write carries a record from
+    /// every live slot, so it never sends the start of a pass alone; a pass
+    /// can still be split at a window edge, as under the plain window.
     ///
     /// The `max_linger` spacing keeps writes at no more than one per window
     /// when one stream sends faster than the window. Needs `max_linger`;
@@ -62,8 +63,8 @@ pub struct AutoFlush {
     pub on_complete: bool,
     /// Also write once the staged batch is this many bytes.
     ///
-    /// Batching saves packets only until a batch fills a transport segment;
-    /// past that, waiting adds latency and saves only write calls. Unlike
+    /// Past about one transport segment, a longer wait saves at most one
+    /// partly filled packet per write, and adds latency. Unlike
     /// [`MuxConfig::max_batch_bytes`], this does not change which records go
     /// through rendezvous: a single record larger than it is still sent eagerly
     /// in a batch of its own.

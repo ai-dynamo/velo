@@ -65,8 +65,8 @@
 //!   window. Counting slots needs the batcher's slot table, which this gate
 //!   does not have: the batcher marks each slot with [`FlushGate::batch_gen`]
 //!   when it stages for it, and passes the live count in a [`FlushContext`].
-//! - [`AutoFlush::at_bytes`]: the batch has reached a size past which batching
-//!   saves no packets.
+//! - [`AutoFlush::at_bytes`]: the batch has reached about one transport
+//!   segment, past which a longer wait saves at most one partly filled packet.
 //!
 //! Neither is a reason for the idle-lane rule "write at once when the lane has
 //! been quiet": a forward pass's records reach the batcher over a fraction of a
@@ -198,6 +198,13 @@ impl FlushGate {
     /// slot it stages for.
     pub(super) const fn batch_gen(&self) -> u64 {
         self.batch_gen
+    }
+
+    /// A slot with a data record in the open batch closed. It no longer counts
+    /// toward a complete batch: it is not live, and the batch must not go
+    /// early because of a record from a slot that is gone.
+    pub(super) fn slot_left_batch(&mut self) {
+        self.slots_in_batch = self.slots_in_batch.saturating_sub(1);
     }
 
     /// As [`Self::stage`], for one slot's data records. `first_for_slot` says
@@ -340,8 +347,9 @@ impl FlushGate {
     /// policy that lets such a batch go early.
     ///
     /// Credit replies and closes do not count, so a replies-only batch is never
-    /// complete. `>=` rather than `==` because a slot can close while its record
-    /// is still staged; its close is urgent and writes the batch anyway.
+    /// complete. A slot that closes leaves the count
+    /// ([`Self::slot_left_batch`]), so the two sides stay equal; `>=` only
+    /// keeps a miscount from holding a batch back.
     fn complete(&self, ctx: FlushContext) -> bool {
         self.policy.on_complete() && ctx.live_slots > 0 && self.slots_in_batch >= ctx.live_slots
     }
@@ -785,8 +793,8 @@ mod tests {
         assert_eq!(gate.deadline(live(1)), Some(staged + reply_linger));
     }
 
-    /// Past a segment's worth of bytes, batching saves no packets, so a batch at
-    /// `at_bytes` goes without waiting for the window. An empty batch is never
+    /// Past about a segment's worth of bytes, a longer wait saves little, so a
+    /// batch at `at_bytes` goes without waiting for the window. An empty batch is never
     /// due by size, even though its header alone has a length.
     #[test]
     fn a_batch_at_the_byte_threshold_is_due_at_once() {

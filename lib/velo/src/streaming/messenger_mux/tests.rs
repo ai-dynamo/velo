@@ -185,6 +185,266 @@ async fn bind_slot(mux: &MessengerMuxTransport, anchor_id: u64, session_id: u64)
     BoundSlot { rx, drain }
 }
 
+/// A staged item can finish resolving after its batcher's epoch ends.
+/// Its refusal must not end a stream that reuses the id in the next epoch.
+#[tokio::test]
+async fn a_stale_payload_refusal_spares_a_stream_in_a_new_epoch() {
+    use crate::messenger::large_payload::PayloadTooLarge;
+    use protocol::{BatchEncoder, SlotId};
+
+    let messenger = Messenger::builder()
+        .add_transport(tcp_transport())
+        .build()
+        .await
+        .expect("messenger");
+    let mux = MessengerMuxTransport::new(
+        messenger,
+        test_config(),
+        None,
+        crate::streaming::ReservationConfig::default().prebind_timeout,
+    )
+    .expect("mux");
+    let key = lane0(WorkerId::from_u64(0xABCD));
+    let id = SlotId::new(0, 0).expect("slot id");
+    let first = bind_slot(&mux, 7, 11).await;
+    let mut open = BatchEncoder::new(1, 0, key.lane);
+    open.push_open_slot(id, 0, 7, 11).expect("first open");
+    mux.core.deliver_batch(key, &open.finish().freeze());
+    assert_eq!(mux.core.ingress.live_slot_ids(key), vec![id]);
+
+    // The resolver retains these headers while it waits for the first item's owner.
+    let headers = singleton_headers(1, id, 11);
+    let refused = RefusedPayload {
+        sender: key.peer,
+        headers: Some(&headers),
+        too_large: PayloadTooLarge {
+            len: 64 << 20,
+            limit: 1 << 20,
+        },
+    };
+    let replacement = bind_slot(&mux, 7, 12).await;
+    let mut open = BatchEncoder::new(2, 0, key.lane);
+    open.push_open_slot(id, 0, 7, 12).expect("replacement open");
+    open.push_data(id, 1, &item(7)).expect("replacement item");
+    mux.core.deliver_batch(key, &open.finish().freeze());
+    assert!(first.is_disconnected(), "the first epoch has ended");
+    assert_eq!(replacement.recv().await, item(7));
+
+    mux.core.refuse_singleton(key, &refused);
+
+    assert!(
+        !replacement.is_disconnected(),
+        "the first epoch's refused item closed the replacement stream: {:?}",
+        replacement.rx.try_recv()
+    );
+    assert_eq!(mux.core.ingress.live_slot_ids(key), vec![id]);
+}
+
+/// Cancel can retire a slot while its resolve still runs. Its eight-bit
+/// generation can wrap before that resolve's refusal arrives.
+#[tokio::test]
+async fn a_refusal_after_cancel_spares_a_reused_id_in_the_same_epoch() {
+    use crate::messenger::large_payload::PayloadTooLarge;
+    use protocol::{BatchEncoder, CloseReason, SlotId};
+
+    let node = prebinding_node(test_config(), None).await;
+    let mux = &node.mux;
+    let key = lane0(WorkerId::from_u64(0xABCD));
+    let id = SlotId::new(0, 0).expect("slot id");
+    let first = bind_slot(mux, 7, 11).await;
+    let mut open = BatchEncoder::new(1, 0, key.lane);
+    open.push_open_slot(id, 0, 7, 11).expect("first open");
+    mux.core.deliver_batch(key, &open.finish().freeze());
+    let headers = singleton_headers(1, id, 11);
+    let refused = RefusedPayload {
+        sender: key.peer,
+        headers: Some(&headers),
+        too_large: PayloadTooLarge {
+            len: 64 << 20,
+            limit: 1 << 20,
+        },
+    };
+    assert!(
+        mux.core
+            .ingress
+            .close_consumer_gone(key, id, None, Some(11))
+            .is_some()
+    );
+    assert!(first.is_disconnected(), "cancel retired the first stream");
+
+    for generation in 1..=u8::MAX {
+        let session = 11 + u64::from(generation);
+        let consumer = bind_slot(mux, 7, session).await;
+        let next_id = SlotId::new(0, generation).expect("slot id");
+        let mut batch = BatchEncoder::new(1, u32::from(generation), key.lane);
+        batch.push_open_slot(next_id, 0, 7, session).expect("open");
+        batch
+            .push_data(next_id, 1, cached_finalized())
+            .expect("terminal");
+        batch
+            .push_close_slot(next_id, 2, CloseReason::TerminalSent)
+            .expect("close");
+        mux.core.deliver_batch(key, &batch.finish().freeze());
+        assert_eq!(consumer.recv().await, *cached_finalized());
+        assert!(consumer.is_disconnected());
+    }
+
+    let replacement = bind_slot(mux, 7, 267).await;
+    let mut open = BatchEncoder::new(1, 256, key.lane);
+    open.push_open_slot(id, 0, 7, 267)
+        .expect("replacement open");
+    open.push_data(id, 1, &item(7)).expect("replacement item");
+    mux.core.deliver_batch(key, &open.finish().freeze());
+    assert_eq!(replacement.recv().await, item(7));
+
+    mux.core.refuse_singleton(key, &refused);
+
+    assert!(
+        !replacement.is_disconnected(),
+        "the cancelled stream's refusal closed a later stream after generation wrap"
+    );
+    assert_eq!(mux.core.ingress.live_slot_ids(key), vec![id]);
+}
+
+/// A terminal held behind a refused item must not leave the anchor waiting.
+#[tokio::test]
+async fn a_payload_refusal_ends_an_anchor_with_a_terminal_in_the_hold() {
+    use crate::messenger::large_payload::PayloadTooLarge;
+    use protocol::{BatchEncoder, CloseReason, SlotId};
+
+    let node = prebinding_node(test_config(), None).await;
+    let mut anchor = node.manager.create_anchor::<u32>();
+    let (_, anchor_id) = anchor.handle().unpack();
+    let ticket = node
+        .manager
+        .prebind_anchor(anchor.handle())
+        .expect("ticket");
+    let key = lane0(WorkerId::from_u64(0xABCD));
+    let id = SlotId::new(0, 0).expect("slot id");
+    let mut batch = BatchEncoder::new(1, 0, key.lane);
+    batch
+        .push_open_slot(id, 0, anchor_id, ticket.routing_session_id)
+        .expect("open");
+    batch.push_data(id, 1, &item(7)).expect("first item");
+    batch
+        .push_data(id, 3, cached_finalized())
+        .expect("terminal ahead of seq 2");
+    batch
+        .push_close_slot(id, 4, CloseReason::TerminalSent)
+        .expect("close");
+    node.mux.core.deliver_batch(key, &batch.finish().freeze());
+    let first = tokio::time::timeout(Duration::from_secs(1), anchor.next())
+        .await
+        .expect("first item arrives");
+    assert!(matches!(first, Some(Ok(StreamFrame::Item(7)))));
+
+    let headers = singleton_headers(1, id, ticket.routing_session_id);
+    node.mux.core.refuse_singleton(
+        key,
+        &RefusedPayload {
+            sender: key.peer,
+            headers: Some(&headers),
+            too_large: PayloadTooLarge {
+                len: 64 << 20,
+                limit: 1 << 20,
+            },
+        },
+    );
+    assert_eq!(node.mux.core.ingress.live_slots(key), 0);
+
+    let terminal = tokio::time::timeout(Duration::from_secs(1), anchor.next())
+        .await
+        .expect("the refused item must end the anchor even when its terminal arrived first");
+    let Some(Err(crate::streaming::StreamError::TransportError(why))) = terminal else {
+        panic!("expected the size error, got {terminal:?}");
+    };
+    assert!(why.contains("67108864"), "{why}");
+    assert!(why.contains("1048576"), "{why}");
+}
+
+/// An eager open can be queued while the detached resolver refuses its first item.
+/// The refusal must follow that open through the ordered lane.
+#[tokio::test]
+async fn a_payload_refusal_ends_a_stream_whose_open_is_queued() {
+    use crate::messenger::common::messages::ResponseType;
+    use crate::messenger::common::responses::ResponseId;
+    use crate::messenger::large_payload::PayloadTooLarge;
+    use crate::messenger::server::{DispatcherHub, InboundCall};
+    use protocol::{BatchEncoder, SlotId};
+
+    let node = prebinding_node(test_config(), None).await;
+    let mut anchor = node.manager.create_anchor::<u32>();
+    let (_, anchor_id) = anchor.handle().unpack();
+    let ticket = node
+        .manager
+        .prebind_anchor(anchor.handle())
+        .expect("ticket");
+    let message_id = ResponseId::from_u128(1);
+    let key = lane0(WorkerId::from_u64(message_id.worker_id()));
+    let id = SlotId::new(0, 0).expect("slot id");
+    let core = Arc::clone(&node.mux.core);
+    let handler = Handler::am_handler_async(key.lane.handler_name(), move |ctx: Context| {
+        let core = Arc::clone(&core);
+        async move {
+            core.deliver_batch(key, &ctx.payload);
+            Ok(())
+        }
+    })
+    .ordered()
+    .build();
+    let hub = DispatcherHub::new(Arc::clone(node.messenger.backend()));
+    hub.set_system(Arc::clone(&node.messenger)).expect("system");
+    hub.handlers_arc()
+        .insert(key.lane.handler_name().to_string(), handler.dispatcher);
+    let core = Arc::clone(&node.mux.core);
+    hub.on_refused(
+        key.lane.handler_name(),
+        Arc::new(move |refused| core.refuse_singleton(key, refused)),
+    );
+    let mut open = BatchEncoder::new(1, 0, key.lane);
+    open.push_open_slot(id, 0, anchor_id, ticket.routing_session_id)
+        .expect("open");
+    hub.dispatch_message(
+        key.lane.handler_name(),
+        InboundCall {
+            message_id,
+            payload: open.finish().freeze(),
+            response_type: ResponseType::FireAndForget,
+            headers: None,
+            staged: false,
+            in_flight: None,
+        },
+        &node.messenger,
+    );
+    assert_eq!(node.mux.core.ingress.live_slots(key), 0);
+
+    // No yield: the open is queued, as when the resolver runs on another worker.
+    let headers = singleton_headers(1, id, ticket.routing_session_id);
+    hub.refused(
+        key.lane.handler_name(),
+        &RefusedPayload {
+            sender: key.peer,
+            headers: Some(&headers),
+            too_large: PayloadTooLarge {
+                len: 64 << 20,
+                limit: 1 << 20,
+            },
+        },
+    );
+
+    let terminal = tokio::time::timeout(Duration::from_secs(1), anchor.next())
+        .await
+        .expect("a refusal must survive an OpenSlot already queued on its ordered lane");
+    assert!(
+        matches!(
+            terminal,
+            Some(Err(crate::streaming::StreamError::TransportError(_)))
+        ),
+        "expected the size error, got {terminal:?}"
+    );
+    assert_eq!(node.mux.core.ingress.live_slots(key), 0);
+}
+
 async fn eventually(mut predicate: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + RECV_TIMEOUT;
     while tokio::time::Instant::now() < deadline {

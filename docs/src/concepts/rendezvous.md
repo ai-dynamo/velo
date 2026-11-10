@@ -166,6 +166,21 @@ A sweep in the store enforces both, every 100 ms. It starts when a deadline or a
 
 The lease deadline is a header, not a field of `RvAcquireRequest`, because a new public field breaks code that builds the request. A message from the receiver that abandons the fetch was rejected. Before `_rv_acquire` returns, the receiver has no lease to name, and a lost message still leaves the payload staged. What still stays staged is in [the limitation](../appendix/limitations.md#a-staged-payload-without-a-deadline-can-stay-staged).
 
+### The receiver's limit
+
+A staged payload's size is its owner's word: the acquire answer states `total_len`, or a descriptor states its length. With no limit, the consumer allocates that size before it pulls a byte, so one peer can make another allocate any amount for one message. `VeloBuilder::staged_payload_max` sets the largest payload a node takes this way. The transparent resolver checks the stated size against it before it allocates anything, on the chunked path and on the RDMA path.
+
+A payload over the limit is refused:
+
+- The consumer releases the handle, so the owner frees the staged copy. Transparent handles are single-use, and a detached one would stay on the owner with nobody left to read it.
+- A request that expects a reply fails with an error that names both sizes. Its handler never runs.
+- A stream item on the messenger mux ends its own stream with a `TransportError` that names both sizes, and the producer is told to stop ([Batched streaming](batched-streaming.md#a-record-refused-for-its-size)). Other streams from the same peer go on.
+- Any other fire-and-forget message is lost, and the refusal is logged.
+
+The limit does not bound a payload under the staging threshold. Such a payload travels inline, in one transport frame, and the frame limit bounds it.
+
+The size is checked after the acquire, from its answer, not by a `_rv_metadata` query first: that query would add a round trip to every staged payload to catch the rare one that is too large. The check is not after the allocation, because by then the memory is spent.
+
 ## Reading on the consumer
 
 - `get` GETs into a pool buffer on the consumer, then copies into `Bytes` so the pool space returns at once.
@@ -349,6 +364,7 @@ See [Shutdown and drain](shutdown.md) for the messenger half.
 | `DEFAULT_THRESHOLD` | constant (the `Velo` builder uses it) | 256 KiB | Messenger payloads above this go through rendezvous. |
 | `staged_fetch_timeout` | `VeloBuilder` | `None` | The longest the receiver fetches a staged payload. A call's `.timeout` bounds it too. Stream items are exempt. |
 | `DEFAULT_CHUNK_SIZE` | constant | 512 KiB | Chunk size of the chunked path. |
+| `staged_payload_max` | `VeloBuilder` | `None` | The largest payload this node takes from a peer by rendezvous. Checked before anything of its size is allocated. |
 | `rdma_min_bytes` | `RdmaRendezvousConfig` | 64 KiB | Pinned slots below this answer chunked. |
 | `enabled` | `RdmaRendezvousConfig` | `true` | The kill switch. |
 | `lease_timeout` | `RdmaRendezvousConfig` | 30 s | RDMA lease deadline. Clamped to at least 1 ms. |

@@ -77,6 +77,30 @@ pub trait LargePayloadResolver: Send + Sync {
 /// Header key used to signal that the payload was staged via rendezvous.
 pub const RV_HEADER_KEY: &str = "_rv";
 
+/// A staged payload over the receiver's limit (`VeloBuilder::staged_payload_max`),
+/// refused before anything of its size is allocated. `len` is the size the
+/// payload's owner stated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("a payload of {len} bytes is over this node's limit of {limit} bytes")]
+pub(crate) struct PayloadTooLarge {
+    pub(crate) len: u64,
+    pub(crate) limit: u64,
+}
+
+/// What a handler's refusal hook is told about a payload refused for its size.
+pub(crate) struct RefusedPayload<'a> {
+    /// The worker that sent the message.
+    pub(crate) sender: velo_ext::WorkerId,
+    /// The headers the message carried, which name what the payload was for.
+    pub(crate) headers: Option<&'a std::collections::HashMap<String, String>>,
+    pub(crate) too_large: PayloadTooLarge,
+}
+
+/// Run when a payload staged for a handler is refused for its size. A
+/// fire-and-forget message has no reply to carry the refusal, so without a
+/// hook its handler would never learn that a message was lost.
+pub(crate) type RefusalHook = std::sync::Arc<dyn Fn(&RefusedPayload<'_>) + Send + Sync>;
+
 /// Header key for the time the receiver has to fetch a staged payload, in
 /// whole milliseconds, as a decimal string.
 ///

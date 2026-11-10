@@ -234,6 +234,12 @@ path = "tests/streaming/tcp_batching.rs"
 required-features = ["test-helpers"]
 
 [[test]]
+name = "streaming_staged_limit"
+# Its own binary: a global allocator that records the consumer's largest
+# allocation.
+path = "tests/streaming/staged_limit.rs"
+
+[[test]]
 name = "streaming_timing"
 path = "tests/streaming/timing.rs"
 

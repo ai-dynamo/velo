@@ -199,7 +199,10 @@ impl Batcher {
         let id = slot.id;
         let seq = slot.take_seq();
         let close_seq = terminal.then(|| slot.take_seq());
-        let first_for_slot = slot.mark_batch(self.gate.batch_gen());
+        // Marked only for a record the gate counts: a terminal goes as an
+        // urgent pair, and `close_local` must not take back what was never
+        // counted.
+        let first_for_slot = !terminal && slot.mark_batch(self.gate.batch_gen());
 
         // `emit_data` opened the batch, and nothing between that and here can
         // have flushed it.
@@ -252,6 +255,7 @@ impl Batcher {
             return;
         }
         let id = slot.id;
+        let session = slot.session_id;
         let seq = slot.take_seq();
         let close_seq = terminal.then(|| slot.take_seq());
         // A terminal sent alone retires its stream with its own admission.
@@ -260,7 +264,10 @@ impl Batcher {
             .flatten()
             .map(|entry| RetireGuard::new(entry.closed));
 
-        if !self.fire_singleton(id, FenceSkip::Never, retire, |encoder| {
+        // The receiver resolves a staged record before it reads it. If it
+        // refuses the payload for its size, the session names the one stream
+        // to end (see `BatchWriter::dispatch_singleton`).
+        if !self.fire_singleton(id, FenceSkip::Never, retire, Some(session), |encoder| {
             encoder.push_data(id, seq, &bytes)?;
             match close_seq {
                 Some(close_seq) => {

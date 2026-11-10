@@ -507,6 +507,19 @@ async fn resolve_and_dispatch(job: ResolveJob) {
                 handler = %handler_name,
                 "Failed to resolve large payload: {e}"
             );
+            if let Some(too_large) = e
+                .downcast_ref::<crate::messenger::large_payload::PayloadTooLarge>()
+                .copied()
+            {
+                hub.refused(
+                    &handler_name,
+                    &crate::messenger::large_payload::RefusedPayload {
+                        sender: velo_ext::WorkerId::from_u64(message_id.worker_id()),
+                        headers: headers.as_ref(),
+                        too_large,
+                    },
+                );
+            }
             if matches!(
                 response_type,
                 crate::messenger::common::messages::ResponseType::AckNack

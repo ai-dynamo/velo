@@ -317,6 +317,11 @@ impl EgressSlot {
         first
     }
 
+    /// Whether this slot has a data record in batch `batch_gen`.
+    pub(super) const fn in_batch(&self, batch_gen: u64) -> bool {
+        self.batch_mark == batch_gen
+    }
+
     /// Whether a record offered now has to be withheld rather than sent.
     ///
     /// Order first — anything already queued goes before a newcomer — then the

@@ -243,9 +243,15 @@ impl BatchWriter {
     /// The previous flush returns spare buffer capacity for this write. The
     /// fallback allocation keeps this helper from taking a live encoder's
     /// buffer if another internal caller is added later.
+    ///
+    /// `stream` is the slot id and session of the stream a data singleton is
+    /// for. When the messenger stages the payload, the send names that stream
+    /// in a header, so a receiver that refuses the payload for its size can
+    /// end the stream.
     pub(super) fn dispatch_singleton(
         &mut self,
         write: impl FnOnce(&mut BatchEncoder) -> Result<(), EncodeError>,
+        stream: Option<(super::super::protocol::SlotId, u64)>,
     ) -> Option<FireResult> {
         let batch_seq = self.take_batch_seq();
         let mut encoder = if self.encoder.is_none() {
@@ -281,6 +287,19 @@ impl BatchWriter {
                 if let Some(metrics) = &self.metrics {
                     metrics.batch_sent(by_type);
                 }
+                // Only a staged singleton can be refused, so only it carries
+                // the header that names its stream (`stream`: its slot id and
+                // session). An inline one may already be at the transport's
+                // frame limit, with no room for it, and is built per record,
+                // so the header is not even made for it.
+                let builder = match stream {
+                    Some((id, session))
+                        if self.messenger.client().stager_for(payload.len()).is_some() =>
+                    {
+                        builder.headers(super::super::singleton_headers(self.epoch, id, session))
+                    }
+                    _ => builder,
+                };
                 Some(
                     builder
                         .raw_payload(payload)

@@ -771,15 +771,19 @@ impl RendezvousManager {
     /// For local handles: DashMap lookup + `Bytes::clone()` (cheap refcount bump).
     /// For remote handles: receiver-driven pull via `_rv_acquire` + `_rv_pull` AMs.
     pub async fn get(&self, handle: DataHandle) -> Result<(Bytes, u64)> {
-        self.get_within(handle, None).await
+        self.get_within(handle, u64::MAX, None).await
     }
 
-    /// As [`get`](Self::get), asking a remote owner to end a chunked lease
-    /// that no pull renews within `lease_timeout`. See
-    /// [`Consumer::get_within`](consumer::Consumer::get_within).
+    /// As [`get`](Self::get), for the messenger's resolver: refuse a remote
+    /// payload over `limit` bytes before anything of its size is allocated,
+    /// and ask its owner to end a chunked lease that no pull renews within
+    /// `lease_timeout`. See
+    /// [`Consumer::get_within`](consumer::Consumer::get_within). A local
+    /// handle is not checked: its bytes are already in this process.
     pub(crate) async fn get_within(
         &self,
         handle: DataHandle,
+        limit: u64,
         lease_timeout: Option<std::time::Duration>,
     ) -> Result<(Bytes, u64)> {
         let started = Instant::now();
@@ -797,7 +801,7 @@ impl RendezvousManager {
                 .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
             Ok((data, lease.disarm()))
         } else {
-            consumer::Consumer::get_within(self, handle, lease_timeout).await
+            consumer::Consumer::get_within(self, handle, limit, lease_timeout).await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {

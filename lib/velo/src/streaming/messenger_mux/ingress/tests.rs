@@ -1013,6 +1013,146 @@ fn a_terminal_close_defers_behind_records_still_in_the_hold() {
     assert_eq!(registry.live_slots(peer()), 0);
 }
 
+/// A terminal can overtake a staged item and spend the terminal reserve in the hold.
+/// Refusing that item must still deliver the size error to its consumer.
+#[test]
+fn a_payload_refusal_replaces_a_terminal_waiting_in_the_hold() {
+    let (registry, consumer, config) = bound();
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+    let payload = batch(1, 1, |encoder| {
+        encoder.push_data(id, 2, cached_finalized()).unwrap();
+        encoder
+            .push_close_slot(id, 3, CloseReason::TerminalSent)
+            .unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(outcome.closed, 0, "seq 1 has not resolved");
+    assert!(consumer.pump().is_empty());
+    let error = rmp_serde::to_vec(&crate::streaming::StreamFrame::<()>::TransportError(
+        "refused a staged stream item: a payload of 67108864 bytes is over this node's limit of 1048576 bytes".into(),
+    ))
+    .expect("error frame");
+
+    let record = crate::streaming::messenger_mux::SingletonRecord {
+        epoch: 1,
+        slot: id,
+        session: SESSION,
+    };
+    let reply = registry.refuse_record(
+        peer(),
+        &record,
+        error.clone(),
+        None,
+        config.peer_byte_budget,
+    );
+
+    assert_eq!(
+        reply,
+        Some(ReplyRecord::LifecycleSlot {
+            slot: id,
+            session_id: SESSION,
+            cancel: true,
+        })
+    );
+    assert_eq!(registry.live_slots(peer()), 0);
+    assert!(consumer.rx.is_disconnected());
+    assert_eq!(
+        consumer.pump(),
+        vec![error],
+        "the size error must survive a terminal that overtook the refused item"
+    );
+}
+
+/// A refusal waiting for its own open still ends its stream when another
+/// peer named the same session first. Keeping only the first refusal would
+/// let that peer block it.
+#[test]
+fn a_refusal_waiting_for_its_open_survives_another_peer_naming_it_first() {
+    let (registry, consumer, config) = bound();
+    let id = slot(0, 0);
+    let record = crate::streaming::messenger_mux::SingletonRecord {
+        epoch: 1,
+        slot: id,
+        session: SESSION,
+    };
+    let error = rmp_serde::to_vec(&crate::streaming::StreamFrame::<()>::TransportError(
+        "refused a staged stream item: 67108864 exceeds 1048576".into(),
+    ))
+    .unwrap();
+    let stranger = PeerLane::new(WorkerId::from_u64(PEER + 1), LaneIndex::ZERO);
+    for from in [stranger, peer()] {
+        assert!(
+            registry
+                .refuse_record(from, &record, error.clone(), None, config.peer_byte_budget)
+                .is_none()
+        );
+    }
+
+    let outcome = open(&registry, &config, id, 1);
+    assert_eq!(
+        outcome.closed, 1,
+        "the refusal waiting for this open was lost"
+    );
+    assert_eq!(consumer.pump(), vec![error]);
+}
+
+/// Another peer's header must not erase a refusal waiting for its own open.
+#[test]
+fn another_peers_refusal_preserves_a_refusal_waiting_for_its_open() {
+    let (registry, consumer, config) = bound();
+    let id = slot(0, 0);
+    let record = crate::streaming::messenger_mux::SingletonRecord {
+        epoch: 1,
+        slot: id,
+        session: SESSION,
+    };
+    let error = rmp_serde::to_vec(&crate::streaming::StreamFrame::<()>::TransportError(
+        "refused a staged stream item: 67108864 exceeds 1048576".into(),
+    ))
+    .unwrap();
+    assert!(
+        registry
+            .refuse_record(
+                peer(),
+                &record,
+                error.clone(),
+                None,
+                config.peer_byte_budget
+            )
+            .is_none()
+    );
+    let stranger = PeerLane::new(WorkerId::from_u64(PEER + 1), LaneIndex::ZERO);
+    assert!(
+        registry
+            .refuse_record(
+                stranger,
+                &record,
+                error.clone(),
+                None,
+                config.peer_byte_budget,
+            )
+            .is_none()
+    );
+
+    let outcome = open(&registry, &config, id, 1);
+    assert_eq!(
+        outcome.closed, 1,
+        "another peer's refusal erased the refusal waiting for this OpenSlot"
+    );
+    assert_eq!(consumer.pump(), vec![error]);
+    assert_eq!(registry.live_slots(peer()), 0);
+    assert!(consumer.rx.is_disconnected());
+    assert_eq!(
+        outcome.replies,
+        vec![ReplyRecord::LifecycleSlot {
+            slot: id,
+            session_id: SESSION,
+            cancel: true,
+        }]
+    );
+}
+
 /// Index 0 at generation 0, ended behind a rendezvous record that has not
 /// resolved, and index 0 at generation 1 opened over it with one record
 /// delivered. Returns the two consumers, old stream first.
