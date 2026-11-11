@@ -531,7 +531,6 @@ async fn on_complete_waits_for_every_live_slot() {
     let harness = harness(windowed(WINDOW, true, None)).await;
     let (a, _) = harness.open_credited(1, 1, CREDIT).await;
     let (b, _) = harness.open_credited(2, 2, CREDIT).await;
-    tokio::time::sleep(WINDOW + Duration::from_millis(100)).await;
 
     let first = Instant::now();
     a.send(item(0)).expect("stage on a");
@@ -564,7 +563,6 @@ async fn a_slot_closed_after_staging_does_not_complete_the_batch() {
     let (a, a_slot) = harness.open_credited(1, 1, CREDIT).await;
     let (b, _) = harness.open_credited(2, 2, CREDIT).await;
     let (_c, _) = harness.open_credited(3, 3, CREDIT).await;
-    tokio::time::sleep(WINDOW + Duration::from_millis(100)).await;
 
     a.send(item(0)).expect("stage on a");
     harness.await_staged(1).await;

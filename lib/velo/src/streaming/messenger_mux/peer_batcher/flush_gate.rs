@@ -360,15 +360,12 @@ impl FlushGate {
 
     /// The open batch was written.
     ///
-    /// Only a write with a data record that [`Self::stage_data`] counted starts
-    /// the `on_complete` spacing, because the spacing is about a stream's own
-    /// cadence. An empty flush writes nothing, and `Velo::flush_batch` kicks
-    /// every batcher on the node, so stamping it held the next lone record on
-    /// every idle lane. An `OpenSlot`, credit replies and closes are not a
-    /// stream's data; stamping an `OpenSlot` held a stream's first record until
-    /// one window after its open. A slot that closed with its record in the
-    /// batch has left the count ([`Self::slot_left_batch`]), so its record
-    /// does not start the spacing either: its stream is gone.
+    /// It starts the `on_complete` spacing only if it carried a data record
+    /// that [`Self::stage_data`] counted. An empty flush, an `OpenSlot`, credit
+    /// replies and closes carry none. A slot that closed has left the count
+    /// ([`Self::slot_left_batch`]), so its record does not start it either.
+    /// `tests::a_write_without_data_does_not_start_the_spacing` has the
+    /// failures this avoids.
     pub(super) fn cleared(&mut self) {
         if self.slots_in_batch > 0 && self.policy.on_complete() && self.linger_window().is_some() {
             self.last_write = Some(Instant::now());
@@ -801,6 +798,25 @@ mod tests {
                 gate.deadline(live(1)).map(|due| due - Instant::now())
             );
         }
+    }
+
+    /// A record whose slot closed does not start the spacing either.
+    ///
+    /// A close from the receiver writes nothing, so the record stays staged
+    /// and goes at the window. Its slot has left the count
+    /// ([`FlushGate::slot_left_batch`]) and its stream is gone, so that write
+    /// is not the cadence of any stream left on the lane.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_from_a_closed_slot_does_not_start_the_spacing() {
+        let mut gate = written_then_quiet(windowed(true, None), WINDOW * 3).await;
+        gate.stage_data(1, true);
+        gate.slot_left_batch();
+        gate.cleared();
+        gate.stage_data(1, true);
+        assert!(
+            gate.should_flush(live(1)),
+            "the closed slot's record must not hold the next stream's record"
+        );
     }
 
     /// Many streams on a lane: while one has nothing staged, the batch is not
