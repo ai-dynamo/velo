@@ -45,7 +45,8 @@ pub struct AutoFlush {
     /// trading up to `w` of latency for packing. `None` is no timer at all.
     pub max_linger: Option<Duration>,
     /// Also write once every live slot on this (peer, lane) has a record in
-    /// the batch, but not sooner than `max_linger` after the last write.
+    /// the batch, but not sooner than `max_linger` after the last write that
+    /// carried data.
     ///
     /// Waiting can only add records from slots that are not in the batch yet.
     /// When every slot is already in it, the wait buys nothing until those
@@ -58,8 +59,11 @@ pub struct AutoFlush {
     /// can still be split at a window edge, as under the plain window.
     ///
     /// The `max_linger` spacing keeps writes at no more than one per window
-    /// when one stream sends faster than the window. Needs `max_linger`;
-    /// without a window there is nothing to cut short.
+    /// when one stream sends faster than the window. Only a write that carried
+    /// data starts it. An empty flush (such as a `flush_batch` with nothing
+    /// staged), an `OpenSlot`, or a batch of credit replies does not, so a
+    /// stream's first record does not wait on its own open. Needs
+    /// `max_linger`; without a window there is nothing to cut short.
     pub on_complete: bool,
     /// Also write once the staged batch is this many bytes.
     ///

@@ -61,10 +61,13 @@
 //! - [`AutoFlush::on_complete`]: every live slot already has a data record in
 //!   the batch. More waiting could only add a second record from one of them.
 //!   The batch then goes at the later of its oldest record and one window
-//!   after the last write, which keeps a single fast stream at one write per
-//!   window. Counting slots needs the batcher's slot table, which this gate
-//!   does not have: the batcher marks each slot with [`FlushGate::batch_gen`]
-//!   when it stages for it, and passes the live count in a [`FlushContext`].
+//!   after the last write that carried data, which keeps a single fast stream
+//!   at one write per window. A write without data (an empty flush, an
+//!   `OpenSlot`, credit replies, closes) is not the stream's cadence, so it
+//!   does not hold the stream's next record. Counting slots needs the
+//!   batcher's slot table, which this gate does not have: the batcher marks
+//!   each slot with [`FlushGate::batch_gen`] when it stages for it, and passes
+//!   the live count in a [`FlushContext`].
 //! - [`AutoFlush::at_bytes`]: the batch has reached about one transport
 //!   segment, past which a longer wait saves at most one partly filled packet.
 //!
@@ -146,11 +149,12 @@ pub(super) struct FlushGate {
     /// rather than a second count alongside `staged`, because nothing here
     /// needs the magnitude — only whether the batch is still pure.
     non_reply_staged: bool,
-    /// When this batcher last wrote a batch.
+    /// When this batcher last wrote a batch that carried a data record.
     ///
     /// Only tracked under [`AutoFlush::on_complete`] with a linger window,
     /// the one place that reads it: a complete batch may go early, but no
-    /// sooner than one window after this.
+    /// sooner than one window after this. A write without data does not
+    /// move it; see [`Self::cleared`].
     ///
     /// [`AutoFlush::on_complete`]: super::super::AutoFlush::on_complete
     last_write: Option<Instant>,
@@ -310,9 +314,9 @@ impl FlushGate {
     /// two that are actually armed, not one replacing the other.
     ///
     /// A complete batch (see [`Self::complete`]) is due at the later of its
-    /// oldest record and one window after the last write. That is never later
-    /// than the plain window, because the last write came before the oldest
-    /// record.
+    /// oldest record and one window after the last write that carried data.
+    /// That is never later than the plain window, because that write came
+    /// before the oldest record.
     pub(super) fn deadline(&self, ctx: FlushContext) -> Option<Instant> {
         let reply_due = self.replies_since.map(|since| since + self.reply_linger);
         let policy_due = match (self.since, self.linger_window()) {
@@ -355,8 +359,15 @@ impl FlushGate {
     }
 
     /// The open batch was written.
+    ///
+    /// It starts the `on_complete` spacing only if it carried a data record
+    /// that [`Self::stage_data`] counted. An empty flush, an `OpenSlot`, credit
+    /// replies and closes carry none. A slot that closed has left the count
+    /// ([`Self::slot_left_batch`]), so its record does not start it either.
+    /// `tests::a_write_without_data_does_not_start_the_spacing` has the
+    /// failures this avoids.
     pub(super) fn cleared(&mut self) {
-        if self.policy.on_complete() && self.linger_window().is_some() {
+        if self.slots_in_batch > 0 && self.policy.on_complete() && self.linger_window().is_some() {
             self.last_write = Some(Instant::now());
         }
         self.forget_staged();
@@ -750,6 +761,62 @@ mod tests {
 
         tokio::time::advance(WINDOW - WINDOW / 5).await;
         assert!(gate.should_flush(live(1)));
+    }
+
+    /// Only a write that carried data starts the spacing.
+    ///
+    /// The spacing keeps a fast stream at one write per window, so it is about
+    /// the stream's own records. These three writes carry none, and each used
+    /// to restart it:
+    ///
+    /// - An empty flush. `Velo::flush_batch` kicks every batcher on the node,
+    ///   so one call with nothing staged held the next lone record on every
+    ///   idle lane for up to a window.
+    /// - An `OpenSlot`, staged urgent like any liveness record. It held a
+    ///   stream's first record until one window after the stream opened.
+    /// - Credit replies, which belong to the peer's streams.
+    ///
+    /// Each case starts from a data write long ago, so the record staged after
+    /// it is due at once unless the write without data moved the spacing.
+    #[tokio::test(start_paused = true)]
+    async fn a_write_without_data_does_not_start_the_spacing() {
+        /// What a write stages before it goes.
+        type Stage = fn(&mut FlushGate);
+        let cases: [(&str, Stage); 3] = [
+            ("an empty flush", |_| {}),
+            ("an OpenSlot", |gate| gate.stage_urgent(1)),
+            ("credit replies", |gate| gate.stage_reply(2)),
+        ];
+        for (write, stage) in cases {
+            let mut gate = written_then_quiet(windowed(true, None), WINDOW * 3).await;
+            stage(&mut gate);
+            gate.cleared();
+            gate.stage_data(1, true);
+            assert!(
+                gate.should_flush(live(1)),
+                "{write} carried no data, so it must not hold the next record; due in {:?}",
+                gate.deadline(live(1)).map(|due| due - Instant::now())
+            );
+        }
+    }
+
+    /// A record whose slot closed does not start the spacing either.
+    ///
+    /// A close from the receiver writes nothing, so the record stays staged
+    /// and goes at the window. Its slot has left the count
+    /// ([`FlushGate::slot_left_batch`]) and its stream is gone, so that write
+    /// is not the cadence of any stream left on the lane.
+    #[tokio::test(start_paused = true)]
+    async fn a_record_from_a_closed_slot_does_not_start_the_spacing() {
+        let mut gate = written_then_quiet(windowed(true, None), WINDOW * 3).await;
+        gate.stage_data(1, true);
+        gate.slot_left_batch();
+        gate.cleared();
+        gate.stage_data(1, true);
+        assert!(
+            gate.should_flush(live(1)),
+            "the closed slot's record must not hold the next stream's record"
+        );
     }
 
     /// Many streams on a lane: while one has nothing staged, the batch is not
