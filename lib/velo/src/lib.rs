@@ -314,6 +314,8 @@ pub struct VeloBuilder {
     mux_config: Option<crate::streaming::MuxConfig>,
     reservation_config: crate::streaming::ReservationConfig,
     mux_only: bool,
+    /// See [`mux_runtime`](Self::mux_runtime).
+    mux_runtime: Option<tokio::runtime::Handle>,
     metrics: Option<Arc<VeloMetrics>>,
     /// See [`staged_payload_max`](Self::staged_payload_max).
     staged_payload_max: Option<usize>,
@@ -344,6 +346,7 @@ impl VeloBuilder {
             mux_config: None,
             reservation_config: Default::default(),
             mux_only: false,
+            mux_runtime: None,
             metrics: None,
             staged_payload_max: None,
             staged_fetch_timeout: None,
@@ -455,6 +458,27 @@ impl VeloBuilder {
         self
     }
 
+    /// Run the messenger mux's tasks on `runtime` instead of the runtime
+    /// that builds this instance.
+    ///
+    /// One batcher task per peer writes every stream's records and heartbeats.
+    /// A producer's `send` wakes it from the producer's thread, and on the
+    /// same multi-thread runtime tokio puts that task in the waking worker's
+    /// LIFO slot, which no other worker steals (tokio-rs/tokio#4941). A
+    /// producer that then holds its thread, with a long encode or a blocking
+    /// call, stalls every stream to that peer, and its consumer's watchdog
+    /// ends its stream after a few heartbeat windows. On another runtime the
+    /// wake goes through that runtime's remote queue, and an idle worker
+    /// there runs the batcher.
+    ///
+    /// Give it a multi-thread runtime built with `enable_all`, and keep it
+    /// running for as long as this instance. A wake across runtimes costs a
+    /// thread unpark when the batcher is parked.
+    pub fn mux_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
+        self.mux_runtime = Some(runtime);
+        self
+    }
+
     /// Set the peer discovery backend.
     pub fn discovery(mut self, discovery: Arc<dyn PeerDiscovery>) -> Self {
         self.inner = self.inner.discovery(discovery);
@@ -539,6 +563,7 @@ impl VeloBuilder {
                 config,
                 self.metrics.clone(),
                 self.reservation_config.prebind_timeout,
+                self.mux_runtime,
             )?;
             Some(mux)
         } else {
