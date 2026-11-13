@@ -164,6 +164,13 @@ pub enum RdmaTestHook {
     /// deadline is the condition the renewal ticker exists for, and over
     /// `UCX_TLS=tcp` on a loopback there is no honest way to produce one.
     SlowGet(std::time::Duration),
+    /// Answer the transfer as a backend does when it cannot say whether the
+    /// transfer has stopped writing (`RdmaError::Unconfirmed`).
+    ///
+    /// The UCX backend never returns that, so without the hook the consumer's
+    /// response to it — leak the destination, and refuse to fall back into a
+    /// caller's registered buffer — has no test on a UCX-only build.
+    UnconfirmedGet,
 }
 
 #[cfg(all(velo_rdma, feature = "test-helpers"))]
@@ -203,7 +210,7 @@ impl RdmaTestHook {
                     descriptor[at..at + 2].copy_from_slice(&u16::MAX.to_le_bytes());
                 }
             }
-            Self::FailGet | Self::SlowGet(_) => {}
+            Self::FailGet | Self::SlowGet(_) | Self::UnconfirmedGet => {}
         }
         descriptor
     }

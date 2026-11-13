@@ -34,6 +34,12 @@
 //! the lease, re-acquire with no offer, and pull chunks — which always works,
 //! because a pinned slot serves the chunked path too.
 //!
+//! One outcome is not a failure of that kind: a backend that cannot say whether
+//! a transfer has stopped writing (`RdmaError::Unconfirmed`). The destination
+//! is leaked. If it is the caller's own registered memory (`get_into`), the
+//! call returns an error and does not fall back, because the chunks would land
+//! in a buffer that the transfer can still write.
+//!
 //! **Exactly one attempt.** The re-acquire carries no offer, so an owner that
 //! answers it with another descriptor is broken; that is an error rather than a
 //! second fallback, because a loop here would turn one misbehaving owner into
@@ -343,6 +349,19 @@ impl Consumer {
                 .await
                 {
                     Ok(()) => Ok(lease_id),
+                    // No fallback. The chunked path would write into the same
+                    // registered buffer, and a transfer nobody can observe may
+                    // still write there too.
+                    Err(reason) if reason.tainted_destination => {
+                        manager.data_store().record_path(reason.reason);
+                        if let Err(e) = detach(client, handle, lease_id).await {
+                            tracing::warn!(%handle, error = %e, "rendezvous: could not detach after an unconfirmed transfer");
+                        }
+                        Err(anyhow::anyhow!(
+                            "{}, so it holds no usable data and must not be reused",
+                            reason.detail
+                        ))
+                    }
                     Err(reason) => {
                         let (data, lease_id) = fallback_chunked(
                             manager,
@@ -581,6 +600,8 @@ enum TransferHook {
     Fail,
     /// Issue it, but not yet.
     Delay(std::time::Duration),
+    /// Do not issue it, and answer as a backend that lost track of it would.
+    Unconfirmed,
 }
 
 #[cfg(velo_rdma)]
@@ -591,6 +612,7 @@ fn take_transfer_hook(manager: &RendezvousManager) -> Option<TransferHook> {
         match manager.take_get_hook() {
             Some(RdmaTestHook::FailGet) => Some(TransferHook::Fail),
             Some(RdmaTestHook::SlowGet(delay)) => Some(TransferHook::Delay(delay)),
+            Some(RdmaTestHook::UnconfirmedGet) => Some(TransferHook::Unconfirmed),
             _ => None,
         }
     }
@@ -610,6 +632,11 @@ fn take_transfer_hook(manager: &RendezvousManager) -> Option<TransferHook> {
 struct RdmaFallback {
     reason: RdmaPathReason,
     detail: String,
+    /// An unconfirmed transfer was writing into the *caller's* registered
+    /// memory. This one is matched on: there must be no chunked fallback,
+    /// because the fallback would write into the buffer a late transfer can
+    /// still hit, and the caller would read a mix of the two.
+    tainted_destination: bool,
 }
 
 #[cfg(velo_rdma)]
@@ -618,6 +645,7 @@ impl RdmaFallback {
         Self {
             reason,
             detail: detail.into(),
+            tainted_destination: false,
         }
     }
 }
@@ -700,7 +728,13 @@ async fn rdma_pull_into(
                 ),
             ));
         }
-        return run_get(manager, handle, lease_id, &desc, target, lease_timeout_ms).await;
+        return run_get(manager, handle, lease_id, &desc, target, lease_timeout_ms)
+            .await
+            .map_err(|mut fallback| {
+                // The destination here is the caller's own memory.
+                fallback.tainted_destination = fallback.reason == RdmaPathReason::Unconfirmed;
+                fallback
+            });
     }
 
     // Otherwise the GET lands in a pooled buffer and is copied once. This is
@@ -803,15 +837,16 @@ async fn run_get(
         len: desc.len,
     };
 
-    let delay = match take_transfer_hook(manager) {
+    let (delay, unconfirmed) = match take_transfer_hook(manager) {
         Some(TransferHook::Fail) => {
             return Err(RdmaFallback::new(
                 RdmaPathReason::GetFailed,
                 "injected transfer failure",
             ));
         }
-        Some(TransferHook::Delay(delay)) => Some(delay),
-        None => None,
+        Some(TransferHook::Delay(delay)) => (Some(delay), false),
+        Some(TransferHook::Unconfirmed) => (None, true),
+        None => (None, false),
     };
 
     // The transfer is *spawned*, not awaited in place, and the destination's
@@ -835,10 +870,21 @@ async fn run_get(
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
-        let outcome = registry.get(req).await;
-        // Released here and nowhere else: after the backend has finished with
-        // the range, whether it succeeded or failed.
-        drop(hold);
+        let outcome = if unconfirmed {
+            // Injected inside the task, so the hold takes the same path it
+            // takes when a backend gives this answer.
+            Err(crate::rendezvous::rdma::RdmaError::Unconfirmed)
+        } else {
+            registry.get(req).await
+        };
+        match (&outcome, hold) {
+            // The backend cannot say the write is over, so the range must
+            // never be handed out again.
+            (Err(crate::rendezvous::rdma::RdmaError::Unconfirmed), Some(hold)) => hold.abandon(),
+            // Released here and nowhere else: after the backend has finished
+            // with the range, whether it succeeded or failed.
+            (_, hold) => drop(hold),
+        }
         outcome
     });
 
@@ -863,6 +909,19 @@ async fn run_get(
             }
             store.record_path(RdmaPathReason::Ok);
             Ok(())
+        }
+        Err(e @ crate::rendezvous::rdma::RdmaError::Unconfirmed) => {
+            tracing::error!(
+                %handle,
+                lease = lease_id,
+                len = desc.len,
+                "rendezvous: the rdma backend cannot confirm that a transfer stopped \
+                 writing; its destination is leaked and will not be reused"
+            );
+            Err(RdmaFallback::new(
+                RdmaPathReason::Unconfirmed,
+                e.to_string(),
+            ))
         }
         Err(e) => Err(RdmaFallback::new(RdmaPathReason::GetFailed, e.to_string())),
     }

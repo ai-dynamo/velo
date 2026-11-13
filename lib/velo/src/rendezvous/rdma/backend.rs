@@ -127,6 +127,16 @@ pub enum RdmaError {
     /// The operation did not finish inside the caller's budget.
     #[error("rdma operation timed out")]
     Timeout,
+
+    /// A transfer was posted, and the backend can no longer say whether it has
+    /// stopped writing into its destination.
+    ///
+    /// Not "failed". A failed transfer is over, and its destination is free to
+    /// reuse. This one may still land bytes later, so velo leaks the
+    /// destination, and a caller that owns it must not read or reuse it. The
+    /// UCX backend never returns this; a backend that polls for completion can.
+    #[error("rdma transfer outcome unknown: the destination may still be written")]
+    Unconfirmed,
 }
 
 /// One registered range, as the backend reports it.
@@ -217,4 +227,19 @@ pub(crate) trait RdmaBackend: Send + Sync {
     fn live_registrations(&self) -> Option<usize> {
         None
     }
+
+    /// Stop the backend's own machinery, after the transports are down.
+    ///
+    /// `Velo::graceful_shutdown` awaits this between transport teardown and
+    /// the final latch, so a backend that owns a thread can make
+    /// [`live_registrations`](Self::live_registrations) true before the latch
+    /// reads it. UCX needs nothing: transport teardown has already joined its
+    /// progress thread.
+    fn teardown(&self) -> BoxFuture<'_, ()> {
+        Box::pin(std::future::ready(()))
+    }
+
+    /// Drop what the backend holds for a peer this instance has unregistered.
+    /// UCX holds nothing of its own: `Transport::unregister` clears it.
+    fn forget_peer(&self, _peer: InstanceId) {}
 }

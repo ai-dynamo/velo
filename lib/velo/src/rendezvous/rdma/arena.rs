@@ -524,6 +524,19 @@ impl Drop for TransferHold {
     }
 }
 
+impl TransferHold {
+    /// Give the range up for good: the backend cannot say that the transfer
+    /// has stopped writing into it ([`RdmaError::Unconfirmed`]).
+    ///
+    /// The suballocation is leaked, so no later allocation is handed memory
+    /// that a late write can still hit, and its arena is never unmapped. The
+    /// hold itself still drops: a shutdown sweep that waited for a transfer
+    /// nobody can observe would spend its whole budget every time.
+    pub(crate) fn abandon(self) {
+        std::mem::forget(Arc::clone(&self.0));
+    }
+}
+
 /// An owned, registered byte range cut from an [`Arena`].
 ///
 /// Derefs to its bytes, so it is usable as a plain buffer. Dropping it returns

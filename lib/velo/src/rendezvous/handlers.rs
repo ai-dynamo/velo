@@ -141,7 +141,7 @@ fn serve_acquire(
 ///    itself against the single pull it would replace (D11).
 /// 6. The consumer's offer does not name the backend this owner serves (D12) —
 ///    a NIXL-only consumer talking to a UCX owner is well-formed and simply
-///    unservable.
+///    unservable (`backend_mismatch`).
 /// 7. This owner is draining (`draining`). The drain gate lets `_rv_acquire`
 ///    through so that a payload staged before the drain can still be pulled,
 ///    but the shutdown sweep that follows frees pinned memory, and a
@@ -199,7 +199,7 @@ fn rdma_response(
     }
     let backend = rdma.backend;
     if !offer.backends.iter().any(|name| name == backend.key()) {
-        return decline(RdmaPathReason::NoOffer);
+        return decline(RdmaPathReason::BackendMismatch);
     }
     if draining {
         return decline(RdmaPathReason::Draining);

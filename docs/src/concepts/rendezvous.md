@@ -71,9 +71,11 @@ The owner answers `AcquireResponse::Rdma` only if every check below passes. The 
 | 3 | The RDMA path is enabled on this owner (the kill switch is off). | `kill_switch` |
 | 4 | The slot is staged in registered memory. | `not_pinned` |
 | 5 | The payload is at least `rdma_min_bytes` (64 KiB by default). | `below_min` |
-| 6 | The offer names the backend this owner serves (`"ucx"`). | `no_offer` |
+| 6 | The offer names the backend this owner serves (`"ucx"`). | `backend_mismatch` |
 | 7 | The owner is not draining. The shutdown sweep that follows a drain frees pinned memory. | `draining` |
 | 8 | The staging still exists and the descriptor encodes. | `not_pinned` |
+
+Check 6 is not `no_offer`. Both sides are set up for RDMA, but not with each other, so a fleet that mixes backends shows up as `backend_mismatch`.
 
 Check 7 comes after the facts about the configuration and the slot, so `draining` counts only the acquires that the drain changed. A heap-staged slot on a draining owner still counts as `not_pinned`. Check 8 catches an external region that was deregistered under the slot.
 
@@ -102,6 +104,13 @@ After the owner sends a descriptor, four failures can occur on the consumer. The
 | The GET fails. | `get_failed` |
 
 For each failure, the consumer detaches the lease, acquires again with no offer, and pulls chunks. This always works, because a pinned slot also serves the chunked path.
+
+One outcome is not a failure of this kind. A backend that polls for completion can lose track of a transfer that still runs. It then answers that the transfer is unconfirmed. velo counts `unconfirmed` and leaks the destination, because a late write can still land in it. A count above zero means the instance is losing registered memory. What the consumer does next depends on whose memory the destination is:
+
+- A destination from velo's pool: the consumer falls back to chunks, as above.
+- A destination the caller registered (`get_into`): the call returns an error and does not fall back. The chunks would land in a buffer that the transfer can still write. The caller must not read or reuse that buffer.
+
+The UCX backend never gives this answer.
 
 The fallback happens **exactly once**. The second acquire carries no offer, so an owner that answers it with another descriptor is broken. The consumer returns an error in that case. A retry loop turns one bad owner into an unbounded storm of round trips.
 
@@ -347,6 +356,7 @@ sequenceDiagram
     Reg->>UCX: unmap (regions before endpoints)
     Velo->>Velo: messenger graceful_shutdown (remaining budget)
     UCX->>UCX: teardown force-unmaps anything left
+    Velo->>Reg: backend teardown (a backend with its own thread stops here)
     Velo->>Reg: latch deregistered() for every region
 ```
 
@@ -403,8 +413,8 @@ The switch acts on both roles. An owner with it on never answers `Rdma` and stag
 
 Both sides record into `path_total`, at different points:
 
-- The owner records at staging time, when `register_data_pinned` falls back (`kill_switch`, `budget`, `pool_exhausted`). It also records at each acquire (`no_offer`, `not_configured`, `kill_switch`, `not_pinned`, `below_min`, `draining`, `ok`).
-- The consumer records when it builds its offer (`not_configured`, `kill_switch`, `no_offer`), after a failure (`decode_error`, `pool_exhausted`, `get_failed`), and when a GET completes (`ok`).
+- The owner records at staging time, when `register_data_pinned` falls back (`kill_switch`, `budget`, `pool_exhausted`). It also records at each acquire (`no_offer`, `not_configured`, `kill_switch`, `not_pinned`, `below_min`, `backend_mismatch`, `draining`, `ok`).
+- The consumer records when it builds its offer (`not_configured`, `kill_switch`, `no_offer`), after a failure (`decode_error`, `pool_exhausted`, `get_failed`, `unconfirmed`), and when a GET completes (`ok`).
 
 The series counts decisions, not transfers. With the owner's kill switch on, one slot adds `kill_switch` once at staging and again at each acquire. A fallback acquire carries no offer, so the owner also counts `no_offer` for a consumer whose GET failed. The owner counts `ok` when it sends a descriptor, before the GET runs. The consumer's `ok` is the proof that a GET completed.
 
