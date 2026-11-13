@@ -217,6 +217,15 @@ pub(crate) enum RdmaPathReason {
     /// NIC is still reading when the sweep frees it. The pull is served
     /// chunked instead.
     Draining,
+    /// The consumer offered RDMA, but not with the backend this owner serves.
+    /// Both sides are configured, so this is not `NoOffer`: a fleet that mixes
+    /// backends shows up here.
+    BackendMismatch,
+    /// The backend could not say that a transfer stopped writing, so its
+    /// destination is leaked. Above zero, this instance is losing registered
+    /// memory. A pooled destination falls back to chunks; a caller's own
+    /// destination fails the call, and nothing is pulled.
+    Unconfirmed,
 }
 
 #[cfg(velo_rdma)]
@@ -243,6 +252,8 @@ impl RdmaPathReason {
             Self::Budget => "budget",
             Self::NotConfigured => "not_configured",
             Self::Draining => "draining",
+            Self::BackendMismatch => "backend_mismatch",
+            Self::Unconfirmed => "unconfirmed",
         }
     }
 }

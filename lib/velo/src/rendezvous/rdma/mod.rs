@@ -687,6 +687,10 @@ impl RdmaRegistry {
     /// still reporting registrations is the evidence being absent. Freeing
     /// arena pages while the progress thread may still be alive is precisely
     /// the hazard the leak-by-default discipline exists for.
+    ///
+    /// Call [`teardown_backend`](Self::teardown_backend) first: a backend that
+    /// owns a thread releases its last registrations there, and this reads the
+    /// backend's count.
     pub(crate) fn latch_all_deregistered(&self) {
         match self.shared.backend.live_registrations() {
             Some(0) | None => {}
@@ -763,6 +767,18 @@ impl RdmaRegistry {
     /// descriptor and is matched against the consumer's offer.
     pub(crate) fn backend_key(&self) -> &str {
         self.shared.backend.key()
+    }
+
+    /// Stop the backend's own machinery. Called by `Velo::graceful_shutdown`
+    /// after transport teardown and before
+    /// [`latch_all_deregistered`](Self::latch_all_deregistered).
+    pub(crate) async fn teardown_backend(&self) {
+        self.shared.backend.teardown().await;
+    }
+
+    /// Tell the backend that this instance has unregistered a peer.
+    pub(crate) fn forget_peer(&self, peer: velo_ext::InstanceId) {
+        self.shared.backend.forget_peer(peer);
     }
 }
 

@@ -1651,3 +1651,202 @@ async fn a_draining_owner_still_records_a_heap_staged_slot_as_not_pinned() {
     assert_eq!(pair.owner.path_count("ok"), 0);
     shutdown(pair).await;
 }
+
+/// A transfer the backend cannot confirm leaks its destination, for good.
+///
+/// A backend that polls for completion can lose track of a transfer that is
+/// still running. A destination returned to the pool then is handed to the
+/// next allocation while a NIC still writes into it, and the damage shows up
+/// in a buffer that has nothing to do with the transfer.
+///
+/// So the destination is leaked. The pool here has room for exactly one such
+/// destination, which makes "never returns" observable: the next allocation is
+/// refused, although no transfer holds the space any more.
+///
+/// The other half is the in-flight count. A leak that also kept the count up
+/// would make every later shutdown wait its whole budget for a transfer that
+/// nobody can observe, so the hold still drops.
+///
+/// The pooled destination is velo's own memory, so the caller is still served:
+/// the chunked path reads into fresh memory.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unconfirmed_transfer_leaks_its_destination_and_falls_back() {
+    const ARENA: u64 = 1 << 20;
+    const CUT: usize = 768 * 1024;
+
+    let tight = RdmaConfig {
+        pool: RdmaPoolConfig {
+            initial_arena_bytes: ARENA,
+            max_arena_bytes: ARENA,
+            dedicated_arena_min: 64 << 20,
+            registered_bytes_budget: ARENA + (ARENA / 2),
+            ..RdmaPoolConfig::default()
+        },
+        ..RdmaConfig::default()
+    };
+    let pair = Pair::with_configs(None, Some(tight)).await;
+
+    let payload = pattern(CUT);
+    let handle = pair.owner.velo.register_data_pinned(&payload).await;
+    pair.consumer
+        .velo
+        .rendezvous_manager()
+        .arm_rdma_hook(RdmaTestHook::UnconfirmedGet);
+
+    let (data, lease) = pair
+        .consumer
+        .velo
+        .get(handle)
+        .await
+        .expect("an unconfirmed transfer into pool memory must fall back, not surface");
+    assert_pattern(&data, payload.len());
+    pair.consumer.velo.release(handle, lease).await.unwrap();
+
+    assert_eq!(pair.consumer.path_count("unconfirmed"), 1);
+    assert_eq!(pair.consumer.path_count("get_failed"), 0);
+    assert_eq!(
+        pair.owner.path_count("no_offer"),
+        1,
+        "exactly one chunked re-acquire"
+    );
+
+    assert_eq!(
+        pair.consumer.velo.rdma_in_flight_transfers(),
+        0,
+        "the hold must drop, or shutdown waits for a transfer nobody can observe"
+    );
+    let refused = pair.consumer.velo.alloc_pinned_writer(CUT).await;
+    assert!(
+        matches!(refused, Err(RdmaError::BudgetExceeded { .. })),
+        "the destination of an unconfirmed transfer went back to the pool; got {refused:?}"
+    );
+
+    // Well under one shutdown budget (`T`): a sweep that waited on the
+    // abandoned transfer would spend all of it.
+    tokio::time::timeout(T / 2, shutdown(pair))
+        .await
+        .expect("shutdown must not wait for the abandoned transfer");
+}
+
+/// An unconfirmed transfer into the caller's registered memory is an error.
+/// It does **not** fall back.
+///
+/// Every other RDMA failure in `get_into` falls back to the chunked path, and
+/// the chunked path writes into the same destination. For a failed transfer
+/// that is right: the transfer is over. For an unconfirmed one it is silent
+/// wrong data: the chunks land, the caller gets `Ok`, and the transfer that
+/// nobody could observe writes over them later, or in between.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unconfirmed_get_into_registered_memory_does_not_fall_back() {
+    let pair = Pair::new().await;
+
+    let payload = pattern(768 * 1024);
+    let handle = pair.owner.velo.register_data_pinned(&payload).await;
+    let mut dest = pair
+        .consumer
+        .velo
+        .alloc_pinned_writer(payload.len())
+        .await
+        .expect("a registered destination");
+    pair.consumer
+        .velo
+        .rendezvous_manager()
+        .arm_rdma_hook(RdmaTestHook::UnconfirmedGet);
+
+    let err = pair
+        .consumer
+        .velo
+        .get_into(handle, &mut dest)
+        .await
+        .expect_err("an unconfirmed transfer into the caller's buffer must surface");
+    assert!(
+        err.to_string().contains("outcome unknown"),
+        "the error must say why the buffer is unusable: {err}"
+    );
+
+    assert_eq!(pair.owner.path_count("ok"), 1);
+    assert_eq!(
+        pair.owner.path_count("no_offer"),
+        0,
+        "a chunked re-acquire ran: it writes into the buffer the transfer may still hit"
+    );
+    assert!(
+        dest.as_slice().iter().all(|b| *b == 0),
+        "something wrote the destination"
+    );
+    assert_eq!(pair.consumer.path_count("unconfirmed"), 1);
+    assert_eq!(pair.consumer.path_count("get_failed"), 0);
+
+    // The lease was given back, so the handle is still readable.
+    let (data, lease) = pair
+        .consumer
+        .velo
+        .get(handle)
+        .await
+        .expect("the handle is still readable after the refused transfer");
+    assert_pattern(&data, payload.len());
+    pair.consumer.velo.release(handle, lease).await.unwrap();
+
+    drop(dest);
+    shutdown(pair).await;
+}
+
+/// An offer that names only another backend is answered chunked, and counted
+/// as a mismatch, not as "no offer".
+///
+/// Both sides of such a pair are configured for RDMA, and every transfer
+/// between them takes the chunked path. Under `no_offer` that looks like a
+/// consumer that was never set up. `backend_mismatch` says what it is: a fleet
+/// that mixes backends.
+///
+/// The second acquire names two backends. The owner serves the one it has, so
+/// a consumer that could offer more than one is not refused for the extra.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_offer_of_another_backend_is_answered_chunked_as_a_mismatch() {
+    let pair = Pair::new().await;
+
+    let payload = pattern(512 * 1024);
+    let handle = pair.owner.velo.register_data_pinned(&payload).await;
+    let raw = handle.as_u128();
+    let acquire = |backends: &str| {
+        let wire = format!(
+            r#"{{"handle":{{"hi":{},"lo":{}}},"rdma":{{"backends":[{backends}]}}}}"#,
+            (raw >> 64) as u64,
+            raw as u64
+        );
+        let call = pair
+            .consumer
+            .velo
+            .messenger()
+            .unary_streaming("_rv_acquire")
+            .raw_payload(Bytes::from(wire))
+            .instance(pair.owner.velo.instance_id());
+        async move {
+            let bytes: Bytes = call.send().await.expect("the acquire is answered");
+            serde_json::from_slice::<AcquireResponse>(&bytes).expect("an AcquireResponse")
+        }
+    };
+
+    let lease = match acquire(r#""nixl""#).await {
+        AcquireResponse::Ready { lease_id, .. } => lease_id,
+        AcquireResponse::Rdma { .. } => {
+            panic!("a UCX owner answered a descriptor to an offer that names only NIXL")
+        }
+    };
+    assert_eq!(pair.owner.path_count("backend_mismatch"), 1);
+    assert_eq!(pair.owner.path_count("no_offer"), 0);
+    assert_eq!(pair.owner.path_count("ok"), 0);
+    pair.consumer.velo.detach(handle, lease).await.unwrap();
+
+    let lease = match acquire(r#""nixl","ucx""#).await {
+        AcquireResponse::Rdma { lease_id, .. } => lease_id,
+        AcquireResponse::Ready { .. } => {
+            panic!("the offer names the owner's backend beside another, and was refused")
+        }
+    };
+    assert_eq!(pair.owner.path_count("ok"), 1);
+    assert_eq!(pair.owner.path_count("backend_mismatch"), 1);
+    pair.consumer.velo.detach(handle, lease).await.unwrap();
+
+    shutdown(pair).await;
+}

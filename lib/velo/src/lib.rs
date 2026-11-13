@@ -976,11 +976,15 @@ impl Velo {
         self.inner.anchor_manager.stop_mux_sending().await;
         backend.finish_shutdown().await;
 
-        // Teardown has returned, so the progress thread has force-unmapped
-        // everything it still held: nothing is pinned any more, and every latch
-        // the sweep could not resolve honestly can be resolved now.
+        // Teardown has returned, so a backend that lives on a transport's
+        // thread (UCX) has force-unmapped everything it still held. A backend
+        // with a thread of its own stops it here and does the same. After
+        // that nothing is pinned any more, and every latch the sweep could
+        // not resolve honestly can be resolved now. The latch checks the
+        // backend's own count before it does so.
         #[cfg(velo_rdma)]
         if let Some(rdma) = &self.inner.rdma {
+            rdma.teardown_backend().await;
             rdma.latch_all_deregistered();
         }
 
@@ -1208,6 +1212,11 @@ impl Velo {
     pub fn unregister_peer(&self, instance_id: InstanceId) {
         self.inner.stream_transport.unregister(instance_id);
         self.inner.messenger.unregister_peer(instance_id);
+        // A backend that keeps its own state for each peer drops it too.
+        #[cfg(velo_rdma)]
+        if let Some(rdma) = &self.inner.rdma {
+            rdma.forget_peer(instance_id);
+        }
     }
 
     /// Discover a peer by instance_id and register it for communication.
