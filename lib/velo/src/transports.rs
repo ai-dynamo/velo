@@ -144,6 +144,26 @@ pub struct VeloBackend {
     teardown_outcome: teardown::Outcome,
     runtime: tokio::runtime::Handle,
     observability: Option<Arc<VeloMetrics>>,
+    peer_observer: OnceLock<Arc<dyn PeerTableObserver>>,
+    advertised: OnceLock<PeerInfo>,
+}
+
+/// Told when the backend's peer table changes.
+///
+/// The backend's table is the one every way of learning a peer goes
+/// through: `Velo::register_peer`, `Messenger::register_peer`, `_hello`,
+/// and discovery when a send names an unknown worker. `VeloBuilder::build`
+/// installs one observer that keeps the per-stream transport's own peer
+/// table in step, so that no path can fill one table and not the other.
+pub(crate) trait PeerTableObserver: Send + Sync {
+    /// The peer was added: at least one messenger transport accepted it.
+    /// Infallible, because the messenger's registration stands either way;
+    /// an observer logs what it could not do.
+    fn registered(&self, peer: &PeerInfo);
+
+    /// The peer was dropped. Called for every `unregister_peer`, also for a
+    /// peer never registered, so it must be cheap and idempotent.
+    fn unregistered(&self, instance_id: InstanceId);
 }
 
 /// Stop completed transports if construction fails or is cancelled.
@@ -289,6 +309,8 @@ impl VeloBackend {
                 teardown_outcome: Default::default(),
                 runtime,
                 observability,
+                peer_observer: OnceLock::new(),
+                advertised: OnceLock::new(),
             },
             data_streams,
         ))
@@ -308,6 +330,42 @@ impl VeloBackend {
     /// Returns a [`PeerInfo`] describing this backend (instance ID + composite address).
     pub fn peer_info(&self) -> PeerInfo {
         PeerInfo::new(self.instance_id, self.address.clone())
+    }
+
+    /// What this node sends to a peer in `_hello`: its complete address.
+    ///
+    /// [`peer_info`](Self::peer_info) has the messenger transports only. A
+    /// `Velo` node also listens for streams on an endpoint of its own, and a
+    /// peer that learns the node by `_hello` must get that endpoint too, or
+    /// it cannot attach to the node's anchors. `VeloBuilder::build` sets the
+    /// complete address; a plain messenger has nothing to add.
+    pub(crate) fn advertised_peer_info(&self) -> PeerInfo {
+        match self.advertised.get() {
+            Some(peer_info) => peer_info.clone(),
+            None => self.peer_info(),
+        }
+    }
+
+    /// Set the address [`advertised_peer_info`](Self::advertised_peer_info)
+    /// returns. Once only: a node's address does not change.
+    pub(crate) fn set_advertised_peer_info(&self, peer_info: PeerInfo) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            peer_info.instance_id() == self.instance_id,
+            "advertised address belongs to another instance"
+        );
+        self.advertised
+            .set(peer_info)
+            .map_err(|_| anyhow::anyhow!("advertised address already set"))
+    }
+
+    /// Install the one [`PeerTableObserver`]. Fails if one is installed.
+    pub(crate) fn set_peer_observer(
+        &self,
+        observer: Arc<dyn PeerTableObserver>,
+    ) -> anyhow::Result<()> {
+        self.peer_observer
+            .set(observer)
+            .map_err(|_| anyhow::anyhow!("a peer table observer is already installed"))
     }
 
     /// Returns `true` if the given instance has been registered via [`register_peer`](Self::register_peer).
@@ -672,6 +730,9 @@ impl VeloBackend {
             .insert(instance_id, alternative_transport_keys);
         self.workers.insert(instance_id.worker_id(), instance_id);
 
+        if let Some(observer) = self.peer_observer.get() {
+            observer.registered(&peer);
+        }
         Ok(())
     }
 
@@ -693,6 +754,9 @@ impl VeloBackend {
         // can still hold the peer from before.
         for transport in self.transports.values() {
             transport.unregister(instance_id);
+        }
+        if let Some(observer) = self.peer_observer.get() {
+            observer.unregistered(instance_id);
         }
         tracing::debug!(peer = %instance_id, "Unregistered peer");
     }

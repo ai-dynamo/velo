@@ -1156,3 +1156,67 @@ async fn cancelled_start_stops_only_completed_transports() {
     assert!(ready.shut_down.load(Ordering::Relaxed));
     assert!(!pending.shut_down.load(Ordering::Relaxed));
 }
+
+/// Records what the backend told it, in order.
+#[derive(Default)]
+struct RecordingObserver {
+    events: parking_lot::Mutex<Vec<(&'static str, InstanceId)>>,
+}
+
+impl PeerTableObserver for RecordingObserver {
+    fn registered(&self, peer: &PeerInfo) {
+        self.events.lock().push(("registered", peer.instance_id()));
+    }
+
+    fn unregistered(&self, instance_id: InstanceId) {
+        self.events.lock().push(("unregistered", instance_id));
+    }
+}
+
+/// The backend's peer table is the one every registration path goes
+/// through, so it is where the stream transport's table is kept in step.
+/// The observer hears of a peer only once a messenger transport accepted it,
+/// so a refused peer is not half-registered, and it hears of every
+/// unregister, which is idempotent there as it is here. Only one observer
+/// can be installed.
+#[tokio::test]
+async fn the_peer_table_observer_follows_registration() {
+    let accepting = MockTransport::new("tcp", true);
+    let (backend, _streams) = VeloBackend::new(vec![accepting as Arc<dyn Transport>], None)
+        .await
+        .unwrap();
+    let observer = Arc::new(RecordingObserver::default());
+    backend
+        .set_peer_observer(Arc::clone(&observer) as Arc<dyn PeerTableObserver>)
+        .unwrap();
+    assert!(
+        backend
+            .set_peer_observer(Arc::new(RecordingObserver::default()))
+            .is_err()
+    );
+
+    let peer = make_peer_info(&["tcp"]);
+    let id = peer.instance_id();
+    backend.register_peer(peer).unwrap();
+    backend.unregister_peer(id);
+    backend.unregister_peer(id);
+    assert_eq!(
+        *observer.events.lock(),
+        [
+            ("registered", id),
+            ("unregistered", id),
+            ("unregistered", id)
+        ]
+    );
+
+    let refusing = MockTransport::new("tcp", false);
+    let (backend, _streams) = VeloBackend::new(vec![refusing as Arc<dyn Transport>], None)
+        .await
+        .unwrap();
+    let observer = Arc::new(RecordingObserver::default());
+    backend
+        .set_peer_observer(Arc::clone(&observer) as Arc<dyn PeerTableObserver>)
+        .unwrap();
+    assert!(backend.register_peer(make_peer_info(&["tcp"])).is_err());
+    assert!(observer.events.lock().is_empty());
+}
