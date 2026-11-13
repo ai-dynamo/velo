@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! A task that holds its tokio worker thread right after it wakes a velo task
 //! stalls that velo task until it lets go.
 //!
