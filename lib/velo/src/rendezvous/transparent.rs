@@ -78,9 +78,9 @@ impl LargePayloadStager for RendezvousStager {
     /// transparently staged slot has refcount 1 and a single reader.
     fn stage(&self, payload: Bytes, ttl: Option<Duration>) -> String {
         let opts = ttl.map(|ttl| crate::rendezvous::RegisterOptions::new().ttl(ttl));
-        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        #[cfg(velo_rdma)]
         let handle = self.manager.register_data_pinned_sync(payload, opts);
-        #[cfg(not(all(target_os = "linux", feature = "ucx")))]
+        #[cfg(not(velo_rdma))]
         let handle = match opts {
             Some(opts) => self.manager.register_data_with(payload, opts),
             None => self.manager.register_data(payload),
