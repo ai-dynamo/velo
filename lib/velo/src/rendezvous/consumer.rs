@@ -17,7 +17,8 @@
 //! table — the GET rides *this* consumer's UCX endpoint to the owner, so "UCX
 //! is registered for that peer" is the whole condition. UCX does not have to be
 //! the primary transport; a control plane on TCP with UCX beside it is the
-//! expected deployment.
+//! expected deployment. The NIXL backend is not a transport: it connects from
+//! what the descriptor carries, so for it a registered owner is enough.
 //!
 //! Nothing is asked of the owner, which is what makes the scheme skew-safe: an
 //! owner that does not understand the offer ignores it and answers chunked.
@@ -563,16 +564,20 @@ fn rdma_offer(manager: &RendezvousManager, target: WorkerId) -> Option<RdmaOffer
         store.record_path(RdmaPathReason::NoOffer);
         return None;
     };
-    // Registered is enough; primary is not required.
-    let serves = backend
-        .primary_transport_key(instance)
-        .is_some_and(|k| k.as_str() == key)
-        || backend
-            .alternative_transport_keys(instance)
-            .is_some_and(|keys| keys.iter().any(|k| k.as_str() == key));
-    if !serves {
-        store.record_path(RdmaPathReason::NoOffer);
-        return None;
+    // UCX reads over the messenger's UCX transport, so the owner must be on
+    // it. Registered is enough; primary is not required. NIXL connects from
+    // what the descriptor carries, so a registered owner is enough.
+    if ctx.backend == crate::rendezvous::descriptor::DescriptorBackend::Ucx {
+        let serves = backend
+            .primary_transport_key(instance)
+            .is_some_and(|k| k.as_str() == key)
+            || backend
+                .alternative_transport_keys(instance)
+                .is_some_and(|keys| keys.iter().any(|k| k.as_str() == key));
+        if !serves {
+            store.record_path(RdmaPathReason::NoOffer);
+            return None;
+        }
     }
     Some(RdmaOffer {
         backends: vec![key.to_string()],

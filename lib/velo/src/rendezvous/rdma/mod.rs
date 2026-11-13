@@ -40,6 +40,9 @@
 pub(crate) mod arena;
 pub(crate) mod backend;
 pub(crate) mod region;
+// The NIXL backend. The only module here that names NIXL.
+#[cfg(feature = "nixl")]
+pub(crate) mod nixl;
 // The UCX backend. The only file here that names UCX.
 #[cfg(feature = "ucx")]
 pub(crate) mod ucx;
@@ -61,6 +64,10 @@ pub use region::{Deregistered, RegionGuard, RegionWatch};
 
 pub(crate) use arena::{ArenaSet, Budget, TransferHold};
 pub(crate) use backend::{BackendGet, RdmaBackend};
+#[cfg(all(feature = "nixl", feature = "test-helpers"))]
+pub use nixl::NixlLoopback;
+#[cfg(feature = "nixl")]
+pub use nixl::NixlRdmaConfig;
 use region::{RegionInner, RegionParts};
 #[cfg(feature = "ucx")]
 pub(crate) use ucx::UcxBackend;

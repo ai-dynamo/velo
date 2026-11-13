@@ -14,7 +14,7 @@
 # limitations under the License.
 
 name: Rust Setup
-description: Checkout, install protoc + system deps (cmake/mold/clang), and cache cargo registry
+description: Checkout, install protoc + system deps (cmake/mold/clang/g++/libclang), and cache cargo registry
 
 runs:
   using: composite
@@ -49,6 +49,12 @@ runs:
       # Headers only — no RDMA hardware is needed; the UCX tests run over tcp.
       [ -f /usr/include/infiniband/verbs.h ] || pkgs="$pkgs libibverbs-dev"
       [ -f /usr/include/rdma/rdma_cma.h ]    || pkgs="$pkgs librdmacm-dev"
+      # nixl-sys: the `nixl` feature (on under --all-features) runs bindgen and
+      # compiles a C++ stub in every build. bindgen loads libclang, which the
+      # `clang` binary alone does not provide. No NIXL library is needed: the
+      # stub loads it at run time, and the tests use a loopback agent.
+      command -v g++ >/dev/null 2>&1 || pkgs="$pkgs g++"
+      ls /usr/lib/llvm-*/lib/libclang*.so* >/dev/null 2>&1 || pkgs="$pkgs libclang-dev"
       [ -z "$pkgs" ] || { sudo apt-get update -qq && sudo apt-get install -y -qq $pkgs; }
 
   - name: Cache cargo registry and tools
