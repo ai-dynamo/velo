@@ -1557,10 +1557,19 @@ async fn retirement_reports_late_sends_and_preserves_successor() {
     assert!(connections.get(&key).unwrap().tx.same_channel(&next.tx));
 }
 
-/// Pause cancellation after the child reader wakes and before parent waiters wake.
-/// The peer must see the connection close, rather than STOP_SENDING from the reader.
+/// A listener in teardown wakes each connection's task before that
+/// connection's stream readers, so the peer sees the connection close, not a
+/// STOP_SENDING from a reader that stopped first (see
+/// `a_listener_in_teardown_closes_the_connection_before_its_streams` for why
+/// that matters).
+///
+/// Cancelling a token wakes its children before its own waiters. The reader
+/// of `serve_frames` waits on a child token, so on the node-wide token it
+/// would wake before the connection task. This test holds the cancel after
+/// the children wake and before the node-wide token's own waiters do: a
+/// reader that is a child of the node-wide token stops its stream in that
+/// gap. The readers' tokens must be children of the connection's token.
 #[tokio::test]
-#[ignore = "F1: child teardown sends STOP_SENDING before the connection closes"]
 async fn teardown_closes_the_connection_before_child_readers_stop_streams() {
     use std::future::Future;
     use std::task::{Context, Wake, Waker};

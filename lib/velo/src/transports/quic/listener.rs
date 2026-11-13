@@ -87,8 +87,15 @@ pub(super) async fn run_accept_loop(endpoint: quinn::Endpoint, ctx: AcceptContex
 }
 
 /// Serve the streams that one peer opens on a connection.
-async fn serve_connection(connection: quinn::Connection, ctx: AcceptContext) {
+async fn serve_connection(connection: quinn::Connection, mut ctx: AcceptContext) {
     let peer = connection.remote_address();
+    // The stream readers' teardown tokens are children of this connection's
+    // token. A cancel wakes a child before the children it has, so this task
+    // drops its connection handle before the readers drop their streams. The
+    // peer then sees the connection close, not a STOP_SENDING from a reader
+    // that stopped first. On the node-wide token, the readers' tokens would be
+    // its children and wake before this task.
+    ctx.teardown = ctx.teardown.child_token();
     loop {
         let stream = tokio::select! {
             biased;
