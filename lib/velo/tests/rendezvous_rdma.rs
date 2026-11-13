@@ -341,12 +341,9 @@ fn assert_pattern(data: &[u8], expected_len: usize) {
 async fn shutdown(pair: Pair) {
     pair.consumer
         .velo
-        .graceful_shutdown(ShutdownPolicy::Timeout(T))
+        .shutdown(ShutdownPolicy::Timeout(T))
         .await;
-    pair.owner
-        .velo
-        .graceful_shutdown(ShutdownPolicy::Timeout(T))
-        .await;
+    pair.owner.velo.shutdown(ShutdownPolicy::Timeout(T)).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -523,9 +520,7 @@ async fn register_data_in_region_checks_its_range() {
         Deregistered::Drained,
         "a refused staging must not have taken an in-flight guard"
     );
-    node.velo
-        .graceful_shutdown(ShutdownPolicy::Timeout(T))
-        .await;
+    node.velo.shutdown(ShutdownPolicy::Timeout(T)).await;
 }
 
 /// The RDMA path is taken when UCX is registered but **not** primary.
@@ -961,9 +956,7 @@ async fn a_spent_budget_stages_in_plain_memory() {
     assert_pattern(&data, payload.len());
     node.velo.release(handle, lease).await.unwrap();
 
-    node.velo
-        .graceful_shutdown(ShutdownPolicy::Timeout(T))
-        .await;
+    node.velo.shutdown(ShutdownPolicy::Timeout(T)).await;
 }
 
 /// A `get` that fails after taking the lease still gives the lease back.
@@ -1007,9 +1000,7 @@ async fn a_get_that_fails_after_taking_the_lease_returns_it() {
         "a failed get_pinned stranded its read lock, so the slot cannot be freed"
     );
 
-    node.velo
-        .graceful_shutdown(ShutdownPolicy::Timeout(T))
-        .await;
+    node.velo.shutdown(ShutdownPolicy::Timeout(T)).await;
 }
 
 /// The same, for the lease the *fallback* takes out.
@@ -1387,6 +1378,7 @@ async fn a_cancelled_transfer_does_not_release_its_destination() {
 /// transfer is observed in flight — the same counter shutdown drains on —
 /// before the caller is dropped.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(deprecated)] // times the deprecated `Velo::graceful_shutdown` sweep itself
 async fn shutdown_waits_for_a_live_transfer_before_unmapping_its_arena() {
     let pair = Pair::new().await;
 
@@ -1432,10 +1424,7 @@ async fn shutdown_waits_for_a_live_transfer_before_unmapping_its_arena() {
         "the arena should still have been unmapped once the transfer was done"
     );
 
-    pair.owner
-        .velo
-        .graceful_shutdown(ShutdownPolicy::Timeout(T))
-        .await;
+    pair.owner.velo.shutdown(ShutdownPolicy::Timeout(T)).await;
 }
 
 /// A staged anchor does not starve the shutdown sweep.
@@ -1446,6 +1435,7 @@ async fn shutdown_waits_for_a_live_transfer_before_unmapping_its_arena() {
 /// nothing. Dropping pinned slots before the sweep is what makes the drains
 /// finish normally instead.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(deprecated)] // times the deprecated `Velo::graceful_shutdown` sweep itself
 async fn a_staged_anchor_does_not_starve_the_shutdown_sweep() {
     let node = Node::start(None).await;
 
@@ -1524,9 +1514,7 @@ async fn dropping_a_pinned_buffer_returns_its_pool_space() {
         .await
         .expect("the space the dropped buffer gave back must be reusable");
 
-    node.velo
-        .graceful_shutdown(ShutdownPolicy::Timeout(T))
-        .await;
+    node.velo.shutdown(ShutdownPolicy::Timeout(T)).await;
 }
 
 // ---------------------------------------------------------------------------
