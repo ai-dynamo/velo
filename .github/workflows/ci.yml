@@ -176,6 +176,10 @@ jobs:
           production-features: ""
         - features: "ucx,test-helpers"
           production-features: ucx
+        # NIXL with no UCX transport: the RDMA layer must build and pass on the
+        # NIXL backend alone. The tests run on the loopback agent.
+        - features: "nixl,test-helpers"
+          production-features: nixl
     env:
       UCX_TLS: tcp
       CARGO_INCREMENTAL: "0"

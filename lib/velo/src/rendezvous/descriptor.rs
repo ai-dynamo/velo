@@ -28,7 +28,7 @@
 //! Fixed prefix, little-endian, no padding and no alignment requirement:
 //!
 //! ```text
-//! backend:    u8      1 = ucx
+//! backend:    u8      1 = ucx, 2 = nixl
 //! version:    u8      1
 //! flags:      u8      0
 //! generation: u64le   owner's registration generation
@@ -80,7 +80,11 @@ pub(crate) const HEADER_LEN: usize = 1 + 1 + 1 + 8 + 8 + 8 + 2;
 /// bound its own format justifies. A blob that passes here and fails there is
 /// refused there, which is the right place for a backend-specific limit to
 /// live.
-pub(crate) const MAX_KEY_LEN: usize = 4096;
+///
+/// Sized for the largest key: a NIXL key holds the owner's connection info and
+/// one region's metadata (`rdma/nixl/key.rs`), 532 bytes measured over tcp with
+/// one device, and the connection info grows with the number of devices.
+pub(crate) const MAX_KEY_LEN: usize = 16 * 1024;
 
 /// Which RDMA provider authored a descriptor (D12's wire discriminator).
 ///
@@ -92,6 +96,8 @@ pub(crate) const MAX_KEY_LEN: usize = 4096;
 pub(crate) enum DescriptorBackend {
     /// UCX, via `ucp_rkey_pack` / `ucp_get_nbx`.
     Ucx,
+    /// NIXL, via its partial metadata and a READ transfer request.
+    Nixl,
 }
 
 impl DescriptorBackend {
@@ -99,6 +105,7 @@ impl DescriptorBackend {
     pub(crate) fn to_wire(self) -> u8 {
         match self {
             Self::Ucx => 1,
+            Self::Nixl => 2,
         }
     }
 
@@ -106,6 +113,7 @@ impl DescriptorBackend {
     pub(crate) fn from_wire(value: u8) -> Option<Self> {
         match value {
             1 => Some(Self::Ucx),
+            2 => Some(Self::Nixl),
             _ => None,
         }
     }
@@ -115,6 +123,7 @@ impl DescriptorBackend {
     pub(crate) fn key(self) -> &'static str {
         match self {
             Self::Ucx => "ucx",
+            Self::Nixl => "nixl",
         }
     }
 
@@ -122,6 +131,7 @@ impl DescriptorBackend {
     pub(crate) fn from_key(key: &str) -> Option<Self> {
         match key {
             "ucx" => Some(Self::Ucx),
+            "nixl" => Some(Self::Nixl),
             _ => None,
         }
     }
@@ -390,17 +400,36 @@ mod tests {
         assert!(d.encode().is_none());
     }
 
+    /// The wire value and the name of a backend are a contract with every
+    /// other velo version: a value that moves makes one backend's key reach
+    /// another backend's parser.
     #[test]
     fn backend_names_and_wire_values_agree() {
-        assert_eq!(
-            DescriptorBackend::from_key("ucx"),
-            Some(DescriptorBackend::Ucx)
-        );
-        assert_eq!(DescriptorBackend::from_key("nixl"), None);
-        assert_eq!(
-            DescriptorBackend::from_wire(DescriptorBackend::Ucx.to_wire()),
-            Some(DescriptorBackend::Ucx)
-        );
-        assert_eq!(DescriptorBackend::Ucx.key(), "ucx");
+        for (backend, wire, key) in [
+            (DescriptorBackend::Ucx, 1u8, "ucx"),
+            (DescriptorBackend::Nixl, 2u8, "nixl"),
+        ] {
+            assert_eq!(backend.to_wire(), wire);
+            assert_eq!(DescriptorBackend::from_wire(wire), Some(backend));
+            assert_eq!(backend.key(), key);
+            assert_eq!(DescriptorBackend::from_key(key), Some(backend));
+        }
+        assert_eq!(DescriptorBackend::from_key("libfabric"), None);
+        assert_eq!(DescriptorBackend::from_wire(3), None);
+        assert_eq!(DescriptorBackend::from_wire(0), None);
+    }
+
+    /// A NIXL key is longer than any UCX rkey. One over the 4 KiB that the
+    /// bound used to be must still travel.
+    #[test]
+    fn a_nixl_descriptor_round_trips() {
+        let d = RdmaDescriptor {
+            backend: DescriptorBackend::Nixl,
+            packed_key: Bytes::from(vec![0xAB; 5000]),
+            ..sample()
+        };
+        let bytes = d.encode().expect("encode");
+        assert_eq!(bytes[0], 2, "backend discriminator");
+        assert_eq!(RdmaDescriptor::decode(&bytes).expect("decode"), d);
     }
 }
