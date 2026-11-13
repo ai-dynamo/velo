@@ -73,15 +73,15 @@ pub use crate::rendezvous::{
     DataHandle, DataMetadata, RegisterOptions, RendezvousManager, RendezvousWrite, StageMode,
 };
 
-// RDMA registration. Gated exactly as `transports::ucx` is: these types are the
-// public face of a subsystem that only exists when a UCX transport can back it.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+// RDMA registration: the public face of a subsystem that only exists when an
+// RDMA backend is compiled in.
+#[cfg(velo_rdma)]
 pub use crate::rendezvous::rdma::{
     Deregistered, PinnedBuf, RdmaConfig, RdmaError, RdmaPoolConfig, RdmaRendezvousConfig,
     RegionGuard, RegionWatch, RegisterOwnedError,
 };
 
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 pub use crate::rendezvous::write::PinnedWriter;
 /// The registered `get_into` destination, and the capability that describes it.
 ///
@@ -239,9 +239,9 @@ struct VeloInner {
     /// address publication. The mux adds no streaming listener or endpoint.
     stream_transport: Arc<dyn crate::streaming::FrameTransport>,
     stream_owner: StreamOwner,
-    /// RDMA registration layer, present only when a UCX transport was added
-    /// through [`VeloBuilder::add_ucx_transport`].
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    /// RDMA registration layer, present only when the builder was given an
+    /// RDMA backend (a UCX transport through `VeloBuilder::add_ucx_transport`).
+    #[cfg(velo_rdma)]
     rdma: Option<Arc<crate::rendezvous::rdma::RdmaRegistry>>,
     /// Serialises [`graceful_shutdown`](Velo::graceful_shutdown).
     ///
@@ -325,7 +325,7 @@ pub struct VeloBuilder {
     /// (D10) — so the builder simply remembers what it was handed.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     ucx_transport: Option<Arc<crate::transports::ucx::UcxTransport>>,
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     rdma_config: Option<crate::rendezvous::rdma::RdmaConfig>,
 }
 
@@ -349,7 +349,7 @@ impl VeloBuilder {
             staged_fetch_timeout: None,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             ucx_transport: None,
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            #[cfg(velo_rdma)]
             rdma_config: None,
         }
     }
@@ -381,8 +381,9 @@ impl VeloBuilder {
     }
 
     /// Tune the RDMA registration layer: arena sizing, the registered-bytes
-    /// budget, and the shutdown budgets. Ignored without a UCX transport.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    /// budget, and the shutdown budgets. Ignored when the instance has no RDMA
+    /// backend.
+    #[cfg(velo_rdma)]
     pub fn rdma_config(mut self, config: crate::rendezvous::rdma::RdmaConfig) -> Self {
         self.rdma_config = Some(config);
         self
@@ -650,8 +651,11 @@ impl VeloBuilder {
         });
         messenger.set_large_payload_support(stager, resolver);
 
-        // Build the RDMA registration layer, if a UCX transport was
-        // added through `add_ucx_transport`.
+        // The RDMA backend this instance was built with, if any. One per
+        // instance: the registry holds a single `Arc<dyn RdmaBackend>`.
+        #[cfg(velo_rdma)]
+        let mut rdma_backend: Option<Arc<dyn crate::rendezvous::rdma::RdmaBackend>> = None;
+        // UCX: a transport added through `add_ucx_transport`.
         //
         // Ordering: `MessengerBuilder::build` above has already called
         // `Transport::start` on every transport (`transports.rs`), so the RMA
@@ -660,8 +664,16 @@ impl VeloBuilder {
         // the transport marks itself started — but it would let a registration
         // fail for a reason that reads like a bug.
         #[cfg(all(target_os = "linux", feature = "ucx"))]
-        let rdma = match self.ucx_transport.as_ref() {
-            Some(transport) => {
+        if let Some(transport) = self.ucx_transport.as_ref() {
+            rdma_backend = Some(crate::rendezvous::rdma::UcxBackend::new(
+                transport.rdma_endpoint(),
+            ));
+        }
+
+        // Build the RDMA registration layer over that backend.
+        #[cfg(velo_rdma)]
+        let rdma = match rdma_backend {
+            Some(backend) => {
                 let mut config = self.rdma_config.clone().unwrap_or_default();
                 // The kill switch (D6), read once at build. An environment
                 // variable rather than only a config field so a rollback is a
@@ -677,15 +689,15 @@ impl VeloBuilder {
                 }
                 let rendezvous_config = config.rendezvous.clone();
                 let registry = Arc::new(crate::rendezvous::rdma::RdmaRegistry::new(
-                    crate::rendezvous::rdma::UcxBackend::new(transport.rdma_endpoint()),
+                    backend,
                     config,
                     messenger.runtime().clone(),
                     self.metrics.clone(),
                 ));
                 // Hand the rendezvous manager the registry it was built too
-                // early to be given: the registry wraps an RMA endpoint on a
-                // transport that has to have started first. This also starts
-                // the lease reaper.
+                // early to be given: the registry wraps a backend that needs
+                // the transports started first. This also starts the lease
+                // reaper.
                 rendezvous_manager.set_rdma_context(
                     Arc::clone(&registry),
                     rendezvous_config,
@@ -707,7 +719,7 @@ impl VeloBuilder {
                 anchor_manager,
                 rendezvous_manager,
                 stream_transport,
-                #[cfg(all(target_os = "linux", feature = "ucx"))]
+                #[cfg(velo_rdma)]
                 rdma,
                 shutdown: ShutdownOnce {
                     lock: tokio::sync::Mutex::new(()),
@@ -726,7 +738,7 @@ impl Default for VeloBuilder {
 
 /// Whether `VELO_RDMA_RENDEZVOUS_DISABLE` asks for the rendezvous RDMA path to
 /// be switched off (D6). Parsed by [`kill_switch_set`].
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 fn rdma_rendezvous_disabled_by_env() -> bool {
     kill_switch_set(
         std::env::var("VELO_RDMA_RENDEZVOUS_DISABLE")
@@ -918,7 +930,7 @@ impl Velo {
 
         // Shadowed with what is left of the caller budget after the sweep, so
         // the two phases share one deadline instead of taking one each.
-        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        #[cfg(velo_rdma)]
         let policy = {
             let started = std::time::Instant::now();
             if let Some(rdma) = &self.inner.rdma {
@@ -967,7 +979,7 @@ impl Velo {
         // Teardown has returned, so the progress thread has force-unmapped
         // everything it still held: nothing is pinned any more, and every latch
         // the sweep could not resolve honestly can be resolved now.
-        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        #[cfg(velo_rdma)]
         if let Some(rdma) = &self.inner.rdma {
             rdma.latch_all_deregistered();
         }
@@ -1459,7 +1471,7 @@ impl Velo {
     /// See [`RendezvousManager::register_data_in_region`]: the slot holds an
     /// in-flight guard on the region, so
     /// [`RegionGuard::unregister`] waits for the anchors staged inside it.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub fn register_data_in_region(
         &self,
         guard: &RegionGuard,
@@ -1488,14 +1500,14 @@ impl Velo {
     /// Returns `(buffer, lease_id)`. Dropping the buffer returns its space to
     /// the pool. See [`RendezvousManager::get_pinned`] for what the lease does
     /// and does not cover.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub async fn get_pinned(&self, handle: DataHandle) -> Result<(PinnedBuf, u64)> {
         self.inner.rendezvous_manager.get_pinned(handle).await
     }
 
     /// Allocate a registered [`get_into`](Self::get_into) destination, so an
     /// RDMA transfer into it costs no copy at all.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub async fn alloc_pinned_writer(&self, len: usize) -> Result<PinnedWriter, RdmaError> {
         self.inner.rendezvous_manager.alloc_pinned_writer(len).await
     }
@@ -1616,7 +1628,7 @@ impl Velo {
     ///
     /// Registering is therefore a trust decision about the peers this instance
     /// talks to, not merely a performance one.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub async unsafe fn register_external_memory(
         &self,
         ptr: std::ptr::NonNull<u8>,
@@ -1644,7 +1656,7 @@ impl Velo {
     /// Note that a `Box<[u8]>` is byte-aligned while registration pins whole
     /// pages, so neighbouring heap shares the pinning — and with it the remote
     /// writability. [`RegionGuard::effective_range`] is how to see it.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub async fn register_owned(
         &self,
         buf: Box<[u8]>,
@@ -1659,7 +1671,7 @@ impl Velo {
     }
 
     /// Bytes currently registered for RDMA, pool and external together.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub fn rdma_registered_bytes(&self) -> u64 {
         self.inner
             .rdma
@@ -1674,7 +1686,7 @@ impl Velo {
     /// in flight has to be able to see that it started; timing the caller's
     /// future instead races the acquire round trip, and a cancelled future
     /// looks identical whether the transfer began or never did.
-    #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    #[cfg(all(velo_rdma, feature = "test-helpers"))]
     pub fn rdma_in_flight_transfers(&self) -> usize {
         self.inner
             .rdma
@@ -1684,13 +1696,14 @@ impl Velo {
     }
 
     /// The registration layer, for tests that need to observe it directly.
+    /// Only the UCX tests do.
     #[cfg(all(target_os = "linux", feature = "ucx", test))]
     pub(crate) fn rdma(&self) -> Option<&Arc<crate::rendezvous::rdma::RdmaRegistry>> {
         self.inner.rdma.as_ref()
     }
 
     /// The registration layer, for staging and transfers.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn rdma_registry(
         &self,
     ) -> Result<&Arc<crate::rendezvous::rdma::RdmaRegistry>, RdmaError> {

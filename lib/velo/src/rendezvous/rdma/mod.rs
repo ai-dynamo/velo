@@ -40,6 +40,9 @@
 pub(crate) mod arena;
 pub(crate) mod backend;
 pub(crate) mod region;
+// The UCX backend. The only file here that names UCX.
+#[cfg(feature = "ucx")]
+pub(crate) mod ucx;
 
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -57,8 +60,10 @@ pub use backend::RdmaError;
 pub use region::{Deregistered, RegionGuard, RegionWatch};
 
 pub(crate) use arena::{ArenaSet, Budget, TransferHold};
-pub(crate) use backend::{BackendGet, RdmaBackend, UcxBackend};
+pub(crate) use backend::{BackendGet, RdmaBackend};
 use region::{RegionInner, RegionParts};
+#[cfg(feature = "ucx")]
+pub(crate) use ucx::UcxBackend;
 
 /// Tuning for the whole registration layer.
 #[derive(Debug, Clone)]
@@ -743,8 +748,8 @@ impl RdmaRegistry {
         &self.pool
     }
 
-    /// How many times the shutdown sweep has run.
-    #[cfg(test)]
+    /// How many times the shutdown sweep has run. Only a UCX test reads it.
+    #[cfg(all(test, feature = "ucx"))]
     pub(crate) fn sweep_count(&self) -> usize {
         self.shared.sweeps.load(Ordering::Relaxed)
     }

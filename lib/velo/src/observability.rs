@@ -126,9 +126,8 @@ fn direction_index(d: Direction) -> usize {
 
 /// Which registration path produced an RDMA registration.
 ///
-/// Gated with the `ucx` feature because it is the only backend that can emit
-/// one today; the series simply does not exist in a build without it.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+/// The series does not exist in a build with no RDMA backend.
+#[cfg(velo_rdma)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RdmaRegistrationKind {
     /// A pool arena velo allocated and registered itself. Emitted by the arena
@@ -138,7 +137,7 @@ pub(crate) enum RdmaRegistrationKind {
     External,
 }
 
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 impl RdmaRegistrationKind {
     fn as_str(self) -> &'static str {
         match self {
@@ -180,7 +179,7 @@ impl RdmaRegistrationKind {
 ///
 /// Gated with the RDMA path itself: on a build without it there is no decision
 /// to record, and a series that is always zero is worse than absent.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RdmaPathReason {
     /// The RDMA path was taken. The only reason with `path="rdma"`.
@@ -204,8 +203,8 @@ pub(crate) enum RdmaPathReason {
     /// The owner's pinned staging was refused by the registered-bytes budget
     /// and the slot was staged in plain memory instead.
     Budget,
-    /// This instance has no RDMA registry at all — no UCX transport was
-    /// installed through `VeloBuilder::add_ucx_transport`.
+    /// This instance has no RDMA registry at all — the builder was given no
+    /// RDMA backend (for UCX, `VeloBuilder::add_ucx_transport`).
     ///
     /// A deployment fact rather than a decision, and the one decline that used
     /// to be silent: an instance configured without the RDMA path emitted
@@ -220,7 +219,7 @@ pub(crate) enum RdmaPathReason {
     Draining,
 }
 
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 impl RdmaPathReason {
     /// Which path this reason ended on.
     pub(crate) fn path(self) -> &'static str {
@@ -1182,19 +1181,19 @@ pub struct VeloMetrics {
     rendezvous_operation_duration_seconds: HistogramVec,
     rendezvous_bytes_total: CounterVec,
     rendezvous_active_slots: Gauge,
-    // RDMA registration metrics. Gated with the backend that can emit them, so
-    // a build without `ucx` carries neither the fields nor the series.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    // RDMA registration metrics. A build with no RDMA backend carries neither
+    // the fields nor the series.
+    #[cfg(velo_rdma)]
     rdma_registered_bytes: Gauge,
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     rdma_registrations_total: CounterVec,
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     rdma_live_regions: Gauge,
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     rendezvous_rdma_path_total: CounterVec,
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     rendezvous_rdma_get_duration_seconds: Histogram,
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     rendezvous_rdma_leases_reaped_total: Counter,
 }
 
@@ -1943,7 +1942,7 @@ impl VeloMetrics {
             )?,
         )?;
 
-        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        #[cfg(velo_rdma)]
         let rdma_registered_bytes = register_collector(
             registry,
             Gauge::new(
@@ -1951,7 +1950,7 @@ impl VeloMetrics {
                 "Bytes currently registered for RDMA (arena pool plus external regions).",
             )?,
         )?;
-        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        #[cfg(velo_rdma)]
         let rdma_registrations_total = register_collector(
             registry,
             CounterVec::new(
@@ -1962,7 +1961,7 @@ impl VeloMetrics {
                 &["kind"],
             )?,
         )?;
-        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        #[cfg(velo_rdma)]
         let rdma_live_regions = register_collector(
             registry,
             Gauge::new(
@@ -1970,7 +1969,7 @@ impl VeloMetrics {
                 "Memory regions the RDMA backend currently holds registered.",
             )?,
         )?;
-        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        #[cfg(velo_rdma)]
         let rendezvous_rdma_path_total = register_collector(
             registry,
             CounterVec::new(
@@ -1981,7 +1980,7 @@ impl VeloMetrics {
                 &["path", "reason"],
             )?,
         )?;
-        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        #[cfg(velo_rdma)]
         let rendezvous_rdma_get_duration_seconds = register_collector(
             registry,
             Histogram::with_opts(
@@ -1993,7 +1992,7 @@ impl VeloMetrics {
                 .buckets(exponential_buckets(0.00005, 2.0, 20)?),
             )?,
         )?;
-        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        #[cfg(velo_rdma)]
         let rendezvous_rdma_leases_reaped_total = register_collector(
             registry,
             Counter::new(
@@ -2062,17 +2061,17 @@ impl VeloMetrics {
             rendezvous_operation_duration_seconds,
             rendezvous_bytes_total,
             rendezvous_active_slots,
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            #[cfg(velo_rdma)]
             rdma_registered_bytes,
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            #[cfg(velo_rdma)]
             rdma_registrations_total,
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            #[cfg(velo_rdma)]
             rdma_live_regions,
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            #[cfg(velo_rdma)]
             rendezvous_rdma_path_total,
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            #[cfg(velo_rdma)]
             rendezvous_rdma_get_duration_seconds,
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            #[cfg(velo_rdma)]
             rendezvous_rdma_leases_reaped_total,
         })
     }
@@ -2457,13 +2456,13 @@ impl VeloMetrics {
     /// A gauge rather than a counter pair: registration is not monotonic, and
     /// the number that matters operationally is how much is pinned right now
     /// against the configured budget and against `RLIMIT_MEMLOCK`.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn set_rdma_registered_bytes(&self, bytes: u64) {
         self.rdma_registered_bytes.set(bytes as f64);
     }
 
     /// Count one registration, labelled by which path produced it.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn record_rdma_registration(&self, kind: RdmaRegistrationKind) {
         self.rdma_registrations_total
             .with_label_values(&[kind.as_str()])
@@ -2486,13 +2485,13 @@ impl VeloMetrics {
     /// keys. That is a UCX-level concept living behind the backend seam (D12),
     /// and widening the trait to reach it would put a backend-specific idea
     /// into the interface a NIXL or libfabric provider has to implement.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn set_rdma_live_regions(&self, regions: usize) {
         self.rdma_live_regions.set(regions as f64);
     }
 
     /// Count one rendezvous transfer by the path it took and what decided it.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn record_rendezvous_rdma_path(&self, reason: RdmaPathReason) {
         self.rendezvous_rdma_path_total
             .with_label_values(&[reason.path(), reason.as_str()])
@@ -2505,7 +2504,7 @@ impl VeloMetrics {
     /// that one covers the whole `get`, and the question this phase has to be
     /// able to answer is what the *transfer* costs once the control plane is
     /// out of the way.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn record_rendezvous_rdma_get(&self, duration: std::time::Duration) {
         self.rendezvous_rdma_get_duration_seconds
             .observe(duration.as_secs_f64());
@@ -2517,7 +2516,7 @@ impl VeloMetrics {
     /// crashed mid-transfer, or too slow and not renewing. Either way the owner
     /// is reclaiming slots somebody else believes they still hold, which is a
     /// fact worth alerting on rather than one to find in a log.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn record_rendezvous_leases_reaped(&self, leases: usize) {
         self.rendezvous_rdma_leases_reaped_total
             .inc_by(leases as f64);

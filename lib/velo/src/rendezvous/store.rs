@@ -20,7 +20,7 @@
 //!
 //! Every read path here serves both bodies. A pinned slot is host memory that a
 //! peer *may* read with an RDMA GET, not memory that only an RDMA consumer can
-//! reach: an old consumer, a consumer without the UCX transport, one whose GET
+//! reach: an old consumer, a consumer without an RDMA backend, one whose GET
 //! failed, and one below the RDMA size threshold all pull it chunk by chunk.
 //! Bifurcating the two — a pinned slot that refuses non-RDMA readers — was an
 //! earlier version's worst property, and this store never reintroduces it.
@@ -89,7 +89,7 @@ pub(crate) enum SlotBody {
     /// Plain heap bytes.
     InMemory(Bytes),
     /// Registered memory a peer may read directly.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     Pinned(super::pinned::PinnedSlot),
 }
 
@@ -98,7 +98,7 @@ impl SlotBody {
     pub(crate) fn stage_mode(&self) -> StageMode {
         match self {
             Self::InMemory(_) => StageMode::InMemory,
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            #[cfg(velo_rdma)]
             Self::Pinned(slot) => slot.stage_mode(),
         }
     }
@@ -107,7 +107,7 @@ impl SlotBody {
     pub(crate) fn total_len(&self) -> u64 {
         match self {
             Self::InMemory(data) => data.len() as u64,
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            #[cfg(velo_rdma)]
             Self::Pinned(slot) => slot.len(),
         }
     }
@@ -127,7 +127,7 @@ impl SlotBody {
                 // Cheap: a `Bytes` slice is a refcount bump, not a copy.
                 Some(data.slice(start..end))
             }
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            #[cfg(velo_rdma)]
             Self::Pinned(slot) => slot.read_at(offset, len),
         }
     }
@@ -136,7 +136,7 @@ impl SlotBody {
     fn to_bytes(&self) -> Option<Bytes> {
         match self {
             Self::InMemory(data) => Some(data.clone()),
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            #[cfg(velo_rdma)]
             Self::Pinned(slot) => slot.to_bytes(),
         }
     }
@@ -296,7 +296,7 @@ pub struct DataStore {
     /// The store is the one thing the handler already holds an `Arc` to, and it
     /// is per-instance, so it is where the late-bound context goes. Set once,
     /// by `RendezvousManager::set_rdma_context`.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     rdma: std::sync::OnceLock<super::RdmaContext>,
 }
 
@@ -315,7 +315,7 @@ impl DataStore {
             #[cfg(test)]
             between_inserts: std::sync::OnceLock::new(),
             metrics: None,
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            #[cfg(velo_rdma)]
             rdma: std::sync::OnceLock::new(),
         }
     }
@@ -335,19 +335,19 @@ impl DataStore {
 
     /// Bind the RDMA registry and policy. Called once, from
     /// `RendezvousManager::set_rdma_context`.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn set_rdma(&self, ctx: super::RdmaContext) -> Result<(), super::RdmaContext> {
         self.rdma.set(ctx)
     }
 
     /// The RDMA registry and policy, if this instance has them.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn rdma(&self) -> Option<&super::RdmaContext> {
         self.rdma.get()
     }
 
     /// Count one path decision. A no-op without metrics.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn record_path(&self, reason: crate::observability::RdmaPathReason) {
         if let Some(m) = &self.metrics {
             m.record_rendezvous_rdma_path(reason);
@@ -414,7 +414,7 @@ impl DataStore {
     /// at a point the caller cannot get wrong: a descriptor built from a slot
     /// must not be held while the map shard is locked, and the read paths that
     /// copy out of pinned memory must not be reentered from inside one.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn with_pinned<R>(
         &self,
         local_id: u64,
@@ -782,7 +782,7 @@ impl DataStore {
     /// it is transient: the copies go when the slots do.
     ///
     /// Returns `(demoted, dropped)`.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn demote_pinned_slots(&self) -> (usize, usize) {
         // Collected first: the copy below happens under a *read* guard on the
         // slot, and taking that while iterating the same map would hold a shard
@@ -901,7 +901,7 @@ impl DataStore {
     }
 
     /// Stop the reaper, for good. Called when the instance shuts down.
-    #[cfg_attr(not(all(target_os = "linux", feature = "ucx")), allow(dead_code))]
+    #[cfg_attr(not(velo_rdma), allow(dead_code))]
     pub(crate) fn stop_reaper(&self) {
         self.reaper.stop.cancel();
     }

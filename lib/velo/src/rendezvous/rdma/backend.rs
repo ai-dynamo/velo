@@ -20,7 +20,7 @@
 //!
 //! These are the properties the layers above depend on, stated here so a second
 //! backend has something to implement against rather than inferring them from
-//! [`UcxBackend`]:
+//! the UCX one (`rdma/ucx.rs`):
 //!
 //! * **`map` rolls back if its future is dropped.** A cancelled `map` must
 //!   leave no registration behind under the id it was minting. The caller
@@ -38,19 +38,16 @@
 //! * **`get` keeps the destination region alive for the transfer's duration**,
 //!   whether or not anyone is still awaiting the future.
 
-use std::sync::Arc;
-
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use velo_ext::InstanceId;
 
 /// Why a registration-layer operation could not be performed.
 ///
-/// Backend-agnostic by construction: the UCX-specific
-/// [`RmaError`](crate::transports::ucx::rma::RmaError) is projected onto these
-/// variants by [`UcxBackend`], with the original diagnosis preserved in
-/// [`RdmaError::Backend`]'s string. Callers switch on the variant; humans read
-/// the string.
+/// Backend-agnostic by construction: each backend projects its own failures
+/// onto these variants (the UCX backend does it for its `RmaError`), with the
+/// original diagnosis preserved in [`RdmaError::Backend`]'s string. Callers
+/// switch on the variant; humans read the string.
 ///
 /// `#[non_exhaustive]`: this enum is explicitly evolutionary. D12 admits later
 /// NIXL and libfabric backends, and Phases 3 to 5 add lease, descriptor and
@@ -114,8 +111,8 @@ pub enum RdmaError {
     #[error("rdma backend: {0}")]
     Backend(String),
 
-    /// This instance has no RDMA backend: the UCX transport was never installed
-    /// through `VeloBuilder::add_ucx_transport`.
+    /// This instance has no RDMA backend: the builder was never given one
+    /// (for UCX, through `VeloBuilder::add_ucx_transport`).
     ///
     /// A deployment fact, not a failure. Retrying cannot change it, and a
     /// caller with a chunked fallback should take it permanently.
@@ -201,7 +198,7 @@ pub(crate) trait RdmaBackend: Send + Sync {
     ///
     /// Read it precisely: *the backend attempted an unmap for every region it
     /// held, and has finished doing so*. It is not a direct observation that
-    /// no pages are pinned. For [`UcxBackend`] the counter decrements
+    /// no pages are pinned. For the UCX backend the counter decrements
     /// unconditionally in the worker's unmap path, so `Some(0)` would still be
     /// reported if a `ucp_mem_unmap` had failed — the two are equivalent today
     /// only because `ucp_mem_unmap` cannot fail on UCX 1.22 for a handle it
@@ -219,96 +216,5 @@ pub(crate) trait RdmaBackend: Send + Sync {
     /// weaker than `Some(0)`.
     fn live_registrations(&self) -> Option<usize> {
         None
-    }
-}
-
-/// [`RdmaBackend`] over the UCX transport's Phase-1 RMA plumbing.
-///
-/// Holds an [`RdmaEndpoint`], which is two `Arc`s and no UCX state — every
-/// `ucp_*` handle stays on the progress thread. Constructing one before
-/// [`Transport::start`](velo_ext::Transport::start) has resolved is harmless:
-/// every method answers `NotStarted` until the transport marks itself started,
-/// which this projects to [`RdmaError::Backend`].
-pub(crate) struct UcxBackend {
-    endpoint: crate::transports::ucx::rma::RdmaEndpoint,
-}
-
-impl UcxBackend {
-    /// Wrap a transport's RMA endpoint.
-    pub(crate) fn new(endpoint: crate::transports::ucx::rma::RdmaEndpoint) -> Arc<Self> {
-        Arc::new(Self { endpoint })
-    }
-}
-
-impl RdmaBackend for UcxBackend {
-    fn key(&self) -> &str {
-        "ucx"
-    }
-
-    fn map(&self, ptr: usize, len: usize) -> BoxFuture<'_, Result<BackendRegion, RdmaError>> {
-        Box::pin(async move {
-            let region = self
-                .endpoint
-                .map_region(ptr, len)
-                .await
-                .map_err(rma_error)?;
-            Ok(BackendRegion {
-                backend_region_id: region.region_id,
-                effective_addr: region.effective_addr,
-                effective_len: region.effective_len,
-                packed_key: region.packed_rkey,
-            })
-        })
-    }
-
-    fn unmap(&self, backend_region_id: u64) -> BoxFuture<'_, Result<(), RdmaError>> {
-        Box::pin(async move {
-            self.endpoint
-                .unmap_region(backend_region_id)
-                .await
-                .map_err(rma_error)
-        })
-    }
-
-    /// The progress thread's own region count.
-    ///
-    /// Decremented on unmap *attempt*, not on success — see the trait docs.
-    /// Sound as a precondition on UCX 1.22, where `ucp_mem_unmap` cannot fail
-    /// for a handle UCX itself issued; a UCX bump has to re-check that.
-    fn live_registrations(&self) -> Option<usize> {
-        Some(self.endpoint.live_regions())
-    }
-
-    fn get(&self, req: BackendGet) -> BoxFuture<'_, Result<(), RdmaError>> {
-        Box::pin(async move {
-            self.endpoint
-                .get(crate::transports::ucx::rma::RmaGetRequest {
-                    peer: req.peer,
-                    remote_addr: req.remote_addr,
-                    packed_rkey: req.packed_key,
-                    local_region: req.local_region_id,
-                    local_offset: req.local_offset,
-                    len: req.len,
-                })
-                .await
-                .map_err(rma_error)
-        })
-    }
-}
-
-/// Project a UCX-level RMA failure onto the backend-agnostic error.
-///
-/// The three "the plumbing is not there" conditions — not started, no progress
-/// thread, a `ucp_*` call failing — all collapse into
-/// [`RdmaError::Backend`], because nothing above this trait can act on the
-/// difference. The message keeps the distinction so a human can.
-fn rma_error(e: crate::transports::ucx::rma::RmaError) -> RdmaError {
-    use crate::transports::ucx::rma::RmaError as E;
-    match e {
-        E::ShuttingDown => RdmaError::ShuttingDown,
-        E::OutOfRange => RdmaError::OutOfRange,
-        E::RegionNotFound => RdmaError::RegionNotFound,
-        E::InvalidRkey => RdmaError::InvalidKey,
-        other => RdmaError::Backend(format!("ucx: {other}")),
     }
 }
