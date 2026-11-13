@@ -1220,3 +1220,145 @@ async fn the_peer_table_observer_follows_registration() {
     assert!(backend.register_peer(make_peer_info(&["tcp"])).is_err());
     assert!(observer.events.lock().is_empty());
 }
+
+/// Register and unregister may finish in either order, but their final
+/// messenger and stream tables must agree.
+#[tokio::test]
+#[ignore = "F1: a delayed unregister erases a newer stream registration"]
+async fn a_delayed_unregister_does_not_erase_a_new_stream_registration() {
+    struct PausedUnregister {
+        inner: Arc<MockTransport>,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    }
+
+    impl Transport for PausedUnregister {
+        fn key(&self) -> TransportKey {
+            self.inner.key()
+        }
+
+        fn address(&self) -> WorkerAddress {
+            self.inner.address()
+        }
+
+        fn register(&self, peer: PeerInfo) -> Result<(), TransportError> {
+            self.inner.register(peer)
+        }
+
+        fn unregister(&self, peer: InstanceId) {
+            self.inner.unregister(peer);
+            self.entered.send(()).unwrap();
+            self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+
+        fn send_message(
+            &self,
+            target: InstanceId,
+            header: Bytes,
+            payload: Bytes,
+            kind: MessageType,
+            on_error: Arc<dyn TransportErrorHandler>,
+        ) -> SendOutcome {
+            self.inner
+                .send_message(target, header, payload, kind, on_error)
+        }
+
+        fn start(
+            &self,
+            id: InstanceId,
+            adapter: TransportAdapter,
+            runtime: tokio::runtime::Handle,
+        ) -> BoxFuture<'_, anyhow::Result<()>> {
+            self.inner.start(id, adapter, runtime)
+        }
+
+        fn shutdown(&self) {
+            self.inner.shutdown();
+        }
+
+        fn begin_drain(&self) {
+            self.inner.begin_drain();
+        }
+
+        fn closed(&self) -> BoxFuture<'_, ()> {
+            self.inner.closed()
+        }
+
+        fn check_health(
+            &self,
+            id: InstanceId,
+            timeout: Duration,
+        ) -> BoxFuture<'_, Result<(), HealthCheckError>> {
+            self.inner.check_health(id, timeout)
+        }
+    }
+
+    let (entered_tx, entered_rx) = flume::bounded(1);
+    let (release_tx, release_rx) = flume::bounded(1);
+    let transport = Arc::new(PausedUnregister {
+        inner: MockTransport::new("tcp", true),
+        entered: entered_tx,
+        release: release_rx,
+    });
+    let (backend, _streams) = VeloBackend::new(vec![transport], None).await.unwrap();
+    let backend = Arc::new(backend);
+    let stream = crate::streaming::TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .unwrap();
+    let remote = crate::streaming::TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .unwrap();
+    let erased: Arc<dyn crate::streaming::FrameTransport> = stream.clone();
+    backend
+        .set_peer_observer(Arc::new(
+            crate::streaming::peer_table::StreamPeerTable::new(Arc::downgrade(&erased)),
+        ))
+        .unwrap();
+    let peer =
+        crate::streaming::peer_table::complete_peer_info(make_peer_info(&["tcp"]), remote.as_ref());
+    let id = peer.instance_id();
+    backend.register_peer(peer.clone()).unwrap();
+    assert!(stream.knows_peer(id.worker_id()));
+
+    let unregistering = Arc::clone(&backend);
+    let unregister = std::thread::spawn(move || unregistering.unregister_peer(id));
+    tokio::time::timeout(Duration::from_secs(5), entered_rx.recv_async())
+        .await
+        .unwrap()
+        .unwrap();
+    let registering = Arc::clone(&backend);
+    let (registered_tx, registered_rx) = flume::bounded(1);
+    let register = std::thread::spawn(move || {
+        registering.register_peer(peer).unwrap();
+        registered_tx.send(()).unwrap();
+    });
+    // A serialized implementation can finish registering after the release.
+    // The deadline releases unregister in that case without assuming an order.
+    let _ = tokio::time::timeout(Duration::from_secs(1), registered_rx.recv_async()).await;
+    release_tx.send(()).unwrap();
+    unregister.join().unwrap();
+    register.join().unwrap();
+
+    let messenger_knows = backend.is_registered(id);
+    let stream_knows = stream.knows_peer(id.worker_id());
+    let connect_error = if messenger_knows {
+        let bound = crate::streaming::FrameTransport::bind(remote.as_ref(), 1, 1)
+            .await
+            .unwrap();
+        let connected = erased.connect(id.worker_id(), 1, 1).await;
+        let error = connected.as_ref().err().map(|error| format!("{error:#}"));
+        drop(connected);
+        drop(bound);
+        error
+    } else {
+        None
+    };
+    stream.shutdown().await;
+    remote.shutdown().await;
+    backend.graceful_shutdown(ShutdownPolicy::WaitForever).await;
+    assert_eq!(
+        stream_knows, messenger_knows,
+        "the delayed unregister erases the re-registered peer's stream route; connect error: {connect_error:?}"
+    );
+    assert!(connect_error.is_none(), "{connect_error:?}");
+}
