@@ -273,7 +273,7 @@ impl VeloEvents {
         let instance_id = peer_info.instance_id();
 
         // Auto-register discovered peer for future fast-path lookups
-        self.messenger()?.register_peer(peer_info)?;
+        self.messenger()?.register_peer_inner(peer_info)?;
 
         Ok(instance_id)
     }

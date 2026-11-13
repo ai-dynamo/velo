@@ -56,16 +56,18 @@ impl Drop for Messenger {
 /// `velo_ext::DrainExemption`), and it is read only while draining.
 type DrainExemptNames = Arc<std::sync::RwLock<std::collections::HashSet<Box<[u8]>>>>;
 
-/// Builder for Messenger allowing incremental configuration.
-pub struct MessengerBuilder {
+/// What a [`Messenger`] is built from, gathered one piece at a time.
+///
+/// The crate's own builders (`VeloBuilder`) and unit tests use this, so they do
+/// not depend on the deprecated, public [`MessengerBuilder`].
+pub(crate) struct MessengerParts {
     transports: Vec<Arc<dyn Transport>>,
     discovery: Option<Arc<dyn PeerDiscovery>>,
     metrics: Option<Arc<VeloMetrics>>,
 }
 
-impl MessengerBuilder {
-    /// Create a new empty MessengerBuilder.
-    pub fn new() -> Self {
+impl MessengerParts {
+    pub(crate) fn new() -> Self {
         Self {
             transports: Vec::new(),
             discovery: None,
@@ -73,30 +75,70 @@ impl MessengerBuilder {
         }
     }
 
+    pub(crate) fn add_transport(mut self, transport: Arc<dyn Transport>) -> Self {
+        self.transports.push(transport);
+        self
+    }
+
+    pub(crate) fn discovery(mut self, discovery: Arc<dyn PeerDiscovery>) -> Self {
+        self.discovery = Some(discovery);
+        self
+    }
+
+    pub(crate) fn metrics(mut self, metrics: Arc<VeloMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    pub(crate) async fn build(self) -> Result<Arc<Messenger>> {
+        Messenger::new(self.transports, self.discovery, self.metrics).await
+    }
+}
+
+/// Builder for Messenger allowing incremental configuration.
+#[deprecated(
+    since = "0.22.1",
+    note = "Use `Velo::builder` (`VeloBuilder`). `MessengerBuilder` goes away in 0.23.0"
+)]
+pub struct MessengerBuilder {
+    parts: MessengerParts,
+}
+
+// The deprecated type's own impls name it; only callers outside it should warn.
+#[allow(deprecated)]
+impl MessengerBuilder {
+    /// Create a new empty MessengerBuilder.
+    pub fn new() -> Self {
+        Self {
+            parts: MessengerParts::new(),
+        }
+    }
+
     /// Add a transport to the Messenger system.
     pub fn add_transport(mut self, transport: Arc<dyn Transport>) -> Self {
-        self.transports.push(transport);
+        self.parts = self.parts.add_transport(transport);
         self
     }
 
     /// Set the peer discovery backend.
     pub fn discovery(mut self, discovery: Arc<dyn PeerDiscovery>) -> Self {
-        self.discovery = Some(discovery);
+        self.parts = self.parts.discovery(discovery);
         self
     }
 
     /// Install Prometheus collectors for this messenger instance.
     pub fn metrics(mut self, metrics: Arc<VeloMetrics>) -> Self {
-        self.metrics = Some(metrics);
+        self.parts = self.parts.metrics(metrics);
         self
     }
 
     /// Build the Messenger system with the configured transports and discovery.
     pub async fn build(self) -> Result<Arc<Messenger>> {
-        Messenger::new(self.transports, self.discovery, self.metrics).await
+        self.parts.build().await
     }
 }
 
+#[allow(deprecated)] // an impl of the deprecated type itself
 impl Default for MessengerBuilder {
     fn default() -> Self {
         Self::new()
@@ -114,6 +156,11 @@ impl Messenger {
     ///     .build()
     ///     .await?;
     /// ```
+    #[deprecated(
+        since = "0.22.1",
+        note = "Use `Velo::builder`. `Messenger::builder` goes away in 0.23.0"
+    )]
+    #[allow(deprecated)] // returns the deprecated builder; the caller sees the warning
     pub fn builder() -> MessengerBuilder {
         MessengerBuilder::new()
     }
@@ -453,7 +500,22 @@ impl Messenger {
     ///
     /// Must be called after construction (the stager/resolver are typically provided
     /// by `velo-rendezvous` which depends on this crate).
+    #[deprecated(
+        since = "0.22.1",
+        note = "`Velo::builder` sets up large payload support. It has no `Velo` method. This method goes away in 0.23.0"
+    )]
     pub fn set_large_payload_support(
+        &self,
+        stager: Arc<dyn crate::messenger::large_payload::LargePayloadStager>,
+        resolver: Arc<dyn crate::messenger::large_payload::LargePayloadResolver>,
+    ) {
+        self.set_large_payload_support_inner(stager, resolver);
+    }
+
+    /// What [`set_large_payload_support`](Self::set_large_payload_support)
+    /// does, for the callers inside this crate that must keep working after
+    /// that method is removed.
+    pub(crate) fn set_large_payload_support_inner(
         &self,
         stager: Arc<dyn crate::messenger::large_payload::LargePayloadStager>,
         resolver: Arc<dyn crate::messenger::large_payload::LargePayloadResolver>,
@@ -521,7 +583,17 @@ impl Messenger {
     }
 
     /// Connect to a peer by registering their peer information.
+    #[deprecated(
+        since = "0.22.1",
+        note = "Use `Velo::register_peer`, which also registers the peer with the streaming transport. `Messenger::register_peer` goes away in 0.23.0"
+    )]
     pub fn register_peer(&self, peer_info: PeerInfo) -> Result<()> {
+        self.register_peer_inner(peer_info)
+    }
+
+    /// What [`register_peer`](Self::register_peer) does, for the callers
+    /// inside this crate (`Velo::register_peer`, the `_hello` handler).
+    pub(crate) fn register_peer_inner(&self, peer_info: PeerInfo) -> Result<()> {
         let instance_id = peer_info.instance_id();
 
         // Register with backend (registers with transports)
@@ -538,7 +610,17 @@ impl Messenger {
     /// Drops it from every transport, closes its connections, and forgets
     /// its handler list. See [`crate::Velo::unregister_peer`] for when to
     /// call it.
+    #[deprecated(
+        since = "0.22.1",
+        note = "Use `Velo::unregister_peer`. `Messenger::unregister_peer` goes away in 0.23.0"
+    )]
     pub fn unregister_peer(&self, instance_id: InstanceId) {
+        self.unregister_peer_inner(instance_id);
+    }
+
+    /// What [`unregister_peer`](Self::unregister_peer) does, for the callers
+    /// inside this crate.
+    pub(crate) fn unregister_peer_inner(&self, instance_id: InstanceId) {
         // Backend first, so a new send fails at once instead of starting a
         // handshake to a peer that is going away.
         self.backend.unregister_peer(instance_id);
@@ -546,6 +628,10 @@ impl Messenger {
     }
 
     /// Discover a peer by instance_id and register it for communication.
+    #[deprecated(
+        since = "0.22.1",
+        note = "Use `Velo::discover_and_register_peer`, which also registers the peer with the streaming transport. `Messenger::discover_and_register_peer` goes away in 0.23.0"
+    )]
     pub async fn discover_and_register_peer(&self, instance_id: InstanceId) -> Result<()> {
         tracing::debug!(
             target: "crate::messenger::discovery",
@@ -568,7 +654,7 @@ impl Messenger {
             "Discovered peer, registering"
         );
 
-        self.register_peer(peer_info)
+        self.register_peer_inner(peer_info)
     }
 
     /// Check whether a specific instance has subscribed to a locally-owned event.
@@ -661,7 +747,17 @@ impl Messenger {
     /// handler invocations continue to completion; use
     /// [`graceful_shutdown`](Self::graceful_shutdown) to also wait for them
     /// and tear down. Idempotent.
+    #[deprecated(
+        since = "0.22.1",
+        note = "Use `Velo::begin_drain`. `Messenger::begin_drain` goes away in 0.23.0"
+    )]
     pub fn begin_drain(&self) {
+        self.begin_drain_inner();
+    }
+
+    /// What [`begin_drain`](Self::begin_drain) does, for the callers inside
+    /// this crate.
+    pub(crate) fn begin_drain_inner(&self) {
         self.backend.begin_drain();
     }
 
@@ -710,7 +806,17 @@ impl Messenger {
     /// Panics if a transport's shutdown hook panicked. The other hooks still
     /// ran, but shutdown cannot report the instance as stopped. A later call
     /// panics at once, without draining again.
+    #[deprecated(
+        since = "0.22.1",
+        note = "Use `Velo::shutdown`. `Messenger::graceful_shutdown` goes away in 0.23.0"
+    )]
     pub async fn graceful_shutdown(&self, policy: crate::transports::ShutdownPolicy) {
+        self.graceful_shutdown_inner(policy).await;
+    }
+
+    /// What [`graceful_shutdown`](Self::graceful_shutdown) does, for the
+    /// callers inside this crate.
+    pub(crate) async fn graceful_shutdown_inner(&self, policy: crate::transports::ShutdownPolicy) {
         self.backend.graceful_shutdown(policy).await;
     }
 
