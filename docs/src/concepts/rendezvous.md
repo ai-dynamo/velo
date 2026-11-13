@@ -21,6 +21,14 @@ The RDMA path needs the `ucx` feature on Linux. See [Run rendezvous over RDMA](.
 | `detach(handle, lease)` | consumer | Drop the read lock. The handle stays usable. |
 | `release(handle, lease)` | consumer | Drop the read lock and one reference. The owner frees the slot at zero. |
 
+### When a slot is freed
+
+A slot holds two counts: references and read locks. `register_data` starts with one reference, and each `get` takes a read lock under a lease. The owner frees the slot when both counts are 0, whichever reaches 0 last.
+
+An owner can drop its reference while a reader holds a lease. Then the slot stays until the last lease ends, and the call that ends it frees the slot. Six paths end a lease: local and remote `detach`, local and remote `release`, the drop of a `get` that did not finish, and the lease reaper. All six free the slot this way.
+
+A reaped lease does not prove that the reader's RDMA GET finished. The reaper frees the slot under the same contract as any reaped lease: a peer that still reads can fail or read freed memory (see [RDMA design](../development/rdma-design.md)).
+
 A handle is a `u128`: the owner's `WorkerId` in the upper 64 bits and a local slot id in the lower 64. Serde writes it as `{hi, lo}` because MessagePack has no clean `u128` encoding.
 
 The owner registers seven handlers: `_rv_metadata`, `_rv_acquire`, `_rv_pull`, `_rv_ref`, `_rv_detach`, `_rv_release`, and `_rv_lease_renew`. The control plane uses JSON over ordinary messenger calls, so any transport carries it.

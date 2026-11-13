@@ -20,7 +20,9 @@ use crate::rendezvous::protocol::{
     AcquireResponse, RvAcquireRequest, RvDetachRequest, RvLeaseRenewRequest, RvMetadataRequest,
     RvPullRequest, RvRefRequest, RvReleaseRequest, requested_lease_timeout,
 };
-use crate::rendezvous::store::{DEFAULT_CHUNK_SIZE, DataStore, LeaseOutcome, ensure_reaper};
+use crate::rendezvous::store::{
+    DEFAULT_CHUNK_SIZE, DataStore, LeaseEnd, LeaseOutcome, ensure_reaper,
+};
 
 /// Build the `_rv_metadata` handler: returns [`DataMetadata`](crate::rendezvous::protocol::DataMetadata)
 /// without acquiring a read lock.
@@ -332,17 +334,15 @@ pub fn create_rv_lease_renew_handler(store: Arc<DataStore>) -> crate::messenger:
 }
 
 /// Build the `_rv_detach` handler: releases read lock without decrementing refcount.
+/// Frees the slot if that was its last reader and its refcount is already zero.
 pub fn create_rv_detach_handler(store: Arc<DataStore>) -> crate::messenger::Handler {
     crate::messenger::Handler::am_handler("_rv_detach", move |ctx: crate::messenger::Context| {
         let req: RvDetachRequest = serde_json::from_slice(&ctx.payload)?;
         let handle = req.handle.to_handle();
         let (_, local_id) = handle.unpack();
 
-        match store.consume_lease(req.lease_id, local_id) {
-            LeaseOutcome::Consumed => {
-                store.release_read_lock(local_id);
-                store.remove_transfers_by_lease(req.lease_id);
-            }
+        match store.end_lease(req.lease_id, local_id, LeaseEnd::Detach) {
+            LeaseOutcome::Consumed => {}
             // Nothing was consumed, so nothing is released and the lease keeps
             // its deadline — a mismatched detach cannot strand the slot it
             // names *or* the slot it does not.
@@ -374,16 +374,8 @@ pub fn create_rv_release_handler(store: Arc<DataStore>) -> crate::messenger::Han
         let handle = req.handle.to_handle();
         let (_, local_id) = handle.unpack();
 
-        match store.consume_lease(req.lease_id, local_id) {
-            LeaseOutcome::Consumed => {
-                store.release_read_lock(local_id);
-                store.remove_transfers_by_lease(req.lease_id);
-                let should_free = store.ref_decrement(local_id);
-                if should_free {
-                    store.try_free(local_id);
-                    tracing::debug!("_rv_release: freed slot for {handle}");
-                }
-            }
+        match store.end_lease(req.lease_id, local_id, LeaseEnd::Release) {
+            LeaseOutcome::Consumed => {}
             LeaseOutcome::Mismatch { actual } => {
                 tracing::warn!(
                     "_rv_release: lease {} maps to slot {}, not {}; ignored",

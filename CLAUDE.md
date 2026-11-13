@@ -46,6 +46,7 @@ Rules:
 - **Write the book, READMEs, and comments with the `simple-english` skill.** Comments are terse but readable: they say why, or which failure the code avoids.
 - **Hard-earned lessons go into tests.** A test's doc comment can be long, because it carries the knowledge forward; a comment alone enforces nothing.
 - **Every merge to `main` updates the book and the top-level `README.md`**, and removes `agent-docs/` from the branch.
+- **Read `docs/src/development/coding-gotchas.md` before changing concurrent counters or lifecycle code.** It lists races that shipped and the tests that now catch them. Add an entry when you fix a race or a flaky test.
 
 ## Build & Test
 
