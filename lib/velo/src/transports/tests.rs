@@ -1178,13 +1178,16 @@ impl PeerTableObserver for RecordingObserver {
 /// The observer hears of a peer only once a messenger transport accepted it,
 /// so a refused peer is not half-registered, and it hears of every
 /// unregister, which is idempotent there as it is here. Only one observer
-/// can be installed.
+/// can be installed, and it first hears of the peers registered before it.
 #[tokio::test]
 async fn the_peer_table_observer_follows_registration() {
     let accepting = MockTransport::new("tcp", true);
     let (backend, _streams) = VeloBackend::new(vec![accepting as Arc<dyn Transport>], None)
         .await
         .unwrap();
+    let early = make_peer_info(&["tcp"]);
+    let early_id = early.instance_id();
+    backend.register_peer(early).unwrap();
     let observer = Arc::new(RecordingObserver::default());
     backend
         .set_peer_observer(Arc::clone(&observer) as Arc<dyn PeerTableObserver>)
@@ -1203,6 +1206,7 @@ async fn the_peer_table_observer_follows_registration() {
     assert_eq!(
         *observer.events.lock(),
         [
+            ("registered", early_id),
             ("registered", id),
             ("unregistered", id),
             ("unregistered", id)
@@ -1224,7 +1228,6 @@ async fn the_peer_table_observer_follows_registration() {
 /// Register and unregister may finish in either order, but their final
 /// messenger and stream tables must agree.
 #[tokio::test]
-#[ignore = "F1: a delayed unregister erases a newer stream registration"]
 async fn a_delayed_unregister_does_not_erase_a_new_stream_registration() {
     struct PausedUnregister {
         inner: Arc<MockTransport>,
@@ -1366,7 +1369,6 @@ async fn a_delayed_unregister_does_not_erase_a_new_stream_registration() {
 /// A transport can queue `_hello` as soon as it starts. A successful
 /// handshake must leave its stream endpoint registered after the build.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "F2: startup dispatch can learn a peer before the stream observer is installed"]
 async fn a_hello_queued_at_startup_reaches_the_stream_table() {
     struct QueuedHello {
         inner: Arc<MockTransport>,

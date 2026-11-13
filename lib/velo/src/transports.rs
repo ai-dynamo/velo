@@ -144,8 +144,20 @@ pub struct VeloBackend {
     teardown_outcome: teardown::Outcome,
     runtime: tokio::runtime::Handle,
     observability: Option<Arc<VeloMetrics>>,
-    peer_observer: OnceLock<Arc<dyn PeerTableObserver>>,
+    peers: Mutex<PeerTable>,
     advertised: OnceLock<PeerInfo>,
+}
+
+/// The registered peers and the one observer of their changes.
+///
+/// One lock covers the routes, the transports, and the observer, so a
+/// register and an unregister of one peer cannot interleave: the observer's
+/// table ends as the routes do. It also lets an observer installed after
+/// the transports started learn the peers that a `_hello` registered first.
+#[derive(Default)]
+struct PeerTable {
+    peers: HashMap<InstanceId, PeerInfo>,
+    observer: Option<Arc<dyn PeerTableObserver>>,
 }
 
 /// Told when the backend's peer table changes.
@@ -155,6 +167,9 @@ pub struct VeloBackend {
 /// and discovery when a send names an unknown worker. `VeloBuilder::build`
 /// installs one observer that keeps the per-stream transport's own peer
 /// table in step, so that no path can fill one table and not the other.
+///
+/// The backend calls it under its peer-table lock: it must not block, and
+/// it must not call back into the backend.
 pub(crate) trait PeerTableObserver: Send + Sync {
     /// The peer was added: at least one messenger transport accepted it.
     /// Infallible, because the messenger's registration stands either way;
@@ -309,7 +324,7 @@ impl VeloBackend {
                 teardown_outcome: Default::default(),
                 runtime,
                 observability,
-                peer_observer: OnceLock::new(),
+                peers: Mutex::default(),
                 advertised: OnceLock::new(),
             },
             data_streams,
@@ -359,13 +374,24 @@ impl VeloBackend {
     }
 
     /// Install the one [`PeerTableObserver`]. Fails if one is installed.
+    ///
+    /// The observer first hears of every peer already registered: the
+    /// transports start before `VeloBuilder::build` can install it, and a
+    /// `_hello` can register a peer in between.
     pub(crate) fn set_peer_observer(
         &self,
         observer: Arc<dyn PeerTableObserver>,
     ) -> anyhow::Result<()> {
-        self.peer_observer
-            .set(observer)
-            .map_err(|_| anyhow::anyhow!("a peer table observer is already installed"))
+        let mut table = self.peers.lock();
+        anyhow::ensure!(
+            table.observer.is_none(),
+            "a peer table observer is already installed"
+        );
+        for peer in table.peers.values() {
+            observer.registered(peer);
+        }
+        table.observer = Some(observer);
+        Ok(())
     }
 
     /// Returns `true` if the given instance has been registered via [`register_peer`](Self::register_peer).
@@ -691,6 +717,7 @@ impl VeloBackend {
     /// can accept the peer's address.
     pub fn register_peer(&self, peer: PeerInfo) -> Result<(), VeloBackendError> {
         let instance_id = peer.instance_id();
+        let mut table = self.peers.lock();
         let mut compatible_transports = Vec::new();
         let mut failures = Vec::new();
         for (key, transport) in self.transports.iter() {
@@ -730,9 +757,10 @@ impl VeloBackend {
             .insert(instance_id, alternative_transport_keys);
         self.workers.insert(instance_id.worker_id(), instance_id);
 
-        if let Some(observer) = self.peer_observer.get() {
+        if let Some(observer) = &table.observer {
             observer.registered(&peer);
         }
+        table.peers.insert(instance_id, peer);
         Ok(())
     }
 
@@ -743,6 +771,8 @@ impl VeloBackend {
     /// A send to it then fails with [`VeloBackendError::InstanceNotRegistered`].
     /// Idempotent; other peers are not affected.
     pub fn unregister_peer(&self, instance_id: InstanceId) {
+        let mut table = self.peers.lock();
+        table.peers.remove(&instance_id);
         // Routes first, so a new send fails here and does not reach a
         // transport that is closing the peer's connections.
         self.primary_transport.remove(&instance_id);
@@ -755,7 +785,7 @@ impl VeloBackend {
         for transport in self.transports.values() {
             transport.unregister(instance_id);
         }
-        if let Some(observer) = self.peer_observer.get() {
+        if let Some(observer) = &table.observer {
             observer.unregistered(instance_id);
         }
         tracing::debug!(peer = %instance_id, "Unregistered peer");
