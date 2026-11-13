@@ -90,11 +90,12 @@ pub(super) async fn run_accept_loop(endpoint: quinn::Endpoint, ctx: AcceptContex
 async fn serve_connection(connection: quinn::Connection, mut ctx: AcceptContext) {
     let peer = connection.remote_address();
     // The stream readers' teardown tokens are children of this connection's
-    // token. A cancel wakes a child before the children it has, so this task
-    // drops its connection handle before the readers drop their streams. The
-    // peer then sees the connection close, not a STOP_SENDING from a reader
-    // that stopped first. On the node-wide token, the readers' tokens would be
-    // its children and wake before this task.
+    // token, so a cancel wakes this task before its readers. On the node-wide
+    // token the readers' tokens would be its children, and would wake first.
+    // The peer must see the connection close, not a STOP_SENDING from a reader
+    // that stopped first. The wake order makes that certain only on a
+    // current-thread runtime; on a multi-thread one a reader can still run
+    // first, as it could when every task waited on the node-wide token.
     ctx.teardown = ctx.teardown.child_token();
     loop {
         let stream = tokio::select! {
