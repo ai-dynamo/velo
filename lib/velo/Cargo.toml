@@ -195,6 +195,10 @@ path = "tests/streaming/mux_negotiation/mod.rs"
 required-features = ["test-helpers"]
 
 [[test]]
+name = "streaming_held_thread"
+path = "tests/streaming/held_thread.rs"
+
+[[test]]
 name = "streaming_mux_credit"
 path = "tests/streaming/mux_credit.rs"
 required-features = ["test-helpers"]
