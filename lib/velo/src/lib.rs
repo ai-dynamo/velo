@@ -83,6 +83,10 @@ pub use crate::rendezvous::rdma::{
 
 #[cfg(velo_rdma)]
 pub use crate::rendezvous::write::PinnedWriter;
+// The NIXL backend's configuration. Plain fields: no `nixl-sys` type is part
+// of velo's public API.
+#[cfg(all(target_os = "linux", feature = "nixl"))]
+pub use crate::rendezvous::rdma::NixlRdmaConfig;
 /// The registered `get_into` destination, and the capability that describes it.
 ///
 /// `RdmaDestination` is unconditional so the [`RendezvousWrite`] trait has one
@@ -325,6 +329,9 @@ pub struct VeloBuilder {
     /// (D10) — so the builder simply remembers what it was handed.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     ucx_transport: Option<Arc<crate::transports::ucx::UcxTransport>>,
+    /// The NIXL backend, if the builder was asked for it.
+    #[cfg(all(target_os = "linux", feature = "nixl"))]
+    nixl_rdma: Option<crate::rendezvous::rdma::nixl::NixlSetup>,
     #[cfg(velo_rdma)]
     rdma_config: Option<crate::rendezvous::rdma::RdmaConfig>,
 }
@@ -349,6 +356,8 @@ impl VeloBuilder {
             staged_fetch_timeout: None,
             #[cfg(all(target_os = "linux", feature = "ucx"))]
             ucx_transport: None,
+            #[cfg(all(target_os = "linux", feature = "nixl"))]
+            nixl_rdma: None,
             #[cfg(velo_rdma)]
             rdma_config: None,
         }
@@ -378,6 +387,40 @@ impl VeloBuilder {
     ) -> Self {
         self.ucx_transport = Some(Arc::clone(&transport));
         self.add_transport(transport)
+    }
+
+    /// Use NIXL as this instance's RDMA backend.
+    ///
+    /// NIXL is not a messenger transport. It moves rendezvous payloads only:
+    /// the registration layer registers memory with a NIXL agent that velo
+    /// creates, and a consumer reads a staged payload with a NIXL READ. Add a
+    /// messenger transport (TCP, say) for everything else.
+    ///
+    /// An instance has one RDMA backend. [`build`](Self::build) fails if this
+    /// is combined with `add_ucx_transport`, and it fails if the NIXL library
+    /// (`libnixl_capi.so`) cannot be loaded. Two instances use the RDMA path
+    /// with each other only if they have the same backend; otherwise they use
+    /// the chunked path.
+    #[cfg(all(target_os = "linux", feature = "nixl"))]
+    pub fn add_nixl_rdma(mut self, config: crate::rendezvous::rdma::NixlRdmaConfig) -> Self {
+        self.nixl_rdma = Some(crate::rendezvous::rdma::nixl::NixlSetup::Real(config));
+        self
+    }
+
+    /// As [`add_nixl_rdma`](Self::add_nixl_rdma), over an agent that lives in
+    /// this process and reaches the other agents on `net`. For tests: it needs
+    /// no NIXL library, and it follows the NIXL behaviour the backend's rules
+    /// exist for.
+    #[cfg(all(target_os = "linux", feature = "nixl", feature = "test-helpers"))]
+    pub fn add_nixl_rdma_loopback(
+        mut self,
+        net: crate::rendezvous::rdma::NixlLoopback,
+        config: crate::rendezvous::rdma::NixlRdmaConfig,
+    ) -> Self {
+        self.nixl_rdma = Some(crate::rendezvous::rdma::nixl::NixlSetup::Loopback(
+            net, config,
+        ));
+        self
     }
 
     /// Tune the RDMA registration layer: arena sizing, the registered-bytes
@@ -668,6 +711,17 @@ impl VeloBuilder {
             rdma_backend = Some(crate::rendezvous::rdma::UcxBackend::new(
                 transport.rdma_endpoint(),
             ));
+        }
+
+        // NIXL: an agent of velo's own, named after this instance.
+        #[cfg(all(target_os = "linux", feature = "nixl"))]
+        if let Some(setup) = self.nixl_rdma {
+            anyhow::ensure!(
+                rdma_backend.is_none(),
+                "add_ucx_transport and add_nixl_rdma were both used: an instance has one RDMA backend"
+            );
+            rdma_backend =
+                Some(crate::rendezvous::rdma::nixl::start(setup, messenger.instance_id()).await?);
         }
 
         // Build the RDMA registration layer over that backend.

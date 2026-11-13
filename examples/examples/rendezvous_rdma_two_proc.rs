@@ -7,6 +7,13 @@
 //! cargo run --features ucx --example rendezvous_rdma_two_proc
 //! ```
 //!
+//! The same demo over the NIXL backend, with a NIXL library on the loader
+//! path (see the "Run rendezvous over NIXL" guide):
+//!
+//! ```text
+//! cargo run --features nixl --example rendezvous_rdma_two_proc -- --backend nixl
+//! ```
+//!
 //! That launches both roles as children and waits for them. To drive them by
 //! hand — on two nodes, or under a profiler:
 //!
@@ -56,6 +63,25 @@ use velo::transports::ucx::UcxTransportBuilder;
 /// How long either side waits for the other to appear.
 const RENDEZVOUS_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// Which RDMA backend moves the payload.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Backend {
+    /// The UCX transport, beside TCP. Needs the `ucx` feature.
+    Ucx,
+    /// A NIXL agent. Not a transport: TCP carries every message. Needs the
+    /// `nixl` feature and the NIXL library at run time.
+    Nixl,
+}
+
+impl Backend {
+    fn flag(self) -> &'static str {
+        match self {
+            Self::Ucx => "ucx",
+            Self::Nixl => "nixl",
+        }
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum Role {
     /// Spawn both roles as children and wait for them. The default.
@@ -80,6 +106,14 @@ struct Args {
     /// Payload size in bytes.
     #[arg(long, default_value_t = 8 * 1024 * 1024)]
     size: usize,
+
+    /// Which RDMA backend moves the payload.
+    #[arg(long, value_enum, default_value_t = Backend::Ucx)]
+    backend: Backend,
+
+    /// UCX workers inside the NIXL agent (`--backend nixl` only).
+    #[arg(long, default_value_t = 1)]
+    nixl_workers: u32,
 }
 
 /// What the owner publishes: how to reach it, and what to ask for.
@@ -128,6 +162,10 @@ fn launch(args: &Args) -> Result<()> {
             .arg(&dir)
             .arg("--size")
             .arg(args.size.to_string())
+            .arg("--backend")
+            .arg(args.backend.flag())
+            .arg("--nixl-workers")
+            .arg(args.nixl_workers.to_string())
             .spawn()
     };
 
@@ -157,7 +195,7 @@ async fn run(args: Args) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 async fn owner(args: Args) -> Result<()> {
-    let (velo, registry) = build().await?;
+    let (velo, registry) = build(&args).await?;
 
     // Staged in registered memory, so a capable consumer can read it with one
     // GET. This never fails: under pool pressure it stages in plain memory and
@@ -213,7 +251,7 @@ async fn owner(args: Args) -> Result<()> {
 
 async fn consumer(args: Args) -> Result<()> {
     let card: OwnerCard = await_card(&args.dir.join("owner.json")).await?;
-    let (velo, registry) = build().await?;
+    let (velo, registry) = build(&args).await?;
 
     let owner_instance = card.peer.instance_id();
     velo.register_peer(card.peer)?;
@@ -277,7 +315,7 @@ async fn consumer(args: Args) -> Result<()> {
 /// messages; the RDMA path only needs UCX to be *registered* for the peer,
 /// which is what makes "control plane on TCP" a supported deployment rather
 /// than a compromise.
-async fn build() -> Result<(Velo, Registry)> {
+async fn build(args: &Args) -> Result<(Velo, Registry)> {
     let registry = Registry::new();
     let metrics = Arc::new(VeloMetrics::register(&registry)?);
 
@@ -286,30 +324,32 @@ async fn build() -> Result<(Velo, Registry)> {
             .from_listener(std::net::TcpListener::bind("0.0.0.0:0")?)?
             .build()?,
     );
+    let builder = Velo::builder().metrics(metrics).add_transport(tcp);
 
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
-    let velo = {
-        let ucx = Arc::new(UcxTransportBuilder::new().build()?);
-        Velo::builder()
-            .metrics(metrics)
-            .add_transport(tcp)
-            .add_ucx_transport(ucx)
-            .build()
-            .await?
-    };
-    #[cfg(not(all(target_os = "linux", feature = "ucx")))]
-    let velo = {
+    let builder = match args.backend {
+        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        Backend::Ucx => builder.add_ucx_transport(Arc::new(UcxTransportBuilder::new().build()?)),
+        // NIXL is no transport. The agent makes its own connection to the
+        // owner from what the descriptor carries, so TCP alone is the whole
+        // messenger here.
+        #[cfg(all(target_os = "linux", feature = "nixl"))]
+        Backend::Nixl => builder.add_nixl_rdma(velo::NixlRdmaConfig {
+            num_workers: args.nixl_workers,
+            ..Default::default()
+        }),
         // Without the feature there is no RDMA path to demonstrate; the example
         // still runs and shows the chunked transfer it falls back to.
-        eprintln!("note: built without the `ucx` feature — the chunked path is the only one here");
-        Velo::builder()
-            .metrics(metrics)
-            .add_transport(tcp)
-            .build()
-            .await?
+        #[allow(unreachable_patterns)]
+        other => {
+            eprintln!(
+                "note: built without the `{}` feature — the chunked path is the only one here",
+                other.flag()
+            );
+            builder
+        }
     };
 
-    Ok((velo, registry))
+    Ok((builder.build().await?, registry))
 }
 
 // ---------------------------------------------------------------------------

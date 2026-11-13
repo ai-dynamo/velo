@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Velo
 
-Velo is a distributed messaging library for Rust. It gives active messages, typed streams, distributed events, large-payload transfer (with RDMA over UCX), and work queues over pluggable transports. It has peer discovery and Prometheus metrics built in.
+Velo is a distributed messaging library for Rust. It gives active messages, typed streams, distributed events, large-payload transfer (with RDMA over UCX or NIXL), and work queues over pluggable transports. It has peer discovery and Prometheus metrics built in.
 
 NOTE: Velo is experimental. Its design, development, and tests are still in progress, and the APIs are not stable. Do not use Velo in production.
 
@@ -119,7 +119,7 @@ bash scripts/check-semver.sh
 bash scripts/build-book.sh                # needs mdbook, mdbook-mermaid, mdbook-linkcheck
 ```
 
-The `zmq` feature needs `cmake`. The `ucx` feature needs the `libibverbs-dev` and `librdmacm-dev` headers. See [Testing](docs/src/development/testing.md).
+The `zmq` feature needs `cmake`. The `ucx` feature needs the `libibverbs-dev` and `librdmacm-dev` headers. The `nixl` feature needs a C++ compiler and `libclang` to build, and the NIXL library only at run time. See [Testing](docs/src/development/testing.md).
 
 A change on a hot path also needs a test that counts its cost. See [Review for performance](docs/src/development/performance-review.md).
 

@@ -8,6 +8,13 @@ coverage:
       default:
         target: 80%
 
+# Files that no CI job can run.
+ignore:
+  # The adapter over a real NIXL agent. CI has no libnixl, so no line of it
+  # runs there. The driver's rules are tested on the loopback agent, and
+  # `rendezvous_rdma_nixl` runs this file on a machine where the library loads.
+  - "lib/velo/src/rendezvous/rdma/nixl/sys.rs"
+
 comment:
   layout: "reach,diff,flags,files"
   behavior: default

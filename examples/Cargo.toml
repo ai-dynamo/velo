@@ -12,6 +12,7 @@ publish = false
 default = []
 zmq = ["velo/zmq"]
 ucx = ["velo/ucx"]
+nixl = ["velo/nixl"]
 grpc = ["velo/grpc"]
 quic = ["velo/quic"]
 
@@ -64,9 +65,11 @@ name = "anchor_setup_bench"
 [[example]]
 name = "stream_lifecycle"
 
+# No `required-features`: it runs over UCX (`ucx`) or over NIXL (`nixl`), and
+# Cargo cannot say "either". With neither it shows the chunked path and exits
+# non-zero, as it does whenever the RDMA path was not taken.
 [[example]]
 name = "rendezvous_rdma_two_proc"
-required-features = ["ucx"]
 
 [[example]]
 name = "soak"

@@ -61,6 +61,8 @@ An earlier rendezvous prototype on NIXL had these faults. The current design avo
 
 The two ideas kept from it: the owner decides the path at acquire time, and the two-process launcher became the `rendezvous_rdma_two_proc` example.
 
+NIXL is a backend for rendezvous, where none of these faults apply. See [NIXL as a rendezvous backend](#nixl-as-a-rendezvous-backend).
+
 ### `async-ucx`
 
 The published crate is unmaintained at 0.1.1. Its `Drop` calls `ucp_request_free` without `ucp_request_cancel`, a cancellation soundness hole that was never fixed. Its workers and endpoints are `Rc`-based and `!Send`. Velo's wrapper closes the hole by structure (see [Completion-owned operations](#completion-owned-operations)). From its unmerged modernization branch, three pieces were worth mining: the owned-`Bytes` worker address, the zeroed request-parameter builder, and the bindgen allowlist.
@@ -175,6 +177,56 @@ The pre-parse checks framing. A stale rkey with perfect framing passes it. Conse
 - The shutdown straggler, the reaper force-release, and shutdown demotion all release memory under a peer that can still hold a descriptor. On InfiniBand that peer's GET can abort the peer's process, not only fail.
 - A consumer-side rkey cache removes both safety legs at once. It makes an rkey outlive its operation, and it skips revalidation. Arena reclamation is safe only because an empty arena has no live descriptor, and a cached rkey breaks that too. An rkey cache is a safety change, not a profile-gated optimization.
 - The `mlx5` completion path differs from `rc_verbs`. This finding needs a rerun on the accelerated lane.
+
+## NIXL as a rendezvous backend
+
+NIXL is rejected for messaging (above). It is a backend for rendezvous: `RdmaBackend` has a second implementation, and the registry, the pool, the leases, and the wire descriptor are unchanged. The reason to add it: NIXL's UCX plugin has several workers and sets two RMA rails, and an application that already loads NIXL can use one RDMA stack.
+
+One GET is one `ucp_get_nbx` on one worker in both backends. So NIXL can only be faster by spreading concurrent GETs over workers and by its two rails, and velo's UCX transport can also be given `UCX_MAX_RMA_RAILS=2`. Every number in this section is from `UCX_TLS=tcp` on one host with no RDMA device. They are fixed costs, not transfer rates.
+
+### What was measured, and what it forced
+
+Measured on 2026-11-12 with `nixl-sys` 1.5.2 (stub build) and libnixl 1.5.2 from the `nixl-cu12` PyPI wheel, on an x86_64 workstation, two agents in one process over `UCX_TLS=tcp,cuda_copy`.
+
+| NIXL behaviour | Consequence in velo |
+|---|---|
+| A partial metadata request with no descriptor returns connection info only (271 B). One with a descriptor returns that region only (232 B). | The key holds both blobs. The consumer loads connection info first: a region blob before it is refused (`NotFound`), with no harm. |
+| NIXL keeps every region blob it loads. Only the whole peer can be dropped. | The consumer keeps a mirror of what it loaded, with a cap. |
+| A READ through a stale entry is not refused. After the owner deregistered, a READ through the consumer's old entry returned `Ok`. | A stale entry must never be used. |
+| A READ is served only from an entry under the device id it names. A READ under an id that was never loaded fails. One range registers under two ids. The UCX plugin does not read the device id of host memory. | Each registration gets a device id that is never used again, and the descriptor states it. No purge is needed when an address is reused. |
+| A reload of an identical blob is a no-op (about 200 ns). | Loads are still skipped for a loaded region: a load takes NIXL's lock. |
+| A peer dropped during a 2 GiB READ: the status says `NotFound` at once, and the last page of the destination changed 1.6 s later. | A peer is never dropped with a READ in flight. A READ whose status is `NotFound` is "unconfirmed", and its destination is leaked. |
+| After a drop, a reload and a READ work (540 µs p50 for the three). | The cap can purge. |
+| With each byte of a 232-byte region blob flipped in turn: 36 flips loaded with no error, 81 were refused and left the peer usable, 111 were refused and left it unloadable, and 4 crashed the process (SIGSEGV). A drop of the peer recovered none of the 111. | A peer with a refused load is not used again until it is unregistered. Velo cannot make a hostile blob safe. See below. |
+| `RegistrationHandle::deregister` returns `Ok` always. | The backend checks: a metadata request for the region must answer as one for a region that never existed. |
+| That answer is a blob with no region in it when the agent holds nothing, and `NotFound` when the agent holds another region. | Both forms mean "released". A test holds a pool arena across the unmaps, so that both are seen. |
+| `is_stub()` is `true` when `libnixl_capi.so` is missing, and nothing aborts. Any other call without the library aborts the process. | `build` asks `is_stub()` first and returns an error. |
+| Progress thread delay 0: 100% of one core for each idle agent. Delay 1 ms: 1%. Delay 100 ms: 0%, with the same READ latency, because the thread wakes on events. | The delay is 100 ms. |
+| `worker_id=N` in the custom parameter picks the worker. NIXL otherwise gives every READ from one thread to one worker. | Each READ names a worker in turn. |
+
+Costs over tcp loopback (not RDMA numbers): load connection info 4.3 ms cold; load a region 3.5 µs; first READ on a fresh pair 16 ms; warm 4 KiB READ 16.4 µs p50 and 18.7 µs p99, with create, post, and poll.
+
+### Less containment than UCX
+
+For UCX, velo parses a packed rkey before UCX sees it, so a truncated or corrupt key cannot drive UCX past its own bytes. For NIXL there is no such check. The blobs are in NIXL's format, NIXL unpacks the rkey inside them, and the `nixl-sys` binding unwraps the agent name of a blob as UTF-8.
+
+What velo does:
+
+- Its own frame around the two blobs is exact, so NIXL never gets a blob cut at the wrong byte.
+- The driver thread catches a panic. It then leaks the agent and reports a registration that does not go away. Unwinding would destroy the agent and release transfers that still run.
+
+What it cannot do: stop a blob that crashes NIXL. Peers on different NIXL versions are the likely source, because a change of blob format looks like a corrupt blob. The versions are not checked: the C API has no version call.
+
+### Rejected for this backend
+
+- **Connection info in the worker address.** A `nixl` entry in `PeerInfo`, loaded once for each peer, as the UCX endpoint blob is. It gives smaller descriptors and wireup at `register`. But NIXL is not a `Transport`, and the messenger builds addresses and registers peers through transports only. It needs a new hook in both places. A descriptor that carries everything also recovers by itself after a peer is dropped.
+- **The flag that puts connection info into a region blob** (`includeConnInfo`). It is not exposed to Rust, and the upstream change that exposed it was closed. Two blobs do the same.
+- **A purge on every address overlap.** The first design tracked loaded regions by address and dropped the peer when a new region overlapped an old one. A drop needs an idle peer and costs a wireup, and a workload with one registration per payload overlaps all the time. The device id rule needs no purge.
+- **Dropping a peer to recover from a refused load.** Measured: it does not recover.
+- **Polling from tokio tasks.** NIXL's Rust agent takes one lock for every call. A second caller adds a lock order with the unmap and purge rules. One thread owns the agent and both rules.
+- **A linked `nixl-sys`.** With NIXL installed, `nixl-sys` links `libnixl.so` into every test binary; without it, the build falls back to the stub. Two machines then build two different things. The stub is forced.
+- **A `nixl-sys` type in velo's API.** A `nixl-sys` release would then be a velo API break. The configuration is plain fields, and velo creates the agent.
+- **A separate `velo-nixl` crate.** See [Versioning](versioning.md): the workspace has two crates on purpose.
 
 ## The mlx5 link-order defect
 
