@@ -88,7 +88,7 @@ fn serve_acquire(
         .get_total_len(local_id)
         .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
 
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     if let Some(response) = rdma_response(
         store,
         local_id,
@@ -99,7 +99,7 @@ fn serve_acquire(
     ) {
         return Ok(response);
     }
-    #[cfg(not(all(target_os = "linux", feature = "ucx")))]
+    #[cfg(not(velo_rdma))]
     let _ = draining;
 
     // Always use chunked transfer (even for 1 chunk) to avoid
@@ -159,7 +159,7 @@ fn serve_acquire(
 ///
 /// A lease that *is* answered with a descriptor gets a deadline, and that is
 /// the only place one is set. Chunked leases stay deadline-free.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 fn rdma_response(
     store: &Arc<DataStore>,
     local_id: u64,
@@ -180,8 +180,8 @@ fn rdma_response(
         return decline(RdmaPathReason::NoOffer);
     };
     let Some(rdma) = store.rdma() else {
-        // No registry at all: a `ucx` build whose instance never got
-        // `add_ucx_transport`. That is a transport-configuration fact, not a
+        // No registry at all: an RDMA build whose instance was given no
+        // backend. That is a transport-configuration fact, not a
         // staging one, and `NotPinned` below means something else entirely —
         // the slot exists and is heap-staged. The consumer records
         // `NotConfigured` for this same condition, so labelling it anything

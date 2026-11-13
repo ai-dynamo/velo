@@ -25,11 +25,14 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
+#[cfg(feature = "ucx")]
 use velo_ext::Transport;
 
 use super::arena::{ArenaSet, Budget, GRANULE, RdmaPoolConfig, pool_arena_target};
-use super::backend::{BackendGet, BackendRegion, RdmaBackend, RdmaError, UcxBackend};
+use super::backend::{BackendGet, BackendRegion, RdmaBackend, RdmaError};
 use super::region::{Deregistered, RegionInner, RegionParts};
+#[cfg(feature = "ucx")]
+use super::ucx::UcxBackend;
 use super::{RdmaConfig, RdmaRegistry};
 
 /// Generous ceiling for anything that should resolve promptly.
@@ -835,6 +838,7 @@ async fn an_unconfirmed_reclaim_holds_its_budget() {
 /// Every other reclamation test drives the sweep directly, so all of them would
 /// pass with `set_rdma_context` never having been taught to call it. This is the
 /// one that would not.
+#[cfg(feature = "ucx")]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_rendezvous_tick_reclaims_arenas_without_being_asked() {
     let transport = Arc::new(
@@ -1440,12 +1444,14 @@ async fn registration_in_flight_is_not_missed_by_shutdown() {
 ///
 /// `_streams` is held because dropping the receivers would tear the inbound
 /// channels down under a transport that is still running.
+#[cfg(feature = "ucx")]
 struct UcxHarness {
     transport: Arc<crate::transports::ucx::UcxTransport>,
     registry: Arc<RdmaRegistry>,
     _streams: crate::transports::DataStreams,
 }
 
+#[cfg(feature = "ucx")]
 impl UcxHarness {
     async fn start(cfg: RdmaConfig) -> Self {
         use velo_ext::InstanceId;
@@ -1494,6 +1500,7 @@ impl UcxHarness {
 ///
 /// Asserted through the progress thread's own `live_regions`, so a registration
 /// the registry has forgotten but UCX still holds cannot pass.
+#[cfg(feature = "ucx")]
 #[tokio::test(flavor = "multi_thread")]
 async fn ucx_backend_maps_and_unmaps() {
     let harness = UcxHarness::start(RdmaConfig::default()).await;
@@ -1529,6 +1536,7 @@ async fn ucx_backend_maps_and_unmaps() {
 
 /// The pool over a real backend: an arena is one UCX registration however many
 /// buffers come out of it, and the shutdown sweep releases it.
+#[cfg(feature = "ucx")]
 #[tokio::test(flavor = "multi_thread")]
 async fn ucx_pool_arena_is_one_registration() {
     let cfg = RdmaConfig {
@@ -1564,6 +1572,7 @@ async fn ucx_pool_arena_is_one_registration() {
 /// after transport teardown, or not at all, `live_regions` would be non-zero
 /// here or the unmap would have been a forced one from teardown rather than an
 /// orderly one from the sweep.
+#[cfg(feature = "ucx")]
 #[tokio::test(flavor = "multi_thread")]
 async fn velo_graceful_shutdown_deregisters_before_transport_teardown() {
     let transport = Arc::new(
@@ -1613,6 +1622,7 @@ async fn velo_graceful_shutdown_deregisters_before_transport_teardown() {
 /// A guard dropped without awaiting is deregistered in the background against
 /// the real backend too — the failure mode being ruled out is a warn that
 /// announces a deregistration nobody actually performs.
+#[cfg(feature = "ucx")]
 #[tokio::test(flavor = "multi_thread")]
 async fn ucx_dropped_guard_deregisters() {
     let harness = UcxHarness::start(RdmaConfig::default()).await;
@@ -1640,6 +1650,7 @@ async fn ucx_dropped_guard_deregisters() {
 /// Without a UCX transport the facade refuses rather than panicking, and the
 /// rest of Velo is unaffected. Adding the transport with `add_transport`
 /// instead of `add_ucx_transport` is a legitimate messaging-only setup.
+#[cfg(feature = "ucx")]
 #[tokio::test(flavor = "multi_thread")]
 async fn velo_without_ucx_transport_refuses_registration() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -2316,6 +2327,7 @@ async fn unregister_owned_refuses_before_deregistering() {
 /// property the lock exists to provide. (The latch precondition is the
 /// independent backstop if it ever does interleave: it refuses while the
 /// backend still reports registrations.)
+#[cfg(feature = "ucx")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_graceful_shutdowns_are_serialised() {
     const CALLERS: usize = 8;

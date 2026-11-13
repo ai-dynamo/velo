@@ -57,9 +57,9 @@ use crate::rendezvous::protocol::{
 };
 use crate::rendezvous::write::RendezvousWrite;
 
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 use crate::observability::RdmaPathReason;
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 use crate::rendezvous::protocol::RvLeaseRenewRequest;
 
 /// Consumer-side operations for the rendezvous protocol.
@@ -153,7 +153,7 @@ impl Consumer {
                     }
                 }
             }
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            #[cfg(velo_rdma)]
             AcquireResponse::Rdma {
                 lease_id,
                 descriptor,
@@ -191,7 +191,7 @@ impl Consumer {
                     }
                 }
             }
-            #[cfg(not(all(target_os = "linux", feature = "ucx")))]
+            #[cfg(not(velo_rdma))]
             AcquireResponse::Rdma { lease_id, .. } => {
                 unsolicited_rdma(client, handle, lease_id, limit).await
             }
@@ -206,7 +206,7 @@ impl Consumer {
     /// an in-memory slot, a payload under the threshold, a kill switch — the
     /// chunks are pulled and then copied into a pooled buffer, so the return
     /// type is the same either way and the caller does not branch.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub async fn get_pinned(
         manager: &RendezvousManager,
         handle: DataHandle,
@@ -325,7 +325,7 @@ impl Consumer {
                     }
                 }
             }
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            #[cfg(velo_rdma)]
             AcquireResponse::Rdma {
                 lease_id,
                 descriptor,
@@ -363,7 +363,7 @@ impl Consumer {
                     }
                 }
             }
-            #[cfg(not(all(target_os = "linux", feature = "ucx")))]
+            #[cfg(not(velo_rdma))]
             AcquireResponse::Rdma { lease_id, .. } => {
                 let (data, lease_id) = unsolicited_rdma(client, handle, lease_id, u64::MAX).await?;
                 let lease = manager.lease_guard(handle, lease_id, Some(client));
@@ -513,7 +513,7 @@ async fn acquire(
 
 /// A build without the RDMA path never offers. The function exists so the call
 /// sites read the same either way.
-#[cfg(not(all(target_os = "linux", feature = "ucx")))]
+#[cfg(not(velo_rdma))]
 fn rdma_offer(_manager: &RendezvousManager, _target: WorkerId) -> Option<RdmaOffer> {
     None
 }
@@ -524,7 +524,7 @@ fn rdma_offer(_manager: &RendezvousManager, _target: WorkerId) -> Option<RdmaOff
 /// process's life, and an offer that outlived the endpoint it was based on
 /// would send the owner down a path this side can no longer walk. See the
 /// module docs for why the three conditions are the whole of eligibility.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 fn rdma_offer(manager: &RendezvousManager, target: WorkerId) -> Option<RdmaOffer> {
     let store = manager.data_store();
     let Some(ctx) = store.rdma() else {
@@ -562,7 +562,7 @@ fn rdma_offer(manager: &RendezvousManager, target: WorkerId) -> Option<RdmaOffer
 
 /// Apply an armed descriptor fault, if there is one. Identity in a release
 /// build, where the hook does not exist.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 fn with_descriptor_hook(manager: &RendezvousManager, descriptor: Vec<u8>) -> Vec<u8> {
     #[cfg(feature = "test-helpers")]
     if let Some(hook) = manager.take_descriptor_hook() {
@@ -574,7 +574,7 @@ fn with_descriptor_hook(manager: &RendezvousManager, descriptor: Vec<u8>) -> Vec
 
 /// What an armed transfer fault asks of the GET. Always `None` in a build
 /// without `test-helpers`, where nothing can arm one.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 #[cfg_attr(not(feature = "test-helpers"), allow(dead_code))]
 enum TransferHook {
     /// Report the transfer as failed without issuing it.
@@ -583,7 +583,7 @@ enum TransferHook {
     Delay(std::time::Duration),
 }
 
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 fn take_transfer_hook(manager: &RendezvousManager) -> Option<TransferHook> {
     #[cfg(feature = "test-helpers")]
     {
@@ -606,13 +606,13 @@ fn take_transfer_hook(manager: &RendezvousManager) -> Option<TransferHook> {
 /// Every variant means the same thing to the caller — detach, re-acquire
 /// chunked, once — so this exists to carry the *reason* to the metric and the
 /// log rather than to be matched on.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 struct RdmaFallback {
     reason: RdmaPathReason,
     detail: String,
 }
 
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 impl RdmaFallback {
     fn new(reason: RdmaPathReason, detail: impl Into<String>) -> Self {
         Self {
@@ -623,7 +623,7 @@ impl RdmaFallback {
 }
 
 /// Read the range the owner's descriptor names into a pooled buffer.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 async fn rdma_pull(
     manager: &RendezvousManager,
     handle: DataHandle,
@@ -667,7 +667,7 @@ async fn rdma_pull(
 
 /// Read the descriptor into the caller's destination, using the destination's
 /// own registered memory when it has some.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 async fn rdma_pull_into(
     manager: &RendezvousManager,
     handle: DataHandle,
@@ -726,7 +726,7 @@ async fn rdma_pull_into(
 
 /// The length a descriptor states, or `None` when it does not decode: the
 /// transfer then falls back to the chunked path, which checks its own length.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 fn descriptor_len(descriptor: &[u8]) -> Option<u64> {
     crate::rendezvous::descriptor::RdmaDescriptor::decode(descriptor)
         .ok()
@@ -734,7 +734,7 @@ fn descriptor_len(descriptor: &[u8]) -> Option<u64> {
 }
 
 /// Decode a descriptor and check it against this instance's backend.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 fn decode_for<'a>(
     manager: &'a RendezvousManager,
     descriptor: &[u8],
@@ -766,7 +766,7 @@ fn decode_for<'a>(
 }
 
 /// Issue the GET, keeping the lease alive while it runs.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 async fn run_get(
     manager: &RendezvousManager,
     handle: DataHandle,
@@ -885,7 +885,7 @@ async fn run_get(
 ///
 /// A `lease_timeout_ms` of zero is an owner that set no deadline — there is
 /// nothing to renew, and the transfer runs unwrapped.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 async fn with_lease_renewal<F, T>(
     manager: &RendezvousManager,
     handle: DataHandle,
@@ -918,7 +918,7 @@ where
 /// Fire one keepalive. Losing it is benign — the standing deadline still
 /// applies and the next tick is half a deadline away — so a failure is a debug
 /// line rather than something that interrupts the transfer.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 async fn send_lease_renewal(manager: &RendezvousManager, handle: DataHandle, lease_id: u64) {
     let payload = match serde_json::to_vec(&RvLeaseRenewRequest {
         handle: RvHandleWire::from_handle(handle),
@@ -948,7 +948,7 @@ async fn send_lease_renewal(manager: &RendezvousManager, handle: DataHandle, lea
 }
 
 /// Detach the lease and pull the same handle chunked instead. **One attempt.**
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 async fn fallback_chunked(
     manager: &RendezvousManager,
     client: &Arc<ActiveMessageClient>,
@@ -982,7 +982,7 @@ async fn fallback_chunked(
 /// Reachable only from a build without the RDMA path, or from an owner that
 /// ignored a missing offer. Either way the lease names a transfer this side
 /// cannot perform.
-#[cfg(not(all(target_os = "linux", feature = "ucx")))]
+#[cfg(not(velo_rdma))]
 async fn unsolicited_rdma(
     client: &Arc<ActiveMessageClient>,
     handle: DataHandle,
@@ -1057,7 +1057,7 @@ async fn chunked_only(
 
 /// Copy bytes the chunked path produced into a pooled buffer, so
 /// [`Consumer::get_pinned`] returns the same type whichever way it got them.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 async fn copy_into_pool(
     manager: &RendezvousManager,
     data: &[u8],

@@ -125,6 +125,8 @@ The acceptance test for the boundary: `cargo tree -p velo-ext | grep -c promethe
 
 `nats-transport`, `nats-discovery`, and `nats-queue` select separate code paths that share `async-nats`. They do not enable each other. The discovery and queue features enable `services`; the transport feature does not.
 
+The backend-neutral RDMA layer (the registry, the arena pool, regions, the rendezvous GET path) is gated on `cfg(velo_rdma)`, which `lib/velo/build.rs` sets on Linux when the `ucx` feature is on. Gate code on `velo_rdma` unless it names UCX; then gate it on the `ucx` feature.
+
 Core builds retain discovery traits, direct peer registration, metrics, ACK/NACK messages, all streaming APIs, and full rendezvous. The `ucx` feature keeps its messaging and RDMA APIs without `services`. Use `VeloBuilder::mux_only()` to omit the extra stream listener at runtime; this adds no compile-time feature. See `docs/src/guides/migrate-services.md`.
 
 ## Transport layer

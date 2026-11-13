@@ -75,11 +75,11 @@ pub mod handlers;
 /// Slot bodies staged in RDMA-registered memory. Gated with the registration
 /// layer it depends on, and runtime-internal: a `PinnedSlot` is how the store
 /// holds staged memory, not something a caller names.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 pub(crate) mod pinned;
 pub mod protocol;
-// The RDMA registration layer, gated exactly as `transports::ucx` is.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+// The RDMA registration layer. Each backend has its own feature gate.
+#[cfg(velo_rdma)]
 pub mod rdma;
 pub mod store;
 pub mod transparent;
@@ -116,11 +116,11 @@ pub struct RendezvousManager {
     /// Stops the lease reaper. Cancelled by `Velo::graceful_shutdown` before
     /// the registration sweep, so the reaper is not force-releasing leases
     /// while regions are being unmapped underneath them.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     reaper_shutdown: tokio_util::sync::CancellationToken,
     /// One armed fault for the next RDMA transfer. See
     /// [`arm_rdma_hook`](Self::arm_rdma_hook).
-    #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    #[cfg(all(velo_rdma, feature = "test-helpers"))]
     test_hook: parking_lot::Mutex<Option<RdmaTestHook>>,
 }
 
@@ -140,7 +140,7 @@ struct MessengerLink {
 /// responses stay covered.
 ///
 /// Behind `test-helpers`, so it is not part of a release build's surface.
-#[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+#[cfg(all(velo_rdma, feature = "test-helpers"))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RdmaTestHook {
@@ -166,7 +166,7 @@ pub enum RdmaTestHook {
     SlowGet(std::time::Duration),
 }
 
-#[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+#[cfg(all(velo_rdma, feature = "test-helpers"))]
 impl RdmaTestHook {
     /// Whether this fault applies to the descriptor rather than the transfer.
     fn is_descriptor_fault(&self) -> bool {
@@ -216,7 +216,7 @@ impl RdmaTestHook {
 /// is the one thing the `_rv_acquire` handler closure already has an `Arc` to.
 /// See the field's own docs for why capturing the manager instead would be a
 /// reference cycle.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 pub(crate) struct RdmaContext {
     /// The registration layer: the arena pool, the external regions, the GET.
     pub(crate) registry: Arc<rdma::RdmaRegistry>,
@@ -244,9 +244,9 @@ impl RendezvousManager {
             store: Arc::new(store::DataStore::with_metrics(metrics.clone())),
             messenger_lock: OnceLock::new(),
             metrics,
-            #[cfg(all(target_os = "linux", feature = "ucx"))]
+            #[cfg(velo_rdma)]
             reaper_shutdown: tokio_util::sync::CancellationToken::new(),
-            #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+            #[cfg(all(velo_rdma, feature = "test-helpers"))]
             test_hook: parking_lot::Mutex::new(None),
         }
     }
@@ -374,7 +374,7 @@ impl RendezvousManager {
     ///
     /// It returns a [`DataHandle`], not a `Result`, and that is the contract.
     /// Pool exhaustion, a registered-bytes budget that is already spent, a
-    /// switched-off kill switch, an instance with no UCX transport at all —
+    /// switched-off kill switch, an instance with no RDMA backend at all —
     /// every one of them stages the data in plain memory instead and records
     /// the reason on `velo_rendezvous_rdma_path_total`. Pinning is a transfer
     /// optimisation, and a *staging* call that failed because the pool was busy
@@ -395,7 +395,7 @@ impl RendezvousManager {
     /// To stage without a copy, register the memory yourself and use
     /// [`register_data_in_region`](Self::register_data_in_region).
     pub async fn register_data_pinned(&self, data: &[u8]) -> DataHandle {
-        #[cfg(all(target_os = "linux", feature = "ucx"))]
+        #[cfg(velo_rdma)]
         if !data.is_empty()
             && let Some(ctx) = self.store.rdma()
         {
@@ -450,7 +450,7 @@ impl RendezvousManager {
     /// which can await. Warming it from a send in the background was considered
     /// and rejected — a message send that side-effects a 64 MiB pin on a
     /// detached task is not something a caller can reason about.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn register_data_pinned_sync(
         &self,
         data: Bytes,
@@ -505,8 +505,8 @@ impl RendezvousManager {
     ///
     /// # Errors
     ///
-    /// [`NotConfigured`](rdma::RdmaError::NotConfigured) without a UCX
-    /// transport, [`OutOfRange`](rdma::RdmaError::OutOfRange) for an empty,
+    /// [`NotConfigured`](rdma::RdmaError::NotConfigured) without an RDMA
+    /// backend, [`OutOfRange`](rdma::RdmaError::OutOfRange) for an empty,
     /// inverted, or out-of-bounds range, and
     /// [`ShuttingDown`](rdma::RdmaError::ShuttingDown) once the region or the
     /// registry has begun to go away.
@@ -519,7 +519,7 @@ impl RendezvousManager {
     /// so anchoring in it costs nothing extra; the switch decides whether
     /// `_rv_acquire` answers with a descriptor, and a switched-off owner serves
     /// the same slot chunked.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub fn register_data_in_region(
         &self,
         guard: &rdma::RegionGuard,
@@ -571,7 +571,7 @@ impl RendezvousManager {
     /// Called once, by `VeloBuilder::build`, after the transports have started
     /// and the registry exists. Mirrors `messenger_lock`: the manager is
     /// constructed before the thing it needs, and the binding is a set-once.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn set_rdma_context(
         &self,
         registry: Arc<rdma::RdmaRegistry>,
@@ -676,7 +676,7 @@ impl RendezvousManager {
     ///
     /// Chunked pulls, by contrast, keep working — which is the whole reason
     /// demotion is not a drop.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn shutdown(&self) {
         self.reaper_shutdown.cancel();
         self.store.stop_reaper();
@@ -702,7 +702,7 @@ impl RendezvousManager {
     /// today only because the fallback re-acquire carries no offer and so never
     /// sees a second descriptor — a property of the code under test, which is
     /// not something a test should quietly rely on.
-    #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    #[cfg(all(velo_rdma, feature = "test-helpers"))]
     pub fn arm_rdma_hook(&self, hook: RdmaTestHook) {
         *self.test_hook.lock() = Some(hook);
     }
@@ -712,7 +712,7 @@ impl RendezvousManager {
     /// Split from [`take_get_hook`](Self::take_get_hook) so one slot can hold
     /// either kind without a descriptor test consuming a GET fault or the
     /// reverse.
-    #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    #[cfg(all(velo_rdma, feature = "test-helpers"))]
     fn take_descriptor_hook(&self) -> Option<RdmaTestHook> {
         let mut slot = self.test_hook.lock();
         match slot.as_ref() {
@@ -722,7 +722,7 @@ impl RendezvousManager {
     }
 
     /// Take an armed transfer fault, if the armed one is a transfer fault.
-    #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    #[cfg(all(velo_rdma, feature = "test-helpers"))]
     fn take_get_hook(&self) -> Option<RdmaTestHook> {
         let mut slot = self.test_hook.lock();
         match slot.as_ref() {
@@ -867,7 +867,7 @@ impl RendezvousManager {
     /// [`BudgetExceeded`](rdma::RdmaError::BudgetExceeded) under a tight pool,
     /// until the abandoned transfer completes. That is the reservation working,
     /// not a leak.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub async fn get_pinned(&self, handle: DataHandle) -> Result<(rdma::PinnedBuf, u64)> {
         let started = Instant::now();
         let (target_worker, local_id) = handle.unpack();
@@ -880,7 +880,7 @@ impl RendezvousManager {
                 .acquire_read_lock(local_id)
                 .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found: {handle}"))?;
             // Guarded from here: `NotConfigured` is a *documented* outcome of
-            // this call on an instance with no UCX transport, so without the
+            // this call on an instance with no RDMA backend, so without the
             // guard the ordinary configuration leaked a deadline-free lease on
             // every single invocation.
             let lease = self.lease_guard(handle, lease_id, None);
@@ -932,7 +932,7 @@ impl RendezvousManager {
     /// into it that is still outstanding holds a claim of its own — so the
     /// space comes back when the *later* of the two lets go, and never while a
     /// NIC write is still landing.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub async fn alloc_pinned_writer(
         &self,
         len: usize,
@@ -1149,7 +1149,7 @@ impl RendezvousManager {
 /// `AcquireResponse::Rdma` carries the deadline in **milliseconds**, and zero is
 /// the documented "no deadline" encoding, so anything under a millisecond
 /// rounds to a value that means the opposite of what was configured.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 const MIN_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1);
 
 /// Bring a configured lease timeout up to something the wire can carry.
@@ -1178,7 +1178,7 @@ const MIN_LEASE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(
 /// correctly, and as configured. See
 /// [`RdmaRendezvousConfig::lease_timeout`](rdma::RdmaRendezvousConfig::lease_timeout)
 /// for the range that actually works.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 fn normalize_lease_timeout(configured: std::time::Duration) -> std::time::Duration {
     if configured >= MIN_LEASE_TIMEOUT {
         return configured;
@@ -1369,7 +1369,7 @@ impl Drop for LeaseGuard {
 /// fall out of scope — must not be kept alive by its own reaper. The token is
 /// the orderly exit; the upgrade failure is the backstop for every other way a
 /// runtime ends.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 async fn reap_expired_leases(
     store: std::sync::Weak<store::DataStore>,
     registry: std::sync::Weak<rdma::RdmaRegistry>,
@@ -1431,7 +1431,7 @@ async fn reap_expired_leases(
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "ucx", test))]
+#[cfg(all(velo_rdma, test))]
 mod lease_timeout_tests {
     use super::*;
     use std::time::Duration;

@@ -74,7 +74,7 @@ pub struct RdmaDestination<'a> {
     /// overwrite. The transfer takes this out of the destination before it is
     /// submitted, so what the caller drops is no longer what keeps the space
     /// reserved.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     hold: Option<super::rdma::TransferHold>,
     /// Ties this destination to the `&mut` borrow it came from. The borrow is
     /// what excludes other *local* writers for as long as the destination
@@ -97,7 +97,7 @@ impl RdmaDestination<'_> {
     /// builds is one an outstanding transfer must be able to outlive, and a
     /// second constructor without that argument would be the easy way to
     /// reintroduce the recycle-under-the-NIC bug.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn held(
         region_id: u64,
         offset: u64,
@@ -117,7 +117,7 @@ impl RdmaDestination<'_> {
     ///
     /// Called once, immediately before submitting: from then on the transfer
     /// owns the reservation and the destination is only a description.
-    #[cfg(all(target_os = "linux", feature = "ucx"))]
+    #[cfg(velo_rdma)]
     pub(crate) fn take_hold(&mut self) -> Option<super::rdma::TransferHold> {
         self.hold.take()
     }
@@ -220,12 +220,12 @@ impl RendezvousWrite for Vec<u8> {
 /// anything yet. The bytes may still change after the future is dropped, so a
 /// writer recovered from a cancelled transfer must be treated as having
 /// unspecified contents.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 pub struct PinnedWriter {
     buf: super::rdma::PinnedBuf,
 }
 
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 impl PinnedWriter {
     pub(crate) fn new(buf: super::rdma::PinnedBuf) -> Self {
         Self { buf }
@@ -253,7 +253,7 @@ impl PinnedWriter {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 impl std::ops::Deref for PinnedWriter {
     type Target = [u8];
 
@@ -262,7 +262,7 @@ impl std::ops::Deref for PinnedWriter {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 impl std::fmt::Debug for PinnedWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PinnedWriter")
@@ -271,7 +271,7 @@ impl std::fmt::Debug for PinnedWriter {
     }
 }
 
-#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[cfg(velo_rdma)]
 impl RendezvousWrite for PinnedWriter {
     /// Fixed-size, like `&mut [u8]`: the destination is a pool allocation and
     /// cannot grow, so a chunk past the end is an error rather than a resize.
