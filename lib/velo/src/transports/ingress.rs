@@ -28,7 +28,7 @@ use futures::StreamExt;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::FramedRead;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use velo_ext::{AdmitOutcome, MessageType, TransportAdapter, TransportErrorHandler};
 
@@ -193,7 +193,8 @@ fn connection_teardown(teardown: &CancellationToken) -> WaitForCancellationFutur
 /// How a frame loop answers a `Message` that the drain gate refused.
 ///
 /// A generic parameter of [`serve_frames`], not a trait object, so each
-/// transport gets its own copy of the loop with no indirect call per frame.
+/// transport gets its own copy of the loop and the loop adds no indirect call
+/// per frame.
 pub(crate) trait DrainReply {
     /// Tell the peer its request was refused. `header` is the request's
     /// header, which the peer needs to correlate the answer.
@@ -241,7 +242,9 @@ pub(crate) struct FrameRoute<'a> {
 /// drain gate refuses is answered with `reply`.
 ///
 /// The reader, the reply and the peer label are generic, so each caller gets
-/// its own copy of the loop and no call per frame goes through a vtable.
+/// its own copy of the loop, and the loop adds no indirect call per frame. The
+/// one it has, `record_frame` on the observability handle, is in
+/// [`route_frame`], and only when metrics are on.
 pub(crate) async fn serve_frames<R, D, P>(
     mut framed: FramedRead<R, TcpFrameCodec>,
     mut reply: D,
@@ -300,7 +303,7 @@ pub(crate) async fn serve_frames<R, D, P>(
                 if let Some(metrics) = route.metrics {
                     metrics.record_rejection(TransportRejection::DecodeError);
                 }
-                warn!("{key}: frame decode error from {peer}: {e}");
+                error!("{key}: frame decode error from {peer}: {e}");
                 break;
             }
             None => {
