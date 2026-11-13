@@ -6,18 +6,14 @@
 
 use std::sync::Arc;
 
-use bytes::Bytes;
-use futures::StreamExt;
 use tokio_util::codec::FramedRead;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tracing::debug;
 
-use velo_ext::{MessageType, TransportAdapter, TransportErrorHandler};
+use velo_ext::{TransportAdapter, TransportErrorHandler};
 
-use crate::observability::TransportRejection;
-use crate::transports::ingress::{Routed, route_frame};
+use crate::transports::ingress::{EchoShuttingDown, FrameRoute, serve_frames};
 use crate::transports::tcp::TcpFrameCodec;
-use crate::transports::tcp::framing::maybe_shrink_read_buffer;
 
 /// Everything an accepted stream needs besides the stream itself.
 #[derive(Clone)]
@@ -118,62 +114,116 @@ async fn serve_connection(connection: quinn::Connection, ctx: AcceptContext) {
 /// drain gets a `ShuttingDown` frame back on the same stream, with the
 /// request header echoed, so the sender fails it at once.
 async fn serve_stream(
-    mut send: quinn::SendStream,
+    send: quinn::SendStream,
     recv: quinn::RecvStream,
     ctx: AcceptContext,
     peer: std::net::SocketAddr,
 ) {
-    let mut framed = FramedRead::new(OrderlyEnd(recv), TcpFrameCodec::new());
-    loop {
-        let frame = tokio::select! {
-            biased;
-            _ = ctx.teardown.cancelled() => break,
-            frame = framed.next() => frame,
-        };
-        match frame {
-            Some(Ok((msg_type, header, payload))) => {
-                let frame_size = header.len() + payload.len();
-                match route_frame(
-                    msg_type,
-                    header,
-                    payload,
-                    &ctx.adapter,
-                    &ctx.error_handler,
-                    &ctx.transport_key,
-                    ctx.metrics.as_ref(),
-                )
-                .await
-                {
-                    Ok(Routed::Delivered) => {}
-                    Ok(Routed::DrainRejected { header }) => {
-                        debug!("QUIC: rejecting Message from {peer} during drain");
-                        if let Err(e) = echo_shutting_down(&mut send, &header).await {
-                            warn!("QUIC: failed to send ShuttingDown to {peer}: {e:#}");
-                        }
-                    }
-                    Err(e) => warn!("QUIC: failed to route {msg_type:?} from {peer}: {e:#}"),
-                }
-                maybe_shrink_read_buffer(
-                    framed.read_buffer_mut(),
-                    ctx.shrink_threshold,
-                    frame_size,
-                );
-            }
-            Some(Err(e)) => {
-                if let Some(metrics) = ctx.metrics.as_ref() {
-                    metrics.record_rejection(TransportRejection::DecodeError);
-                }
-                warn!("QUIC: frame decode error from {peer}: {e:#}");
-                break;
-            }
-            None => {
-                debug!("QUIC: stream from {peer} finished");
-                break;
-            }
-        }
-    }
+    serve_frames(
+        FramedRead::new(OrderlyEnd(recv), TcpFrameCodec::new()),
+        EchoShuttingDown(send),
+        &ctx.teardown,
+        FrameRoute {
+            adapter: &ctx.adapter,
+            error_handler: &ctx.error_handler,
+            transport_key: &ctx.transport_key,
+            metrics: ctx.metrics.as_ref(),
+            shrink_threshold: ctx.shrink_threshold,
+        },
+        peer,
+    )
+    .await;
 }
 
-async fn echo_shutting_down(send: &mut quinn::SendStream, header: &Bytes) -> std::io::Result<()> {
-    TcpFrameCodec::encode_frame(send, MessageType::ShuttingDown, header, &[]).await
+#[cfg(test)]
+mod tests {
+    use super::super::tls;
+    use super::*;
+    use crate::transports::ingress::TEARDOWN_ARMS;
+    use bytes::Bytes;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+    use velo_ext::MessageType;
+
+    struct FailErrors;
+    impl TransportErrorHandler for FailErrors {
+        fn on_error(&self, _header: Bytes, _payload: Bytes, error: String) {
+            panic!("{error}");
+        }
+    }
+
+    /// A stream builds its teardown future once, not once per frame: the QUIC
+    /// twin of `tcp::listener::a_connection_arms_its_teardown_once`, which
+    /// says why. QUIC used to rebuild it per frame on the node-wide token (65
+    /// builds for these 64 frames).
+    #[tokio::test]
+    async fn a_stream_arms_its_teardown_once() {
+        let identity = tls::Identity::generate().unwrap();
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(
+            tls::server_crypto(&identity).unwrap(),
+        )
+        .unwrap();
+        let server = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(tls::pinned_client_config(identity.fingerprint).unwrap());
+        let accept = tokio::spawn({
+            let server = server.clone();
+            async move {
+                let conn = server.accept().await.unwrap().await.unwrap();
+                let (send, recv) = conn.accept_bi().await.unwrap();
+                (conn, send, recv)
+            }
+        });
+        let conn = client
+            .connect(server.local_addr().unwrap(), "velo")
+            .unwrap()
+            .await
+            .unwrap();
+        let (mut send, _recv) = conn.open_bi().await.unwrap();
+        for _ in 0..64 {
+            TcpFrameCodec::encode_frame(&mut send, MessageType::Response, b"h", b"p")
+                .await
+                .unwrap();
+        }
+        let (_server_conn, server_send, server_recv) =
+            tokio::time::timeout(Duration::from_secs(5), accept)
+                .await
+                .unwrap()
+                .unwrap();
+        let (adapter, streams) = velo_ext::make_channels();
+        let teardown = CancellationToken::new();
+        let ctx = AcceptContext {
+            adapter,
+            error_handler: Arc::new(FailErrors),
+            transport_key: "quic".into(),
+            metrics: None,
+            teardown: teardown.clone(),
+            shrink_threshold: usize::MAX,
+        };
+        let arms = Arc::new(AtomicU64::new(0));
+        let handler = tokio::spawn(TEARDOWN_ARMS.scope(
+            arms.clone(),
+            serve_stream(server_send, server_recv, ctx, conn.remote_address()),
+        ));
+        for _ in 0..64 {
+            tokio::time::timeout(Duration::from_secs(5), streams.response_stream.recv_async())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        teardown.cancel();
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .unwrap()
+            .unwrap();
+        let count = arms.load(Ordering::Relaxed);
+        conn.close(0u32.into(), b"done");
+        server.close(0u32.into(), b"done");
+        client.close(0u32.into(), b"done");
+        assert_eq!(count, 1);
+    }
 }
