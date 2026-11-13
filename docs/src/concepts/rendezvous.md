@@ -2,9 +2,14 @@
 
 Rendezvous moves a large payload by handle. One worker (the *owner*) stages the bytes and gets a compact `DataHandle`. The owner passes the handle to consumers by any means: a message field, an event, or a typed response. Each consumer then pulls the bytes from the owner. The consumer drives every transfer. The owner only answers.
 
-The bytes move on one of two paths. The **chunked path** works everywhere and pulls the payload in 512 KiB messages. The **RDMA path** lets the consumer's NIC read the owner's memory with one UCX `ucp_get_nbx` call. The owner decides the path for each transfer, and a caller writes the same code for both.
+The bytes move on one of two paths. The **chunked path** works everywhere and pulls the payload in 512 KiB messages. The **RDMA path** lets the consumer's NIC read the owner's memory with one read. The owner decides the path for each transfer, and a caller writes the same code for both.
 
-The RDMA path needs the `ucx` feature on Linux. See [Run rendezvous over RDMA](../guides/ucx-rdma.md) for the build and the runtime setup. See [RDMA performance](../operations/rdma-performance.md) for measured numbers, and [RDMA design](../development/rdma-design.md) for why the design has this shape.
+The RDMA path needs an RDMA backend on Linux. Velo has two, and an instance uses one of them:
+
+- **UCX** (the `ucx` feature): velo's own UCX transport, and one `ucp_get_nbx` call. See [Run rendezvous over RDMA](../guides/ucx-rdma.md).
+- **NIXL** (the `nixl` feature): a NIXL agent, and one NIXL READ. See [The NIXL backend](#the-nixl-backend) and [Run rendezvous over NIXL](../guides/nixl-rdma.md).
+
+Most of this chapter holds for both. Where it names UCX, the NIXL section says what differs. See [RDMA performance](../operations/rdma-performance.md) for measured numbers, and [RDMA design](../development/rdma-design.md) for why the design has this shape.
 
 ## The handle API
 
@@ -67,11 +72,11 @@ The owner answers `AcquireResponse::Rdma` only if every check below passes. The 
 | # | Check | Reason label on refusal |
 |---|---|---|
 | 1 | The consumer sent an RDMA offer. | `no_offer` |
-| 2 | This instance has an RDMA registry (UCX was added with `add_ucx_transport`). | `not_configured` |
+| 2 | This instance has an RDMA registry (the builder was given a backend with `add_ucx_transport` or `add_nixl_rdma`). | `not_configured` |
 | 3 | The RDMA path is enabled on this owner (the kill switch is off). | `kill_switch` |
 | 4 | The slot is staged in registered memory. | `not_pinned` |
 | 5 | The payload is at least `rdma_min_bytes` (64 KiB by default). | `below_min` |
-| 6 | The offer names the backend this owner serves (`"ucx"`). | `backend_mismatch` |
+| 6 | The offer names the backend this owner serves (`"ucx"` or `"nixl"`). | `backend_mismatch` |
 | 7 | The owner is not draining. The shutdown sweep that follows a drain frees pinned memory. | `draining` |
 | 8 | The staging still exists and the descriptor encodes. | `not_pinned` |
 
@@ -90,6 +95,8 @@ The consumer builds its offer from three local facts. It asks the owner nothing.
 - The owner is registered on a transport whose key matches the registry backend.
 
 The GET uses this consumer's own UCX endpoint to the owner. So "UCX is registered for that peer" is the whole condition. UCX does not have to be the primary transport. The expected deployment is a TCP control plane with UCX beside it.
+
+The third fact is different for NIXL. NIXL is not a transport: the agent makes its own connection from what the descriptor carries. So a NIXL consumer offers to every owner it has registered, on any transport.
 
 The rule has a cold-start effect. A peer that is not registered yet translates to nothing. The first `get` to an unknown owner therefore offers nothing and pulls chunks. Later gets take the RDMA path.
 
@@ -214,7 +221,7 @@ On the wire, `0` means "no deadline". A consumer that gets `0` starts no renewal
 The RDMA answer carries a velo-owned binary descriptor, not JSON:
 
 ```text
-backend:    u8      1 = ucx
+backend:    u8      1 = ucx, 2 = nixl
 version:    u8      1
 flags:      u8      0
 generation: u64le   owner's registration generation
@@ -238,7 +245,7 @@ Decoding refuses anything that it cannot account for byte for byte:
 
 A refusal is not an error for the caller. It costs one extra round trip on the chunked path.
 
-The key is bounded at 4096 bytes by the descriptor and at 1024 bytes by the UCX backend. The backend checks the bound at map time and again before unpack. Before any pointer reaches `ucp_ep_rkey_unpack`, the UCX backend also walks the two stages of the UCX 1.22 packed-rkey format. It refuses a blob unless UCX's own parse ends inside the blob, and it refuses an out-of-range `mem_type`. This pre-parse checks framing only. A stale key with perfect framing passes it. See [RDMA design](../development/rdma-design.md#a-stale-rkey-aborts-the-process-on-infiniband) for why that matters.
+The key is bounded at 16 KiB by the descriptor, which leaves room for a NIXL key (see [The NIXL backend](#the-nixl-backend)), and at 1024 bytes by the UCX backend. The backend checks its bound at map time and again before unpack. Before any pointer reaches `ucp_ep_rkey_unpack`, the UCX backend also walks the two stages of the UCX 1.22 packed-rkey format. It refuses a blob unless UCX's own parse ends inside the blob, and it refuses an out-of-range `mem_type`. This pre-parse checks framing only. A stale key with perfect framing passes it. See [RDMA design](../development/rdma-design.md#a-stale-rkey-aborts-the-process-on-infiniband) for why that matters.
 
 `generation` is in the descriptor for diagnostics. The consumer does not send it back in `detach` or `release`.
 
@@ -250,6 +257,66 @@ Two `#[serde(default)]` fields make a mixed-version deployment fall back to chun
 - `AcquireResponse::Rdma::lease_timeout_ms`. If a future owner omits it, the default `0` means no deadline, which is the old behavior.
 
 The rule for new fields: every field is `#[serde(default)]`, and every default means what the protocol did before the field existed. A default that means "the new behavior" makes an old peer's silence look like consent.
+
+## The NIXL backend
+
+With the `nixl` feature, `VeloBuilder::add_nixl_rdma` gives the instance a NIXL agent as its RDMA backend. The pool, the regions, the leases, the fallback, and the public calls are the same code as with UCX. This section covers what NIXL changes below them.
+
+Velo does not send messages over NIXL (see [RDMA design](../development/rdma-design.md#nixl-for-messaging) for why). The agent only registers memory and reads. So the instance needs a messenger transport for everything else, and the descriptor is how a consumer reaches the owner's agent.
+
+### The key
+
+For NIXL, the key bytes of the descriptor hold a frame that velo owns:
+
+```text
+version:     u8      1
+region_dev:  u64le   the NIXL device id this registration was made under
+region_addr: u64le   start of the registered region
+region_len:  u64le
+conn_len:    u16le
+md_len:      u16le
+conn:        [u8]    NIXL connection info of the owner's agent
+md:          [u8]    NIXL metadata of this one region
+```
+
+Connection info travels in every descriptor. A consumer that has never met the owner, or that has dropped what it held for the owner, needs nothing else. The cost is size: 532 bytes over tcp with one device. The frame is built once, when the region is registered. If it is over the bound, the registration fails. A key that only failed at acquire time would send every transfer down the chunked path with no error.
+
+The owner's agent is named `velo-<instance id>`. NIXL keeps what it knows about a peer under the agent name in the blobs, so the consumer checks that name against the instance it reads from, and refuses a key whose blobs say another.
+
+### A region id is used once
+
+NIXL keeps every region key a consumer loads. It has no call to drop one, only a call to drop the whole peer. So the consumer's agent holds keys for registrations that the owner has dropped. NIXL does not refuse a READ through such a key: over tcp it returns whatever the memory holds now. On InfiniBand a stale key [aborts the process](../development/rdma-design.md#a-stale-rkey-aborts-the-process-on-infiniband).
+
+Two facts about NIXL make this safe. A READ names a device id, and NIXL serves it only from an entry under that id. And NIXL's UCX plugin does not use the device id of host memory for anything. So the owner registers every region under an id that it never uses again, the descriptor states that id, and a READ of a new registration cannot go through the entry of an old one, even at the same address.
+
+The other half is unchanged: the owner checks its registration again at every acquire.
+
+### What the consumer keeps for each peer
+
+- **A region is loaded once.** Connection info goes first. Later READs of the region make no load call.
+- **The cap.** At 1,024 loaded regions, the peer is dropped and loaded again. NIXL has no bound of its own.
+- **A failed transfer drops the peer.** NIXL refuses further loads on an endpoint that had an error, so the peer is dropped before the next load.
+- **A drop waits.** If the peer is dropped while a READ to it runs, NIXL loses track of that READ (see below). So a drop waits until no READ to the peer is in flight, and the READs that need the drop wait for it. A READ that arrives later waits behind them, so the peer does go idle.
+- **A refused load is final.** On NIXL 1.5.2, a load that NIXL refuses often leaves the peer unloadable for the life of the agent, and a drop does not help. So velo does not try again, and transfers from that peer take the chunked path. `Velo::unregister_peer` clears the state, and the next registration of the peer starts fresh.
+
+### A transfer NIXL cannot confirm
+
+NIXL has no completion callback. A transfer is over when a status poll says so. If the peer's state is dropped under a transfer, the poll answers `NotFound`, and the transfer goes on. Measured with a 2 GiB READ: the last page of the destination changed 1.6 s after that answer.
+
+Velo never drops a peer with a READ in flight. But NIXL drops a peer itself when a load for it fails, and a READ to that peer may be in flight then. For such a READ the backend answers that the transfer is unconfirmed. [Fallback is a routing decision](#fallback-is-a-routing-decision) says what the consumer does then. On the NIXL side, the destination's region is never deregistered. The backend reports one registration that does not go away, so the registry does not free the pages at shutdown.
+
+### One thread calls the agent
+
+A thread named `velo-nixl` makes every NIXL call. It takes commands from a bounded channel, as the UCX progress thread does, and it polls the transfers in flight.
+
+- With nothing in flight it blocks on the channel. It does not poll and it sets no timer.
+- After a post or a completion it spins for `spin` (200 µs), then sleeps between polls, from 50 µs up to 1 ms. So a READ that runs longer than the spin is seen up to one sleep after it ends, 1 ms at most. UCX has a completion callback and does not pay this. [The guide](../guides/nixl-rdma.md#wire-it) says what it costs.
+- An unmap of a region waits for the READs into that region. While it waits, new READs into the region are refused.
+- NIXL gives every READ from one thread to one of its UCX workers. So each READ names a worker, in turn. With `num_workers` above 1, concurrent READs spread over the workers.
+
+### Shutdown
+
+The NIXL thread is not part of any transport, so transport teardown does not stop it. `graceful_shutdown` calls the backend after transport teardown and before the final latch. The backend then waits up to 5 s for READs in flight, deregisters what is left, and destroys the agent. If a READ is still running, or a region cannot be deregistered, it leaks the agent instead and keeps reporting a live registration.
 
 ## Memory registration
 
@@ -390,7 +457,7 @@ See [Shutdown and drain](shutdown.md) for the messenger half.
 | `ep_idle_timeout` | `UcxTransportBuilder` | `None` | Endpoint idle reaper. Floor 500 ms. |
 | `eager_endpoints` | `UcxTransportBuilder` | `false` | Wire up endpoints at `register()`. |
 
-Pass `RdmaConfig` with `VeloBuilder::rdma_config`. It has no effect without `VeloBuilder::add_ucx_transport`. A UCX transport added with `add_transport` gives full messaging and no RDMA registry.
+Pass `RdmaConfig` with `VeloBuilder::rdma_config`. It has no effect without an RDMA backend (`VeloBuilder::add_ucx_transport` or `VeloBuilder::add_nixl_rdma`). A UCX transport added with `add_transport` gives full messaging and no RDMA registry. The NIXL backend has its own knobs in `NixlRdmaConfig`: see [Run rendezvous over NIXL](../guides/nixl-rdma.md#wire-it).
 
 The defaults keep the order `rdma_min_bytes <= DEFAULT_THRESHOLD < DEFAULT_CHUNK_SIZE` (64 KiB, 256 KiB, 512 KiB). A transparently staged payload is then large enough for the RDMA path from its first byte over the threshold. If `rdma_min_bytes` is above the transparent threshold, a band of payloads sits in pinned memory and never uses it.
 
@@ -429,3 +496,5 @@ This series is the only honest answer to "did the RDMA path run", because the ch
 - **Register-in-place for large owned buffers.** It needs an explicit API. Registering arbitrary caller `Bytes` by default is unsound: provenance is unknown and UCX pins past the caller's range.
 - **Metrics:** an arena-utilization gauge, and a Prometheus series for endpoints closed by the idle reaper (the count exists only as an internal atomic).
 - GPU memory, scatter-gather anchors, and an RDMA surface in `velo-ext` for out-of-tree transports.
+- **NIXL connection info sent once for each peer.** Today every descriptor carries it. An offer that says "I have it" would let the owner leave it out.
+- **A NIXL agent that the application supplies.** Velo creates its own agent. An application that already runs one registers its memory twice.

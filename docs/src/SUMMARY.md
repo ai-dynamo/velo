@@ -24,6 +24,7 @@
 - [Write an out-of-tree transport](guides/out-of-tree-transport.md)
 - [Tune batched streaming](guides/tune-batched-streaming.md)
 - [Run rendezvous over RDMA](guides/ucx-rdma.md)
+- [Run rendezvous over NIXL](guides/nixl-rdma.md)
 - [Run the examples](guides/examples.md)
 
 # Operations

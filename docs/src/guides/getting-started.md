@@ -19,6 +19,7 @@ The default features are `http`, `nats-transport`, `grpc`, and `services`. Add o
 | `http` (default) | The `axum` dependency. The HTTP messenger transport is not built at this time. |
 | `zmq` | ZeroMQ transport. The build compiles libzmq and needs `cmake`. |
 | `ucx` | UCX transport and RDMA rendezvous. Linux only. See [Run rendezvous over RDMA](ucx-rdma.md). |
+| `nixl` | A NIXL agent as the RDMA backend of rendezvous. Linux only. See [Run rendezvous over NIXL](nixl-rdma.md). |
 | `quic` | QUIC transport (quinn, TLS 1.3) |
 | `nats-discovery` | NATS peer and service discovery |
 | `etcd` | etcd peer and service discovery |

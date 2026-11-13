@@ -106,6 +106,7 @@ The acceptance test for the boundary: `cargo tree -p velo-ext | grep -c promethe
 - **Always use `--all-features`** for clippy, tests, and coverage. Without it, feature-gated code (zmq, grpc, nats-transport, nats-discovery, nats-queue, etcd, simulation) is silently skipped.
 - **`cmake` is required** on CI runners — `zeromq-src` (bundled with the `zmq` crate) compiles libzmq from source and needs cmake.
 - **rdma-core headers are required** for `--all-features`: the `ucx` feature builds the vendored UCX with InfiniBand support and hard-fails without `libibverbs-dev librdmacm-dev` (headers only — no RDMA hardware needed; the UCX tests run over `UCX_TLS=tcp`). UCX's own configure only *warns* and silently ships a TCP-only build, which is why `ucx-rs` refuses instead.
+- **A C++ compiler and `libclang` are required** for `--all-features`: the `nixl` feature builds `nixl-sys`, which runs `bindgen` and compiles a C++ stub in every build. No NIXL library is needed. The `nixl` tests run on a loopback agent (`NixlLoopback`); the real-agent half of `rendezvous_rdma_nixl` runs only where `libnixl_capi.so` loads, and `VELO_REQUIRE_NIXL=1` makes a skip a failure.
 - **`mold` linker** is used on CI for test/coverage compilation — linking all features (including the bundled libzmq C library) can OOM the default `ld` linker on GitHub runners. Set via `RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=mold"`.
 - **`rustup component add rustfmt clippy`** — the toolchain pinned in `rust-toolchain.toml` does not ship these by default on CI runners.
 - **`cargo-machete`** may false-positive on feature-gated deps. Use `[package.metadata.cargo-machete] ignored` in `lib/velo/Cargo.toml` when a dep is only used behind a feature gate (e.g., `prost` for the `grpc` feature).
@@ -120,12 +121,13 @@ The acceptance test for the boundary: `cargo tree -p velo-ext | grep -c promethe
 - Services: `services` (default; distributed events, named work queues, and filesystem discovery)
 - Discovery backends: `nats-discovery`, `etcd` (both enable `services`)
 - Queue backends: `nats-queue`, `queue-messenger` (both enable `services`)
+- RDMA backend without a transport: `nixl` (Linux only; a NIXL agent as the RDMA backend of rendezvous, through `VeloBuilder::add_nixl_rdma`. `nixl-sys` is built as a stub and loads `libnixl_capi.so` at run time)
 - Optional subsystems: `distributed-tracing`, `simulation`, `test-helpers`
 - Default: `["http", "nats-transport", "grpc", "services"]`
 
 `nats-transport`, `nats-discovery`, and `nats-queue` select separate code paths that share `async-nats`. They do not enable each other. The discovery and queue features enable `services`; the transport feature does not.
 
-The backend-neutral RDMA layer (the registry, the arena pool, regions, the rendezvous GET path) is gated on `cfg(velo_rdma)`, which `lib/velo/build.rs` sets on Linux when the `ucx` feature is on. Gate code on `velo_rdma` unless it names UCX; then gate it on the `ucx` feature.
+The backend-neutral RDMA layer (the registry, the arena pool, regions, the rendezvous GET path) is gated on `cfg(velo_rdma)`, which `lib/velo/build.rs` sets on Linux when `ucx` or `nixl` is on. Gate code on `velo_rdma` unless it names one backend; then gate it on that backend's feature. An instance has one RDMA backend.
 
 Core builds retain discovery traits, direct peer registration, metrics, ACK/NACK messages, all streaming APIs, and full rendezvous. The `ucx` feature keeps its messaging and RDMA APIs without `services`. Use `VeloBuilder::mux_only()` to omit the extra stream listener at runtime; this adds no compile-time feature. See `docs/src/guides/migrate-services.md`.
 
