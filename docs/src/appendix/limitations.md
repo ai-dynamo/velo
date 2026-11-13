@@ -164,3 +164,15 @@ time-to-live.
 **Lifted by.** Not scheduled. A default time-to-live for transparently staged
 payloads would lift it, but it would also fail a fetch that is slower than
 that time.
+
+## A task that holds its worker thread stalls velo's tasks
+
+**What happens.** An application task wakes a parked velo task, then holds its tokio worker thread without yielding. The velo task can then not run until the thread is free. For a stream over the mux, no record and no heartbeat leaves on that peer's lane, from this stream or any other (with the default single lane, that is every mux stream to the peer). While the sender holds data credit, the consumer's watchdog then ends the stream with `Dropped` after three to four heartbeat intervals of silence, though the producer is alive. For a unary or typed call, later messages to that peer on the same connection wait for the hold. A handler that returns its response and then holds its thread delays that connection's writer the same way. A consumer that reads items and then holds its thread delays the node-wide credit sweep, so credit returns that wait for the sweep are late for every peer; a batch that arrives can still return credit on its own.
+
+**When.** velo runs on the application's multi-thread runtime, which is the default, and the task blocks or computes without yielding right after it calls velo: `std::thread::sleep`, a blocking call, a long encode or decode.
+
+**Why.** The call wakes the velo task (the peer's batcher, a connection's writer, the credit sweep) from the application's worker. tokio puts a task woken there in that worker's LIFO slot, unless it has turned the slot off for the rest of a tick after three LIFO polls in a row, and no other worker steals from the slot. tokio 1.51.0 made the slot stealable, and 1.51.2 and 1.52.2 reverted it for its cost; `disable_lifo_slot` needs `tokio_unstable`.
+
+**Workaround.** Keep blocking work off the task that calls velo. Run it in `tokio::task::spawn_blocking`, or wrap it in `tokio::task::block_in_place`, which hands the worker's queued tasks, the LIFO slot included, to another worker before it blocks.
+
+**Lifted by.** Not scheduled. Running velo's own tasks on a runtime the application cannot hold would lift it; what that costs per message is not measured. `lib/velo/tests/streaming/held_thread.rs` tests the workaround, and shows the stall in an ignored test (`--ignored`): no test setup can force the stall, because another wake can reach the velo task first.
