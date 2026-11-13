@@ -11,3 +11,11 @@ The wrong rule: each side decrements its own count, loads the other count, and f
 The rule in `DataStore::end_lease`: whichever call takes a count to 0 calls `try_free`. Each count changes under a read guard on the slot's `DashMap` shard, and `try_free` checks both counts under that shard's write lock. So the later of the two `try_free` calls sees both zeros. The test passed 50 of 50 runs with this rule.
 
 The same pattern applies to any pair of counters that two threads drop at once. Either take a lock that orders the two checks, or make all four operations `SeqCst`. The shutdown gate uses `SeqCst` for this reason ([Shutdown and drain](../concepts/shutdown.md)).
+
+## A test cannot force a tokio scheduling outcome by arranging wakes
+
+The wrong test: it arranges wakes so that a task stalls behind another one in the LIFO slot, or runs on a chosen worker thread, and then asserts the stall. Another wake can reach the task first: a heartbeat, a credit reply, or a timer. If the task's poll is still running at that time, tokio only marks the task notified, and the task then runs on another worker. Such a test passes hundreds of times and still fails on a loaded CI runner.
+
+To check a test like this, force the other interleaving: pause threads under a debugger, or add a concurrent wake. Then see whether the assertion still holds. Assert the workaround or the invariant instead of the stall, and keep a demonstration of the stall as an ignored test.
+
+The test that shows this is in `lib/velo/tests/streaming/held_thread.rs`. `block_in_place_keeps_the_stream` is the live test of the workaround. `a_held_worker_thread_cuts_the_stream` is the ignored demonstration of the stall.
