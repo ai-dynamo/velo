@@ -12,7 +12,7 @@ The examples are in the `examples/` crate. This crate is not a workspace member.
 | `response_plane_bench` | Load harness for the streaming response plane | none |
 | `stream_lifecycle` | What a producer pays to learn that a stream's output left its node | none |
 | `anchor_setup_bench` | What an SPSC anchor costs to create, attach and finish, and what an unattached anchor holds | none |
-| `rendezvous_rdma_two_proc` | Two processes that move 8 MiB by RDMA GET | `ucx` |
+| `rendezvous_rdma_two_proc` | Two processes that move 8 MiB by RDMA GET | `ucx` or `nixl` |
 | `soak` | Stress and correctness driver for messaging, streams, and rendezvous | `grpc` |
 
 ## Messaging examples

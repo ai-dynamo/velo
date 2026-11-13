@@ -19,6 +19,14 @@ dependency feature in a smaller build:
 ```bash
 timeout 900 cargo test --locked -p velo --no-default-features --features test-helpers --all-targets
 UCX_TLS=tcp timeout 900 cargo test --locked -p velo --no-default-features --features ucx,test-helpers --all-targets
+timeout 900 cargo test --locked -p velo --no-default-features --features nixl,test-helpers --all-targets
+```
+
+The `nixl` tests need no NIXL library. They run on a loopback agent in the test process, and that is all CI runs. With a NIXL library (see [Run rendezvous over NIXL](../guides/nixl-rdma.md#give-the-process-a-nixl-library)), the integration suite also runs each scenario on a real agent. `VELO_REQUIRE_NIXL=1` makes it fail if it cannot:
+
+```bash
+VELO_REQUIRE_NIXL=1 LD_LIBRARY_PATH=$L NIXL_PLUGIN_DIR=$L/plugins UCX_TLS=tcp,cuda_copy \
+  cargo test -p velo --no-default-features --features nixl,test-helpers --test rendezvous_rdma_nixl
 ```
 
 The `bytes` serde feature is enabled explicitly for tests. Tests must not rely on
@@ -44,6 +52,7 @@ If the run exits with 124, suspect the newest test or the newest change. Run tha
 | etcd on `localhost:2379` | etcd discovery tests |
 | `cmake` | `zmq`. The build compiles libzmq from source. |
 | `libibverbs-dev` and `librdmacm-dev` (headers only) | `ucx`. See below. |
+| A C++ compiler and `libclang` | `nixl`. `nixl-sys` runs `bindgen` and compiles a C++ stub in every build. No NIXL library is needed. |
 | `protoc` | gRPC code generation |
 
 The `ucx` feature builds UCX with InfiniBand support. UCX configure only warns when the rdma-core headers are missing, and then it builds a TCP-only UCX. `ucx-rs` stops the build instead, so a TCP-only build can never ship by mistake. No RDMA hardware is needed for the tests. They run with `UCX_TLS=tcp`.
