@@ -1830,7 +1830,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let messenger = Messenger::builder()
+        let messenger = MessengerParts::new()
             .add_transport(transport)
             .build()
             .await
@@ -1988,6 +1988,7 @@ mod tests {
     /// the first rather than starting a teardown of its own. Holding the lock
     /// stands in for a first caller that is mid-sequence.
     #[tokio::test]
+    #[allow(deprecated)] // tests the lock of the deprecated `Velo::graceful_shutdown`
     async fn clones_serialise_graceful_shutdown_on_one_lock() {
         let velo = tcp_stream_node(None).await;
         let clone = velo.clone();
@@ -3018,14 +3019,14 @@ mod tests {
             sends: Arc::clone(&sends),
             adapter: std::sync::OnceLock::new(),
         });
-        let messenger = Messenger::builder()
+        let messenger = MessengerParts::new()
             .add_transport(transport)
             .build()
             .await
             .unwrap();
         let peer_instance = crate::InstanceId::new_v4();
         messenger
-            .register_peer(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
+            .register_peer_inner(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
             .unwrap();
         (messenger, peer_instance, sends)
     }
@@ -3284,14 +3285,14 @@ mod tests {
             sends: Default::default(),
             adapter: std::sync::OnceLock::new(),
         });
-        let messenger = Messenger::builder()
+        let messenger = MessengerParts::new()
             .add_transport(transport.clone())
             .build()
             .await
             .unwrap();
         let resolver = Arc::new(NeverResolves::default());
         let resolver_alive = Arc::downgrade(&resolver);
-        messenger.set_large_payload_support(resolver.clone(), resolver);
+        messenger.set_large_payload_support_inner(resolver.clone(), resolver);
         let backend = Arc::clone(messenger.backend());
         let headers = std::collections::HashMap::from([(
             crate::messenger::large_payload::RV_HEADER_KEY.to_string(),

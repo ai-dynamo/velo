@@ -859,7 +859,7 @@ mod tests {
     async fn public_tracker_covers_receive_loops_without_extending_internal_shutdown() {
         use futures::FutureExt;
 
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         messenger.tracker().close();
         assert!(
             messenger.tracker().wait().now_or_never().is_none(),
@@ -871,7 +871,7 @@ mod tests {
             let _ = pending.await;
         });
         messenger
-            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+            .graceful_shutdown_inner(crate::ShutdownPolicy::WaitForever)
             .await;
         tokio::time::timeout(Duration::from_secs(2), messenger.closed())
             .await
@@ -1075,7 +1075,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replacing_an_exempt_handler_puts_its_name_back_behind_the_drain_gate() {
         let transport = InMemoryTransport::new(format!("in-memory://{}", InstanceId::new_v4()));
-        let messenger = Messenger::builder()
+        let messenger = MessengerParts::new()
             .add_transport(Arc::clone(&transport) as Arc<dyn Transport>)
             .build()
             .await
@@ -1091,7 +1091,7 @@ mod tests {
         messenger
             .register_drain_exempt_handler(Handler::am_handler("_x", |_ctx| Ok(())).build())
             .unwrap();
-        messenger.begin_drain();
+        messenger.begin_drain_inner();
         assert!(admit("_x"), "the exempt handler was refused by the drain");
         // Control: the gate is closed for a name that was never exempt.
         assert!(!admit("_y"), "the drain let a gated handler through");
@@ -1107,7 +1107,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_register_streaming_handler_allows_underscore() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         let handler = Handler::am_handler("_anchor_test", |_ctx| Ok(())).build();
         let result = messenger.register_streaming_handler(handler);
         assert!(
@@ -1118,7 +1118,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_register_streaming_handler_allows_normal() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         let handler = Handler::am_handler("normal_test", |_ctx| Ok(())).build();
         let result = messenger.register_streaming_handler(handler);
         assert!(
@@ -1129,7 +1129,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_am_send_streaming_allows_underscore_prefix() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         let result = messenger.am_send_streaming("_stream_data");
         assert!(
             result.is_ok(),
@@ -1139,7 +1139,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_am_send_still_rejects_underscore_prefix() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         let result = messenger.am_send("_stream_data");
         assert!(
             result.is_err(),
@@ -1149,7 +1149,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_am_send_streaming_builder_has_setters() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         // Verify builder methods compile and chain correctly
         let builder = messenger.am_send_streaming("_stream_data").unwrap();
         let _builder = builder
@@ -1160,7 +1160,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_typed_unary_streaming_allows_underscore_prefix() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         // Should not panic or return validation error:
         let _builder = messenger.typed_unary_streaming::<String>("_anchor_attach");
         // (builder construction succeeds; no network call made)
@@ -1168,7 +1168,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_typed_unary_still_rejects_underscore_prefix() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         let result = messenger.typed_unary::<String>("_anchor_attach");
         assert!(
             result.is_err(),
@@ -1179,19 +1179,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_enabled_system_handlers_are_available_immediately_after_startup() {
         let (transport_a, transport_b) = make_transport_pair();
-        let a = Messenger::builder()
+        let a = MessengerParts::new()
             .add_transport(transport_a)
             .build()
             .await
             .unwrap();
-        let b = Messenger::builder()
+        let b = MessengerParts::new()
             .add_transport(transport_b)
             .build()
             .await
             .unwrap();
 
-        a.register_peer(b.peer_info()).unwrap();
-        b.register_peer(a.peer_info()).unwrap();
+        a.register_peer_inner(b.peer_info()).unwrap();
+        b.register_peer_inner(a.peer_info()).unwrap();
 
         let handlers = a.available_handlers(b.instance_id()).await.unwrap();
 
@@ -1224,26 +1224,26 @@ mod tests {
                 )
             };
             let (transport_a, transport_b) = make_transport_pair();
-            let a = Messenger::builder()
+            let a = MessengerParts::new()
                 .add_transport(transport_a)
                 .metrics(metrics)
                 .build()
                 .await
                 .unwrap();
-            let b = Messenger::builder()
+            let b = MessengerParts::new()
                 .add_transport(transport_b.clone())
                 .build()
                 .await
                 .unwrap();
 
-            a.register_peer(b.peer_info()).unwrap();
+            a.register_peer_inner(b.peer_info()).unwrap();
             a.wait_for_handler(b.instance_id(), "_hello").await.unwrap();
             assert_eq!(handshakes(), 1.0, "unknown peers need the initial hello");
             assert!(b.client.is_peer_registered(a.instance_id()));
 
             // Dynamo registers the response peer again for each request.
             for _ in 0..3 {
-                a.register_peer(b.peer_info()).unwrap();
+                a.register_peer_inner(b.peer_info()).unwrap();
                 a.wait_for_handler(b.instance_id(), "_hello").await.unwrap();
             }
             assert_eq!(handshakes(), 1.0, "cached handlers need no round trip");
@@ -1254,15 +1254,15 @@ mod tests {
             assert_eq!(handshakes(), 2.0, "a missing cached handler must refresh");
 
             // Reuse the address with a new instance, as after a peer restart.
-            b.graceful_shutdown(crate::ShutdownPolicy::Timeout(Duration::from_secs(1)))
+            b.graceful_shutdown_inner(crate::ShutdownPolicy::Timeout(Duration::from_secs(1)))
                 .await;
-            let restarted = Messenger::builder()
+            let restarted = MessengerParts::new()
                 .add_transport(transport_b)
                 .build()
                 .await
                 .unwrap();
             assert_ne!(b.instance_id(), restarted.instance_id());
-            a.register_peer(restarted.peer_info()).unwrap();
+            a.register_peer_inner(restarted.peer_info()).unwrap();
             a.wait_for_handler(restarted.instance_id(), "_hello")
                 .await
                 .unwrap();
@@ -1280,7 +1280,7 @@ mod tests {
     /// exercised in the `common::responses` unit tests.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_await_capacity_chains_through_all_public_builders() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
 
         let _ = messenger
             .am_send("fan_out")
@@ -1313,7 +1313,7 @@ mod tests {
     /// recycle with an error.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_await_capacity_misuse_fails_without_waiting_for_slot() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
 
         // Case 1: no target set.
         let res = tokio::time::timeout(
