@@ -1362,3 +1362,157 @@ async fn a_delayed_unregister_does_not_erase_a_new_stream_registration() {
     );
     assert!(connect_error.is_none(), "{connect_error:?}");
 }
+
+/// A transport can queue `_hello` as soon as it starts. A successful
+/// handshake must leave its stream endpoint registered after the build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "F2: startup dispatch can learn a peer before the stream observer is installed"]
+async fn a_hello_queued_at_startup_reaches_the_stream_table() {
+    struct QueuedHello {
+        inner: Arc<MockTransport>,
+        header: Bytes,
+        payload: Bytes,
+        answered: flume::Sender<()>,
+    }
+
+    impl Transport for QueuedHello {
+        fn key(&self) -> TransportKey {
+            self.inner.key()
+        }
+
+        fn address(&self) -> WorkerAddress {
+            self.inner.address()
+        }
+
+        fn register(&self, peer: PeerInfo) -> Result<(), TransportError> {
+            self.inner.register(peer)
+        }
+
+        fn send_message(
+            &self,
+            target: InstanceId,
+            header: Bytes,
+            payload: Bytes,
+            kind: MessageType,
+            on_error: Arc<dyn TransportErrorHandler>,
+        ) -> SendOutcome {
+            if matches!(kind, MessageType::Response) {
+                serde_json::from_slice::<crate::messenger::server::system_handlers::HandlersResponse>(
+                    &payload,
+                )
+                .unwrap();
+                self.answered.send(()).unwrap();
+            }
+            self.inner
+                .send_message(target, header, payload, kind, on_error)
+        }
+
+        fn start(
+            &self,
+            id: InstanceId,
+            adapter: TransportAdapter,
+            runtime: tokio::runtime::Handle,
+        ) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async move {
+                self.inner.start(id, adapter.clone(), runtime).await?;
+                assert!(matches!(
+                    adapter.admit_message(self.header.clone(), self.payload.clone()),
+                    AdmitOutcome::Admitted
+                ));
+                Ok(())
+            })
+        }
+
+        fn shutdown(&self) {
+            self.inner.shutdown();
+        }
+
+        fn begin_drain(&self) {
+            self.inner.begin_drain();
+        }
+
+        fn closed(&self) -> BoxFuture<'_, ()> {
+            self.inner.closed()
+        }
+
+        fn check_health(
+            &self,
+            id: InstanceId,
+            timeout: Duration,
+        ) -> BoxFuture<'_, Result<(), HealthCheckError>> {
+            self.inner.check_health(id, timeout)
+        }
+    }
+
+    let remote = crate::streaming::TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .unwrap();
+    let peer =
+        crate::streaming::peer_table::complete_peer_info(make_peer_info(&["tcp"]), remote.as_ref());
+    let id = peer.instance_id();
+    let responses = crate::messenger::common::responses::ResponseManager::with_capacity(
+        id.worker_id().as_u64(),
+        1,
+        None,
+    );
+    let response = responses.register_outcome().unwrap();
+    let message = crate::messenger::common::messages::ActiveMessage {
+        metadata: crate::messenger::common::messages::MessageMetadata::new_unary(
+            response.response_id(),
+            "_hello".to_string(),
+            None,
+        ),
+        payload: Bytes::from(
+            serde_json::to_vec(&crate::messenger::server::system_handlers::HelloRequest {
+                peer_info: peer,
+            })
+            .unwrap(),
+        ),
+    };
+    let (header, payload, _) = message.encode().unwrap();
+    for attempt in 0..100 {
+        let (answered_tx, answered_rx) = flume::bounded(1);
+        let transport = Arc::new(QueuedHello {
+            inner: MockTransport::new("tcp", true),
+            header: header.clone(),
+            payload: payload.clone(),
+            answered: answered_tx,
+        });
+        let node = crate::Velo::builder()
+            .add_transport(transport)
+            .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
+            .build()
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), answered_rx.recv_async())
+            .await
+            .unwrap()
+            .unwrap();
+        let messenger_knows = node.messenger().backend().is_registered(id);
+        let Some(crate::OwnedStreamTransport::Tcp(stream)) = &node.inner.stream_owner.transport
+        else {
+            unreachable!();
+        };
+        let stream_knows = stream.knows_peer(id.worker_id());
+        let connect_error = if stream_knows {
+            None
+        } else {
+            Some(
+                crate::streaming::FrameTransport::connect(stream.as_ref(), id.worker_id(), 1, 1)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+            )
+        };
+        node.shutdown(ShutdownPolicy::WaitForever).await;
+        if !stream_knows {
+            remote.shutdown().await;
+        }
+        assert!(messenger_knows);
+        assert!(
+            stream_knows,
+            "startup _hello missed the stream table on attempt {attempt}; connect error: {connect_error:?}"
+        );
+    }
+    remote.shutdown().await;
+}
