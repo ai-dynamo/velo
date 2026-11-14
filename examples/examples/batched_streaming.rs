@@ -186,6 +186,10 @@ struct Args {
     /// Per-stream credit window (`MuxConfig::initial_credit`).
     #[arg(long = "initial-credit", default_value_t = MuxConfig::default().initial_credit)]
     initial_credit: u32,
+
+    /// Scratch: arm, core sets, saturation.
+    #[command(flatten)]
+    arm: velo_examples::arm::ArmArgs,
 }
 
 /// The two flush policies, as the example exposes them.
@@ -616,9 +620,13 @@ async fn host(rx: flume::Receiver<(u32, StreamAnchor<Token>)>) -> Result<HostSta
 // Main
 // ---------------------------------------------------------------------------
 
-#[tokio::main(flavor = "multi_thread")]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
+    let rt = args.arm.runtime()?;
+    rt.block_on(async_main(args))
+}
+
+async fn async_main(args: Args) -> Result<()> {
     let mux = !args.legacy;
     if args.engines == 0 || args.max_batch == 0 || args.requests == 0 {
         bail!("--engines, --max-batch and --requests must all be non-zero");
@@ -698,6 +706,11 @@ async fn main() -> Result<()> {
         )));
     }
 
+    let saturation = args.arm.saturate();
+    let engine_registries: Vec<&prometheus::Registry> =
+        engines.iter().map(|n| &n.registry).collect();
+    let (wakes0, _, _) = velo_examples::arm::mux_counters(&engine_registries);
+    let p0 = velo_examples::arm::ProcStats::now();
     let started = Instant::now();
 
     // The request generator. Every request's response stream is an anchor on
@@ -728,6 +741,20 @@ async fn main() -> Result<()> {
         .into_iter()
         .collect::<Result<Vec<_>>>()?;
     let elapsed = started.elapsed();
+    let p1 = velo_examples::arm::ProcStats::now();
+    drop(saturation);
+    let (wakes1, _, _) = velo_examples::arm::mux_counters(&engine_registries);
+    let (cpu, vcsw, threads) = p1.since(&p0);
+    println!(
+        "ARM,bench=batched_streaming,arm={},engines={},tokens={expected_tokens},elapsed_ms={},cpu_us_per_token={:.3},vcsw_per_token={:.3},wakes_per_token={:.3},threads={threads},saturate={}",
+        args.arm.label(),
+        args.engines,
+        elapsed.as_millis(),
+        cpu * 1e6 / expected_tokens as f64,
+        vcsw as f64 / expected_tokens as f64,
+        (wakes1 - wakes0) / expected_tokens as f64,
+        args.arm.saturate,
+    );
 
     // -----------------------------------------------------------------------
     // Summary

@@ -3075,6 +3075,7 @@ dependencies = [
  "futures",
  "hdrhistogram",
  "humantime",
+ "libc",
  "prometheus",
  "rmp-serde",
  "serde",

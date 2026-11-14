@@ -4,6 +4,8 @@
 //! Shared helpers for Velo examples — CLI transport selection, transport
 //! construction, and a default tracing subscriber.
 
+pub mod arm;
+
 use std::sync::Arc;
 
 use anyhow::Result;

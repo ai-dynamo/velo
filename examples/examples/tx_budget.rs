@@ -12,6 +12,7 @@
 //! | `l1` | same bytes over tokio `TcpStream`/`UnixStream` | epoll/reactor + task wake + scheduler hop |
 //! | `l2` | + `TcpFrameCodec` encode + `FramedRead` decode | preamble build, staging memcpy, `split_to().freeze()` |
 //! | `l3` | + full `Transport::send_message` / `DataStreams` | DashMap, `AdmissionGate`, per-conn flume, coalescing writer task, `route_frame`, unbounded flume, consumer recv |
+//! | `l4t` | a `Velo` unary call to an echo handler, `--inflight` callers (scratch) | messenger client, inbound loop, dispatch, handler, response path; and where `--arm` runs velo's tasks |
 //!
 //! Everything is an echo ping-pong of the *same* frame size in both
 //! directions, so `one_way = rtt / 2`.
@@ -39,6 +40,7 @@ use velo::transports::{
     InboundMessage, MessageType, Transport, TransportErrorHandler, make_channels,
 };
 use velo::{InstanceId, PeerInfo};
+use velo_examples::arm::{ArmArgs, ProcStats};
 
 /// Frame preamble written by `TcpFrameCodec` (version + type + 2 lengths).
 const PREAMBLE: usize = 11;
@@ -93,6 +95,11 @@ struct Args {
     /// removes every cross-thread wake from the l3 rungs.
     #[arg(long, default_value = "4")]
     worker_threads: usize,
+
+    /// Scratch: arm, core sets and saturation. `--app-threads` is ignored
+    /// here; `--worker-threads` sets the application's runtime.
+    #[command(flatten)]
+    arm: ArmArgs,
 }
 
 // ---------------------------------------------------------------------------
@@ -658,8 +665,10 @@ async fn tcp_pair_opts(opts: bool) -> Result<(tokio::net::TcpStream, tokio::net:
     if opts {
         for s in [&a, &b] {
             let sr = socket2::SockRef::from(s);
-            sr.set_send_buffer_size(velo::transports::tcp::DEFAULT_SOCKET_BUFFERS).ok();
-            sr.set_recv_buffer_size(velo::transports::tcp::DEFAULT_SOCKET_BUFFERS).ok();
+            sr.set_send_buffer_size(velo::transports::tcp::DEFAULT_SOCKET_BUFFERS)
+                .ok();
+            sr.set_recv_buffer_size(velo::transports::tcp::DEFAULT_SOCKET_BUFFERS)
+                .ok();
         }
     }
     Ok((a, b))
@@ -761,6 +770,7 @@ async fn run_cell(rung: &str, cell: Cell, args: &Args) -> Result<Outcome> {
             let _ = std::fs::remove_file(&ps);
             r
         }
+        "l4t" => l4_velo_unary(cell, args).await,
         "lh" => lh_task_hop(cell).await,
         "lg" => lg_gate(cell).await,
         other => anyhow::bail!("unknown rung {other}"),
@@ -779,18 +789,121 @@ fn clock_overhead_ns() -> f64 {
 }
 
 fn main() -> Result<()> {
-    let args = Args::parse();
+    let mut args = Args::parse();
     let rt = if args.worker_threads <= 1 {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?
     } else {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(args.worker_threads)
-            .enable_all()
-            .build()?
+        args.arm.app_threads = args.worker_threads;
+        args.arm.runtime()?
     };
     rt.block_on(run(args))
+}
+
+// ---------------------------------------------------------------------------
+// L4 (scratch) — a Velo unary call, end to end
+// ---------------------------------------------------------------------------
+
+async fn l4_node(args: &Args) -> Result<velo::Velo> {
+    let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let t = Arc::new(
+        TcpTransportBuilder::new()
+            .from_listener(l)?
+            .channel_capacity(args.channel_capacity)
+            .build()?,
+    );
+    velo::Velo::builder()
+        .add_transport(t)
+        .mux_only()
+        .build()
+        .await
+}
+
+/// `ifl` caller tasks, each making `per` sequential unary calls.
+async fn l4_calls(
+    client: &velo::Velo,
+    target: InstanceId,
+    payload: &Bytes,
+    ifl: usize,
+    per: usize,
+) -> Result<Histogram<u64>> {
+    let mut tasks = Vec::with_capacity(ifl);
+    for _ in 0..ifl {
+        let client = client.clone();
+        let payload = payload.clone();
+        tasks.push(tokio::spawn(async move {
+            let mut h = new_hist();
+            for _ in 0..per {
+                let t0 = Instant::now();
+                client
+                    .unary("echo")?
+                    .raw_payload(payload.clone())
+                    .instance(target)
+                    .send()
+                    .await?;
+                h.record(t0.elapsed().as_nanos() as u64).ok();
+            }
+            Ok::<_, anyhow::Error>(h)
+        }));
+    }
+    let mut all = new_hist();
+    for t in tasks {
+        all.add(&t.await??)?;
+    }
+    Ok(all)
+}
+
+async fn l4_velo_unary(cell: Cell, args: &Args) -> Result<Outcome> {
+    let server = l4_node(args).await?;
+    let client = l4_node(args).await?;
+    server.register_handler(
+        velo::Handler::unary_handler("echo", |ctx: velo::Context| Ok(Some(ctx.payload))).build(),
+    )?;
+    client.register_peer(server.peer_info())?;
+    server.register_peer(client.peer_info())?;
+    client
+        .wait_for_handler(server.instance_id(), "echo")
+        .await?;
+    let target = server.instance_id();
+    let payload = Bytes::from(vec![0u8; cell.size]);
+    let ifl = cell.inflight.max(1);
+    l4_calls(&client, target, &payload, ifl, cell.warmup.div_ceil(ifl)).await?;
+    let saturation = args.arm.saturate();
+    if args.arm.saturate > 0 {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let per = cell.iters.div_ceil(ifl);
+    let s0 = ProcStats::now();
+    let start = Instant::now();
+    let rtt = l4_calls(&client, target, &payload, ifl, per).await?;
+    let wall = start.elapsed();
+    let s1 = ProcStats::now();
+    drop(saturation);
+    let (cpu, vcsw, threads) = s1.since(&s0);
+    let n = (per * ifl) as f64;
+    println!(
+        "ARM,rung=l4t,arm={},size={},ifl={},n={},calls_per_s={:.0},cpu_us_per_call={:.2},vcsw_per_call={:.3},threads={},saturate={},p50_ns={},p99_ns={},p999_ns={}",
+        args.arm.label(),
+        cell.size,
+        ifl,
+        n,
+        n / wall.as_secs_f64(),
+        cpu * 1e6 / n,
+        vcsw as f64 / n,
+        threads,
+        args.arm.saturate,
+        rtt.value_at_quantile(0.50),
+        rtt.value_at_quantile(0.99),
+        rtt.value_at_quantile(0.999),
+    );
+    drop(client);
+    drop(server);
+    Ok(Outcome {
+        rtt,
+        send_call: None,
+        wall,
+    })
 }
 
 async fn run(args: Args) -> Result<()> {

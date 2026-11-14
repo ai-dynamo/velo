@@ -39,6 +39,7 @@ prometheus = "0.14"
 crc32fast = "1"
 humantime = "2"
 socket2 = "0.6"
+libc = "0.2"
 
 [[example]]
 name = "ping_pong"

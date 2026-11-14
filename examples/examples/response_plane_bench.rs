@@ -90,6 +90,7 @@ use velo::streaming::{
     FlushPolicy, MuxConfig, StreamAnchor, StreamAnchorHandle, StreamFrame, StreamSender,
 };
 use velo::{Velo, VeloBuilder};
+use velo_examples::arm::{ArmArgs, ProcStats, mux_counters};
 use velo_examples::{TransportType, new_transport};
 
 /// Longest response any request may ask for. Bounds the histograms.
@@ -165,6 +166,40 @@ struct Args {
     /// fails the run.
     #[arg(long)]
     unattached_timeout_ms: Option<u64>,
+
+    /// Scratch: `paced` is the engine model above. `closed`: `--streams`
+    /// streams, each sends one record and waits for it to arrive before the
+    /// next. `flood`: each stream sends its records back to back.
+    #[arg(long, value_enum, default_value_t = Load::Paced)]
+    load: Load,
+
+    /// Streams for `closed` and `flood`.
+    #[arg(long, default_value_t = 64)]
+    streams: usize,
+
+    /// Producer nodes for `closed` and `flood`; the streams are spread over
+    /// them, so this is the consumer's count of busy peer lanes.
+    #[arg(long, default_value_t = 1)]
+    peers: usize,
+
+    /// Measured records per stream for `closed` and `flood`.
+    #[arg(long, default_value_t = 2000)]
+    records: u32,
+
+    /// Unmeasured records per stream before them.
+    #[arg(long, default_value_t = 200)]
+    warmup_records: u32,
+
+    /// Scratch: arm, core sets, saturation.
+    #[command(flatten)]
+    arm: ArmArgs,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum Load {
+    Paced,
+    Closed,
+    Flood,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -551,9 +586,16 @@ struct RunReport {
     samples_itl: u64,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     let args = Args::parse();
+    let rt = args.arm.runtime()?;
+    rt.block_on(async_main(args))
+}
+
+async fn async_main(args: Args) -> Result<()> {
+    if args.load != Load::Paced {
+        return stream_load(args).await;
+    }
     if args.tokens > MAX_TOKENS {
         bail!("--tokens above {MAX_TOKENS} is outside what this harness bounds");
     }
@@ -630,7 +672,11 @@ async fn main() -> Result<()> {
         )));
     }
 
+    let saturation = args.arm.saturate();
+    let engine_registries: Vec<&Registry> = engines.iter().map(|n| &n.registry).collect();
+    let (wakes0, _, _) = mux_counters(&engine_registries);
     // CPU is sampled around the measured region only.
+    let p0 = ProcStats::now();
     let (user0, sys0) = cpu_seconds();
     let started = Instant::now();
 
@@ -667,6 +713,9 @@ async fn main() -> Result<()> {
 
     let elapsed = started.elapsed();
     let (user1, sys1) = cpu_seconds();
+    let p1 = ProcStats::now();
+    drop(saturation);
+    let (_, vcsw, threads) = p1.since(&p0);
     let cpu_user = user1 - user0;
     let cpu_sys = sys1 - sys0;
 
@@ -704,6 +753,21 @@ async fn main() -> Result<()> {
         0.0
     };
     let cpu_total = cpu_user + cpu_sys;
+    let (wakes1, _, _) = mux_counters(&engine_registries);
+    println!(
+        "ARM,load=paced,arm={},engines={},hosts={},tokens={tokens},cpu_us_per_token={:.3},vcsw_per_token={:.3},wakes_per_token={:.3},tokens_per_write={tokens_per_write:.2},threads={threads},saturate={},ttft_p50_us={},ttft_p99_us={},itl_p50_us={},itl_p99_us={}",
+        args.arm.label(),
+        args.engines,
+        args.anchor_hosts,
+        cpu_total * 1e6 / tokens as f64,
+        vcsw as f64 / tokens as f64,
+        (wakes1 - wakes0) / tokens as f64,
+        args.arm.saturate,
+        lat.ttft.value_at_quantile(0.50),
+        lat.ttft.value_at_quantile(0.99),
+        lat.itl.value_at_quantile(0.50),
+        lat.itl.value_at_quantile(0.99),
+    );
     let cpu_ms_per_request = if args.requests > 0 {
         cpu_total * 1000.0 / f64::from(args.requests)
     } else {
@@ -770,4 +834,169 @@ async fn main() -> Result<()> {
     println!("  per request         {:.3} ms", report.cpu_ms_per_request);
 
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Scratch: closed-loop and flood loads
+// ---------------------------------------------------------------------------
+
+/// One record. `sent_ns` is when its producer sent it, from a shared base.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+struct Rec {
+    seq: u32,
+    sent_ns: u64,
+}
+
+async fn stream_load(args: Args) -> Result<()> {
+    if args.streams == 0 || args.peers == 0 || args.records == 0 {
+        bail!("--streams, --peers and --records must be at least 1");
+    }
+    let closed = args.load == Load::Closed;
+    let manual = args.flush_policy == Flush::Manual;
+    let consumer = node(&args, true).await?;
+    let mut producers = Vec::with_capacity(args.peers);
+    for _ in 0..args.peers {
+        producers.push(node(&args, true).await?);
+    }
+    for p in &producers {
+        p.velo.register_peer(consumer.velo.peer_info())?;
+        consumer.velo.register_peer(p.velo.peer_info())?;
+    }
+    for p in &producers {
+        p.velo
+            .wait_for_handler(consumer.velo.instance_id(), "_anchor_attach")
+            .await?;
+        consumer
+            .velo
+            .wait_for_handler(p.velo.instance_id(), "_anchor_attach")
+            .await?;
+    }
+
+    let base = Instant::now();
+    let warm = args.warmup_records;
+    let total = warm + args.records;
+    // Producers and main meet here after the warmup, and again before the end.
+    let barrier = Arc::new(tokio::sync::Barrier::new(args.streams + 1));
+    let mut consumers = Vec::with_capacity(args.streams);
+    let mut senders = Vec::with_capacity(args.streams);
+    for s in 0..args.streams {
+        let producer = Arc::clone(&producers[s % args.peers]);
+        let anchor = consumer.velo.create_anchor::<Rec>();
+        let sender = producer.velo.attach_anchor::<Rec>(anchor.handle()).await?;
+        // The consumer tells the producer what it has received.
+        let (ack_tx, ack_rx) = flume::unbounded::<u32>();
+        consumers.push(tokio::spawn(consume(anchor, base, warm, ack_tx)));
+        senders.push((producer, sender, ack_rx));
+    }
+
+    let mut tasks = Vec::with_capacity(args.streams);
+    for (producer, sender, ack_rx) in senders {
+        let barrier = Arc::clone(&barrier);
+        tasks.push(tokio::spawn(async move {
+            let send = |seq: u32| {
+                let sender = &sender;
+                async move {
+                    sender
+                        .send(Rec {
+                            seq,
+                            sent_ns: base.elapsed().as_nanos() as u64,
+                        })
+                        .await
+                }
+            };
+            let mut seq = 0u32;
+            for phase_end in [warm, total] {
+                while seq < phase_end {
+                    send(seq).await?;
+                    if manual {
+                        producer.velo.flush_batch();
+                    }
+                    if closed {
+                        // Wait for this record to arrive.
+                        while ack_rx.recv_async().await? < seq {}
+                    }
+                    seq += 1;
+                }
+                if !closed {
+                    while ack_rx.recv_async().await? + 1 < phase_end {}
+                }
+                barrier.wait().await;
+            }
+            sender.finalize()?;
+            Ok::<_, anyhow::Error>(())
+        }));
+    }
+
+    barrier.wait().await;
+    // Measured phase.
+    let saturation = args.arm.saturate();
+    let producer_registries: Vec<&Registry> = producers.iter().map(|n| &n.registry).collect();
+    let (w0, b0, r0) = mux_counters(&producer_registries);
+    let p0 = ProcStats::now();
+    barrier.wait().await;
+    let p1 = ProcStats::now();
+    let (w1, b1, r1) = mux_counters(&producer_registries);
+    drop(saturation);
+
+    for t in tasks {
+        tokio::time::timeout(PATIENCE, t).await???;
+    }
+    let mut lat = Histogram::<u64>::new_with_bounds(1, 100_000_000_000, 3)?;
+    for c in consumers {
+        lat.add(&tokio::time::timeout(PATIENCE, c).await???)?;
+    }
+    let (cpu, vcsw, threads) = p1.since(&p0);
+    let wall = p1.at.unwrap().duration_since(p0.at.unwrap()).as_secs_f64();
+    let n = f64::from(args.records) * args.streams as f64;
+    println!(
+        "ARM,load={},arm={},streams={},peers={},records={},rec_per_s={:.0},p50_us={:.1},p99_us={:.1},p999_us={:.1},cpu_us_per_rec={:.3},vcsw_per_rec={:.3},wakes_per_rec={:.3},rec_per_batch={:.2},threads={},saturate={},flush={:?},samples={}",
+        format!("{:?}", args.load).to_lowercase(),
+        args.arm.label(),
+        args.streams,
+        args.peers,
+        args.records,
+        n / wall,
+        lat.value_at_quantile(0.50) as f64 / 1e3,
+        lat.value_at_quantile(0.99) as f64 / 1e3,
+        lat.value_at_quantile(0.999) as f64 / 1e3,
+        cpu * 1e6 / n,
+        vcsw as f64 / n,
+        (w1 - w0) / n,
+        if b1 > b0 { (r1 - r0) / (b1 - b0) } else { 0.0 },
+        threads,
+        args.arm.saturate,
+        args.flush_policy,
+        lat.len(),
+    );
+    Ok(())
+}
+
+/// Read one stream to its end. Records the one-way latency of every record
+/// after the warmup, in ns, and reports each sequence number received.
+async fn consume(
+    mut anchor: StreamAnchor<Rec>,
+    base: Instant,
+    warm: u32,
+    ack: flume::Sender<u32>,
+) -> Result<Histogram<u64>> {
+    let mut h = Histogram::<u64>::new_with_bounds(1, 100_000_000_000, 3)?;
+    let mut next = 0u32;
+    while let Some(frame) = anchor.next().await {
+        match frame? {
+            StreamFrame::Item(rec) => {
+                let now = base.elapsed().as_nanos() as u64;
+                if rec.seq != next {
+                    bail!("record {} arrived where {next} was due", rec.seq);
+                }
+                next += 1;
+                if rec.seq >= warm {
+                    h.record(now.saturating_sub(rec.sent_ns).max(1))?;
+                }
+                let _ = ack.send(rec.seq);
+            }
+            StreamFrame::Finalized => return Ok(h),
+            other => bail!("unexpected frame {other:?}"),
+        }
+    }
+    bail!("stream ended without a terminal")
 }
