@@ -267,15 +267,13 @@ where
     panic!("{what} never became true; observed: {}", describe());
 }
 
-/// Whether the owner has freed a slot. Local, so it reflects the owner's own
-/// state rather than a round trip that might race with it.
-/// Arm a fault hook on `velo`'s rendezvous manager. The hook is test-only
-/// and has no `Velo` form.
-#[allow(deprecated)]
+/// Arm a fault hook on `velo`'s rendezvous manager. The hook is test-only.
 fn arm_rdma_hook(velo: &Velo, hook: RdmaTestHook) {
     velo.arm_rdma_hook(hook);
 }
 
+/// Whether the owner has freed a slot. Local, so it reflects the owner's own
+/// state rather than a round trip that might race with it.
 async fn slot_is_gone(node: &Node, handle: DataHandle) -> bool {
     node.velo.metadata(handle).await.is_err()
 }
