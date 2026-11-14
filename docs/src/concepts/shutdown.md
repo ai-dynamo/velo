@@ -25,7 +25,7 @@ sequenceDiagram
 
 `Messenger` has no shutdown of its own, and `Velo` has no call that runs only the four phases. See [Move off the Messenger front door](../guides/migrate-messenger-front-door.md).
 
-`Velo` is `Clone`. If two clones call `shutdown` at the same time, the first runs the four phases and the second waits for it. Each then stops the streaming services, which a second time does nothing.
+`Velo` is `Clone`. If two clones call `shutdown` at the same time, the first runs the four phases and the second waits for it. Each then runs the streaming step, and the second run returns.
 
 Shutdown does not remove handlers. A handler that holds a `Velo` clone of its own instance keeps that instance alive, so its final drop never runs. A handler that needs its own instance holds a `WeakVelo` from `Velo::downgrade` and calls `upgrade` on each request.
 
