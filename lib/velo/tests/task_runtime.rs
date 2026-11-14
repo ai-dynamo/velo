@@ -1179,7 +1179,9 @@ enum CallEnd {
 /// Classifies a call by its wakes, not by whether it returned `Pending`.
 /// The response slot registers the caller's waker before it checks for the
 /// value, so a response that lands between the two wakes the caller while
-/// that same poll returns `Ready`.
+/// that same poll returns `Ready`. Call it only once the wakes have settled:
+/// the slot publishes the value before it wakes, so another poll can finish
+/// the call before its wake is recorded.
 fn classify(waited: bool, wakes: &[String]) -> CallEnd {
     match wakes {
         [] if !waited => CallEnd::NoWake,
@@ -1263,17 +1265,26 @@ async fn count_crossings(runtime: TaskRuntime, calls: usize) -> (Crossings, Stri
     server_transport.sends.lock().clear();
     handler_threads.lock().clear();
 
-    let mut ends = Vec::with_capacity(calls);
-    let mut all_wakes = Vec::with_capacity(calls);
+    let mut per_call = Vec::with_capacity(calls);
     for _ in 0..calls {
         let wakes = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let waited = tokio::time::timeout(PATIENCE, record_wakes(call(), Arc::clone(&wakes)))
             .await
             .expect("call timed out");
-        let wakes = wakes.lock().clone();
-        ends.push(classify(waited, &wakes));
-        all_wakes.push((waited, wakes));
+        per_call.push((waited, wakes));
     }
+    // `shutdown` returns once velo's tasks are done and, on the dedicated
+    // runtime, its threads have exited, so every wake has been recorded.
+    client.shutdown(ShutdownPolicy::WaitForever).await;
+    server.shutdown(ShutdownPolicy::WaitForever).await;
+    let all_wakes: Vec<_> = per_call
+        .iter()
+        .map(|(waited, wakes)| (*waited, wakes.lock().clone()))
+        .collect();
+    let ends: Vec<_> = all_wakes
+        .iter()
+        .map(|(waited, wakes)| classify(*waited, wakes))
+        .collect();
 
     let is_velo = |thread: &String| thread == THREAD_NAME;
     let sends: Vec<_> = client_transport
@@ -1308,8 +1319,6 @@ async fn count_crossings(runtime: TaskRuntime, calls: usize) -> (Crossings, Stri
         2 * calls,
         "one request and one response per call: {detail}"
     );
-    client.shutdown(ShutdownPolicy::WaitForever).await;
-    server.shutdown(ShutdownPolicy::WaitForever).await;
     (crossings, detail)
 }
 
@@ -1433,4 +1442,85 @@ async fn a_wake_inside_the_first_poll_counts_as_the_response_hand_off() {
         classify(true, &[THREAD_NAME.to_owned(), THREAD_NAME.to_owned()]),
         CallEnd::Other
     );
+}
+
+/// A response slot publishes its value before it wakes the caller, so a
+/// spurious poll can finish the call before its wake is recorded. The wake
+/// still comes, from velo's runtime, and once the instances have shut down
+/// it is there to count: `count_crossings` classifies only then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_response_read_before_its_wake_counts_as_a_valid_call() {
+    use std::future::Future;
+    use std::task::{Context as TaskContext, Poll, Waker};
+
+    struct HeldWake {
+        inner: Waker,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    }
+
+    impl futures::task::ArcWake for HeldWake {
+        fn wake_by_ref(this: &Arc<Self>) {
+            this.entered.send(()).unwrap();
+            this.release.recv().unwrap();
+            this.inner.wake_by_ref();
+        }
+    }
+
+    let _serial = serial().await;
+    let client = node(TaskRuntime::dedicated()).await;
+    let server = node(TaskRuntime::dedicated()).await;
+    let (answer, may_answer) = flume::bounded::<()>(1);
+    server
+        .register_handler(
+            Handler::unary_handler("probe", move |ctx: Context| {
+                may_answer.recv().unwrap();
+                Ok(Some(ctx.payload))
+            })
+            .build(),
+        )
+        .unwrap();
+    introduce(&client, &server).await;
+    echo(&client, &server).await.unwrap();
+
+    let call = client
+        .unary("probe")
+        .unwrap()
+        .raw_payload(Bytes::from_static(b"ping"))
+        .instance(server.instance_id())
+        .send();
+    let mut call = std::pin::pin!(call);
+    let (entered, waking) = flume::bounded(1);
+    let (release, may_wake) = flume::bounded(1);
+    let held = std::future::poll_fn(|cx| {
+        let waker = futures::task::waker(Arc::new(HeldWake {
+            inner: cx.waker().clone(),
+            entered: entered.clone(),
+            release: may_wake.clone(),
+        }));
+        call.as_mut()
+            .poll(&mut TaskContext::from_waker(&waker))
+            .map(|result| assert_eq!(result.unwrap(), Bytes::from_static(b"ping")))
+    });
+    let wakes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let mut recorded = std::pin::pin!(record_wakes(held, Arc::clone(&wakes)));
+    assert!(futures::poll!(recorded.as_mut()).is_pending());
+    answer.send(()).unwrap();
+    waking.recv_async().await.unwrap();
+
+    // A spurious poll is legal while the response thread is about to wake us.
+    let second_poll = futures::poll!(recorded.as_mut());
+    let at_completion = wakes.lock().clone();
+    release.send(()).unwrap();
+    client.shutdown(ShutdownPolicy::WaitForever).await;
+    server.shutdown(ShutdownPolicy::WaitForever).await;
+    let settled = wakes.lock().clone();
+
+    assert_eq!(second_poll, Poll::Ready(true));
+    assert!(
+        at_completion.is_empty(),
+        "the call finished before its wake: {at_completion:?}"
+    );
+    assert_eq!(settled, [THREAD_NAME]);
+    assert_eq!(classify(true, &settled), CallEnd::WokenFromVelo);
 }

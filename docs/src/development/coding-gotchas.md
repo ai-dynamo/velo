@@ -33,13 +33,13 @@ Test: on `TaskRuntime::Application`, `block_in_place_keeps_the_stream` is the li
 
 ## A wake does not mean the poll returned `Pending`
 
-**Rule.** When a test counts wakes, classify each operation by its wakes, not by whether its future returned `Pending`. A future that registers its waker and then checks for its value can be woken while that same poll returns `Ready`. A future whose value was already there ends with no wake at all.
+**Rule.** When a test counts wakes, classify each operation by its wakes, not by whether its future returned `Pending`. A future that registers its waker and then checks for its value can be woken while that same poll returns `Ready`. A future whose value was already there ends with no wake at all. And classify only once the wakes have settled: a value published before its wake can be read by a spurious poll, so the future finishes before its wake runs.
 
-**Failure.** A test counted one response wake for each unary call that returned `Pending`. The response slot (`Slot::poll_wait`) registers the caller's waker first and then checks for the value. A response that landed between the two gave a call with one wake that never waited, and the count was off by one. Under load, a run of 20 calls also had none that waited, so a check that some call waited failed.
+**Failure.** A test counted one response wake for each unary call that returned `Pending`. The response slot (`Slot::poll_wait`) registers the caller's waker first and then checks for the value. A response that landed between the two gave a call with one wake that never waited, and the count was off by one. Under load, a run of 20 calls also had none that waited, so a check that some call waited failed. The slot also publishes the value before it wakes, so a spurious poll could finish a call whose wake had not run yet, and a count taken when the call finished saw no wake.
 
-**Test.** Hold the waker side on a channel between the registration and the check, and see whether the count still holds. Make the expected wait long, here a 1 ms sleep in the handler, so that most operations have a wake to count. Then run the test 50 times, and again with several copies in parallel.
+**Test.** Hold the waker side on a channel between the registration and the check, or between the publish and the wake, and see whether the count still holds. Count after the instances have shut down: `Velo::shutdown` returns after velo's runtime threads have exited. Make the expected wait long, here a 1 ms sleep in the handler, so that most operations have a wake to count. Then run the test 50 times, and again with several copies in parallel.
 
-Test: `a_wake_inside_the_first_poll_counts_as_the_response_hand_off` forces the interleaving, and `a_unary_call_crosses_between_runtimes_four_times` counts per call (`lib/velo/tests/task_runtime.rs`).
+Test: `a_wake_inside_the_first_poll_counts_as_the_response_hand_off` and `a_response_read_before_its_wake_counts_as_a_valid_call` force the two interleavings, and `a_unary_call_crosses_between_runtimes_four_times` counts per call (`lib/velo/tests/task_runtime.rs`).
 
 ## A cancel wakes child tokens before the parent's own waiters
 
