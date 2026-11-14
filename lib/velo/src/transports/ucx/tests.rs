@@ -2056,15 +2056,21 @@ fn hold_reaper_clock(node: &Node) {
 
 /// Move `node`'s reaper clock forward, then wait until the progress thread
 /// has scanned at the new time.
-///
-/// Two passes: one may already be past its clock read when the clock moves.
 async fn advance(node: &Node, by: Duration) {
+    node.transport.shared.reaper_clock.manual().advance(by);
+    settle(node).await;
+}
+
+/// Wait for two more passes of `node`'s progress thread.
+///
+/// Two, because one may be under way: it may have read its clock before the
+/// clock moved, or be inside the callback the test just saw a sign of.
+async fn settle(node: &Node) {
     let shared = &node.transport.shared;
-    shared.reaper_clock.manual().advance(by);
     let passes = shared.passes.load(Ordering::Acquire);
     assert!(
         wait_until(T, || shared.passes.load(Ordering::Acquire) >= passes + 2).await,
-        "the progress thread scanned no more after the clock moved"
+        "the progress thread ran no more passes"
     );
 }
 
@@ -2795,6 +2801,9 @@ async fn a_send_in_flight_keeps_its_endpoint_open() {
         .await,
         "A's send never completed"
     );
+    // The completion callback lowers `inflight_ops` before it stamps the
+    // completion time; let its pass finish before the clock moves.
+    settle(&a).await;
     assert_eq!(
         errs.count(),
         0,
