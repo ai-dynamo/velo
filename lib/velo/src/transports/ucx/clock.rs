@@ -54,7 +54,11 @@ impl ReaperClock {
 /// A clock a test can freeze and then move forward by hand.
 ///
 /// Frozen, it reads `base + offset`, and only [`ManualClock::advance`] moves
-/// it. It never moves backward: freezing starts from the real time.
+/// it. Freezing starts from the real time, with one exception: a read that
+/// checked the flag just before `freeze` published it returns a real time a
+/// few microseconds later than the frozen one. The reaper tolerates that: it
+/// compares times with `saturating_duration_since`, and the tests freeze the
+/// clock before they create the endpoints they check.
 #[cfg(any(test, feature = "test-helpers"))]
 pub(crate) struct ManualClock {
     frozen: AtomicBool,

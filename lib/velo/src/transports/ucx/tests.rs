@@ -2667,11 +2667,18 @@ async fn a_slow_endpoint_create_does_not_age_the_new_endpoint() {
 ///
 /// The test makes that pass. `pre_progress_hold` stops A after it reads its
 /// pass clock and before it runs `ucp_worker_progress`. B's frame goes into
-/// A's socket meanwhile, and A's clock moves one and a half timeouts. A then
-/// receives the frame in the held pass. With the stale stamp, the next scan
-/// reaps the endpoint, and `reaped_while_active` counts it: the frame is
-/// younger than the timeout on A's clock. With a stamp taken after the
-/// progress loop, the endpoint is a quarter timeout old at that scan.
+/// A's socket meanwhile, and A's clock moves three quarters of a timeout. A
+/// then receives the frame in the held pass, and the clock moves half a
+/// timeout more. With the stale stamp, that scan sees the endpoint a timeout
+/// and a quarter old and reaps it, and `reaped_while_active` counts it: the
+/// frame is half a timeout old. With a stamp taken after the progress loop,
+/// the endpoint is half a timeout old and stays open.
+///
+/// The step during the hold is less than a timeout on purpose. B's send
+/// completing does not prove the frame is in A's socket yet (a corked TCP
+/// connection holds it). If the frame arrives only in a later pass, the held
+/// pass must not find the endpoint stale: it would reap it, correctly, and
+/// fail the test.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_frame_received_late_in_a_long_pass_is_not_stamped_early() {
     let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
@@ -2715,14 +2722,15 @@ async fn a_frame_received_late_in_a_long_pass_is_not_stamped_early() {
         "B never finished its send"
     );
     // The long pass: the clock moves while A is between its clock read and
-    // the progress call.
-    shared.reaper_clock.manual().advance(IDLE + IDLE / 2);
+    // the progress call. Less than a timeout, so the held pass cannot reap
+    // even if the frame reaches A's socket only in a later pass.
+    shared.reaper_clock.manual().advance(IDLE * 3 / 4);
     drop(held);
     assert!(
         recv_message(&a.streams.message_stream, T).await.is_some(),
         "B's frame never reached A"
     );
-    advance(&a, IDLE / 4).await;
+    advance(&a, IDLE / 2).await;
 
     assert_eq!(
         reaped_while_active(&a),
