@@ -212,16 +212,23 @@ fn a_staged_send_created_outside_tokio_still_expires_on_its_owner() {
     });
 }
 
-#[allow(deprecated)] // a `RendezvousManager` built by hand over a bare `Messenger`, which `Velo` registers itself
+/// A `RendezvousManager` built by hand over a `Velo`'s messenger. Its handlers
+/// replace the ones the `Velo` registered.
 fn ttl_data_expires_after_handler_registration(stage_before_handlers: bool) -> bool {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
-    let messenger = runtime
-        .block_on(Messenger::builder().add_transport(new_transport()).build())
+    let velo = runtime
+        .block_on(
+            Velo::builder()
+                .add_transport(new_transport())
+                .mux_only()
+                .build(),
+        )
         .unwrap();
+    let messenger = Arc::clone(velo.messenger());
     let manager = Arc::new(RendezvousManager::new(messenger.instance_id().worker_id()));
     assert!(tokio::runtime::Handle::try_current().is_err());
     let stage = || {

@@ -3,7 +3,7 @@
 
 //! Integration tests for the full control-plane AM dispatch path (TEST-02).
 //!
-//! Tests two-worker simulation using real Messenger + TCP loopback with the complete
+//! Tests two-worker simulation using real messengers + TCP loopback with the complete
 //! AnchorManager control-plane wired up end-to-end. The data plane is
 //! `TcpFrameTransport`; what is under test is the control plane, which is
 //! transport-agnostic:
@@ -23,6 +23,7 @@ mod common;
 use std::sync::Arc;
 use std::time::Duration;
 
+use velo::Velo;
 use velo::messenger::Messenger;
 use velo::streaming::{
     AnchorManagerBuilder, FrameTransport, StreamAnchorHandle, StreamFrame, TcpFrameTransport,
@@ -42,34 +43,33 @@ fn new_tcp_transport() -> Arc<velo::transports::tcp::TcpTransport> {
     )
 }
 
-/// Set up two Messenger instances connected to each other over TCP loopback.
-#[allow(deprecated)] // an `AnchorManager` built by hand over a bare `Messenger`, which `Velo` registers itself
-async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
-    let t1 = new_tcp_transport();
-    let t2 = new_tcp_transport();
-
-    let m1 = Messenger::builder()
-        .add_transport(t1)
-        .build()
-        .await
-        .expect("create messenger 1");
-    let m2 = Messenger::builder()
-        .add_transport(t2)
-        .build()
-        .await
-        .expect("create messenger 2");
-
-    let p1 = m1.peer_info();
-    let p2 = m2.peer_info();
-
-    // Register bidirectionally so each can reach the other.
-    m2.register_peer(p1).expect("register m1 on m2");
-    m1.register_peer(p2).expect("register m2 on m1");
-
+/// Two mux-only `Velo`s that know each other over TCP loopback, and their
+/// messengers. Each test builds its own `AnchorManager` over a messenger,
+/// which replaces the anchor handlers the `Velo` registered. The caller keeps
+/// the `Velo`s alive for the length of the test.
+async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>, [Velo; 2]) {
+    let v1 = mux_only_node().await;
+    let v2 = mux_only_node().await;
+    v2.register_peer(v1.peer_info()).expect("register v1 on v2");
+    v1.register_peer(v2.peer_info()).expect("register v2 on v1");
     // Wait for TCP connections to establish.
     tokio::time::sleep(Duration::from_millis(200)).await;
+    (
+        Arc::clone(v1.messenger()),
+        Arc::clone(v2.messenger()),
+        [v1, v2],
+    )
+}
 
-    (m1, m2)
+/// A `Velo` with no per-stream listener of its own: the tests bring their own
+/// `TcpFrameTransport`.
+async fn mux_only_node() -> Velo {
+    Velo::builder()
+        .add_transport(new_tcp_transport())
+        .mux_only()
+        .build()
+        .await
+        .expect("build velo")
 }
 
 // ---------------------------------------------------------------------------
@@ -88,7 +88,7 @@ async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_02_remote_attach() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
     let worker_id_a = messenger_a.instance_id().worker_id();
     let worker_id_b = messenger_b.instance_id().worker_id();
 
@@ -124,11 +124,11 @@ async fn test_02_remote_attach() {
 
     // Worker B: create the streaming transport and AnchorManager.
     //
-    // `Messenger::register_peer` only covers the control plane; the streaming
-    // transport keeps its own WorkerId -> SocketAddr cache, so the two sides
-    // have to be cross-registered before `connect()` can resolve a peer.
-    // `Velo::register_peer` fans this out automatically; this test builds the
-    // AnchorManager directly and so does it by hand.
+    // The nodes are mux-only, so `Velo::register_peer` covered only the
+    // control plane. The streaming transport keeps its own
+    // WorkerId -> SocketAddr cache, so the two sides have to be
+    // cross-registered before `connect()` can resolve a peer. This test builds
+    // the AnchorManager directly and so does it by hand.
     let stream_b = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
         .await
         .expect("stream listener B");
@@ -219,7 +219,7 @@ async fn a_silent_remote_stream_outlives_the_watchdog_window() {
     use futures::StreamExt;
     use velo::streaming::AnchorConfig;
 
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
     let stream_a = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
         .await
         .expect("stream listener A");

@@ -170,7 +170,6 @@ async fn an_mpsc_detach_reaches_a_draining_consumer() {
 /// a producer streaming into the node, a `ShutdownPolicy::Timeout` shutdown
 /// still returns within its bound.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(deprecated)] // tests the drain of the deprecated `Velo::graceful_shutdown`, not the stream teardown of `shutdown`
 async fn a_timed_shutdown_is_bounded_while_a_stream_flows() {
     let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
     let mut anchor = consumer.velo.create_anchor::<u32>();
@@ -199,10 +198,10 @@ async fn a_timed_shutdown_is_bounded_while_a_stream_flows() {
         Duration::from_secs(5),
         consumer
             .velo
-            .graceful_shutdown(velo::ShutdownPolicy::Timeout(Duration::from_millis(500))),
+            .shutdown(velo::ShutdownPolicy::Timeout(Duration::from_millis(500))),
     )
     .await
-    .expect("graceful shutdown under a timeout policy did not return");
+    .expect("shutdown under a timeout policy did not return");
     stop.cancel();
     let _ = tokio::time::timeout(Duration::from_secs(5), producing).await;
     consuming.abort();
@@ -233,7 +232,6 @@ async fn a_draining_producer_hears_the_consumers_cancel() {
 /// drain finish; teardown then ends the stream. If the drain counted open
 /// streams instead, a node could not shut down while any peer held one open.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(deprecated)] // tests the drain of the deprecated `Velo::graceful_shutdown`, not the stream teardown of `shutdown`
 async fn a_quiet_mux_stream_lets_a_wait_forever_drain_finish() {
     const BURST: u32 = 256;
     let (consumer, producer) = pair(Some(mux_config()), Some(mux_config())).await;
@@ -271,9 +269,7 @@ async fn a_quiet_mux_stream_lets_a_wait_forever_drain_finish() {
     consumer.velo.begin_drain();
     tokio::time::timeout(
         Duration::from_secs(5),
-        consumer
-            .velo
-            .graceful_shutdown(velo::ShutdownPolicy::WaitForever),
+        consumer.velo.shutdown(velo::ShutdownPolicy::WaitForever),
     )
     .await
     .expect("a quiet open stream kept a WaitForever drain waiting");

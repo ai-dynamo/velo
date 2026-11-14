@@ -273,7 +273,7 @@ impl VeloEvents {
         let instance_id = peer_info.instance_id();
 
         // Auto-register discovered peer for future fast-path lookups
-        self.messenger()?.register_peer_inner(peer_info)?;
+        self.messenger()?.register_peer(peer_info)?;
 
         Ok(instance_id)
     }
@@ -1206,8 +1206,8 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        a.register_peer_inner(b.peer_info()).unwrap();
-        b.register_peer_inner(a.peer_info()).unwrap();
+        a.register_peer(b.peer_info()).unwrap();
+        b.register_peer(a.peer_info()).unwrap();
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -1247,8 +1247,8 @@ mod tests {
             .build()
             .await
             .unwrap();
-        owner.register_peer_inner(subscriber.peer_info()).unwrap();
-        subscriber.register_peer_inner(owner.peer_info()).unwrap();
+        owner.register_peer(subscriber.peer_info()).unwrap();
+        subscriber.register_peer(owner.peer_info()).unwrap();
         let events = subscriber.events();
         let waiting = owner.events().new_event().unwrap().into_handle();
         // Keep these requests in discovery so neither can finish while the
@@ -1276,7 +1276,7 @@ mod tests {
         assert!(futures::poll!(&mut poison).is_pending());
 
         subscriber
-            .graceful_shutdown_inner(crate::ShutdownPolicy::WaitForever)
+            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
             .await;
         subscriber.closed().await;
         for result in [
@@ -1304,7 +1304,7 @@ mod tests {
         local.trigger().unwrap();
         local_waiter.await.unwrap();
         owner
-            .graceful_shutdown_inner(crate::ShutdownPolicy::WaitForever)
+            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
             .await;
         owner.closed().await;
     }
@@ -1349,7 +1349,7 @@ mod tests {
         local.trigger().unwrap();
         local_waiter.await.unwrap();
         owner
-            .graceful_shutdown_inner(crate::ShutdownPolicy::WaitForever)
+            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
             .await;
         owner.closed().await;
     }

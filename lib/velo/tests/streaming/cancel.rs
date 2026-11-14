@@ -208,28 +208,33 @@ fn new_tcp_transport() -> Arc<velo::transports::tcp::TcpTransport> {
     )
 }
 
-/// Set up two Messenger instances connected over TCP loopback.
-#[allow(deprecated)] // an `AnchorManager` built by hand over a bare `Messenger`, which `Velo` registers itself
-async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
-    let t1 = new_tcp_transport();
-    let t2 = new_tcp_transport();
-
-    let m1 = Messenger::builder()
-        .add_transport(t1)
-        .build()
-        .await
-        .expect("m1");
-    let m2 = Messenger::builder()
-        .add_transport(t2)
-        .build()
-        .await
-        .expect("m2");
-
-    m2.register_peer(m1.peer_info()).expect("register m1 on m2");
-    m1.register_peer(m2.peer_info()).expect("register m2 on m1");
-
+/// Two mux-only `Velo`s that know each other over TCP loopback, and their
+/// messengers. Each test builds its own `AnchorManager` over a messenger,
+/// which replaces the anchor handlers the `Velo` registered. The caller keeps
+/// the `Velo`s alive for the length of the test.
+async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>, [Velo; 2]) {
+    let v1 = mux_only_node().await;
+    let v2 = mux_only_node().await;
+    v2.register_peer(v1.peer_info()).expect("register v1 on v2");
+    v1.register_peer(v2.peer_info()).expect("register v2 on v1");
+    // Wait for TCP connections to establish.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    (m1, m2)
+    (
+        Arc::clone(v1.messenger()),
+        Arc::clone(v2.messenger()),
+        [v1, v2],
+    )
+}
+
+/// A `Velo` with no per-stream listener of its own: the tests bring their own
+/// `TcpFrameTransport`.
+async fn mux_only_node() -> Velo {
+    Velo::builder()
+        .add_transport(new_tcp_transport())
+        .mux_only()
+        .build()
+        .await
+        .expect("build velo")
 }
 
 /// TEST-CANCEL-03: Remote cross-worker cancel via _stream_cancel AM over TCP.
@@ -239,7 +244,7 @@ async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
 /// StreamSender identified by `sender_stream_id`.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cancel_03_remote_cancel() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
     let worker_id_b = messenger_b.instance_id().worker_id();
 
     // Worker B: create AnchorManager with sender_registry + register _stream_cancel handler

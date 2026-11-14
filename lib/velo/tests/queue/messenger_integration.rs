@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use velo::Velo;
 use velo::messenger::Messenger;
 use velo::transports::uds::UdsTransportBuilder;
 
@@ -16,9 +17,10 @@ use velo::queue::WorkQueueBackend;
 use velo::queue::backends::messenger::{MessengerQueueBackend, MessengerQueueConfig};
 use velo::queue::options::NextOptions;
 
-/// Set up two messenger instances connected via UDS.
-#[allow(deprecated)] // the queue backend runs over a bare `Messenger`, with no `Velo` around it
-async fn setup_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
+/// Set up two mux-only `Velo`s connected via UDS, and return their
+/// messengers, which the queue backend runs over. The caller keeps the
+/// `Velo`s alive for the length of the test.
+async fn setup_two_messengers() -> (Arc<Messenger>, Arc<Messenger>, [Velo; 2]) {
     let socket_a =
         std::env::temp_dir().join(format!("velo-queue-test-{}.sock", uuid::Uuid::new_v4()));
     let socket_b =
@@ -37,28 +39,34 @@ async fn setup_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
             .expect("build transport B"),
     );
 
-    let m_a = Messenger::builder()
+    let v_a = Velo::builder()
         .add_transport(transport_a)
+        .mux_only()
         .build()
         .await
-        .expect("build messenger A");
+        .expect("build node A");
 
-    let m_b = Messenger::builder()
+    let v_b = Velo::builder()
         .add_transport(transport_b)
+        .mux_only()
         .build()
         .await
-        .expect("build messenger B");
+        .expect("build node B");
 
     // Exchange peer info
-    let peer_a = m_a.peer_info();
-    let peer_b = m_b.peer_info();
-    m_a.register_peer(peer_b).expect("register B on A");
-    m_b.register_peer(peer_a).expect("register A on B");
+    let peer_a = v_a.peer_info();
+    let peer_b = v_b.peer_info();
+    v_a.register_peer(peer_b).expect("register B on A");
+    v_b.register_peer(peer_a).expect("register A on B");
 
     // Wait for connections to establish
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    (m_a, m_b)
+    (
+        Arc::clone(v_a.messenger()),
+        Arc::clone(v_b.messenger()),
+        [v_a, v_b],
+    )
 }
 
 // ============================================================================
@@ -67,7 +75,7 @@ async fn setup_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_messenger_local_send_recv() {
-    let (m_a, _m_b) = setup_two_messengers().await;
+    let (m_a, _m_b, _nodes) = setup_two_messengers().await;
 
     let backend = MessengerQueueBackend::new(
         Arc::clone(&m_a),
@@ -87,7 +95,7 @@ async fn test_messenger_local_send_recv() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_messenger_local_batch() {
-    let (m_a, _m_b) = setup_two_messengers().await;
+    let (m_a, _m_b, _nodes) = setup_two_messengers().await;
 
     let backend = MessengerQueueBackend::new(
         Arc::clone(&m_a),
@@ -114,7 +122,7 @@ async fn test_messenger_local_batch() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_messenger_try_send_delivers() {
-    let (m_a, _m_b) = setup_two_messengers().await;
+    let (m_a, _m_b, _nodes) = setup_two_messengers().await;
 
     let backend = MessengerQueueBackend::new(
         Arc::clone(&m_a),
@@ -142,7 +150,7 @@ async fn test_messenger_try_send_delivers() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_messenger_remote_send_recv() {
-    let (m_a, m_b) = setup_two_messengers().await;
+    let (m_a, m_b, _nodes) = setup_two_messengers().await;
 
     // Backend on B: actor lives on B
     let backend_b = MessengerQueueBackend::new(
@@ -175,7 +183,7 @@ async fn test_messenger_remote_send_recv() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_messenger_remote_send_after_stale_handler_cache_refreshes() {
-    let (m_a, m_b) = setup_two_messengers().await;
+    let (m_a, m_b, _nodes) = setup_two_messengers().await;
 
     // Force an initial handshake before the queue service exists on B.
     let handlers = m_a.available_handlers(m_b.instance_id()).await.unwrap();
@@ -210,7 +218,7 @@ async fn test_messenger_remote_send_after_stale_handler_cache_refreshes() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_messenger_remote_recv_waits() {
-    let (m_a, m_b) = setup_two_messengers().await;
+    let (m_a, m_b, _nodes) = setup_two_messengers().await;
 
     // Actor on B
     let backend_b = MessengerQueueBackend::new(
@@ -246,7 +254,7 @@ async fn test_messenger_remote_recv_waits() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_messenger_remote_batch() {
-    let (m_a, m_b) = setup_two_messengers().await;
+    let (m_a, m_b, _nodes) = setup_two_messengers().await;
 
     // Actor on B
     let backend_b = MessengerQueueBackend::new(
@@ -280,7 +288,7 @@ async fn test_messenger_remote_batch() {
 /// arrive after the first poll cycle (250ms) but well before the batch timeout.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_messenger_remote_batch_delayed_arrival() {
-    let (m_a, m_b) = setup_two_messengers().await;
+    let (m_a, m_b, _nodes) = setup_two_messengers().await;
 
     let backend_b = MessengerQueueBackend::new(
         Arc::clone(&m_b),
@@ -324,7 +332,7 @@ async fn test_messenger_remote_batch_delayed_arrival() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_messenger_remote_batch_timeout_partial() {
-    let (m_a, m_b) = setup_two_messengers().await;
+    let (m_a, m_b, _nodes) = setup_two_messengers().await;
 
     // Actor on B
     let backend_b = MessengerQueueBackend::new(

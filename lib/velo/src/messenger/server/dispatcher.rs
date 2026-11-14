@@ -728,9 +728,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        messenger
-            .register_peer_inner(messenger.peer_info())
-            .unwrap();
+        messenger.register_peer(messenger.peer_info()).unwrap();
         // The panic arm reads the metrics from the backend, not the Messenger;
         // a backend built without them would drop these counts silently.
         let panics = |reason| {
@@ -769,7 +767,7 @@ mod tests {
         assert_eq!(panics("handler_panic"), 2.0);
         assert_eq!(panics("ordered_handler_panic"), 2.0);
         messenger
-            .graceful_shutdown_inner(crate::ShutdownPolicy::WaitForever)
+            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
             .await;
         messenger.closed().await;
     }
