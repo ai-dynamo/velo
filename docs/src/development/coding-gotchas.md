@@ -33,11 +33,11 @@ Test: on `TaskRuntime::Application`, `block_in_place_keeps_the_stream` is the li
 
 ## A wake's thread does not always name its sender
 
-**Rule.** Do not count one wake per operation, and do not take a wake's thread as its sender. Assert "at least one wake from the expected side, and none from the other". Ignore a wake that runs inside the woken task's own poll, and read the record only after the senders have stopped.
+**Rule.** Do not count one wake per operation, and do not take a wake's thread as its sender. Assert "at least one wake from the expected side, and none from the other". Ignore a wake that runs inside the woken task's own poll, and read the record only after the senders have stopped. When the test needs a wake, make the sender wait until the waiter has registered its waker (signal it when the waiter's poll first returns `Pending`). Do not sleep in the sender to make the wait likely: a loaded runner can hold the waiter longer than any sleep.
 
 A future whose value arrives during its poll needs no wake. A value published before its wake can be read by another poll, so the future finishes before its wake runs. And `AtomicWaker::register` delivers a wake that races the registration on the registering thread, inside its poll.
 
-**Failure.** A test that counted one response wake from velo's runtime for each unary call fails on three valid interleavings: a response during the first poll, a spurious poll before the wake, and a wake that the registration hands to the caller's own thread.
+**Failure.** A test that counted one response wake from velo's runtime for each unary call fails on three valid interleavings: a response during the first poll, a spurious poll before the wake, and a wake that the registration hands to the caller's own thread. A check for at least one wake, with a short sleep in the handler, still fails when the caller is held past the sleep on every call.
 
 **Test.** Hold the sender between the registration and the check, or between the publish and the wake, and see whether the assertion still holds. Run the test 200 times, with 8 copies in parallel.
 

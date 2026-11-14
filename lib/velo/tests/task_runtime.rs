@@ -1170,6 +1170,25 @@ async fn record_wakes<F: std::future::Future>(
     .await
 }
 
+/// Polls `inner`, and sends one token on `registered` the first time a poll
+/// returns `Pending`, so after the waker has been registered.
+async fn signal_first_pending<F: std::future::Future>(
+    inner: F,
+    registered: flume::Sender<()>,
+) -> F::Output {
+    let mut inner = std::pin::pin!(inner);
+    let mut signalled = false;
+    std::future::poll_fn(|cx| {
+        let poll = inner.as_mut().poll(cx);
+        if poll.is_pending() && !signalled {
+            signalled = true;
+            let _ = registered.send(());
+        }
+        poll
+    })
+    .await
+}
+
 /// Where the parts of a run of unary calls ran, counted by thread.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Crossings {
@@ -1203,15 +1222,23 @@ async fn count_crossings(runtime: TaskRuntime, calls: usize) -> (Crossings, Stri
     let client = build(Arc::clone(&client_transport)).await;
     let server = build(Arc::clone(&server_transport)).await;
     let handler_threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    // The handler replies only once the caller has registered its waker, so
+    // every response arrives after the registration and wakes the caller.
+    // The at-least-one-wake checks depend on that. A sleep in the handler
+    // would only make it likely: a loaded runner can hold the caller longer.
+    // Once the connection is up, `send` hands the request to the transport
+    // and admission is decided before the first poll, so the caller's first
+    // `Pending` comes from the response slot.
+    let (registered, may_reply) = flume::unbounded::<()>();
     server
         .register_handler(
             Handler::unary_handler("probe", {
                 let handler_threads = Arc::clone(&handler_threads);
                 move |ctx: Context| {
                     handler_threads.lock().push(thread_name());
-                    // The caller is then waiting when the response comes
-                    // back, so almost every call has a wake to record.
-                    std::thread::sleep(Duration::from_millis(1));
+                    may_reply
+                        .recv_timeout(PATIENCE)
+                        .expect("the caller never registered its waker");
                     Ok(Some(ctx.payload))
                 }
             })
@@ -1219,15 +1246,15 @@ async fn count_crossings(runtime: TaskRuntime, calls: usize) -> (Crossings, Stri
         )
         .expect("probe");
     introduce(&client, &server).await;
-    let call = || async {
-        client
+    let call = || {
+        let send = client
             .unary("probe")
             .expect("unary")
             .raw_payload(Bytes::from_static(b"ping"))
             .instance(server.instance_id())
-            .send()
-            .await
-            .expect("call")
+            .send();
+        let registered = registered.clone();
+        async move { signal_first_pending(send, registered).await.expect("call") }
     };
     // The first call dials the connection; it is not the steady state.
     for _ in 0..3 {
