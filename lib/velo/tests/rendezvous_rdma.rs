@@ -1463,7 +1463,6 @@ async fn a_cancelled_transfer_does_not_release_its_destination() {
 /// transfer is observed in flight — the same counter shutdown drains on —
 /// before the caller is dropped.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(deprecated)] // times the deprecated `Velo::graceful_shutdown` sweep itself
 async fn shutdown_waits_for_a_live_transfer_before_unmapping_its_arena() {
     let pair = Pair::new().await;
 
@@ -1494,7 +1493,7 @@ async fn shutdown_waits_for_a_live_transfer_before_unmapping_its_arena() {
     let started = std::time::Instant::now();
     pair.consumer
         .velo
-        .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_secs(10)))
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(10)))
         .await;
     let waited = started.elapsed();
 
@@ -1520,7 +1519,6 @@ async fn shutdown_waits_for_a_live_transfer_before_unmapping_its_arena() {
 /// nothing. Dropping pinned slots before the sweep is what makes the drains
 /// finish normally instead.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(deprecated)] // times the deprecated `Velo::graceful_shutdown` sweep itself
 async fn a_staged_anchor_does_not_starve_the_shutdown_sweep() {
     let node = Node::start(None).await;
 
@@ -1540,7 +1538,7 @@ async fn a_staged_anchor_does_not_starve_the_shutdown_sweep() {
 
     let started = std::time::Instant::now();
     node.velo
-        .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_secs(10)))
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(10)))
         .await;
     let took = started.elapsed();
 

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Graceful-shutdown behavior as peers observe it, driven through the public
-//! `Velo::begin_drain` / `Velo::graceful_shutdown` API.
+//! `Velo::begin_drain` / `Velo::shutdown` API.
 //!
 //! Drain rejection chain under test: the server's listener rejects a `Message`
 //! frame during drain by echoing its header in a `ShuttingDown` frame on the
@@ -12,7 +12,7 @@
 //! the awaiter.
 //!
 //! Phase-2 chain under test: the dispatcher acquires an in-flight guard per
-//! handler invocation, so `graceful_shutdown` waits for a running handler
+//! handler invocation, so `shutdown` waits for a running handler
 //! instead of tearing down under it.
 
 use std::collections::VecDeque;
@@ -195,11 +195,10 @@ async fn quic_unary_to_draining_peer_fails_fast() {
     unary_to_draining_peer_fails_fast(new_quic_transport).await;
 }
 
-/// Phase 2 of `graceful_shutdown` must wait for a handler invocation that is
+/// Phase 2 of `shutdown` must wait for a handler invocation that is
 /// already running, and complete promptly once it finishes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(deprecated)] // tests the drain of the deprecated `graceful_shutdown`, which `Velo::shutdown` would extend with a stream teardown
-async fn graceful_shutdown_waits_for_in_flight_handlers() {
+async fn shutdown_waits_for_in_flight_handlers() {
     let server = Velo::builder()
         .add_transport(new_tcp_transport())
         .build()
@@ -251,24 +250,122 @@ async fn graceful_shutdown_waits_for_in_flight_handlers() {
         .forget();
 
     let shutdown = tokio::spawn(async move {
-        server.graceful_shutdown(ShutdownPolicy::WaitForever).await;
+        server.shutdown(ShutdownPolicy::WaitForever).await;
     });
 
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
         !shutdown.is_finished(),
-        "graceful_shutdown must wait for the in-flight handler"
+        "shutdown must wait for the in-flight handler"
     );
 
     release.add_permits(1);
     tokio::time::timeout(Duration::from_secs(2), shutdown)
         .await
-        .expect("graceful_shutdown must complete once the handler finishes")
+        .expect("shutdown must complete once the handler finishes")
         .unwrap();
 
     // Whether the response beat the teardown is a separate race; just make
     // sure the client task winds down rather than asserting its outcome.
     let _ = tokio::time::timeout(Duration::from_millis(500), pending).await;
+}
+
+/// The sequence a caller uses to let accepted work finish before it stops:
+/// `begin_drain`, then the work, then `shutdown`. The drain refuses a new
+/// request at once, a request admitted before it still gets its reply, and
+/// `shutdown` afterwards completes. `shutdown` gates again, which is
+/// harmless because the gate is idempotent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn begin_drain_then_work_then_shutdown() {
+    let server = Velo::builder()
+        .add_transport(new_tcp_transport())
+        .build()
+        .await
+        .unwrap();
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let (entered_h, release_h) = (entered.clone(), release.clone());
+    server
+        .register_handler(
+            Handler::unary_handler_async("slow", move |ctx| {
+                let entered = entered_h.clone();
+                let release = release_h.clone();
+                async move {
+                    entered.add_permits(1);
+                    let _permit = release.acquire().await.expect("release semaphore closed");
+                    Ok(Some(ctx.payload))
+                }
+            })
+            .build(),
+        )
+        .unwrap();
+    server
+        .register_handler(Handler::unary_handler("ping", |ctx| Ok(Some(ctx.payload))).build())
+        .unwrap();
+
+    let client = Velo::builder()
+        .add_transport(new_tcp_transport())
+        .build()
+        .await
+        .unwrap();
+    client.register_peer(server.peer_info()).unwrap();
+    server.register_peer(client.peer_info()).unwrap();
+    let ping = |payload: &'static [u8]| {
+        client
+            .unary("ping")
+            .unwrap()
+            .raw_payload(Bytes::from_static(payload))
+            .instance(server.instance_id())
+            .send()
+    };
+    // Warm-up: the handshake completes while the server is healthy.
+    let echoed: Bytes = tokio::time::timeout(Duration::from_secs(5), ping(b"warmup"))
+        .await
+        .expect("warm-up timed out")
+        .unwrap();
+    assert_eq!(echoed, Bytes::from_static(b"warmup"));
+
+    let admitted = tokio::spawn(
+        client
+            .unary("slow")
+            .unwrap()
+            .raw_payload(Bytes::from_static(b"admitted"))
+            .instance(server.instance_id())
+            .send(),
+    );
+    tokio::time::timeout(Duration::from_secs(2), entered.acquire())
+        .await
+        .expect("handler never started")
+        .expect("entered semaphore closed")
+        .forget();
+
+    server.begin_drain();
+    let refused = tokio::time::timeout(Duration::from_secs(2), ping(b"refused"))
+        .await
+        .expect("a request during the drain must fail fast, not hang")
+        .expect_err("a request during the drain must fail");
+    assert!(
+        refused.to_string().contains("shutting down"),
+        "unexpected error: {refused}"
+    );
+
+    release.add_permits(1);
+    let reply: Bytes = tokio::time::timeout(Duration::from_secs(2), admitted)
+        .await
+        .expect("the admitted request timed out")
+        .expect("request task panicked")
+        .expect("a request admitted before the drain must get its reply");
+    assert_eq!(reply, Bytes::from_static(b"admitted"));
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        server.shutdown(ShutdownPolicy::WaitForever),
+    )
+    .await
+    .expect("shutdown after begin_drain must complete");
+    client
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(2)))
+        .await;
 }
 
 // ── Teardown-aware consumer loop ─────────────────────────────────────────
@@ -296,6 +393,10 @@ struct LoopbackTransport {
     held: Mutex<VecDeque<(Bytes, Bytes)>>,
     reply_gate: Mutex<Option<velo_ext::AdmissionGate<()>>>,
     reply_sent: tokio::sync::Notify,
+    /// Notified when teardown calls [`Transport::shutdown`]. Teardown runs on
+    /// its own thread, so this fires even while the instance's runtime is
+    /// frozen.
+    torn_down: tokio::sync::Notify,
 }
 
 impl LoopbackTransport {
@@ -379,7 +480,9 @@ impl Transport for LoopbackTransport {
         Box::pin(async { Ok(()) })
     }
 
-    fn shutdown(&self) {}
+    fn shutdown(&self) {
+        self.torn_down.notify_one();
+    }
 
     fn check_health(
         &self,
@@ -410,8 +513,7 @@ impl Transport for LoopbackTransport {
 /// and the shutdown driver both run on the test's runtime, so neither freezes
 /// with it — which is exactly the interleaving the fix has to survive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(deprecated)] // tests the drain of the deprecated `graceful_shutdown`, which `Velo::shutdown` would extend with a stream teardown
-async fn graceful_shutdown_timeout_drops_queued_work() {
+async fn shutdown_timeout_drops_queued_work() {
     let server_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .enable_all()
@@ -425,9 +527,18 @@ async fn graceful_shutdown_timeout_drops_queued_work() {
         let (tx, rx) = std::sync::mpsc::channel();
         let transport = transport.clone();
         server_rt.spawn(async move {
+            // No messenger mux: `Velo::shutdown` joins the mux senders
+            // between drain and teardown, and they need this instance's
+            // runtime, which the test freezes across the teardown.
             let built = Velo::builder()
                 .add_transport(transport)
                 .metrics(metrics)
+                .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
+                .messenger_mux(velo::streaming::MuxConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
+                .expect("mux config")
                 .build()
                 .await
                 .expect("server build");
@@ -538,27 +649,36 @@ async fn graceful_shutdown_timeout_drops_queued_work() {
         "both queued messages must be counted work before shutdown starts"
     );
 
-    // Test the messenger drain while its consumer cannot run. Velo shutdown
-    // also joins mux tasks, which need the owning runtime to make progress.
-    tokio::time::timeout(
-        Duration::from_secs(5),
-        server
-            .messenger()
-            .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_millis(50))),
-    )
-    .await
-    .expect("graceful_shutdown must give up once its timeout expires");
+    // Shut down from the test's runtime while the consumer cannot run. The
+    // drain and the teardown need no worker of the instance's runtime; the
+    // streaming half of shutdown, which comes after, joins tasks that do. So
+    // wait for the teardown, then thaw, then let shutdown finish.
+    let shutdown = tokio::spawn({
+        let server = server.clone();
+        async move {
+            server
+                .shutdown(ShutdownPolicy::Timeout(Duration::from_millis(50)))
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), transport.torn_down.notified())
+        .await
+        .expect("shutdown must give up its drain once the timeout expires, then tear down");
 
     // Thaw: the consumer runs again with the teardown token already cancelled
     // and a message still on its queue.
     release_tx.send(()).ok();
+    tokio::time::timeout(Duration::from_secs(5), shutdown)
+        .await
+        .expect("shutdown must finish once the instance's runtime runs again")
+        .expect("shutdown task panicked");
     tokio::time::sleep(Duration::from_millis(300)).await;
 
     assert_eq!(
         ran.load(Ordering::SeqCst),
         1,
         "messages left on the queue at teardown must be dropped, not dispatched \
-         after graceful_shutdown already returned"
+         after the teardown"
     );
 
     // Three messages reached the queue; one was dispatched. The counter has to
@@ -676,7 +796,7 @@ async fn an_undecodable_frame_still_leaves_the_inbound_queue() {
 /// able to disbelieve.
 ///
 /// Starving the loop is the whole trick, and it is the same one
-/// `graceful_shutdown_timeout_drops_queued_work` uses: the instance gets a
+/// `shutdown_timeout_drops_queued_work` uses: the instance gets a
 /// single-worker runtime and a task blocking that worker freezes its dispatch
 /// loop, while admission runs on the test's own runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -820,20 +940,21 @@ async fn a_parked_dispatch_loop_leaves_admitted_messages_uncounted() {
 
 /// Error replies are still admitted work while their transport queue is full.
 #[tokio::test]
-#[allow(deprecated)] // tests the drain of the deprecated `graceful_shutdown`, which `Velo::shutdown` would extend with a stream teardown
-async fn graceful_shutdown_waits_for_negative_reply_admission() {
+async fn shutdown_waits_for_negative_reply_admission() {
     for case in [
         "unknown",
-        "missing_resolver",
+        "bad_rendezvous_handle",
         "ordered_panic",
         "spawned_panic",
     ] {
         let transport = Arc::new(LoopbackTransport::default());
-        let messenger = Messenger::builder()
+        let velo = Velo::builder()
             .add_transport(transport.clone())
+            .mux_only()
             .build()
             .await
             .unwrap();
+        let messenger = velo.messenger();
         messenger
             .register_handler(Handler::unary_handler("ping", |ctx| Ok(Some(ctx.payload))).build())
             .unwrap();
@@ -849,7 +970,7 @@ async fn graceful_shutdown_waits_for_negative_reply_admission() {
                 Handler::unary_handler("_spawned_panic", |_| panic!("test handler panic")).build(),
             )
             .unwrap();
-        messenger.register_peer(messenger.peer_info()).unwrap();
+        velo.register_peer(velo.peer_info()).unwrap();
         messenger
             .unary("ping")
             .unwrap()
@@ -864,7 +985,7 @@ async fn graceful_shutdown_waits_for_negative_reply_admission() {
         assert!(gate.send(()).is_admitted());
         *transport.reply_gate.lock().unwrap() = Some(gate);
         let mut headers = std::collections::HashMap::new();
-        if case == "missing_resolver" {
+        if case == "bad_rendezvous_handle" {
             headers.insert("_rv".to_string(), "missing".to_string());
         }
         let name = match case {
@@ -887,7 +1008,7 @@ async fn graceful_shutdown_waits_for_negative_reply_admission() {
             1,
             "{case}"
         );
-        let shutdown = messenger.graceful_shutdown(ShutdownPolicy::WaitForever);
+        let shutdown = velo.shutdown(ShutdownPolicy::WaitForever);
         tokio::pin!(shutdown);
         assert!(
             tokio::time::timeout(Duration::from_millis(50), &mut shutdown)
@@ -906,7 +1027,7 @@ async fn graceful_shutdown_waits_for_negative_reply_admission() {
         );
         let error = reply.await.unwrap().unwrap_err().to_string();
         let expected = match case {
-            "missing_resolver" => "resolver not configured",
+            "bad_rendezvous_handle" => "invalid rendezvous handle",
             "ordered_panic" | "spawned_panic" => "handler panicked",
             _ => "not found",
         };

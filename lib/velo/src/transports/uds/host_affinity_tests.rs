@@ -4,18 +4,19 @@
 //! UDS host-affinity: peers whose advertised UDS socket is not visible on our
 //! filesystem must not have UDS selected as their primary transport. The
 //! backend's priority sort promotes TCP (or whatever is next) instead.
-
-#![cfg(unix)]
+//!
+//! Unit tests, because `VeloBackend` is crate-private.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use velo::transports::{
+use velo_ext::{InstanceId, PeerInfo, TransportKey, WorkerAddress};
+
+use crate::transports::{
     DataStreams, Transport, VeloBackend, tcp::TcpTransportBuilder, uds::UdsTransportBuilder,
 };
-use velo_ext::{InstanceId, PeerInfo, TransportKey, WorkerAddress};
 
 fn tcp_bind() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)

@@ -813,7 +813,6 @@ async fn test_graceful_shutdown_calls_all_transports() {
 }
 
 #[tokio::test]
-#[allow(deprecated)] // tests the deprecated `Messenger::graceful_shutdown` itself
 async fn final_messenger_drop_stops_transports_once_after_any_teardown_path() {
     for prior_shutdown in ["none", "graceful", "token"] {
         let transport = MockTransport::new("mock", true);
@@ -854,7 +853,6 @@ async fn final_messenger_drop_stops_transports_once_after_any_teardown_path() {
 
 /// A cancelled waiter must not interrupt hooks or let another caller skip them.
 #[tokio::test]
-#[allow(deprecated)] // tests the deprecated `Messenger::graceful_shutdown` itself
 async fn concurrent_shutdown_waits_for_hooks_after_first_waiter_is_cancelled() {
     let mut transport = MockTransport::new("mock", true);
     let (entered_tx, entered) = flume::bounded(1);
@@ -987,7 +985,6 @@ async fn a_teardown_failure_is_seen_with_the_coop_budget_spent() {
 }
 
 #[tokio::test]
-#[allow(deprecated)] // tests the deprecated `Messenger::graceful_shutdown` itself
 async fn failed_teardown_never_reports_successful_shutdown() {
     use futures::FutureExt;
     let mut transport = MockTransport::new("mock", true);
@@ -1058,7 +1055,6 @@ async fn failed_build_with_a_panicking_hook_returns_without_closing() {
 /// failed for good, so running the drain and the RDMA sweep again only spends
 /// their budget (30 s by default for the sweep) before the same panic.
 #[tokio::test]
-#[allow(deprecated)] // tests the deprecated `Velo::graceful_shutdown` itself
 async fn velo_shutdown_retry_after_a_failed_hook_skips_the_drain() {
     use futures::FutureExt;
     let mut transport = MockTransport::new("mock", true);
@@ -1068,12 +1064,12 @@ async fn velo_shutdown_retry_after_a_failed_hook_skips_the_drain() {
         .build()
         .await
         .unwrap();
-    let first = std::panic::AssertUnwindSafe(velo.graceful_shutdown(ShutdownPolicy::WaitForever))
+    let first = std::panic::AssertUnwindSafe(velo.shutdown(ShutdownPolicy::WaitForever))
         .catch_unwind()
         .await;
     assert!(first.is_err());
     let drains = transport.drain_calls.load(Ordering::Relaxed);
-    let retry = std::panic::AssertUnwindSafe(velo.graceful_shutdown(ShutdownPolicy::WaitForever))
+    let retry = std::panic::AssertUnwindSafe(velo.shutdown(ShutdownPolicy::WaitForever))
         .catch_unwind()
         .await;
     assert!(retry.is_err(), "a retry reported a failed teardown as done");
@@ -1088,7 +1084,6 @@ async fn velo_shutdown_retry_after_a_failed_hook_skips_the_drain() {
 /// waiter saw the failure, so the retry must look at the finished teardown
 /// itself, not at what an earlier waiter observed.
 #[tokio::test]
-#[allow(deprecated)] // tests the deprecated `Velo::graceful_shutdown` itself
 async fn velo_shutdown_retry_sees_a_failure_no_waiter_observed() {
     use futures::FutureExt;
     let mut transport = MockTransport::new("mock", true);
@@ -1105,7 +1100,7 @@ async fn velo_shutdown_retry_sees_a_failure_no_waiter_observed() {
         .await
         .unwrap();
     {
-        let first = velo.graceful_shutdown(ShutdownPolicy::WaitForever);
+        let first = velo.shutdown(ShutdownPolicy::WaitForever);
         tokio::pin!(first);
         tokio::select! {
             _ = &mut first => panic!("shutdown finished while its hook was blocked"),
@@ -1124,7 +1119,7 @@ async fn velo_shutdown_retry_sees_a_failure_no_waiter_observed() {
     .await
     .expect("the teardown thread never finished");
     let drains = transport.drain_calls.load(Ordering::Relaxed);
-    let retry = std::panic::AssertUnwindSafe(velo.graceful_shutdown(ShutdownPolicy::WaitForever))
+    let retry = std::panic::AssertUnwindSafe(velo.shutdown(ShutdownPolicy::WaitForever))
         .catch_unwind()
         .await;
     assert!(retry.is_err());

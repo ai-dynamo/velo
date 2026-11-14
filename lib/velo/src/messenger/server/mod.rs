@@ -109,8 +109,9 @@ async fn create_message_handler(
         _ = shutdown_state.teardown_token().cancelled() => {},
     }
 
-    // Phase 3 of graceful shutdown. `VeloBackend::graceful_shutdown` is the
-    // only path that cancels this token *behind a drain*, so under
+    // Phase 3 of graceful shutdown. `Velo::shutdown` (the backend's `drain`,
+    // then `finish_shutdown`) is the only path that cancels this token
+    // *behind a drain*, so under
     // `WaitForever` it can only fire once the queue is provably empty (every
     // queued message holds a guard, so `in_flight == 0` implies nothing is
     // queued). Under `Timeout` it is what stops leftover queued work from
@@ -135,7 +136,7 @@ async fn create_message_handler(
     // outraced by the wake ordering; the remaining window is the instructions
     // between the check and `dispatch_message`, which is as narrow as
     // cancellation-versus-dispatch can be made.
-    // `graceful_shutdown_timeout_drops_queued_work` in
+    // `shutdown_timeout_drops_queued_work` in
     // `lib/velo/tests/drain_rejection.rs` pins it: delete the branch below
     // and the test dispatches 3 messages where it asserts 1.
     //
@@ -862,5 +863,151 @@ mod tests {
 
         handler.await??;
         Ok(())
+    }
+
+    /// A loopback transport whose acks and events go through an admission
+    /// gate that the test holds full. A reply that waits there is still
+    /// counted work.
+    #[derive(Default)]
+    struct GatedLoopback {
+        adapter: std::sync::OnceLock<crate::transports::TransportAdapter>,
+        reply_gate: parking_lot::Mutex<Option<velo_ext::AdmissionGate<()>>>,
+        reply_sent: tokio::sync::Notify,
+    }
+
+    impl velo_ext::Transport for GatedLoopback {
+        fn key(&self) -> velo_ext::TransportKey {
+            velo_ext::TransportKey::from("loopback")
+        }
+
+        fn address(&self) -> velo_ext::WorkerAddress {
+            let mut entries = std::collections::HashMap::<String, Vec<u8>>::new();
+            entries.insert("loopback".to_string(), b"loopback://local".to_vec());
+            velo_ext::WorkerAddress::from_encoded(rmp_serde::to_vec(&entries).unwrap())
+        }
+
+        fn register(&self, _: velo_ext::PeerInfo) -> Result<(), velo_ext::TransportError> {
+            Ok(())
+        }
+
+        fn send_message(
+            &self,
+            _: velo_ext::InstanceId,
+            header: Bytes,
+            payload: Bytes,
+            message_type: velo_ext::MessageType,
+            _: Arc<dyn velo_ext::TransportErrorHandler>,
+        ) -> velo_ext::SendOutcome {
+            let adapter = self.adapter.get().expect("transport was never started");
+            match message_type {
+                velo_ext::MessageType::Message => {
+                    let _ = adapter.admit_message(header, payload);
+                }
+                velo_ext::MessageType::Response => {
+                    let _ = adapter.response_stream.send((header, payload));
+                }
+                velo_ext::MessageType::Ack | velo_ext::MessageType::Event => {
+                    let _ = adapter.event_stream.send((header, payload));
+                    if let Some(gate) = self.reply_gate.lock().as_ref() {
+                        let outcome = gate.send(());
+                        self.reply_sent.notify_one();
+                        return outcome;
+                    }
+                }
+                velo_ext::MessageType::ShuttingDown => {
+                    let _ = adapter.shutdown_stream.send((header, payload));
+                }
+            }
+            velo_ext::SendOutcome::Admitted
+        }
+
+        fn start(
+            &self,
+            _: velo_ext::InstanceId,
+            channels: crate::transports::TransportAdapter,
+            _: tokio::runtime::Handle,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+            let _ = self.adapter.set(channels);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn shutdown(&self) {}
+
+        fn check_health(
+            &self,
+            _: velo_ext::InstanceId,
+            _: std::time::Duration,
+        ) -> futures::future::BoxFuture<'_, Result<(), velo_ext::HealthCheckError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// The error reply to a staged payload on a messenger with no resolver
+    /// is counted work until the transport admits it, so the drain waits for
+    /// it. Every `Velo` installs a resolver, so only a bare `Messenger`
+    /// reaches this branch.
+    #[tokio::test]
+    async fn a_no_resolver_error_reply_holds_the_drain_until_admitted() {
+        let transport = Arc::new(GatedLoopback::default());
+        let messenger = crate::messenger::MessengerParts::new()
+            .add_transport(transport.clone())
+            .build()
+            .await
+            .unwrap();
+        messenger
+            .register_handler(
+                crate::messenger::Handler::unary_handler("ping", |ctx| Ok(Some(ctx.payload)))
+                    .build(),
+            )
+            .unwrap();
+        messenger.register_peer(messenger.peer_info()).unwrap();
+        // Warm-up: the `_hello` handshake completes before the gate fills.
+        timeout(
+            Duration::from_secs(5),
+            messenger
+                .unary("ping")
+                .unwrap()
+                .instance(messenger.instance_id())
+                .send(),
+        )
+        .await
+        .expect("warm-up timed out")
+        .unwrap();
+        let state = transport.adapter.get().unwrap().shutdown_state.clone();
+        state.wait_for_drain().await;
+
+        let (tx, rx) = flume::bounded(1);
+        let gate = velo_ext::AdmissionGate::new(tx, tokio::runtime::Handle::current());
+        assert!(gate.send(()).is_admitted());
+        *transport.reply_gate.lock() = Some(gate);
+        let mut headers = std::collections::HashMap::new();
+        headers.insert("_rv".to_string(), "missing".to_string());
+        let reply = tokio::spawn(
+            messenger
+                .unary_streaming("_missing")
+                .headers(headers)
+                .instance(messenger.instance_id())
+                .send(),
+        );
+        timeout(Duration::from_secs(2), transport.reply_sent.notified())
+            .await
+            .expect("the error reply was not sent");
+        assert_eq!(state.in_flight_count(), 1);
+
+        let shutdown = messenger.graceful_shutdown(crate::transports::ShutdownPolicy::WaitForever);
+        tokio::pin!(shutdown);
+        assert!(
+            timeout(Duration::from_millis(50), &mut shutdown)
+                .await
+                .is_err(),
+            "the drain finished while the error reply waited for admission"
+        );
+        rx.try_recv().expect("release reply admission");
+        timeout(Duration::from_secs(2), shutdown)
+            .await
+            .expect("the drain did not finish after the reply was admitted");
+        assert_eq!(state.in_flight_count(), 0);
+        let error = reply.await.unwrap().unwrap_err().to_string();
+        assert!(error.contains("resolver not configured"), "{error}");
     }
 }

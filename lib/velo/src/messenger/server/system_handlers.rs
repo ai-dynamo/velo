@@ -34,7 +34,7 @@ fn create_hello_handler() -> Handler {
             "Received _hello handshake from peer"
         );
 
-        ctx.msg.register_peer_inner(peer_info.clone())?;
+        ctx.msg.register_peer(peer_info.clone())?;
 
         let handlers = ctx.msg.list_local_handlers();
 

@@ -144,10 +144,10 @@ pub(super) async fn capture_pair() -> (Arc<Messenger>, Arc<Messenger>, flume::Re
         .await
         .expect("capture messenger");
     sender
-        .register_peer_inner(capture.peer_info())
+        .register_peer(capture.peer_info())
         .expect("register capture");
     capture
-        .register_peer_inner(sender.peer_info())
+        .register_peer(sender.peer_info())
         .expect("register sender");
 
     let (batch_tx, batches) = flume::unbounded::<Bytes>();
@@ -533,7 +533,7 @@ pub(super) async fn stalled_harness_with_hooks(
     // gate is the only thing under test.
     let peer_instance = velo_ext::InstanceId::new_v4();
     sender
-        .register_peer_inner(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
+        .register_peer(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
         .expect("register peer");
 
     let registry = prometheus::Registry::new();
