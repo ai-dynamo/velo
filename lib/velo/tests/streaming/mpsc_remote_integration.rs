@@ -17,12 +17,11 @@ mod common;
 use std::time::Duration;
 
 use futures::StreamExt;
-use velo::streaming::control::StreamCancelHandle;
-use velo::streaming::mpsc::{
-    MpscAnchorAttachRequest, MpscAnchorAttachResponse, MpscAnchorCancelRequest,
-    MpscAnchorDetachRequest,
-};
 use velo::streaming::{AttachError, MpscAnchorConfig, MpscFrame, SenderId, StreamAnchorHandle};
+use velo::test_helpers::{
+    MpscAnchorAttachRequest, MpscAnchorAttachResponse, MpscAnchorCancelRequest,
+    MpscAnchorDetachRequest, StreamCancelHandle,
+};
 use velo_ext::WorkerId;
 
 fn roundtrip_handle(handle: StreamAnchorHandle) -> StreamAnchorHandle {

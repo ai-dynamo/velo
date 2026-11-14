@@ -145,7 +145,7 @@ async fn test_cancel_04_drop_no_sender() {
 // TCP helpers + TEST-CANCEL-03 (remote two-worker cancel)
 // ---------------------------------------------------------------------------
 
-use velo::streaming::control::StreamCancelRequest;
+use velo::test_helpers::StreamCancelRequest;
 
 /// TEST-CANCEL-03: Remote cross-worker cancel via _stream_cancel AM over TCP.
 ///
@@ -225,8 +225,8 @@ async fn test_cancel_03_remote_cancel() {
 // test asks for an idle producer, which only the second path cannot serve.
 
 use futures::StreamExt;
+use velo::StreamOpenTicket;
 use velo::Velo;
-use velo::streaming::control::StreamOpenTicket;
 use velo::streaming::{MuxConfig, StreamAnchorHandle, StreamFrame};
 
 /// Long enough to absorb a loaded machine, short enough that a hang fails the
@@ -334,7 +334,7 @@ async fn cancel_with_a_record_in_flight_already_errors() {
 }
 
 /// Behavioural. Under zero-RTT setup there is no attach, so the anchor never
-/// learns a [`velo::streaming::control::StreamCancelHandle`] and cannot cancel
+/// learns a stream cancel handle and cannot cancel
 /// its producer directly. The producer is idle, so the ingress fault that rides
 /// on the next arriving record cannot reach it either. The close the dying
 /// pre-bind posts is the only thing left, and this is the test of it.

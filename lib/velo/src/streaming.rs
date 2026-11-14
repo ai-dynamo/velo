@@ -26,7 +26,7 @@
 //! - [`sender::StreamSender`]: typed sender for pushing frames with heartbeat and drop safety
 
 pub mod anchor;
-pub mod control;
+pub(crate) mod control;
 pub(crate) mod deadline;
 pub mod frame;
 #[cfg(feature = "grpc")]

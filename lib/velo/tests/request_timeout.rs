@@ -212,58 +212,6 @@ fn a_staged_send_created_outside_tokio_still_expires_on_its_owner() {
     });
 }
 
-#[allow(deprecated)] // a `RendezvousManager` built by hand over a bare `Messenger`, which `Velo` registers itself
-fn ttl_data_expires_after_handler_registration(stage_before_handlers: bool) -> bool {
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(2)
-        .enable_all()
-        .build()
-        .unwrap();
-    let messenger = runtime
-        .block_on(Messenger::builder().add_transport(new_transport()).build())
-        .unwrap();
-    let manager = Arc::new(RendezvousManager::new(messenger.instance_id().worker_id()));
-    assert!(tokio::runtime::Handle::try_current().is_err());
-    let stage = || {
-        manager.register_data_with(
-            Bytes::from_static(b"expires"),
-            velo::rendezvous::RegisterOptions::new().ttl(Duration::from_millis(20)),
-        )
-    };
-    let handle = if stage_before_handlers {
-        let handle = stage();
-        manager.register_handlers(Arc::clone(&messenger)).unwrap();
-        handle
-    } else {
-        manager.register_handlers(Arc::clone(&messenger)).unwrap();
-        stage()
-    };
-    runtime.block_on(async {
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while manager.data_store().metadata(handle.unpack().1).is_some() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .is_ok()
-    })
-}
-
-/// Binding the owner's runtime must sweep TTL data staged before its handlers.
-#[test]
-#[ignore = "F4: binding a runtime leaves pre-handler TTL data without a reaper"]
-fn binding_the_owner_runtime_sweeps_data_staged_before_its_handlers() {
-    assert!(
-        ttl_data_expires_after_handler_registration(true),
-        "TTL data stayed staged after the owner's runtime was bound"
-    );
-}
-
-#[test]
-fn a_standalone_owner_expires_data_staged_after_its_handlers() {
-    assert!(ttl_data_expires_after_handler_registration(false));
-}
-
 /// A staged request's fetch gives the receiver's response slot back when the
 /// caller's timeout runs out.
 ///

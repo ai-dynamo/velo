@@ -57,7 +57,7 @@
 //! transfer is running. Holding an RDMA lease idle past its deadline is not
 //! supported in v1 — hold it briefly, or take the data and release.
 
-pub mod consumer;
+pub(crate) mod consumer;
 /// The RDMA transfer descriptor. Runtime-internal: it is a wire format velo
 /// owns end to end, and nothing outside the crate constructs or reads one.
 ///
@@ -71,7 +71,7 @@ pub mod consumer;
 #[allow(dead_code)]
 pub(crate) mod descriptor;
 pub mod handle;
-pub mod handlers;
+pub(crate) mod handlers;
 #[cfg(test)]
 mod owner_release_tests;
 /// Slot bodies staged in RDMA-registered memory. Gated with the registration
@@ -79,20 +79,22 @@ mod owner_release_tests;
 /// holds staged memory, not something a caller names.
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 pub(crate) mod pinned;
-pub mod protocol;
+pub(crate) mod protocol;
 #[cfg(test)]
 mod reclaim_tests;
+#[cfg(test)]
+mod ttl_tests;
 // The RDMA registration layer, gated exactly as `transports::ucx` is.
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 pub mod rdma;
-pub mod store;
+pub(crate) mod store;
 pub mod transparent;
 pub mod write;
 
 pub use handle::DataHandle;
 pub use protocol::DataMetadata;
 pub use store::{RegisterOptions, StageMode};
-pub use transparent::{RendezvousResolver, RendezvousStager};
+pub(crate) use transparent::{RendezvousResolver, RendezvousStager};
 pub use write::RendezvousWrite;
 
 use std::sync::{Arc, OnceLock, Weak};
@@ -108,7 +110,7 @@ use velo_ext::WorkerId;
 /// Each Velo worker creates one `RendezvousManager`. It owns the [`DataStore`](store::DataStore)
 /// for locally staged data and provides methods for both owner-side (register) and
 /// consumer-side (get, release) operations.
-pub struct RendezvousManager {
+pub(crate) struct RendezvousManager {
     /// The WorkerId of the worker that owns this manager.
     worker_id: WorkerId,
     /// The data store holding staged slots and active transfers.
@@ -1094,11 +1096,6 @@ impl RendezvousManager {
         result
     }
 
-    /// Get the worker ID of this manager.
-    pub fn worker_id(&self) -> WorkerId {
-        self.worker_id
-    }
-
     /// Drop the owner's reference to a handle this worker staged. See
     /// [`Velo::unregister_data`](crate::Velo::unregister_data).
     ///
@@ -1110,6 +1107,11 @@ impl RendezvousManager {
     }
 
     /// Get direct access to the data store (for transparent mode integration).
+    #[cfg(any(
+        test,
+        feature = "test-helpers",
+        all(target_os = "linux", feature = "ucx")
+    ))]
     pub fn data_store(&self) -> &Arc<store::DataStore> {
         &self.store
     }

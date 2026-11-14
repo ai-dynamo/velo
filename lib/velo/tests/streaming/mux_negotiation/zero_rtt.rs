@@ -16,8 +16,9 @@
 //! `use super::*` shares them whole, the way `outcome` does.
 
 use super::*;
+use velo::StreamOpenTicket;
 use velo::streaming::AttachError;
-use velo::streaming::control::{AnchorAttachRequest, StreamOpenTicket};
+use velo::test_helpers::AnchorAttachRequest;
 
 /// Stop leaves output usable; cancel wakes an idle producer on both open paths.
 #[tokio::test(flavor = "multi_thread")]

@@ -84,9 +84,9 @@ fn budget_saturates_rather_than_wrapping_when_the_envelope_exceeds_the_ceiling()
 
 /// Install transparent large-payload support with the given threshold.
 fn install_stager(messenger: &Messenger, threshold: usize) {
-    let manager = std::sync::Arc::new(crate::RendezvousManager::new(velo_ext::WorkerId::from_u64(
-        7,
-    )));
+    let manager = std::sync::Arc::new(crate::rendezvous::RendezvousManager::new(
+        velo_ext::WorkerId::from_u64(7),
+    ));
     messenger.set_large_payload_support_inner(
         std::sync::Arc::new(RendezvousStager::new(manager.clone()).with_threshold(threshold)),
         std::sync::Arc::new(crate::rendezvous::transparent::RendezvousResolver::new(

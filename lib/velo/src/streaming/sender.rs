@@ -172,8 +172,8 @@ pub enum Retirement {
     /// behind every record before it. Over the messenger mux, the batch that
     /// carries the terminal was admitted by the transport. One exception: an
     /// item larger than the eager budget (the stager's threshold,
-    /// `RendezvousStager::with_threshold`, 256 KiB by default, or less on a
-    /// transport with a smaller frame limit) is staged on
+    /// [`Velo::staging_threshold`](crate::Velo::staging_threshold), 256 KiB by
+    /// default, or less on a transport with a smaller frame limit) is staged on
     /// this node until the consumer pulls it, so `Sent` can resolve while
     /// this node still holds it; the "Known limitations" appendix of the book says
     /// what that means for a shutdown. On the same worker, the terminal is in

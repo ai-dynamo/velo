@@ -16,7 +16,7 @@ use velo_ext::{PeerInfo, TransportKey};
 use crate::Velo;
 use crate::observability::VeloMetrics;
 use crate::observability::test_helpers::MetricSnapshot;
-use crate::streaming::mpsc::MpscAnchorAttachRequest;
+use crate::streaming::mpsc::control::MpscAnchorAttachRequest;
 use crate::streaming::tcp_transport::TCP_STREAM_KEY as LEGACY_KEY;
 use crate::streaming::transport::FrameTransport;
 use crate::streaming::{MESSENGER_MUX_KEY as MUX_KEY, MuxConfig, StreamAnchorHandle, StreamFrame};

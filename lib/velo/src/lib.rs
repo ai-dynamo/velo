@@ -31,6 +31,9 @@ pub mod transports;
 #[cfg(feature = "simulation")]
 pub mod simulation;
 
+#[cfg(feature = "test-helpers")]
+pub mod test_helpers;
+
 #[cfg(test)]
 mod learned_peer_tests;
 #[cfg(test)]
@@ -76,7 +79,7 @@ pub use crate::streaming::{
 
 // Rendezvous
 pub use crate::rendezvous::{
-    DataHandle, DataMetadata, RegisterOptions, RendezvousManager, RendezvousWrite, StageMode,
+    DataHandle, DataMetadata, RegisterOptions, RendezvousWrite, StageMode,
 };
 
 // RDMA registration. Gated exactly as `transports::ucx` is: these types are the
@@ -1614,10 +1617,8 @@ impl Velo {
     /// The payload size above which this node stages a message through
     /// rendezvous instead of sending it inline.
     ///
-    /// A payload is staged when its length is greater than this value. It is
-    /// the threshold of the stager this node installed, which can differ from
-    /// [`rendezvous::transparent::DEFAULT_THRESHOLD`] (see
-    /// [`RendezvousStager::with_threshold`](crate::rendezvous::RendezvousStager::with_threshold)).
+    /// A payload is staged when its length is greater than this value: the
+    /// threshold of the stager this node installed, 256 KiB by default.
     pub fn staging_threshold(&self) -> usize {
         self.inner
             .messenger
@@ -1708,13 +1709,46 @@ impl Velo {
             .to_string()
     }
 
-    /// Get the underlying rendezvous manager for direct access.
-    #[deprecated(
-        since = "0.22.1",
-        note = "use the rendezvous methods on `Velo`: `unregister_data` instead of `data_store()` with `ref_decrement` and `try_free`, `register_data_in_region`, `register_data`, `get`, `detach`, `release`, `staging_threshold`"
-    )]
-    pub fn rendezvous_manager(&self) -> &crate::rendezvous::RendezvousManager {
-        &self.inner.rendezvous_manager
+    /// The length of the payload this instance holds staged under
+    /// `local_id`, or `None` once it is gone.
+    ///
+    /// Exposed for tests only. Every way a staged payload ends (release,
+    /// detach, a reaped lease, a TTL, the owner's own release) must free its
+    /// slot, and a slot that is never freed holds its bytes for the life of
+    /// the node.
+    #[cfg(feature = "test-helpers")]
+    pub fn staged_payload_len(&self, local_id: u64) -> Option<u64> {
+        self.inner
+            .rendezvous_manager
+            .data_store()
+            .get_total_len(local_id)
+    }
+
+    /// What this instance's `_rv_acquire` handler answers to `request` and
+    /// `headers`, as an owner that is not draining.
+    ///
+    /// Exposed for tests only, for a test that wraps the handler, for example
+    /// to stall a fetch.
+    #[cfg(feature = "test-helpers")]
+    pub fn serve_rv_acquire(
+        &self,
+        request: &crate::test_helpers::RvAcquireRequest,
+        headers: Option<&std::collections::HashMap<String, String>>,
+    ) -> Result<crate::test_helpers::AcquireResponse> {
+        crate::rendezvous::handlers::acquire_lease(
+            self.inner.rendezvous_manager.data_store(),
+            request,
+            headers,
+        )
+    }
+
+    /// Arm one fault for this instance's next RDMA transfer. See
+    /// [`RdmaTestHook`](crate::rendezvous::RdmaTestHook).
+    ///
+    /// Exposed for tests only.
+    #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    pub fn arm_rdma_hook(&self, hook: crate::rendezvous::RdmaTestHook) {
+        self.inner.rendezvous_manager.arm_rdma_hook(hook);
     }
 
     // -----------------------------------------------------------------------
@@ -1849,6 +1883,7 @@ impl Velo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rendezvous::RendezvousManager;
 
     /// Every mode against both kill-switch forms, the config field and the
     /// environment variable. Only a node that opted in to the per-stream path

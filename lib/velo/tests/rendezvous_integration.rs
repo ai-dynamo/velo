@@ -493,7 +493,7 @@ fn answer_acquires_with(
     chunk_count: u32,
     chunk: &'static [u8],
 ) {
-    use velo::rendezvous::protocol::{AcquireResponse, RvAcquireRequest};
+    use velo::test_helpers::{AcquireResponse, RvAcquireRequest};
     owner
         .messenger()
         .register_streaming_handler(

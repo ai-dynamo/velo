@@ -55,7 +55,7 @@ use bytes::Bytes;
 use prometheus::Registry;
 use velo::observability::VeloMetrics;
 use velo::rendezvous::RdmaTestHook;
-use velo::rendezvous::protocol::AcquireResponse;
+use velo::test_helpers::AcquireResponse;
 use velo::transports::ucx::UcxTransportBuilder;
 use velo::*;
 
@@ -270,7 +270,7 @@ where
 /// and has no `Velo` form.
 #[allow(deprecated)]
 fn arm_rdma_hook(velo: &Velo, hook: RdmaTestHook) {
-    velo.rendezvous_manager().arm_rdma_hook(hook);
+    velo.arm_rdma_hook(hook);
 }
 
 async fn slot_is_gone(node: &Node, handle: DataHandle) -> bool {
