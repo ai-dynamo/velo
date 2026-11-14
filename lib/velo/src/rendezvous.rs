@@ -368,7 +368,6 @@ impl RendezvousManager {
                 started.elapsed(),
             );
             m.record_rendezvous_bytes(RendezvousOp::Register, data_len);
-            m.set_rendezvous_active_slots(self.store.slots.len());
         }
         DataHandle::pack(self.worker_id, local_id)
     }

@@ -353,15 +353,19 @@ impl DataStore {
         self.metrics.as_ref()
     }
 
-    /// Set `velo_rendezvous_active_slots` to the slots staged now.
+    /// Take one from `velo_rendezvous_active_slots`.
     ///
     /// Called by each call here that removes a slot, so every path that frees
-    /// one refreshes the gauge: the owner's call, local and remote detach and
+    /// one moves the gauge: the owner's call, local and remote detach and
     /// release, a `LeaseGuard` drop, and the reapers. A caller that refreshed
     /// it after its own free missed the frees it did not know it caused.
-    fn refresh_active_slots(&self) {
+    ///
+    /// A step of one, not the slot count: a count read after a free can be
+    /// older than another thread's, and set last. Only the call whose remove
+    /// returned the slot gets here, so each slot is counted out once.
+    fn note_slot_removed(&self) {
         if let Some(m) = &self.metrics {
-            m.set_rendezvous_active_slots(self.slots.len());
+            m.dec_rendezvous_active_slots();
         }
     }
 
@@ -399,6 +403,11 @@ impl DataStore {
         let local_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let total_len = body.total_len();
         let ttl = opts.as_ref().and_then(|o| o.ttl);
+        // Counted in before the insert, so that a free on another thread
+        // cannot count the slot out first and leave the gauge below 0.
+        if let Some(m) = &self.metrics {
+            m.inc_rendezvous_active_slots();
+        }
         self.slots.insert(
             local_id,
             DataSlot {
@@ -741,7 +750,7 @@ impl DataStore {
         if slot.ttl.is_some() {
             self.expiring.remove(&local_id);
         }
-        self.refresh_active_slots();
+        self.note_slot_removed();
         slot.body.to_bytes()
     }
 
@@ -758,7 +767,7 @@ impl DataStore {
         if slot.ttl.is_some() {
             self.expiring.remove(&local_id);
         }
-        self.refresh_active_slots();
+        self.note_slot_removed();
     }
 
     /// Get the data bytes for a slot (for inline responses or local fast-path).
@@ -906,7 +915,7 @@ impl DataStore {
                 // to preserve and nothing an in-flight pull could have read.
                 Some(None) => {
                     if self.slots.remove(&local_id).is_some() {
-                        self.refresh_active_slots();
+                        self.note_slot_removed();
                         dropped += 1;
                     }
                 }
@@ -961,7 +970,7 @@ impl DataStore {
         if self.slots.remove(&local_id).is_none() {
             return false;
         }
-        self.refresh_active_slots();
+        self.note_slot_removed();
         let mut ended = Vec::new();
         self.active_leases.retain(|lease_id, held| {
             if *held == local_id {

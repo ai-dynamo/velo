@@ -152,3 +152,51 @@ async fn a_remote_release_refreshes_the_gauge() {
     assert!(slot_freed, "the owner's _rv_release handler freed the slot");
     assert_eq!(gauge, 0.0, "the owner's _rv_release handler freed the slot");
 }
+
+/// Eight threads each free a slot at the same time. With every slot gone the
+/// gauge must read 0.
+///
+/// A gauge set to the slot count read after a free can go stale: thread A
+/// frees and reads 1 left, thread B frees and reads 0 and sets 0, then A
+/// sets 1. The gauge then reads 1 with nothing staged until the next change.
+/// A barrier lines the frees up, and each round reads the gauge while every
+/// thread waits. Set from the count, this failed within a few hundred rounds
+/// on every run.
+#[test]
+fn concurrent_frees_leave_the_gauge_at_zero() {
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 5_000;
+    let registry = Registry::new();
+    let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
+    let store = DataStore::with_metrics(Some(metrics));
+    let barrier = std::sync::Barrier::new(THREADS);
+    let stale = parking_lot::Mutex::new(None);
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            let (store, registry, barrier, stale) = (&store, &registry, &barrier, &stale);
+            scope.spawn(move || {
+                for round in 0..ROUNDS {
+                    let slot = store.register(Bytes::from_static(PAYLOAD), None);
+                    barrier.wait();
+                    assert!(store.release_owner_reference(slot));
+                    if barrier.wait().is_leader() {
+                        let value = active_slots(registry);
+                        if value != 0.0 {
+                            *stale.lock() = Some((round, value));
+                        }
+                    }
+                    // Every thread sees the leader's verdict for this round.
+                    barrier.wait();
+                    if stale.lock().is_some() {
+                        return;
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(
+        stale.into_inner(),
+        None,
+        "(round, gauge) with every slot freed"
+    );
+}
