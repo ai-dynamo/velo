@@ -107,6 +107,10 @@ async fn ping(from: &Velo, to: &Velo, by_worker: bool) {
 enum Learned {
     /// `Velo::register_peer`.
     Velo,
+    /// `Velo::discover_and_register_peer`, which asks discovery for the
+    /// consumer's instance id. Until 0.23.0 this case called
+    /// `Messenger::register_peer`, which is no longer public.
+    DiscoverAndRegister,
     /// The `_hello` the consumer sends on its first message to the producer.
     Hello,
     /// Discovery of the consumer when the producer first sends to its worker id.
@@ -136,7 +140,12 @@ async fn a_default_node_learns_peers_without_a_per_stream_transport() {
     .expect("this binary installs one subscriber");
 
     for consumer_opted_in in [false, true] {
-        for path in [Learned::Velo, Learned::Hello, Learned::Discovery] {
+        for path in [
+            Learned::Velo,
+            Learned::DiscoverAndRegister,
+            Learned::Hello,
+            Learned::Discovery,
+        ] {
             let case = format!("{path:?}, consumer opted in {consumer_opted_in}");
             let consumer = if consumer_opted_in {
                 builder(None).stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
@@ -146,16 +155,23 @@ async fn a_default_node_learns_peers_without_a_per_stream_transport() {
             .build()
             .await
             .unwrap();
-            let discovery = matches!(path, Learned::Discovery).then(|| consumer.peer_info());
+            let discovery = matches!(path, Learned::Discovery | Learned::DiscoverAndRegister)
+                .then(|| consumer.peer_info());
             let producer = builder(discovery).build().await.unwrap();
             // Only what this case logs from here on.
             logs.take();
             match path {
                 Learned::Velo => producer.register_peer(consumer.peer_info()).unwrap(),
+                Learned::DiscoverAndRegister => producer
+                    .discover_and_register_peer(consumer.instance_id())
+                    .await
+                    .unwrap(),
                 Learned::Hello | Learned::Discovery => {}
             }
             match path {
-                Learned::Velo => ping(&producer, &consumer, false).await,
+                Learned::Velo | Learned::DiscoverAndRegister => {
+                    ping(&producer, &consumer, false).await
+                }
                 Learned::Hello => {
                     consumer.register_peer(producer.peer_info()).unwrap();
                     ping(&consumer, &producer, false).await;
