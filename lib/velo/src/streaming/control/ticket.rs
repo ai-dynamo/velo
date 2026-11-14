@@ -6,7 +6,7 @@
 //! Split out of `control.rs` because it is a pure value type with no
 //! dependency on the pump or the attach handlers that live there — the only
 //! things this module touches are the wire types it mirrors
-//! ([`super::AnchorAttachResponse`]) and the flow-control limits it is minted
+//! (`AnchorAttachResponse`) and the flow-control limits it is minted
 //! from.
 
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ use std::time::Duration;
 
 /// The terms a stream opens on, carried to the sender instead of asked for.
 ///
-/// Exactly the six fields of [`super::AnchorAttachResponse::Ok`], because it
+/// Exactly the six fields of `AnchorAttachResponse::Ok`, because it
 /// is the same answer arriving by a different road: the receiver decides them
 /// all without needing anything from the sender, so nothing obliges it to
 /// wait to be asked. An application that already sends the worker a request
@@ -27,7 +27,7 @@ use std::time::Duration;
 /// are identical today: the response is a reply whose compatibility is owed
 /// to every peer that sends an attach, while a ticket is only ever read by a
 /// peer new enough to have been sent one, so tying them together would buy
-/// nothing. [`super::AnchorAttachRequest`] and [`super::AnchorAttachResponse`]
+/// nothing. `AnchorAttachRequest` and `AnchorAttachResponse`
 /// gain and lose no field for any of this. `#[non_exhaustive]` is what keeps
 /// the divergence free: fields stay `pub` for reading, but a type this
 /// permissive would otherwise make adding a field a breaking change for
@@ -48,10 +48,10 @@ use std::time::Duration;
 #[non_exhaustive]
 pub struct StreamOpenTicket {
     /// The transport the sender must open on, as
-    /// [`super::AnchorAttachResponse::Ok::streaming_transport_key`].
+    /// `AnchorAttachResponse::Ok::streaming_transport_key`.
     pub streaming_transport_key: velo_ext::TransportKey,
     /// The cadence the sender must beat at, as
-    /// [`super::AnchorAttachResponse::Ok::heartbeat_interval_ms`].
+    /// `AnchorAttachResponse::Ok::heartbeat_interval_ms`.
     ///
     /// No `#[serde(default)]`, for the same reason as `routing_session_id`: a
     /// missing value is corruption, not a legacy peer, and defaulting it to
@@ -59,7 +59,7 @@ pub struct StreamOpenTicket {
     /// of failing to decode.
     pub heartbeat_interval_ms: u64,
     /// The receiver-allocated routing slot this stream owns, as
-    /// [`super::AnchorAttachResponse::Ok::routing_session_id`].
+    /// `AnchorAttachResponse::Ok::routing_session_id`.
     ///
     /// No `#[serde(default)]`: unlike the response this mirrors, a ticket has
     /// no older sender that predates this field (its own doc says so above),
@@ -79,7 +79,7 @@ pub struct StreamOpenTicket {
     /// `NegotiatedLimits::slot_byte_budget`, the already-resolved value, never
     /// the configured `0` that means "use the default". That zero-means-default
     /// reading belongs to the wire encoding this field mirrors —
-    /// [`super::AnchorAttachResponse::Ok`], which `NegotiatedLimits::from_wire`
+    /// `AnchorAttachResponse::Ok`, which `NegotiatedLimits::from_wire`
     /// still interprets on the open path — not to a ticket, which carries only
     /// the resolved value. Code spans rather than links on purpose: this type
     /// is public and `NegotiatedLimits` is crate-private, so rustdoc flags the
@@ -88,7 +88,7 @@ pub struct StreamOpenTicket {
     /// No `#[serde(default)]`, for the same reason as `routing_session_id`.
     pub slot_byte_budget: u32,
     /// The mux lane the receiver put the slot on, as
-    /// [`super::AnchorAttachResponse::Ok::lane`]. The sender clamps it to the
+    /// `AnchorAttachResponse::Ok::lane`. The sender clamps it to the
     /// lanes it keeps to the receiver.
     ///
     /// Last, defaulted, and left out when zero, so a lane-0 ticket encodes to

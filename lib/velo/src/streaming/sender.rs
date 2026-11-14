@@ -403,7 +403,7 @@ impl<T: Serialize> StreamSender<T> {
     /// Use in a `tokio::select!` to stop production proactively:
     /// ```no_run
     /// # async fn example() {
-    /// # let mut sender: velo::streaming::StreamSender<u32> = todo!();
+    /// # let mut sender: velo::StreamSender<u32> = todo!();
     /// # async fn produce() -> u32 { 0 }
     /// loop {
     ///     tokio::select! {

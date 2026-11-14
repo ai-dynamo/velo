@@ -1588,7 +1588,7 @@ impl Velo {
     /// for a GET to transfer.
     ///
     /// To stage without a copy, register the memory yourself and use
-    /// [`register_data_in_region`](Self::register_data_in_region).
+    /// `register_data_in_region` (UCX builds).
     pub async fn register_data_pinned(&self, data: &[u8]) -> DataHandle {
         self.inner
             .rendezvous_manager

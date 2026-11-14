@@ -643,15 +643,15 @@ impl StreamController {
 ///
 /// ```rust,no_run
 /// use futures::StreamExt;
-/// use velo::streaming::{AnchorManager, StreamFrame};
+/// use velo::{StreamFrame, Velo};
 ///
-/// # async fn example(mgr: &AnchorManager) -> anyhow::Result<()> {
+/// # async fn example(velo: &Velo) -> anyhow::Result<()> {
 /// // Consumer creates an anchor
-/// let mut anchor = mgr.create_anchor::<String>();
+/// let mut anchor = velo.create_anchor::<String>();
 /// let handle = anchor.handle();
 ///
 /// // Producer attaches (could be on a different worker)
-/// let sender = mgr.attach_stream_anchor::<String>(handle).await?;
+/// let sender = velo.attach_anchor::<String>(handle).await?;
 ///
 /// // Send items
 /// sender.send("hello".into()).await?;

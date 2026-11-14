@@ -20,12 +20,12 @@
 //! the payload will travel. Both answers end in the same detach-or-release, so
 //! a caller writes the same code either way.
 //!
-//! * **Chunked** ([`AcquireResponse::Ready`](protocol::AcquireResponse::Ready))
+//! * **Chunked** (`AcquireResponse::Ready`)
 //!   — the owner opens a transfer and the consumer pulls `_rv_pull` chunks of
 //!   `DEFAULT_CHUNK_SIZE` (512 KiB) until it has them all.
 //!   Always available, for every slot and every consumer.
 //!
-//! * **RDMA** ([`AcquireResponse::Rdma`](protocol::AcquireResponse::Rdma)) —
+//! * **RDMA** (`AcquireResponse::Rdma`) —
 //!   the owner answers with a [descriptor](descriptor::RdmaDescriptor) naming
 //!   an address, a length and a packed remote key, and the consumer's NIC reads
 //!   the bytes directly with a single `ucp_get_nbx`. No chunk round trips, no
@@ -34,7 +34,7 @@
 //! The RDMA answer requires four things at once, and any one of them missing
 //! means chunked: the slot is staged in registered memory
 //! ([`Velo::register_data_pinned`](crate::Velo::register_data_pinned) or
-//! [`Velo::register_data_in_region`](crate::Velo::register_data_in_region)),
+//! `Velo::register_data_in_region`),
 //! the consumer advertised a backend the owner can serve, the payload is at
 //! least [`rdma_min_bytes`](rdma::RdmaRendezvousConfig::rdma_min_bytes), and
 //! neither side has the RDMA path switched off. GET-first and decided at
