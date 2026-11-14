@@ -1995,6 +1995,52 @@ async fn ping_message_to(
     );
 }
 
+/// Wire B's path to A, then give A its endpoint to B, with B's endpoint
+/// creation slower than A's idle timeout.
+///
+/// The order is what makes the reaper tests independent of wireup time. B's
+/// first frame to A waits for B's `ucp_ep_create`, and under load that took
+/// 630 to 1250 ms, past the 500 ms timeout. With A's endpoint created first,
+/// A saw nothing from B for that long, reaped the endpoint correctly, and B's
+/// first Message was lost the way `reaping_disrupts_the_peers_path_back`
+/// shows. B's slow create is forced here, so the old order fails every time.
+///
+/// B's warm-up Message reaches A before A has an endpoint to B, so it stamps
+/// nothing: the wait for `eps_inbound_unmatched` checks that. A's endpoint is
+/// then created by A's own send and stamped by nothing from B.
+async fn wire_peer_path_first(a: &Node, b: &Node, errs: &Arc<CountingErrors>) {
+    b.transport
+        .shared
+        .ep_create_delay_ms
+        .store((IDLE * 2).as_millis() as u64, Ordering::Relaxed);
+    assert_eq!(eps_open(a), 0);
+    let unmatched = a
+        .transport
+        .shared
+        .eps_inbound_unmatched
+        .load(Ordering::SeqCst);
+    ping_message(b, a, errs).await;
+    assert!(
+        wait_until(T, || a
+            .transport
+            .shared
+            .eps_inbound_unmatched
+            .load(Ordering::SeqCst)
+            > unmatched)
+        .await,
+        "B's warm-up frame was never seen by A's stamp pass"
+    );
+    ping_message(a, b, errs).await;
+    assert_eq!(eps_open(a), 1);
+}
+
+fn eps_stamped_inbound(node: &Node) -> u64 {
+    node.transport
+        .shared
+        .eps_stamped_inbound
+        .load(Ordering::SeqCst)
+}
+
 /// The builder raises a sub-floor idle timeout rather than honouring it.
 ///
 /// Asserted on its own because every other reaper test uses a value at or above
@@ -2212,15 +2258,19 @@ async fn a_peer_that_keeps_sending_keeps_its_endpoint() {
     let errs = CountingErrors::new();
 
     // A owns an endpoint to B, and then never sends again.
-    ping_message(&a, &b, &errs).await;
-    assert_eq!(eps_open(&a), 1);
+    wire_peer_path_first(&a, &b, &errs).await;
 
     // B sends for comfortably longer than the idle window, at well under it.
+    let stamped = eps_stamped_inbound(&a);
     let deadline = tokio::time::Instant::now() + IDLE * 3;
     while tokio::time::Instant::now() < deadline {
         ping_message(&b, &a, &errs).await;
         tokio::time::sleep(IDLE / 4).await;
     }
+    assert!(
+        eps_stamped_inbound(&a) > stamped,
+        "B's Messages did not stamp A's endpoint to B"
+    );
 
     assert_eq!(
         eps_closed_idle(&a),
@@ -2270,11 +2320,11 @@ async fn a_peer_that_keeps_answering_keeps_its_endpoint(kind: MessageType) {
     cross_register(&a, &b);
     let errs = CountingErrors::new();
 
-    // A owns an endpoint to B, and B's path back to A rides it. No frame goes
-    // from B to A before the stream: a Message would stamp A's endpoint and
-    // hide the defect.
-    ping_message(&a, &b, &errs).await;
-    assert_eq!(eps_open(&a), 1);
+    // A owns an endpoint to B, and B's path back to A rides it. No frame from
+    // B stamps A's endpoint before the stream: that stamp would hide the
+    // defect for one timeout.
+    wire_peer_path_first(&a, &b, &errs).await;
+    let stamped = eps_stamped_inbound(&a);
 
     let stream = match kind {
         MessageType::Response => &a.streams.response_stream,
@@ -2306,6 +2356,10 @@ async fn a_peer_that_keeps_answering_keeps_its_endpoint(kind: MessageType) {
          ({arrived} of {FRAMES} arrived)"
     );
     assert_eq!(arrived, FRAMES, "{kind:?} frames from B were lost");
+    assert!(
+        eps_stamped_inbound(&a) > stamped,
+        "B's {kind:?} frames did not stamp A's endpoint to B"
+    );
     assert_eq!(errs.count(), 0);
 
     a.transport.shutdown();
@@ -2541,9 +2595,7 @@ async fn a_frame_received_late_in_a_long_pass_is_not_stamped_early() {
 
     // A owns an endpoint to B, and B's path back is wired up, so B's next
     // frame goes straight to A's socket and stamps A's endpoint on arrival.
-    ping_message(&a, &b, &errs).await;
-    ping_message(&b, &a, &errs).await;
-    assert_eq!(eps_open(&a), 1);
+    wire_peer_path_first(&a, &b, &errs).await;
 
     // Stall A, and wait until it is asleep in the stall: the seam clears its
     // value just before it sleeps.
