@@ -20,12 +20,13 @@ The RDMA path needs the `ucx` feature on Linux. See [Run rendezvous over RDMA](.
 | `ref_handle(handle)` | consumer | Add one reference, for one more consumer. |
 | `detach(handle, lease)` | consumer | Drop the read lock. The handle stays usable. |
 | `release(handle, lease)` | consumer | Drop the read lock and one reference. The owner frees the slot at zero. |
+| `unregister_data(handle)` | owner | Drop the owner's reference, once. Synchronous, needs no runtime, and is safe to call from `Drop`. A repeat call or another node's handle does nothing. |
 
 ### When a slot is freed
 
 A slot holds two counts: references and read locks. `register_data` starts with one reference, and each `get` takes a read lock under a lease. The owner frees the slot when both counts are 0, whichever reaches 0 last.
 
-An owner can drop its reference while a reader holds a lease. Then the slot stays until the last lease ends, and the call that ends it frees the slot. Six paths end a lease: local and remote `detach`, local and remote `release`, the drop of a `get` that did not finish, and the lease reaper. All six free the slot this way.
+An owner can drop its reference with `unregister_data` while a reader holds a lease. Then the slot stays until the last lease ends, and the call that ends it frees the slot. Six paths end a lease: local and remote `detach`, local and remote `release`, the drop of a `get` that did not finish, and the lease reaper. All six free the slot this way.
 
 A reaped lease does not prove that the reader's RDMA GET finished. The reaper frees the slot under the same contract as any reaped lease: a peer that still reads can fail or read freed memory (see [RDMA design](../development/rdma-design.md)).
 

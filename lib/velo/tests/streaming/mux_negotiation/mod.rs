@@ -155,6 +155,8 @@ impl Node {
         );
     }
 
+    // The transport registry has no `Velo` form.
+    #[allow(deprecated)]
     fn registers_mux(&self) -> bool {
         self.velo
             .anchor_manager()
@@ -893,6 +895,8 @@ async fn wire_up(producer: &Node, receiver: &LegacyReceiver) {
         .messenger
         .register_peer(producer.velo.peer_info())
         .expect("register producer on receiver");
+    // The transport registry has no `Velo` form.
+    #[allow(deprecated)]
     producer
         .velo
         .anchor_manager()

@@ -32,6 +32,8 @@ pub mod simulation;
 
 #[cfg(test)]
 pub(crate) mod test_alloc;
+#[cfg(test)]
+mod velo_methods_tests;
 
 // ── Convenience re-exports for the most-used public types ──────────────────
 
@@ -1280,10 +1282,47 @@ impl Velo {
         self.inner.anchor_manager.create_anchor::<T>()
     }
 
+    /// Create a new streaming anchor with per-anchor liveness settings.
+    ///
+    /// Delegates to [`AnchorManager::create_anchor_with_config`](crate::streaming::AnchorManager::create_anchor_with_config).
+    /// Each `Some` field of `config` overrides this node's default; `None`
+    /// inherits it.
+    pub fn create_anchor_with_config<T>(&self, config: streaming::AnchorConfig) -> StreamAnchor<T> {
+        self.inner
+            .anchor_manager
+            .create_anchor_with_config::<T>(config)
+    }
+
+    /// How many SPSC anchors this node holds now.
+    ///
+    /// Delegates to [`AnchorManager::active_anchor_count`](crate::streaming::AnchorManager::active_anchor_count).
+    /// MPSC anchors are not counted. The `velo_streaming_active_anchors`
+    /// gauge counts both kinds.
+    pub fn active_anchor_count(&self) -> usize {
+        self.inner.anchor_manager.active_anchor_count()
+    }
+
+    /// Renew anchor reservations this node holds on other nodes, or on itself,
+    /// before a producer opens its stream.
+    ///
+    /// Delegates to [`AnchorManager::renew_reservations`](crate::streaming::AnchorManager::renew_reservations).
+    /// Reservations that are attached, cancelled, expired or replaced are
+    /// skipped. Only a transport failure returns an error, so `Ok` does not
+    /// prove that a reservation still exists. The caller decides when to renew
+    /// and bounds the call with its own deadline.
+    pub async fn renew_reservations(
+        &self,
+        reservations: &[streaming::AnchorReservation],
+    ) -> Result<()> {
+        self.inner
+            .anchor_manager
+            .renew_reservations(reservations)
+            .await
+    }
+
     /// Attach a sender to an existing anchor (local or remote).
     ///
     /// Delegates to [`AnchorManager::attach_stream_anchor`](crate::streaming::AnchorManager::attach_stream_anchor).
-    /// For fine-grained control, use [`anchor_manager()`](Velo::anchor_manager) directly.
     pub async fn attach_anchor<T: serde::Serialize>(
         &self,
         handle: StreamAnchorHandle,
@@ -1364,6 +1403,10 @@ impl Velo {
     }
 
     /// Get the underlying anchor manager for direct registry access.
+    #[deprecated(
+        since = "0.22.1",
+        note = "use the anchor methods on `Velo`: `create_anchor_with_config`, `active_anchor_count`, `renew_reservations`, `create_anchor`, `attach_anchor`, `prebind_anchor`, `open_anchor_stream`"
+    )]
     pub fn anchor_manager(&self) -> &crate::streaming::AnchorManager {
         &self.inner.anchor_manager
     }
@@ -1524,11 +1567,55 @@ impl Velo {
 
     /// Release the read lock AND decrement refcount.
     /// Data is freed when both refcount and read_lock_count reach zero.
+    ///
+    /// This is the reader's call: it ends the lease that [`get`](Self::get)
+    /// returned. The owner drops its own reference with
+    /// [`unregister_data`](Self::unregister_data).
     pub async fn release(&self, handle: DataHandle, lease_id: u64) -> Result<()> {
         self.inner
             .rendezvous_manager
             .release(handle, lease_id)
             .await
+    }
+
+    /// Drop the owner's reference to data this node staged.
+    ///
+    /// This is the owner's call. [`register_data`](Self::register_data) and
+    /// the other `register_data_*` calls give the owner one reference; this
+    /// gives it back. A reader ends its own lease with
+    /// [`release`](Self::release) or [`detach`](Self::detach) instead.
+    ///
+    /// If no reader holds a lease, the slot is freed now. Otherwise it is freed
+    /// when the last reader detaches or releases, or when its lease expires
+    /// and is reaped. For a slot staged with
+    /// [`register_data_in_region`](Self::register_data_in_region), freeing it
+    /// gives back its hold on the region, so `RegionGuard::unregister` does
+    /// not wait for it.
+    ///
+    /// Synchronous: it does not `await` and needs no tokio runtime, so an
+    /// owner can call it from `Drop`. Returns true if this call dropped the
+    /// owner's reference. A second call, or a handle this node did not stage
+    /// or no longer holds, does nothing and returns false.
+    pub fn unregister_data(&self, handle: DataHandle) -> bool {
+        self.inner.rendezvous_manager.unregister_data(handle)
+    }
+
+    /// The payload size above which this node stages a message through
+    /// rendezvous instead of sending it inline.
+    ///
+    /// A payload is staged when its length is greater than this value. It is
+    /// the threshold of the stager this node installed, which can differ from
+    /// [`rendezvous::transparent::DEFAULT_THRESHOLD`] (see
+    /// [`RendezvousStager::with_threshold`](crate::rendezvous::RendezvousStager::with_threshold)).
+    pub fn staging_threshold(&self) -> usize {
+        self.inner
+            .messenger
+            .client()
+            .large_payload_stager
+            .get()
+            .map_or(rendezvous::transparent::DEFAULT_THRESHOLD, |stager| {
+                stager.threshold()
+            })
     }
 
     /// Which transport this instance chose as `instance`'s primary, if it is
@@ -1565,6 +1652,10 @@ impl Velo {
     }
 
     /// Get the underlying rendezvous manager for direct access.
+    #[deprecated(
+        since = "0.22.1",
+        note = "use the rendezvous methods on `Velo`: `unregister_data` instead of `data_store()` with `ref_decrement` and `try_free`, `register_data_in_region`, `register_data`, `get`, `detach`, `release`, `staging_threshold`"
+    )]
     pub fn rendezvous_manager(&self) -> &crate::rendezvous::RendezvousManager {
         &self.inner.rendezvous_manager
     }

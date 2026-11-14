@@ -72,6 +72,8 @@ pub mod consumer;
 pub(crate) mod descriptor;
 pub mod handle;
 pub mod handlers;
+#[cfg(test)]
+mod owner_release_tests;
 /// Slot bodies staged in RDMA-registered memory. Gated with the registration
 /// layer it depends on, and runtime-internal: a `PinnedSlot` is how the store
 /// holds staged memory, not something a caller names.
@@ -1095,6 +1097,16 @@ impl RendezvousManager {
     /// Get the worker ID of this manager.
     pub fn worker_id(&self) -> WorkerId {
         self.worker_id
+    }
+
+    /// Drop the owner's reference to a handle this worker staged. See
+    /// [`Velo::unregister_data`](crate::Velo::unregister_data).
+    ///
+    /// A handle another worker staged is not this worker's to drop, and a
+    /// synchronous call cannot reach that worker anyway, so it does nothing.
+    pub(crate) fn unregister_data(&self, handle: DataHandle) -> bool {
+        let (worker, local_id) = handle.unpack();
+        worker == self.worker_id && self.store.release_owner_reference(local_id)
     }
 
     /// Get direct access to the data store (for transparent mode integration).
