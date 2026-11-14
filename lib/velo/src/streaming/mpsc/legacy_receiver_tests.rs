@@ -19,7 +19,8 @@ use crate::observability::test_helpers::MetricSnapshot;
 use crate::streaming::mpsc::control::MpscAnchorAttachRequest;
 use crate::streaming::tcp_transport::TCP_STREAM_KEY as LEGACY_KEY;
 use crate::streaming::transport::FrameTransport;
-use crate::streaming::{MESSENGER_MUX_KEY as MUX_KEY, MuxConfig, StreamAnchorHandle, StreamFrame};
+use crate::streaming::{MESSENGER_MUX_KEY as MUX_KEY, MuxConfig};
+use crate::{StreamAnchorHandle, StreamFrame};
 
 const PATIENCE: Duration = Duration::from_secs(30);
 
@@ -132,9 +133,9 @@ async fn legacy_mpsc_receiver(answers_with: &str) -> LegacyReceiver {
     let (frame_tx, frames) = flume::unbounded::<Vec<u8>>();
     let bind_stream = Arc::clone(&stream);
     let answered_key = TransportKey::new(answers_with);
-    let handler = crate::messenger::Handler::typed_unary_async(
+    let handler = crate::Handler::typed_unary_async(
         "_mpsc_anchor_attach",
-        move |ctx: crate::messenger::TypedContext<MpscAnchorAttachRequest>| {
+        move |ctx: crate::TypedContext<MpscAnchorAttachRequest>| {
             let stream = Arc::clone(&bind_stream);
             let frame_tx = frame_tx.clone();
             let answered_key = answered_key.clone();

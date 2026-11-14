@@ -13,9 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use velo::streaming::{
-    AnchorKind, AttachError, MpscAnchorConfig, MpscFrame, MpscStreamAnchor, SenderId,
-};
+use velo::AttachError;
+use velo::streaming::{AnchorKind, MpscAnchorConfig, MpscFrame, MpscStreamAnchor, SenderId};
 
 async fn make_manager() -> Arc<velo::Velo> {
     Arc::new(common::local_node().await)
@@ -25,7 +24,7 @@ async fn make_manager() -> Arc<velo::Velo> {
 /// expected events.
 async fn next_frame<T: serde::de::DeserializeOwned>(
     anchor: &mut MpscStreamAnchor<T>,
-) -> Option<Result<(SenderId, MpscFrame<T>), velo::streaming::StreamError>> {
+) -> Option<Result<(SenderId, MpscFrame<T>), velo::StreamError>> {
     match tokio::time::timeout(Duration::from_secs(3), anchor.next()).await {
         Ok(v) => v,
         Err(_) => panic!("stream stalled: no frame in 3s"),
@@ -251,17 +250,11 @@ async fn test_mpsc_controller_cancel_propagates() {
     tokio::time::sleep(Duration::from_millis(20)).await;
 
     assert!(
-        matches!(
-            s1.send(1).await,
-            Err(velo::streaming::SendError::ChannelClosed)
-        ),
+        matches!(s1.send(1).await, Err(velo::SendError::ChannelClosed)),
         "s1 send must fail after cancel"
     );
     assert!(
-        matches!(
-            s2.send(2).await,
-            Err(velo::streaming::SendError::ChannelClosed)
-        ),
+        matches!(s2.send(2).await, Err(velo::SendError::ChannelClosed)),
         "s2 send must fail after cancel"
     );
 

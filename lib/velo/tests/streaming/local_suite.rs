@@ -10,7 +10,7 @@
 mod common;
 
 use futures::StreamExt;
-use velo::streaming::{AttachError, StreamAnchorHandle, StreamFrame};
+use velo::{AttachError, StreamAnchorHandle, StreamFrame};
 use velo_ext::WorkerId;
 
 /// TEST-01: Local round-trip — send 10 items + finalize; stream yields all 10 then None.
@@ -115,10 +115,7 @@ async fn test_05_finalize_closes_stream() {
     // Registry entry removed after finalize; second attach must fail
     let second_attach = node.attach_anchor::<u32>(handle).await;
     assert!(
-        matches!(
-            second_attach,
-            Err(velo::streaming::AttachError::AnchorNotFound { .. })
-        ),
+        matches!(second_attach, Err(velo::AttachError::AnchorNotFound { .. })),
         "anchor must be absent from registry after finalize"
     );
 }
@@ -140,10 +137,7 @@ async fn test_06_cancel_prevents_attach() {
     );
     let result = node.attach_anchor::<u32>(handle).await;
     assert!(
-        matches!(
-            result,
-            Err(velo::streaming::AttachError::AnchorNotFound { .. })
-        ),
+        matches!(result, Err(velo::AttachError::AnchorNotFound { .. })),
         "attach after cancel must return AnchorNotFound"
     );
 }
@@ -169,10 +163,7 @@ async fn test_08_drop_safety() {
     );
     let frame2 = anchor.next().await;
     assert!(
-        matches!(
-            frame2,
-            Some(Err(velo::streaming::StreamError::SenderDropped))
-        ),
+        matches!(frame2, Some(Err(velo::StreamError::SenderDropped))),
         "second frame must be Err(SenderDropped) from Dropped sentinel, got {:?}",
         frame2
     );
@@ -213,7 +204,7 @@ async fn test_12_sentinel_ordering() {
                 }
                 items.push(v);
             }
-            Err(velo::streaming::StreamError::SenderDropped) => {
+            Err(velo::StreamError::SenderDropped) => {
                 saw_dropped = true;
                 break; // Dropped is terminal; stream yields None next
             }

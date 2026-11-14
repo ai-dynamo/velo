@@ -19,7 +19,7 @@ use std::time::Duration;
 /// all without needing anything from the sender, so nothing obliges it to
 /// wait to be asked. An application that already sends the worker a request
 /// envelope puts a ticket in it, the worker opens its sender locally through
-/// [`AnchorManager::open_anchor_stream`](crate::streaming::AnchorManager::open_anchor_stream),
+/// [`Velo::open_anchor_stream`](crate::Velo::open_anchor_stream),
 /// and the `_anchor_attach` round trip that used to precede the first token
 /// does not happen.
 ///

@@ -16,7 +16,7 @@ const WORKER_SHIFT: u32 = 64;
 /// Compact wire handle encoding a [`WorkerId`] (upper 64 bits) and a local slot ID
 /// (lower 64 bits) into a single `u128`.
 ///
-/// `local_id` of `0` is reserved; [`crate::RendezvousManager`] assigns IDs starting at `1`.
+/// `local_id` of `0` is reserved; the owning instance assigns IDs starting at `1`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DataHandle(u128);
 

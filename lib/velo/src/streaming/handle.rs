@@ -54,7 +54,7 @@ impl std::fmt::Display for AnchorKind {
 /// let the attach entry points fail fast on the wrong kind without wasting an
 /// AM round-trip.
 ///
-/// `local_id` of `0` is reserved. [`crate::streaming::anchor::AnchorManager`] picks
+/// `local_id` of `0` is reserved. The node that creates the anchor picks
 /// the lower 63 bits at random, so a peer cannot guess a handle it was not given.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StreamAnchorHandle(u128);

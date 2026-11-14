@@ -19,10 +19,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::OnceCell;
 
+use velo::Transport;
 use velo::observability::VeloMetrics;
 use velo::transports::{
-    AdmissionGate, HealthCheckError, MessageType, SendAdmission, SendOutcome, Transport,
-    TransportAdapter, TransportError, TransportErrorHandler,
+    AdmissionGate, HealthCheckError, MessageType, SendAdmission, SendOutcome, TransportAdapter,
+    TransportError, TransportErrorHandler,
 };
 use velo_ext::{InstanceId, PeerInfo, TransportKey, WorkerAddress};
 

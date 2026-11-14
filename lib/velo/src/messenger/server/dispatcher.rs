@@ -687,7 +687,7 @@ impl DispatcherHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messenger::Handler;
+    use crate::Handler;
     use crate::transports::tcp::TcpTransportBuilder;
     use std::time::Duration;
 
@@ -843,7 +843,7 @@ mod tests {
             PendingHandler,
             OrderedConfig::global()
                 .with_max_queue_depth(Some(1))
-                .with_overflow(crate::messenger::OverflowPolicy::Reject),
+                .with_overflow(crate::OverflowPolicy::Reject),
         );
         let call = |n: u128| InboundCall {
             message_id: ResponseId::from_u128(n),

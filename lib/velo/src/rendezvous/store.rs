@@ -242,10 +242,7 @@ type RegisterHook = Box<dyn Fn(&DataStore) + Send + Sync>;
 pub struct RegisterOptions {
     /// Optional time-to-live for the staged data. When it is up, the slot is
     /// freed and every lease on it ended, whether or not a consumer is still
-    /// reading. Enforced by the instance's reaper, which a registration
-    /// through [`RendezvousManager`](crate::RendezvousManager) starts; a
-    /// [`DataStore`] used on its own enforces it only through
-    /// [`DataStore::sweep_expired`].
+    /// reading. Enforced by the instance's reaper.
     pub ttl: Option<Duration>,
 }
 

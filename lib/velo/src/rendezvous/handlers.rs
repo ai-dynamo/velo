@@ -26,10 +26,10 @@ use crate::rendezvous::store::{
 
 /// Build the `_rv_metadata` handler: returns [`DataMetadata`](crate::rendezvous::protocol::DataMetadata)
 /// without acquiring a read lock.
-pub fn create_rv_metadata_handler(store: Arc<DataStore>) -> crate::messenger::Handler {
-    crate::messenger::Handler::typed_unary(
+pub fn create_rv_metadata_handler(store: Arc<DataStore>) -> crate::Handler {
+    crate::Handler::typed_unary(
         "_rv_metadata",
-        move |ctx: crate::messenger::TypedContext<RvMetadataRequest>| {
+        move |ctx: crate::TypedContext<RvMetadataRequest>| {
             let handle = ctx.input.handle.to_handle();
             let (_, local_id) = handle.unpack();
             match store.metadata(local_id) {
@@ -48,10 +48,10 @@ pub fn create_rv_metadata_handler(store: Arc<DataStore>) -> crate::messenger::Ha
 /// slot cannot be freed between the decision and the response. Which answer the
 /// consumer gets never changes what it must do afterwards: both carry a lease,
 /// and both end in a detach or a release.
-pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::messenger::Handler {
-    crate::messenger::Handler::typed_unary(
+pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::Handler {
+    crate::Handler::typed_unary(
         "_rv_acquire",
-        move |ctx: crate::messenger::TypedContext<RvAcquireRequest>| {
+        move |ctx: crate::TypedContext<RvAcquireRequest>| {
             let draining = ctx.msg.backend().shutdown_state().is_draining();
             let lease_timeout = requested_lease_timeout(ctx.headers.as_ref());
             serve_acquire(&store, &ctx.input, lease_timeout, draining)
@@ -241,10 +241,10 @@ fn rdma_response(
 }
 
 /// Build the `_rv_pull` handler: returns chunk bytes for a given transfer + index.
-pub fn create_rv_pull_handler(store: Arc<DataStore>) -> crate::messenger::Handler {
-    crate::messenger::Handler::unary_handler(
+pub fn create_rv_pull_handler(store: Arc<DataStore>) -> crate::Handler {
+    crate::Handler::unary_handler(
         "_rv_pull",
-        move |ctx: crate::messenger::Context| -> crate::messenger::UnifiedResponse {
+        move |ctx: crate::Context| -> crate::UnifiedResponse {
             let req: RvPullRequest = serde_json::from_slice(&ctx.payload)?;
             match store.pull_chunk(req.transfer_id, req.chunk_index) {
                 Some(chunk) => Ok(Some(chunk)),
@@ -263,10 +263,10 @@ pub fn create_rv_pull_handler(store: Arc<DataStore>) -> crate::messenger::Handle
 ///
 /// Returns an empty ack so the caller can confirm the increment completed
 /// before proceeding (avoids races between fire-and-forget and metadata queries).
-pub fn create_rv_ref_handler(store: Arc<DataStore>) -> crate::messenger::Handler {
-    crate::messenger::Handler::unary_handler(
+pub fn create_rv_ref_handler(store: Arc<DataStore>) -> crate::Handler {
+    crate::Handler::unary_handler(
         "_rv_ref",
-        move |ctx: crate::messenger::Context| -> crate::messenger::UnifiedResponse {
+        move |ctx: crate::Context| -> crate::UnifiedResponse {
             let req: RvRefRequest = serde_json::from_slice(&ctx.payload)?;
             let handle = req.handle.to_handle();
             let (_, local_id) = handle.unpack();
@@ -293,50 +293,47 @@ pub fn create_rv_ref_handler(store: Arc<DataStore>) -> crate::messenger::Handler
 /// check theirs, so a renewal cannot extend a lease on a slot the caller does
 /// not name — a lease id is a small integer, and a confused or hostile peer
 /// guessing one must not be able to keep somebody else's slot alive.
-pub fn create_rv_lease_renew_handler(store: Arc<DataStore>) -> crate::messenger::Handler {
-    crate::messenger::Handler::am_handler(
-        "_rv_lease_renew",
-        move |ctx: crate::messenger::Context| {
-            let req: RvLeaseRenewRequest = serde_json::from_slice(&ctx.payload)?;
-            let handle = req.handle.to_handle();
-            let (_, local_id) = handle.unpack();
+pub fn create_rv_lease_renew_handler(store: Arc<DataStore>) -> crate::Handler {
+    crate::Handler::am_handler("_rv_lease_renew", move |ctx: crate::Context| {
+        let req: RvLeaseRenewRequest = serde_json::from_slice(&ctx.payload)?;
+        let handle = req.handle.to_handle();
+        let (_, local_id) = handle.unpack();
 
-            match store.lease_slot(req.lease_id) {
-                Some(expected_local_id) if expected_local_id == local_id => {
-                    if !store.renew_lease(req.lease_id) {
-                        tracing::debug!(
-                            lease = req.lease_id,
-                            %handle,
-                            "_rv_lease_renew: lease carries no deadline to renew"
-                        );
-                    }
-                }
-                Some(expected_local_id) => {
-                    tracing::warn!(
-                        "_rv_lease_renew: lease {} maps to slot {}, not {}",
-                        req.lease_id,
-                        expected_local_id,
-                        local_id,
-                    );
-                }
-                None => {
+        match store.lease_slot(req.lease_id) {
+            Some(expected_local_id) if expected_local_id == local_id => {
+                if !store.renew_lease(req.lease_id) {
                     tracing::debug!(
                         lease = req.lease_id,
                         %handle,
-                        "_rv_lease_renew: lease already ended"
+                        "_rv_lease_renew: lease carries no deadline to renew"
                     );
                 }
             }
-            Ok(())
-        },
-    )
+            Some(expected_local_id) => {
+                tracing::warn!(
+                    "_rv_lease_renew: lease {} maps to slot {}, not {}",
+                    req.lease_id,
+                    expected_local_id,
+                    local_id,
+                );
+            }
+            None => {
+                tracing::debug!(
+                    lease = req.lease_id,
+                    %handle,
+                    "_rv_lease_renew: lease already ended"
+                );
+            }
+        }
+        Ok(())
+    })
     .build()
 }
 
 /// Build the `_rv_detach` handler: releases read lock without decrementing refcount.
 /// Frees the slot if that was its last reader and its refcount is already zero.
-pub fn create_rv_detach_handler(store: Arc<DataStore>) -> crate::messenger::Handler {
-    crate::messenger::Handler::am_handler("_rv_detach", move |ctx: crate::messenger::Context| {
+pub fn create_rv_detach_handler(store: Arc<DataStore>) -> crate::Handler {
+    crate::Handler::am_handler("_rv_detach", move |ctx: crate::Context| {
         let req: RvDetachRequest = serde_json::from_slice(&ctx.payload)?;
         let handle = req.handle.to_handle();
         let (_, local_id) = handle.unpack();
@@ -368,8 +365,8 @@ pub fn create_rv_detach_handler(store: Arc<DataStore>) -> crate::messenger::Hand
 
 /// Build the `_rv_release` handler: releases read lock AND decrements refcount.
 /// Frees the slot if both reach zero.
-pub fn create_rv_release_handler(store: Arc<DataStore>) -> crate::messenger::Handler {
-    crate::messenger::Handler::am_handler("_rv_release", move |ctx: crate::messenger::Context| {
+pub fn create_rv_release_handler(store: Arc<DataStore>) -> crate::Handler {
+    crate::Handler::am_handler("_rv_release", move |ctx: crate::Context| {
         let req: RvReleaseRequest = serde_json::from_slice(&ctx.payload)?;
         let handle = req.handle.to_handle();
         let (_, local_id) = handle.unpack();

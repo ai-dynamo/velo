@@ -77,8 +77,9 @@ fn shutdown_lets_an_error_handler_call_back_into_the_transport() {
     use std::time::Duration;
 
     use bytes::Bytes;
+    use velo::Transport;
     use velo::transports::tcp::{TcpTransport, TcpTransportBuilder};
-    use velo::transports::{MessageType, Transport, TransportErrorHandler, make_channels};
+    use velo::transports::{MessageType, TransportErrorHandler, make_channels};
     use velo_ext::{InstanceId, PeerInfo};
 
     struct UnregisterOnError {

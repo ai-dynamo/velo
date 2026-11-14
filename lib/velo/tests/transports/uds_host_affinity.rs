@@ -12,9 +12,10 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
 use bytes::Bytes;
-use velo::transports::{
-    DataStreams, Transport, VeloBackend, tcp::TcpTransportBuilder, uds::UdsTransportBuilder,
-};
+use velo::Transport;
+use velo::transports::tcp::TcpTransportBuilder;
+use velo::transports::uds::UdsTransportBuilder;
+use velo::transports::{DataStreams, VeloBackend};
 use velo_ext::{InstanceId, PeerInfo, TransportKey, WorkerAddress};
 
 fn tcp_bind() -> SocketAddr {

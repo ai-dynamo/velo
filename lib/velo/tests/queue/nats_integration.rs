@@ -13,9 +13,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 
+use velo::queue::NextOptions;
 use velo::queue::WorkQueueBackend;
 use velo::queue::backends::nats::NatsQueueBackend;
-use velo::queue::options::NextOptions;
 
 fn nats_url() -> String {
     std::env::var("NATS_URL").unwrap_or_else(|_| "nats://localhost:4222".to_owned())

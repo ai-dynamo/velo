@@ -45,8 +45,9 @@ async fn inbound_frames_are_recorded_on_every_message_type() {
     use std::time::Duration;
 
     use prometheus::Registry;
+    use velo::Transport;
     use velo::observability::VeloMetrics;
-    use velo::transports::{MessageType, Transport};
+    use velo::transports::MessageType;
 
     use crate::common::TransportFactory;
 

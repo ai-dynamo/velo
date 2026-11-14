@@ -381,7 +381,8 @@ pub fn continuity_starts_live<S: HubStore>(store: &S) {
 mod tests {
     use futures::future::BoxFuture;
     use tokio::sync::watch;
-    use velo::{PeerDiscovery, WorkerId};
+    use velo::WorkerId;
+    use velo::discovery::PeerDiscovery;
 
     use super::*;
     use crate::store::{InMemoryStore, StoredRegistration};

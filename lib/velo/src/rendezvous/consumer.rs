@@ -41,8 +41,9 @@
 
 use std::sync::Arc;
 
+use crate::messenger::ActiveMessageClient;
 use crate::messenger::large_payload::PayloadTooLarge;
-use crate::messenger::{ActiveMessageClient, AmSendBuilder, TypedUnaryBuilder, UnaryBuilder};
+use crate::{AmSendBuilder, TypedUnaryBuilder, UnaryBuilder};
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use velo_ext::WorkerId;

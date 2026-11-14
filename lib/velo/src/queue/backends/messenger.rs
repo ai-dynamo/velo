@@ -13,15 +13,16 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::messenger::{Messenger, TypedContext};
+use crate::TypedContext;
+use crate::messenger::Messenger;
 use bytes::Bytes;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use velo_ext::InstanceId;
 
-use crate::queue::backend::{ReceiverBackend, SenderBackend, WorkQueueBackend};
-use crate::queue::error::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
-use crate::queue::options::NextOptions;
+use crate::queue::NextOptions;
+use crate::queue::{ReceiverBackend, SenderBackend, WorkQueueBackend};
+use crate::queue::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
 
 const QUEUE_RPC_HANDLER: &str = "velo.queue.rpc";
 const REMOTE_RECV_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -156,8 +157,8 @@ enum QueueRpcResponse {
     Empty,
 }
 
-fn build_queue_rpc_handler(service: Arc<QueueService>) -> crate::messenger::Handler {
-    crate::messenger::Handler::typed_unary_async(
+fn build_queue_rpc_handler(service: Arc<QueueService>) -> crate::Handler {
+    crate::Handler::typed_unary_async(
         QUEUE_RPC_HANDLER,
         move |ctx: TypedContext<QueueRpcRequest>| {
             let service = Arc::clone(&service);

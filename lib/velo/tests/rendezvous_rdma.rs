@@ -55,6 +55,9 @@ use bytes::Bytes;
 use prometheus::Registry;
 use velo::observability::VeloMetrics;
 use velo::rendezvous::RdmaTestHook;
+use velo::rendezvous::rdma::{
+    Deregistered, RdmaConfig, RdmaError, RdmaPoolConfig, RdmaRendezvousConfig,
+};
 use velo::test_helpers::AcquireResponse;
 use velo::transports::ucx::UcxTransportBuilder;
 use velo::*;

@@ -640,7 +640,7 @@ impl StreamSender<Bytes> {
     /// The frame is the one [`send`](Self::send) writes for
     /// `Bytes::copy_from_slice(payload)`, so any `StreamAnchor<Bytes>` reads
     /// it, through `next` or through
-    /// [`next_bytes`](crate::streaming::StreamAnchor::next_bytes). It is
+    /// [`next_bytes`](crate::StreamAnchor::next_bytes). It is
     /// built in one allocation of the exact size, with one copy of the
     /// payload. `send` copies the payload once too, but serde grows the
     /// buffer as it writes it.

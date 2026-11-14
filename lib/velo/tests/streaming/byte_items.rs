@@ -24,10 +24,9 @@ use std::time::Duration;
 use bytes::Bytes;
 use futures::StreamExt;
 use velo::Velo;
-use velo::streaming::{
-    ByteItemBuilder, MESSENGER_MUX_KEY, StreamAnchor, StreamFrame, StreamSender,
-};
+use velo::streaming::{ByteItemBuilder, MESSENGER_MUX_KEY};
 use velo::transports::tcp::TcpTransportBuilder;
+use velo::{StreamAnchor, StreamFrame, StreamSender};
 
 const PATIENCE: Duration = Duration::from_secs(30);
 
@@ -158,7 +157,7 @@ enum Read {
 async fn next(
     anchor: &mut StreamAnchor<Bytes>,
     read: Read,
-) -> Option<Result<StreamFrame<Bytes>, velo::streaming::StreamError>> {
+) -> Option<Result<StreamFrame<Bytes>, velo::StreamError>> {
     let frame = match read {
         Read::Typed => anchor.next().await,
         Read::Bytes => anchor.next_bytes().await,

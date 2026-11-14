@@ -17,7 +17,8 @@ use std::time::Duration;
 use common::*;
 use velo_hub::store::testing::{FaultStore, PutFault};
 use velo_hub::store::{HubStore, RegistrationRecord};
-use velo_hub::velo::{PeerDiscovery, PeerInfo, WorkerAddress};
+use velo_hub::velo::discovery::PeerDiscovery;
+use velo_hub::velo::{PeerInfo, WorkerAddress};
 use velo_hub::{AttachContext, Committed, Extension, Hub, Rejection, Txn};
 
 async fn start_custom(store: &Arc<FaultStore>, with_velo: bool) -> Hub {

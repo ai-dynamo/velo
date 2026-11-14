@@ -14,7 +14,7 @@ mod common;
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
-use velo::streaming::StreamError;
+use velo::StreamError;
 
 // TEST-09: Inactivity timeout
 // Anchor configured with 1s timeout; no sender attaches; stream yields None after ~1s.

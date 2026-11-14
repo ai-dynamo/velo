@@ -23,9 +23,10 @@ use prometheus::Registry;
 use serde::Serialize;
 use velo::observability::VeloMetrics;
 use velo::observability::test_helpers::MetricSnapshot;
-use velo::streaming::{MpscFrame, MuxConfig, ReservationConfig, StreamAnchorHandle, StreamFrame};
+use velo::streaming::{MpscFrame, MuxConfig, ReservationConfig};
 use velo::test_helpers::{AnchorAttachResponse, MpscAnchorAttachResponse, StreamCancelHandle};
 use velo::transports::tcp::TcpTransportBuilder;
+use velo::{StreamAnchorHandle, StreamFrame};
 use velo::{Velo, VeloBuilder};
 use velo_ext::WorkerId;
 
@@ -34,7 +35,7 @@ use velo_ext::WorkerId;
 /// Both keys are aliased rather than re-typed: the literals belong to the
 /// transports that answer to them, and a second copy here could agree with the
 /// first for a whole release before anyone noticed it had stopped.
-const LEGACY_KEY: &str = velo::streaming::tcp_transport::TCP_STREAM_KEY;
+const LEGACY_KEY: &str = velo::streaming::TCP_STREAM_KEY;
 const MUX_KEY: &str = velo::streaming::MESSENGER_MUX_KEY;
 
 const PATIENCE: Duration = Duration::from_secs(30);
@@ -908,10 +909,7 @@ async fn an_attached_consumer_that_ends_on_a_bad_record_releases_its_slot() {
         .await
         .expect("timed out waiting for the bad record");
     assert!(
-        matches!(
-            ended,
-            Some(Err(velo::streaming::StreamError::DeserializationError(_)))
-        ),
+        matches!(ended, Some(Err(velo::StreamError::DeserializationError(_)))),
         "a u32 is not a String, got {ended:?}"
     );
 

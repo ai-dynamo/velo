@@ -25,13 +25,13 @@
 //! Sender:
 //! - [`sender::StreamSender`]: typed sender for pushing frames with heartbeat and drop safety
 
-pub mod anchor;
+pub(crate) mod anchor;
 pub(crate) mod control;
 pub(crate) mod deadline;
-pub mod frame;
+pub(crate) mod frame;
 #[cfg(feature = "grpc")]
-pub mod grpc_transport;
-pub mod handle;
+pub(crate) mod grpc_transport;
+pub(crate) mod handle;
 pub(crate) mod heartbeat;
 /// Batched, multiplexed streaming over the Messenger (`messenger-mux-v2`).
 ///
@@ -42,28 +42,29 @@ pub(crate) mod heartbeat;
 /// the key it answers to, which is what
 /// [`StreamSender::negotiated_transport`] is compared against.
 pub(crate) mod messenger_mux;
-pub mod mpsc;
+pub(crate) mod mpsc;
 pub(crate) mod negotiation;
 pub(crate) mod peer_table;
-pub mod sender;
+pub(crate) mod sender;
 pub(crate) mod sweep;
 mod tasks;
-pub mod tcp_transport;
+pub(crate) mod tcp_transport;
 pub(crate) mod transport;
 
-pub use anchor::{
-    AnchorConfig, AnchorReservation, AttachError, ReservationConfig, StreamAnchor, StreamController,
-};
+// The stream types a `Velo` method takes or returns (`StreamAnchor`,
+// `StreamSender`, `StreamFrame`, ...) have their public path at the crate
+// root, not here.
+pub use anchor::{AnchorConfig, AnchorReservation, ReservationConfig};
 pub(crate) use anchor::{AnchorManager, AnchorManagerBuilder};
-pub use frame::{ByteItemBuilder, ByteItemFrame, SendError, StreamError, StreamFrame};
+pub use frame::{ByteItemBuilder, ByteItemFrame};
 #[cfg(feature = "grpc")]
-pub use grpc_transport::GrpcFrameTransport;
-pub use handle::{AnchorKind, StreamAnchorHandle};
+pub use grpc_transport::{GRPC_STREAM_KEY, GrpcFrameTransport};
+pub use handle::AnchorKind;
 pub use messenger_mux::{AutoFlush, FlushPolicy, MESSENGER_MUX_KEY, MuxConfig};
 pub use mpsc::{
     MpscAnchorConfig, MpscFrame, MpscStreamAnchor, MpscStreamController, MpscStreamSender, SenderId,
 };
-pub use sender::{Retired, Retirement, StreamSender};
-pub use tcp_transport::TcpFrameTransport;
+pub use sender::{Retired, Retirement};
+pub use tcp_transport::{TCP_STREAM_KEY, TcpFrameTransport};
 pub(crate) use transport::FrameTransport;
 pub use transport::MAX_ITEM_BYTES;

@@ -21,8 +21,8 @@ mod common;
 
 use std::time::Duration;
 
-use velo::streaming::tcp_transport::TCP_STREAM_KEY;
-use velo::streaming::{StreamAnchorHandle, StreamFrame};
+use velo::streaming::TCP_STREAM_KEY;
+use velo::{StreamAnchorHandle, StreamFrame};
 use velo_ext::WorkerId;
 
 // ---------------------------------------------------------------------------

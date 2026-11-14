@@ -158,9 +158,9 @@ const BUILT_HEADER: [u8; 11] = [0x81, 0xa4, b'I', b't', b'e', b'm', BIN32, 0, 0,
 /// It needs no sender, so an encoder can build the item before the producer
 /// holds one. Append the payload to [`buffer`](Self::buffer), then
 /// [`finish`](Self::finish) it and send it with
-/// [`StreamSender::send_frame`](crate::streaming::StreamSender::send_frame).
+/// [`StreamSender::send_frame`](crate::StreamSender::send_frame).
 ///
-/// The frame decodes as the frame [`send_bytes`](crate::streaming::StreamSender::send_bytes)
+/// The frame decodes as the frame [`send_bytes`](crate::StreamSender::send_bytes)
 /// writes for the same payload, through `next`, `next_bytes`, and any typed
 /// consumer. It is not the same bytes: the length is always a 5-byte `bin32`,
 /// because it is written after the payload. An item under 64 KiB is up to 3
@@ -235,7 +235,7 @@ impl std::fmt::Debug for ByteItemBuilder {
 }
 
 /// One item of a `Bytes` stream, encoded and ready to send with
-/// [`StreamSender::send_frame`](crate::streaming::StreamSender::send_frame).
+/// [`StreamSender::send_frame`](crate::StreamSender::send_frame).
 /// Made by [`ByteItemBuilder::finish`].
 pub struct ByteItemFrame {
     frame: Vec<u8>,

@@ -45,7 +45,7 @@ pub(crate) enum SenderChannel {
 ///
 /// Holds one of two channels ([`SenderChannel`]), a heartbeat registration
 /// when the channel is remote, and a cancellation token. Created by
-/// [`crate::AnchorManager::attach_mpsc_stream_anchor`] (local) or by the
+/// [`Velo::attach_mpsc_anchor`](crate::Velo::attach_mpsc_anchor) (local) or by the
 /// `_mpsc_anchor_attach` handler round-trip (remote).
 ///
 /// Local drop queues `Dropped` after buffered items without blocking the caller.
@@ -260,7 +260,7 @@ impl<T: Serialize> MpscStreamSender<T> {
 
     /// Detach the sender cleanly, returning the anchor handle for reattach.
     ///
-    /// Reattaching via [`crate::AnchorManager::attach_mpsc_stream_anchor`]
+    /// Reattaching via [`Velo::attach_mpsc_anchor`](crate::Velo::attach_mpsc_anchor)
     /// allocates a fresh [`SenderId`]. Once polled, detach runs to completion
     /// even if this future is dropped: at once when the channel has room, else
     /// on the caller's runtime (the sender's own when the caller has none).

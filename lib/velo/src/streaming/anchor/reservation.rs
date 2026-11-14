@@ -153,12 +153,10 @@ impl AnchorManager {
     }
 }
 
-pub(crate) fn renewal_handler(
-    manager: std::sync::Weak<AnchorManager>,
-) -> crate::messenger::Handler {
-    crate::messenger::Handler::typed_unary_async(
+pub(crate) fn renewal_handler(manager: std::sync::Weak<AnchorManager>) -> crate::Handler {
+    crate::Handler::typed_unary_async(
         "_anchor_renew",
-        move |cx: crate::messenger::TypedContext<Vec<AnchorReservation>>| {
+        move |cx: crate::TypedContext<Vec<AnchorReservation>>| {
             let manager = manager.clone();
             async move {
                 anyhow::ensure!(

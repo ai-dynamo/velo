@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use velo::{Handler, InstanceId, PeerDiscovery, PeerInfo, ShutdownPolicy, Velo, WorkerId};
+use velo::discovery::PeerDiscovery;
+use velo::{Handler, InstanceId, PeerInfo, ShutdownPolicy, Velo, WorkerId};
 
 /// A discovery backend that knows one peer.
 struct OnePeer(PeerInfo);

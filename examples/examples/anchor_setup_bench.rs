@@ -20,7 +20,7 @@ use anyhow::Result;
 use clap::Parser;
 use futures::StreamExt;
 use velo::Velo;
-use velo::streaming::StreamFrame;
+use velo::StreamFrame;
 
 #[derive(Parser, Debug)]
 struct Args {

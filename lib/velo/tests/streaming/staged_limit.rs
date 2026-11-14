@@ -29,9 +29,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use velo::streaming::{StreamAnchor, StreamError, StreamFrame};
 use velo::transports::tcp::TcpTransportBuilder;
 use velo::{Handler, Velo};
+use velo::{StreamAnchor, StreamError, StreamFrame};
 
 struct Counting;
 

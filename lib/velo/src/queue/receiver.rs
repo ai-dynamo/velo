@@ -9,9 +9,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::de::DeserializeOwned;
 
-use crate::queue::backend::ReceiverBackend;
-use crate::queue::error::WorkQueueRecvError;
-use crate::queue::options::NextOptions;
+use crate::queue::NextOptions;
+use crate::queue::ReceiverBackend;
+use crate::queue::WorkQueueRecvError;
 
 /// A typed receiver handle for a named work queue.
 ///

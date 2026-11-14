@@ -22,7 +22,7 @@
 //!
 //! * **Chunked** ([`AcquireResponse::Ready`](protocol::AcquireResponse::Ready))
 //!   — the owner opens a transfer and the consumer pulls `_rv_pull` chunks of
-//!   [`DEFAULT_CHUNK_SIZE`](store::DEFAULT_CHUNK_SIZE) until it has them all.
+//!   `DEFAULT_CHUNK_SIZE` (512 KiB) until it has them all.
 //!   Always available, for every slot and every consumer.
 //!
 //! * **RDMA** ([`AcquireResponse::Rdma`](protocol::AcquireResponse::Rdma)) —
@@ -33,8 +33,8 @@
 //!
 //! The RDMA answer requires four things at once, and any one of them missing
 //! means chunked: the slot is staged in registered memory
-//! ([`register_data_pinned`](RendezvousManager::register_data_pinned) or
-//! [`register_data_in_region`](RendezvousManager::register_data_in_region)),
+//! ([`Velo::register_data_pinned`](crate::Velo::register_data_pinned) or
+//! [`Velo::register_data_in_region`](crate::Velo::register_data_in_region)),
 //! the consumer advertised a backend the owner can serve, the payload is at
 //! least [`rdma_min_bytes`](rdma::RdmaRendezvousConfig::rdma_min_bytes), and
 //! neither side has the RDMA path switched off. GET-first and decided at
@@ -70,7 +70,7 @@ pub(crate) mod consumer;
 /// here rather than an attribute on each item.
 #[allow(dead_code)]
 pub(crate) mod descriptor;
-pub mod handle;
+pub(crate) mod handle;
 pub(crate) mod handlers;
 #[cfg(test)]
 mod owner_release_tests;
@@ -88,14 +88,15 @@ mod ttl_tests;
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 pub mod rdma;
 pub(crate) mod store;
-pub mod transparent;
-pub mod write;
+pub(crate) mod transparent;
+pub(crate) mod write;
 
-pub use handle::DataHandle;
-pub use protocol::DataMetadata;
-pub use store::{RegisterOptions, StageMode};
+// Their public path is the crate root (`velo::DataHandle`, ...).
+pub(crate) use handle::DataHandle;
+pub(crate) use protocol::DataMetadata;
+pub(crate) use store::RegisterOptions;
 pub(crate) use transparent::{RendezvousResolver, RendezvousStager};
-pub use write::RendezvousWrite;
+pub(crate) use write::RendezvousWrite;
 
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Instant;
@@ -373,33 +374,8 @@ impl RendezvousManager {
         DataHandle::pack(self.worker_id, local_id)
     }
 
-    /// Stage data in RDMA-registered pool memory, so consumers that can issue
-    /// an RDMA GET read it without a chunk round trip.
-    ///
-    /// # This never fails
-    ///
-    /// It returns a [`DataHandle`], not a `Result`, and that is the contract.
-    /// Pool exhaustion, a registered-bytes budget that is already spent, a
-    /// switched-off kill switch, an instance with no UCX transport at all —
-    /// every one of them stages the data in plain memory instead and records
-    /// the reason on `velo_rendezvous_rdma_path_total`. Pinning is a transfer
-    /// optimisation, and a *staging* call that failed because the pool was busy
-    /// would push a fallback onto every caller that most of them would get
-    /// wrong (D4).
-    ///
-    /// The slot is readable either way: a pinned slot still answers the chunked
-    /// path, so falling back changes how fast the data moves and never whether
-    /// it can be reached.
-    ///
-    /// # Cost
-    ///
-    /// One copy, always: the bytes are copied into registered memory here so a
-    /// peer's NIC can read them later, and the fallback copies them into a
-    /// `Bytes`. Zero-length data is staged in plain memory — there is nothing
-    /// for a GET to transfer.
-    ///
-    /// To stage without a copy, register the memory yourself and use
-    /// [`register_data_in_region`](Self::register_data_in_region).
+    /// Backs [`Velo::register_data_pinned`](crate::Velo::register_data_pinned), whose docs
+    /// carry the contract.
     pub async fn register_data_pinned(&self, data: &[u8]) -> DataHandle {
         #[cfg(all(target_os = "linux", feature = "ucx"))]
         if !data.is_empty()
@@ -481,50 +457,8 @@ impl RendezvousManager {
         self.stage(store::SlotBody::InMemory(data), opts)
     }
 
-    /// Stage a range of memory the caller registered, without copying it.
-    ///
-    /// The zero-copy counterpart to
-    /// [`register_data_pinned`](Self::register_data_pinned): the bytes stay
-    /// where the caller put them and the slot merely describes them. `range` is
-    /// measured from the pointer that was registered, not from
-    /// [`RegionGuard::effective_range`](rdma::RegionGuard::effective_range), so
-    /// a caller can never name a byte inside the registration but outside its
-    /// own allocation.
-    ///
-    /// # The staged slot holds the region open
-    ///
-    /// The slot takes an in-flight guard on `guard`'s own accounting, so
-    /// [`RegionGuard::unregister`](rdma::RegionGuard::unregister) drains the
-    /// anchors staged inside the region before it unmaps. Freeing the slot —
-    /// the last `release` — is what lets the deregistration through. A caller
-    /// that stages anchors and then unregisters without releasing them sees
-    /// `unregister` wait and, if it runs out of budget, unmap anyway with a
-    /// warning.
-    ///
-    /// Reads of that slot refuse from the moment the region's
-    /// [`deregistered`](rdma::RegionGuard::deregistered) latch closes — which
-    /// is the moment the caller is told it may free the memory, and is what the
-    /// refusal protects. Between the unmap and the latch a read may still run:
-    /// unmapping deregisters rather than frees, so the pages are still there.
-    /// The read and the latch are ordered against each other by the region's
-    /// copy gate, so neither can catch the other half-done.
-    ///
-    /// # Errors
-    ///
-    /// [`NotConfigured`](rdma::RdmaError::NotConfigured) without a UCX
-    /// transport, [`OutOfRange`](rdma::RdmaError::OutOfRange) for an empty,
-    /// inverted, or out-of-bounds range, and
-    /// [`ShuttingDown`](rdma::RdmaError::ShuttingDown) once the region or the
-    /// registry has begun to go away.
-    ///
-    /// Unlike `register_data_pinned` this *does* return a `Result`, because no
-    /// fallback could honour what was asked: staging in plain memory would
-    /// silently copy bytes the caller asked not to be copied.
-    ///
-    /// The kill switch does not affect it. The memory is registered either way,
-    /// so anchoring in it costs nothing extra; the switch decides whether
-    /// `_rv_acquire` answers with a descriptor, and a switched-off owner serves
-    /// the same slot chunked.
+    /// Backs [`Velo::register_data_in_region`](crate::Velo::register_data_in_region), whose docs
+    /// carry the contract.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub fn register_data_in_region(
         &self,
@@ -823,56 +757,8 @@ impl RendezvousManager {
         result
     }
 
-    /// Pull data from a handle into registered memory, with no copy out.
-    ///
-    /// The zero-copy counterpart to [`get`](Self::get): where the owner answers
-    /// with an RDMA descriptor, the bytes land in the returned buffer written
-    /// by this instance's NIC and are never copied. Where it answers chunked —
-    /// a heap-staged slot, a payload under the threshold, a kill switch, an
-    /// owner without the RDMA path — the chunks are pulled and copied into a
-    /// pooled buffer, so the return type does not depend on what the owner
-    /// decided.
-    ///
-    /// # Holding the buffer
-    ///
-    /// Dropping the [`PinnedBuf`](rdma::PinnedBuf) returns its space to the
-    /// pool; nothing else is required and nothing is unregistered. Until then
-    /// the space is a live reservation against the registered-bytes budget, so
-    /// hold it for as long as the bytes are being used and no longer.
-    ///
-    /// The lease is a separate matter, and this does **not** hold it open for
-    /// you: the renewal ticker is scoped to the transfer, so a caller that
-    /// keeps the buffer past the lease deadline will find the owner has
-    /// force-released the lease. Release it as soon as the transfer is done —
-    /// the returned buffer stays valid, because it is this instance's memory.
-    ///
-    /// # Errors
-    ///
-    /// Everything [`get`](Self::get) can fail with, plus
-    /// [`RdmaError::NotConfigured`](rdma::RdmaError::NotConfigured) when this
-    /// instance has no RDMA registry to allocate a destination from — including
-    /// for a purely local handle, which still needs somewhere pinned to copy
-    /// into.
-    ///
-    /// # Cancellation
-    ///
-    /// Dropping this future does not stop the transfer. UCX has no way to
-    /// recall a submitted RMA operation, so the NIC keeps writing into the
-    /// destination until it is done; what the drop abandons is the
-    /// notification, not the work.
-    ///
-    /// Velo makes that safe rather than pretending otherwise: the destination's
-    /// pool space is reserved by the *transfer*, not by this future, so it is
-    /// returned when the backend finishes and never while a write is still
-    /// landing in it. Without that a cancelled transfer would silently
-    /// overwrite whatever the pool handed the space to next.
-    ///
-    /// The visible cost is that the space stays spoken for a little after the
-    /// cancellation. A caller that drops one of these and immediately retries
-    /// at the same size can see the retry answer
-    /// [`BudgetExceeded`](rdma::RdmaError::BudgetExceeded) under a tight pool,
-    /// until the abandoned transfer completes. That is the reservation working,
-    /// not a leak.
+    /// Backs [`Velo::get_pinned`](crate::Velo::get_pinned), whose docs
+    /// carry the contract.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub async fn get_pinned(&self, handle: DataHandle) -> Result<(rdma::PinnedBuf, u64)> {
         let started = Instant::now();
