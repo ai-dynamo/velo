@@ -223,6 +223,12 @@ const T: Duration = Duration::from_secs(10);
 /// still fails here.
 const STARTUP: Duration = Duration::from_secs(60);
 
+/// A hang guard for a frame that [`ping_message`] needs to arrive, not a
+/// speed check. With 48 copies of this module on 8 CPUs, 39 such frames
+/// took over 5 s and the slowest 9.7 s, so `T` failed tests on frames that
+/// were only late. A frame that is lost still fails here.
+const ARRIVAL: Duration = Duration::from_secs(60);
+
 #[tokio::test(flavor = "multi_thread")]
 async fn message_round_trip_and_stream_routing() {
     let a = start_node().await;
@@ -1988,7 +1994,7 @@ async fn ping_message_to(
     );
     assert!(matches!(out, SendOutcome::Admitted));
     assert!(
-        recv_message(&arrives_at.streams.message_stream, T)
+        recv_message(&arrives_at.streams.message_stream, ARRIVAL)
             .await
             .is_some(),
         "{what}: the frame must arrive before the endpoint is called established"
