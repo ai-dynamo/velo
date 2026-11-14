@@ -134,3 +134,155 @@ pub(crate) fn complete_peer_info(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use bytes::Bytes;
+    use futures::future::BoxFuture;
+    use velo_ext::{TransportKey, WorkerAddress, WorkerId};
+
+    use super::*;
+
+    /// A stream transport that records the peers it is asked to register.
+    struct Recording {
+        key: &'static str,
+        address: WorkerAddress,
+        refuse: bool,
+        registered: parking_lot::Mutex<Vec<InstanceId>>,
+        unregistered: parking_lot::Mutex<Vec<InstanceId>>,
+    }
+
+    impl Recording {
+        fn new(key: &'static str, address: WorkerAddress, refuse: bool) -> Arc<Self> {
+            Arc::new(Self {
+                key,
+                address,
+                refuse,
+                registered: Default::default(),
+                unregistered: Default::default(),
+            })
+        }
+    }
+
+    impl FrameTransport for Recording {
+        fn key(&self) -> TransportKey {
+            TransportKey::new(self.key)
+        }
+
+        fn address(&self) -> WorkerAddress {
+            self.address.clone()
+        }
+
+        fn register(&self, peer: &PeerInfo) -> anyhow::Result<()> {
+            anyhow::ensure!(!self.refuse, "refused");
+            self.registered.lock().push(peer.instance_id());
+            Ok(())
+        }
+
+        fn unregister(&self, instance_id: InstanceId) {
+            self.unregistered.lock().push(instance_id);
+        }
+
+        fn bind(
+            &self,
+            _anchor_id: u64,
+            _session_id: u64,
+        ) -> BoxFuture<'_, anyhow::Result<flume::Receiver<Vec<u8>>>> {
+            Box::pin(async { Ok(flume::bounded::<Vec<u8>>(1).1) })
+        }
+
+        fn connect(
+            &self,
+            _peer: WorkerId,
+            _anchor_id: u64,
+            _session_id: u64,
+        ) -> BoxFuture<'_, anyhow::Result<flume::Sender<Vec<u8>>>> {
+            Box::pin(async { Ok(flume::bounded::<Vec<u8>>(1).0) })
+        }
+    }
+
+    fn address(keys: &[&str]) -> WorkerAddress {
+        let mut builder = WorkerAddressBuilder::new();
+        for key in keys {
+            builder
+                .add_entry(*key, Bytes::from(format!("{key}-endpoint")))
+                .unwrap();
+        }
+        builder.build().unwrap()
+    }
+
+    fn peer(keys: &[&str]) -> PeerInfo {
+        PeerInfo::new(InstanceId::new_v4(), address(keys))
+    }
+
+    fn observer(transport: &Arc<Recording>) -> StreamPeerTable {
+        let transport: Arc<dyn FrameTransport> = Arc::clone(transport) as _;
+        StreamPeerTable::new(Arc::downgrade(&transport))
+    }
+
+    /// Only a peer with an entry for the transport's key reaches it. A
+    /// missing entry, an address that does not decode, and a transport
+    /// that refuses the peer all leave the messenger's registration alone:
+    /// the observer has no error to return.
+    #[test]
+    fn the_observer_forwards_only_a_peer_with_an_entry_for_its_key() {
+        let transport = Recording::new("tcp-stream", WorkerAddress::empty(), false);
+        let table = observer(&transport);
+        let with_entry = peer(&["tcp", "tcp-stream"]);
+        table.registered(&with_entry);
+        table.registered(&peer(&["tcp"]));
+        table.registered(&PeerInfo::new(
+            InstanceId::new_v4(),
+            WorkerAddress::from_encoded(Bytes::from_static(b"not msgpack")),
+        ));
+        table.unregistered(with_entry.instance_id());
+        assert_eq!(*transport.registered.lock(), [with_entry.instance_id()]);
+        assert_eq!(*transport.unregistered.lock(), [with_entry.instance_id()]);
+
+        let refusing = Recording::new("tcp-stream", WorkerAddress::empty(), true);
+        observer(&refusing).registered(&peer(&["tcp-stream"]));
+        assert!(refusing.registered.lock().is_empty());
+    }
+
+    /// The observer holds the transport weakly, so it outlives it quietly.
+    #[test]
+    fn the_observer_does_nothing_once_the_transport_is_gone() {
+        let transport = Recording::new("tcp-stream", WorkerAddress::empty(), false);
+        let table = observer(&transport);
+        drop(transport);
+        table.registered(&peer(&["tcp-stream"]));
+        table.unregistered(InstanceId::new_v4());
+    }
+
+    /// The stream endpoint is added to the messenger's address. A transport
+    /// with no endpoint of its own adds nothing, and a key that collides
+    /// with a messenger entry leaves the messenger's address as it is.
+    #[test]
+    fn complete_peer_info_adds_the_stream_endpoint_or_keeps_the_messenger_address() {
+        let messenger = peer(&["tcp"]);
+
+        let stream = Recording::new("tcp-stream", address(&["tcp-stream"]), false);
+        let complete = complete_peer_info(messenger.clone(), stream.as_ref());
+        assert_eq!(complete.instance_id(), messenger.instance_id());
+        for key in ["tcp", "tcp-stream"] {
+            assert_eq!(
+                complete.worker_address().get_entry(key).unwrap(),
+                Some(Bytes::from(format!("{key}-endpoint")))
+            );
+        }
+
+        let mux = Recording::new("messenger-mux", WorkerAddress::empty(), false);
+        assert_eq!(
+            complete_peer_info(messenger.clone(), mux.as_ref()).worker_address(),
+            messenger.worker_address()
+        );
+
+        let colliding = Recording::new("tcp", address(&["tcp"]), false);
+        assert_eq!(
+            complete_peer_info(messenger.clone(), colliding.as_ref()).worker_address(),
+            messenger.worker_address()
+        );
+    }
+}
