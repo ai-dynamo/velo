@@ -55,6 +55,7 @@ struct RemotePair {
     _msgr_consumer: Arc<Messenger>,
 }
 
+#[allow(deprecated)] // an `AnchorManager` built by hand over a bare `Messenger`, which `Velo` registers itself
 async fn make_two_tcp_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
     let bind = |_| {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();

@@ -195,7 +195,7 @@ async fn owner(args: Args) -> Result<()> {
     // exists to make visible.
     let served_rdma = path_count(&registry, "ok") > 0;
 
-    velo.graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_secs(30)))
+    velo.shutdown(ShutdownPolicy::Timeout(Duration::from_secs(30)))
         .await;
 
     if !served_rdma {
@@ -255,7 +255,7 @@ async fn consumer(args: Args) -> Result<()> {
 
     let took_rdma = path_count(&registry, "ok") > 0;
     std::fs::write(args.dir.join("done"), b"done")?;
-    velo.graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_secs(30)))
+    velo.shutdown(ShutdownPolicy::Timeout(Duration::from_secs(30)))
         .await;
 
     if !took_rdma {

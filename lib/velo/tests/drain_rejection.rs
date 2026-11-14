@@ -198,6 +198,7 @@ async fn quic_unary_to_draining_peer_fails_fast() {
 /// Phase 2 of `graceful_shutdown` must wait for a handler invocation that is
 /// already running, and complete promptly once it finishes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(deprecated)] // tests the drain of the deprecated `graceful_shutdown`, which `Velo::shutdown` would extend with a stream teardown
 async fn graceful_shutdown_waits_for_in_flight_handlers() {
     let server = Velo::builder()
         .add_transport(new_tcp_transport())
@@ -409,6 +410,7 @@ impl Transport for LoopbackTransport {
 /// and the shutdown driver both run on the test's runtime, so neither freezes
 /// with it — which is exactly the interleaving the fix has to survive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[allow(deprecated)] // tests the drain of the deprecated `graceful_shutdown`, which `Velo::shutdown` would extend with a stream teardown
 async fn graceful_shutdown_timeout_drops_queued_work() {
     let server_rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -818,6 +820,7 @@ async fn a_parked_dispatch_loop_leaves_admitted_messages_uncounted() {
 
 /// Error replies are still admitted work while their transport queue is full.
 #[tokio::test]
+#[allow(deprecated)] // tests the drain of the deprecated `graceful_shutdown`, which `Velo::shutdown` would extend with a stream teardown
 async fn graceful_shutdown_waits_for_negative_reply_admission() {
     for case in [
         "unknown",

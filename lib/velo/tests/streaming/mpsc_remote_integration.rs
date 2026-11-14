@@ -39,6 +39,7 @@ fn new_tcp_transport() -> Arc<velo::transports::tcp::TcpTransport> {
     )
 }
 
+#[allow(deprecated)] // an `AnchorManager` built by hand over a bare `Messenger`, which `Velo` registers itself
 async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
     let t1 = new_tcp_transport();
     let t2 = new_tcp_transport();
@@ -338,6 +339,7 @@ async fn test_mpsc_heartbeat_timeout_per_sender() {
 /// attach. Each sender's items must reach the anchor under its own `SenderId`,
 /// with no crossover.
 #[tokio::test(flavor = "multi_thread")]
+#[allow(deprecated)] // an `AnchorManager` built by hand over a bare `Messenger`, which `Velo` registers itself
 async fn test_mpsc_remote_two_workers_no_routing_collision() {
     // Three messengers: A hosts the anchor; B and C are two distinct
     // sender-side workers. Each gets its own streaming stack and a fresh

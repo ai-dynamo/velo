@@ -133,21 +133,21 @@ pub(super) async fn harness(config: MuxConfig) -> Harness {
 /// The far end of every egress test: a real messenger pair over loopback TCP,
 /// so the assertions read wire bytes rather than an accounting mirror.
 pub(super) async fn capture_pair() -> (Arc<Messenger>, Arc<Messenger>, flume::Receiver<Bytes>) {
-    let sender = Messenger::builder()
+    let sender = crate::messenger::MessengerParts::new()
         .add_transport(tcp_transport())
         .build()
         .await
         .expect("sender messenger");
-    let capture = Messenger::builder()
+    let capture = crate::messenger::MessengerParts::new()
         .add_transport(tcp_transport())
         .build()
         .await
         .expect("capture messenger");
     sender
-        .register_peer(capture.peer_info())
+        .register_peer_inner(capture.peer_info())
         .expect("register capture");
     capture
-        .register_peer(sender.peer_info())
+        .register_peer_inner(sender.peer_info())
         .expect("register sender");
 
     let (batch_tx, batches) = flume::unbounded::<Bytes>();
@@ -524,7 +524,7 @@ pub(super) async fn stalled_harness_with_hooks(
     hooks: Option<Arc<super::super::test_hooks::TestHooks>>,
 ) -> StalledHarness {
     let (transport, wire) = StallingTransport::new(tokio::runtime::Handle::current());
-    let sender = Messenger::builder()
+    let sender = crate::messenger::MessengerParts::new()
         .add_transport(Arc::clone(&transport) as Arc<dyn velo_ext::Transport>)
         .build()
         .await
@@ -533,7 +533,7 @@ pub(super) async fn stalled_harness_with_hooks(
     // gate is the only thing under test.
     let peer_instance = velo_ext::InstanceId::new_v4();
     sender
-        .register_peer(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
+        .register_peer_inner(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
         .expect("register peer");
 
     let registry = prometheus::Registry::new();
