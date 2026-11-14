@@ -31,6 +31,16 @@ A test may assert what holds whatever tokio decides: that nothing on a held runt
 
 Test: on `TaskRuntime::Application`, `block_in_place_keeps_the_stream` is the live test of the workaround, and `a_held_worker_thread_cuts_the_stream` is the ignored demonstration of the stall (`lib/velo/tests/streaming/held_thread.rs`). In `lib/velo/tests/streaming/stall_rows.rs` the `dedicated_*` tests are live, because on the default velo's tasks run on a runtime the test does not hold, and the `application_*` tests are the ignored demonstrations.
 
+## A wake does not mean the poll returned `Pending`
+
+**Rule.** When a test counts wakes, classify each operation by its wakes, not by whether its future returned `Pending`. A future that registers its waker and then checks for its value can be woken while that same poll returns `Ready`. A future whose value was already there ends with no wake at all.
+
+**Failure.** A test counted one response wake for each unary call that returned `Pending`. The response slot (`Slot::poll_wait`) registers the caller's waker first and then checks for the value. A response that landed between the two gave a call with one wake that never waited, and the count was off by one. Under load, a run of 20 calls also had none that waited, so a check that some call waited failed.
+
+**Test.** Hold the waker side on a channel between the registration and the check, and see whether the count still holds. Make the expected wait long, here a 1 ms sleep in the handler, so that most operations have a wake to count. Then run the test 50 times, and again with several copies in parallel.
+
+Test: `a_wake_inside_the_first_poll_counts_as_the_response_hand_off` forces the interleaving, and `a_unary_call_crosses_between_runtimes_four_times` counts per call (`lib/velo/tests/task_runtime.rs`).
+
 ## A cancel wakes child tokens before the parent's own waiters
 
 **Rule.** A task on a child token wakes before a task on the parent token.

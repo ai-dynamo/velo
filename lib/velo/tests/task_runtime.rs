@@ -1139,10 +1139,8 @@ impl futures::task::ArcWake for RecordingWaker {
     }
 }
 
-/// Polls `inner` with a waker that records the thread of each wake.
-/// Returns whether `inner` ever returned `Pending`, so waited for a wake: a
-/// call whose response arrived while its first poll still ran finishes on
-/// that poll, with no wake to count.
+/// Polls `inner` with a waker that records the thread of each wake. Returns
+/// whether `inner` ever returned `Pending`.
 async fn record_wakes<F: std::future::Future>(
     inner: F,
     wakes: Arc<parking_lot::Mutex<Vec<String>>>,
@@ -1164,7 +1162,34 @@ async fn record_wakes<F: std::future::Future>(
     waited
 }
 
-/// Where one unary call ran, counted by thread.
+/// How the response of one call reached its caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CallEnd {
+    /// One wake, from a velo thread.
+    WokenFromVelo,
+    /// One wake, from an application thread.
+    WokenFromApplication,
+    /// No wake: the response was there before the caller's first poll
+    /// registered for it.
+    NoWake,
+    /// More than one wake, or a wait with no wake.
+    Other,
+}
+
+/// Classifies a call by its wakes, not by whether it returned `Pending`.
+/// The response slot registers the caller's waker before it checks for the
+/// value, so a response that lands between the two wakes the caller while
+/// that same poll returns `Ready`.
+fn classify(waited: bool, wakes: &[String]) -> CallEnd {
+    match wakes {
+        [] if !waited => CallEnd::NoWake,
+        [thread] if thread == THREAD_NAME => CallEnd::WokenFromVelo,
+        [_] => CallEnd::WokenFromApplication,
+        _ => CallEnd::Other,
+    }
+}
+
+/// Where the parts of a run of unary calls ran, counted by thread.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Crossings {
     /// Requests and responses handed to the transport from an application
@@ -1174,12 +1199,15 @@ struct Crossings {
     /// the handler runs where the transport reads, on the runtime `start`
     /// was given.
     handlers_on_application: usize,
-    /// Calls whose caller waited for its response.
-    calls_that_waited: usize,
-    /// Wakes of the caller's task from a velo thread: the response path.
-    caller_wakes_from_velo: usize,
-    /// Wakes of the caller's task from any other thread.
-    caller_wakes_from_application: usize,
+    /// Calls whose caller was woken once, from a velo thread: the response
+    /// path.
+    woken_from_velo: usize,
+    /// Calls whose caller was woken once, from an application thread.
+    woken_from_application: usize,
+    /// Calls that ended with no wake.
+    no_wake: usize,
+    /// Calls that fit none of the above.
+    other: usize,
 }
 
 /// Makes `calls` unary calls one at a time, after a warm-up, and counts
@@ -1205,6 +1233,9 @@ async fn count_crossings(runtime: TaskRuntime, calls: usize) -> (Crossings, Stri
                 let handler_threads = Arc::clone(&handler_threads);
                 move |ctx: Context| {
                     handler_threads.lock().push(thread_name());
+                    // The caller is then waiting when the response comes
+                    // back, so almost every call has a wake to count.
+                    std::thread::sleep(Duration::from_millis(1));
                     Ok(Some(ctx.payload))
                 }
             })
@@ -1232,13 +1263,16 @@ async fn count_crossings(runtime: TaskRuntime, calls: usize) -> (Crossings, Stri
     server_transport.sends.lock().clear();
     handler_threads.lock().clear();
 
-    let wakes = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let mut calls_that_waited = 0;
+    let mut ends = Vec::with_capacity(calls);
+    let mut all_wakes = Vec::with_capacity(calls);
     for _ in 0..calls {
+        let wakes = Arc::new(parking_lot::Mutex::new(Vec::new()));
         let waited = tokio::time::timeout(PATIENCE, record_wakes(call(), Arc::clone(&wakes)))
             .await
             .expect("call timed out");
-        calls_that_waited += usize::from(waited);
+        let wakes = wakes.lock().clone();
+        ends.push(classify(waited, &wakes));
+        all_wakes.push((waited, wakes));
     }
 
     let is_velo = |thread: &String| thread == THREAD_NAME;
@@ -1249,7 +1283,7 @@ async fn count_crossings(runtime: TaskRuntime, calls: usize) -> (Crossings, Stri
         .chain(server_transport.sends.lock().iter())
         .cloned()
         .collect();
-    let wakes = wakes.lock().clone();
+    let count = |end: CallEnd| ends.iter().filter(|e| **e == end).count();
     let crossings = Crossings {
         sends_from_application: sends.iter().filter(|(_, t)| !is_velo(t)).count(),
         handlers_on_application: handler_threads
@@ -1257,12 +1291,14 @@ async fn count_crossings(runtime: TaskRuntime, calls: usize) -> (Crossings, Stri
             .iter()
             .filter(|t| !is_velo(t))
             .count(),
-        calls_that_waited,
-        caller_wakes_from_velo: wakes.iter().filter(|t| is_velo(t)).count(),
-        caller_wakes_from_application: wakes.iter().filter(|t| !is_velo(t)).count(),
+        woken_from_velo: count(CallEnd::WokenFromVelo),
+        woken_from_application: count(CallEnd::WokenFromApplication),
+        no_wake: count(CallEnd::NoWake),
+        other: count(CallEnd::Other),
     };
     let detail = format!(
-        "sends {sends:?}, handler threads {:?}, caller wakes {wakes:?}, writers on {:?} and {:?}",
+        "sends {sends:?}, handler threads {:?}, (waited, caller wakes) per call {all_wakes:?}, \
+         writers on {:?} and {:?}",
         handler_threads.lock(),
         client_transport.writer_thread.lock(),
         server_transport.writer_thread.lock()
@@ -1287,10 +1323,10 @@ async fn count_crossings(runtime: TaskRuntime, calls: usize) -> (Crossings, Stri
 ///    runtime;
 /// 4. the client's response path, on velo's runtime, wakes the caller.
 ///
-/// The fourth is a wake only when the caller is waiting. A response can
-/// arrive while the caller's first poll still runs, and that call finishes
-/// with no wake, so the test counts the calls that waited and expects one
-/// wake from velo for each.
+/// The fourth is a wake only if the response comes after the caller's first
+/// poll registered for it. A call whose response was already there ends
+/// with no wake, so the test allows that and requires a velo wake for every
+/// other call (the handler's 1 ms sleep makes those almost all of them).
 ///
 /// On `TaskRuntime::Application` the same call runs on the application's
 /// runtime throughout. Each crossing is a wake across threads, and it is the
@@ -1306,25 +1342,25 @@ async fn a_unary_call_crosses_between_runtimes_four_times() {
     let _serial = serial().await;
     const CALLS: usize = 20;
     let (crossings, detail) = count_crossings(TaskRuntime::dedicated(), CALLS).await;
-    let waited = crossings.calls_that_waited;
-    assert!(
-        waited > 0,
-        "no call waited, so no wake was counted: {detail}"
-    );
     assert!(
         detail.ends_with(&format!(
             "writers on Some({THREAD_NAME:?}) and Some({THREAD_NAME:?})"
         )),
         "the writers do not run on velo's runtime: {detail}"
     );
+    assert!(
+        crossings.woken_from_velo > 0,
+        "no caller was woken, so the response hand-off was not seen: {detail}"
+    );
     assert_eq!(
         crossings,
         Crossings {
             sends_from_application: 2 * CALLS,
             handlers_on_application: CALLS,
-            calls_that_waited: waited,
-            caller_wakes_from_velo: waited,
-            caller_wakes_from_application: 0,
+            woken_from_velo: CALLS - crossings.no_wake,
+            woken_from_application: 0,
+            no_wake: crossings.no_wake,
+            other: 0,
         },
         "{detail}"
     );
@@ -1341,9 +1377,60 @@ async fn a_unary_call_on_the_application_runtime_stays_there() {
         !detail.contains(THREAD_NAME),
         "a velo thread exists on the application's runtime: {detail}"
     );
-    assert_eq!(crossings.caller_wakes_from_velo, 0, "{detail}");
+    assert_eq!(crossings.woken_from_velo, 0, "{detail}");
+    assert_eq!(crossings.other, 0, "{detail}");
     assert_eq!(
-        crossings.caller_wakes_from_application, crossings.calls_that_waited,
+        crossings.woken_from_application + crossings.no_wake,
+        CALLS,
         "{detail}"
+    );
+}
+
+/// A response that lands after the caller's waker is registered but before
+/// the same poll checks for it wakes the caller, and that poll still returns
+/// `Ready`. `Slot::poll_wait` registers first, then checks. The count must
+/// take the wake as the response hand-off, though the call never waited.
+#[tokio::test]
+async fn a_wake_inside_the_first_poll_counts_as_the_response_hand_off() {
+    // The responder thread is named `velo-rt`, which the other tests count.
+    let _serial = serial().await;
+    let slot_waker = Arc::new(futures::task::AtomicWaker::new());
+    let (registered, may_complete) = std::sync::mpsc::channel();
+    let (completed, may_read) = std::sync::mpsc::channel();
+    let responder = std::thread::Builder::new()
+        .name(THREAD_NAME.to_owned())
+        .spawn({
+            let slot_waker = Arc::clone(&slot_waker);
+            move || {
+                may_complete.recv().expect("waker registered");
+                slot_waker.wake();
+                completed.send(()).expect("response completed");
+            }
+        })
+        .expect("response thread");
+    let wakes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let response = std::future::poll_fn(|cx| {
+        slot_waker.register(cx.waker());
+        registered.send(()).expect("allow response");
+        may_read
+            .recv()
+            .expect("response available before the check");
+        std::task::Poll::Ready(())
+    });
+    let waited = record_wakes(response, Arc::clone(&wakes)).await;
+    responder.join().expect("response thread");
+    let wakes = wakes.lock().clone();
+    assert!(!waited);
+    assert_eq!(wakes, [THREAD_NAME]);
+    assert_eq!(classify(waited, &wakes), CallEnd::WokenFromVelo);
+    assert_eq!(classify(false, &[]), CallEnd::NoWake);
+    assert_eq!(classify(true, &[]), CallEnd::Other);
+    assert_eq!(
+        classify(true, &["tokio-runtime-worker".to_owned()]),
+        CallEnd::WokenFromApplication
+    );
+    assert_eq!(
+        classify(true, &[THREAD_NAME.to_owned(), THREAD_NAME.to_owned()]),
+        CallEnd::Other
     );
 }
