@@ -242,10 +242,7 @@ type RegisterHook = Box<dyn Fn(&DataStore) + Send + Sync>;
 pub struct RegisterOptions {
     /// Optional time-to-live for the staged data. When it is up, the slot is
     /// freed and every lease on it ended, whether or not a consumer is still
-    /// reading. Enforced by the instance's reaper, which a registration
-    /// through [`RendezvousManager`](crate::RendezvousManager) starts; a
-    /// [`DataStore`] used on its own enforces it only through
-    /// [`DataStore::sweep_expired`].
+    /// reading. Enforced by the instance's reaper.
     pub ttl: Option<Duration>,
 }
 
@@ -374,6 +371,7 @@ impl DataStore {
     }
 
     /// Register data and return the local slot ID.
+    #[cfg(test)]
     pub fn register(&self, data: Bytes, opts: Option<RegisterOptions>) -> u64 {
         self.register_body(SlotBody::InMemory(data), opts)
     }
@@ -424,6 +422,7 @@ impl DataStore {
     }
 
     /// How a slot is staged, or `None` if it does not exist.
+    #[cfg(any(test, all(target_os = "linux", feature = "ucx")))]
     pub fn stage_mode(&self, local_id: u64) -> Option<StageMode> {
         self.slots.get(&local_id).map(|slot| slot.body.stage_mode())
     }
@@ -662,6 +661,7 @@ impl DataStore {
     ///
     /// Uses checked arithmetic: returns `false` if the count is already zero
     /// instead of underflowing.
+    #[cfg(test)]
     pub fn release_read_lock(&self, local_id: u64) -> bool {
         self.take_one(local_id, Count::ReadLocks) == Some((0, 0))
     }
@@ -713,6 +713,7 @@ impl DataStore {
     ///
     /// Uses checked arithmetic: returns `false` if the count is already zero
     /// instead of underflowing.
+    #[cfg(test)]
     pub fn ref_decrement(&self, local_id: u64) -> bool {
         self.take_one(local_id, Count::References) == Some((0, 0))
     }
@@ -723,6 +724,7 @@ impl DataStore {
     /// a caller's region, and handing them out under a `Bytes` would make the
     /// registration's lifetime depend on where that `Bytes` ended up. Removing
     /// the slot drops the staging, which is the whole point of removing it.
+    #[cfg(test)]
     pub fn remove(&self, local_id: u64) -> Option<Bytes> {
         let (_, slot) = self.slots.remove(&local_id)?;
         if slot.ttl.is_some() {
@@ -817,6 +819,7 @@ impl DataStore {
     }
 
     /// Remove a completed transfer.
+    #[cfg(test)]
     pub fn remove_transfer(&self, transfer_id: u64) {
         self.transfers.remove(&transfer_id);
     }

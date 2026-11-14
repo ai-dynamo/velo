@@ -7,7 +7,7 @@
 //! and handler infrastructure for request-response and fire-and-forget messaging
 //! patterns over pluggable transports. Includes a distributed event system.
 
-mod client;
+pub(crate) mod client;
 pub(crate) mod large_payload;
 #[allow(clippy::module_inception)]
 mod messenger;
@@ -16,23 +16,14 @@ pub(crate) mod common;
 pub(crate) mod handlers;
 pub(crate) mod server;
 
-pub mod discovery;
+pub(crate) mod discovery;
 #[cfg(feature = "services")]
-pub mod events;
+pub(crate) mod events;
 
+// The handler and builder types have their public path at the crate root
+// (`velo::Handler`, ...), not here.
 pub(crate) use client::ActiveMessageClient;
-pub use client::builders::{
-    Admitted, AmSendBuilder, AmSyncBuilder, FireResult, RequestTimeout, SyncResult,
-    TypedUnaryBuilder, TypedUnaryResult, UnaryBuilder, UnaryResult,
-};
 pub use common::MessageId;
-pub use discovery::PeerDiscovery;
-#[cfg(feature = "services")]
-pub use events::VeloEvents;
-pub use handlers::{
-    AmHandlerBuilder, AsyncExecutor, Context, Handler, HandlerExecutor, OrderedConfig, OrderingKey,
-    OverflowPolicy, SyncExecutor, TypedContext, TypedUnaryHandlerBuilder, UnaryHandlerBuilder,
-    UnifiedResponse,
-};
+pub(crate) use discovery::PeerDiscovery;
 pub use messenger::Messenger;
 pub(crate) use messenger::MessengerParts;

@@ -14,7 +14,8 @@ use std::time::Duration;
 use anyhow::Result;
 use prometheus::Registry;
 use tokio::time::sleep;
-use velo::{InstanceId, PeerInfo, StreamConfig, Velo, VeloMetrics};
+use velo::{InstanceId, PeerInfo, StreamConfig, Velo};
+use velo::observability::VeloMetrics;
 use velo_examples::{TransportType, new_transport};
 
 use super::StreamTransportKind;

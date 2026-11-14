@@ -11,7 +11,7 @@ use futures::future::BoxFuture;
 use crate::discovery::PeerDiscovery;
 use velo_ext::{InstanceId, PeerInfo, WorkerId};
 
-use crate::simulation::fabric::SimFabric;
+use crate::simulation::SimFabric;
 
 /// In-memory peer discovery backed by the shared [`SimFabric`].
 ///
@@ -68,7 +68,7 @@ impl PeerDiscovery for SimDiscovery {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::simulation::network::BisectionBandwidth;
+    use crate::simulation::BisectionBandwidth;
     use loom_rs::sim::SimulationRuntime;
     use velo_ext::WorkerAddress;
 

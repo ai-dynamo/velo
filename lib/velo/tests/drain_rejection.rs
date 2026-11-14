@@ -22,9 +22,10 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use prometheus::Registry;
+use velo::Transport;
 use velo::observability::VeloMetrics;
 use velo::transports::tcp::TcpTransportBuilder;
-use velo::transports::{AdmitOutcome, MessageType, SendOutcome, Transport};
+use velo::transports::{AdmitOutcome, MessageType, SendOutcome};
 use velo::*;
 
 /// Departures from the messenger's inbound queue. Paired with

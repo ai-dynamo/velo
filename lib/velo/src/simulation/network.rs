@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use velo_ext::InstanceId;
 
-use crate::simulation::fabric::Transfer;
+use crate::simulation::Transfer;
 
 const COMPLETION_EPSILON_BYTES: f64 = 1e-9;
 

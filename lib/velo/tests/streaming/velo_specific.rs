@@ -7,36 +7,31 @@
 
 mod common;
 
-use common::MockFrameTransport;
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
-use velo::streaming::{AnchorManager, AttachError, StreamError, StreamFrame};
-use velo_ext::WorkerId;
+use velo::{AttachError, StreamError, StreamFrame};
 
-fn make_manager() -> Arc<AnchorManager> {
-    Arc::new(AnchorManager::new(
-        WorkerId::from_u64(1),
-        Arc::new(MockFrameTransport::new()),
-    ))
+async fn make_manager() -> Arc<velo::Velo> {
+    Arc::new(common::local_node().await)
 }
 
 // TEST-03: Exclusive reject
 // Requires multi_thread flavor to expose true concurrency in DashMap::entry() path.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_03_exclusive_reject() {
-    let mgr = make_manager();
+    let mgr = make_manager().await;
     let anchor = mgr.create_anchor::<u32>();
     let handle = anchor.handle();
 
     // First attach succeeds
     let _sender = mgr
-        .attach_stream_anchor::<u32>(handle)
+        .attach_anchor::<u32>(handle)
         .await
         .expect("first attach must succeed");
 
     // Second attach while first is active must return AlreadyAttached
-    let result = mgr.attach_stream_anchor::<u32>(handle).await;
+    let result = mgr.attach_anchor::<u32>(handle).await;
     assert!(
         matches!(result, Err(AttachError::AlreadyAttached { .. })),
         "concurrent attach must return AlreadyAttached, got {:?}",
@@ -54,13 +49,13 @@ async fn test_03_exclusive_reject() {
 // observes the termination sentinel and stops yielding items.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_07_transport_error_propagation() {
-    let mgr = make_manager();
+    let mgr = make_manager().await;
 
     let mut anchor = mgr.create_anchor::<u32>();
     let handle = anchor.handle();
     // Attach a sender to start the stream.
     let sender = mgr
-        .attach_stream_anchor::<u32>(handle)
+        .attach_anchor::<u32>(handle)
         .await
         .expect("attach must succeed");
 

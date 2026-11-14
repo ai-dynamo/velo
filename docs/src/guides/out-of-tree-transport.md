@@ -1,10 +1,10 @@
 # Write an out-of-tree transport
 
-A transport, frame transport, or discovery backend in another crate depends on `velo-ext` only. It does not depend on `velo`. `velo-ext` has no Prometheus, no Tonic, no NATS, and no dependency on `velo`.
+A transport or discovery backend in another crate depends on `velo-ext` only. It does not depend on `velo`. `velo-ext` has no Prometheus, no Tonic, no NATS, and no dependency on `velo`.
 
 ```toml
 [dependencies]
-velo-ext = "0.5"
+velo-ext = "0.6"
 ```
 
 ## Pick the trait
@@ -12,10 +12,11 @@ velo-ext = "0.5"
 | Trait | What you provide |
 |---|---|
 | `velo_ext::Transport` | A messenger transport |
-| `velo_ext::FrameTransport` | A frame transport for streams |
 | `velo_ext::PeerDiscovery` | A peer discovery backend |
 | `velo_ext::ServiceDiscovery` | A service discovery backend |
 | `velo_ext::TransportObservability` | Rarely needed. The runtime gives you one of these. |
+
+Streams need no trait of their own. A stream rides the messenger mux over your `Transport`. velo-ext 0.6.0 removed `FrameTransport`: the per-stream transports are in-tree only.
 
 ## Procedure for a messenger transport
 

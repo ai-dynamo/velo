@@ -101,13 +101,13 @@ pub enum AttachError {
 
 /// Per-anchor overrides for the two liveness knobs.
 ///
-/// Both fields are `Option`: `None` means "inherit the manager-level default"
-/// (`AnchorManager::default_unattached_timeout` and
-/// `AnchorManager::default_heartbeat_interval`); `Some(d)` overrides it for the
-/// single anchor created via [`AnchorManager::create_anchor_with_config`].
+/// Both fields are `Option`: `None` means "inherit the node's default" (a
+/// 120 s unattached timeout and a 5 s heartbeat interval); `Some(d)`
+/// overrides it for the single anchor created via
+/// [`Velo::create_anchor_with_config`](crate::Velo::create_anchor_with_config).
 ///
-/// `AnchorConfig::default()` inherits everything, making it equivalent to the
-/// zero-arg [`AnchorManager::create_anchor`] path.
+/// `AnchorConfig::default()` inherits everything, making it equivalent to
+/// [`Velo::create_anchor`](crate::Velo::create_anchor).
 #[derive(Debug, Clone, Default)]
 pub struct AnchorConfig {
     /// How long an unattached anchor may live before being auto-removed.
@@ -643,15 +643,15 @@ impl StreamController {
 ///
 /// ```rust,no_run
 /// use futures::StreamExt;
-/// use velo::streaming::{AnchorManager, StreamFrame};
+/// use velo::{StreamFrame, Velo};
 ///
-/// # async fn example(mgr: &AnchorManager) -> anyhow::Result<()> {
+/// # async fn example(velo: &Velo) -> anyhow::Result<()> {
 /// // Consumer creates an anchor
-/// let mut anchor = mgr.create_anchor::<String>();
+/// let mut anchor = velo.create_anchor::<String>();
 /// let handle = anchor.handle();
 ///
 /// // Producer attaches (could be on a different worker)
-/// let sender = mgr.attach_stream_anchor::<String>(handle).await?;
+/// let sender = velo.attach_anchor::<String>(handle).await?;
 ///
 /// // Send items
 /// sender.send("hello".into()).await?;
@@ -761,7 +761,7 @@ impl<T> StreamAnchor<T> {
     }
 
     /// Return the anchor handle. Pass to a sender (possibly on another worker)
-    /// for attachment via [`AnchorManager::attach_stream_anchor`].
+    /// for attachment via [`Velo::attach_anchor`](crate::Velo::attach_anchor).
     pub fn handle(&self) -> StreamAnchorHandle {
         self.handle
     }
@@ -1043,7 +1043,7 @@ impl StreamAnchor<Bytes> {
     /// A kept item keeps its frame buffer alive: the item plus at most 11
     /// bytes of frame header.
     ///
-    /// [`StreamSender::send_bytes`]: crate::streaming::StreamSender::send_bytes
+    /// [`StreamSender::send_bytes`]: crate::StreamSender::send_bytes
     pub fn poll_next_bytes(
         &mut self,
         cx: &mut Context<'_>,
@@ -1105,12 +1105,12 @@ fn insert_at_random_id<V>(
 /// consumer-side tasks can hold a cheap clone of the registry reference without
 /// holding a reference to the whole `AnchorManager`.
 ///
-/// Use [`AnchorManagerBuilder`] for optional configuration (e.g. `default_unattached_timeout`,
-/// `default_heartbeat_interval`), or [`AnchorManager::new`] as a convenience constructor
-/// with a 120-second unattached timeout and a 5-second heartbeat interval.
+/// The `Velo` builder builds one with [`AnchorManagerBuilder`]. Unit tests
+/// use `AnchorManager::new`, which takes the builder defaults: a 120-second
+/// unattached timeout and a 5-second heartbeat interval.
 #[derive(Builder)]
 #[builder(pattern = "owned", build_fn(name = "build_inner", private))]
-pub struct AnchorManager {
+pub(crate) struct AnchorManager {
     worker_id: velo_ext::WorkerId,
 
     #[builder(default = "Arc::new(DashMap::new())")]
@@ -1212,8 +1212,7 @@ pub struct AnchorManager {
     /// window a peer advertised back, and — for zero-RTT setup — a synchronous
     /// `prebind` plus the `release_bind` and `close_claimed_slot` that give a
     /// pre-bound slot back. Keeping all of that off the trait is deliberate:
-    /// `FrameTransport` lives in `velo-ext` and out-of-tree implementors should
-    /// not grow methods about one in-tree transport's credit protocol.
+    /// the per-stream transports share the trait and have no credit protocol.
     ///
     /// Write-once, like `messenger_lock`, and skipped by the builder: it is a
     /// crate-internal type, and a public setter naming it would leak it.
@@ -1405,11 +1404,10 @@ impl AnchorManager {
         }
     }
 
-    /// Convenience constructor with the builder defaults: a 120 s unattached
-    /// timeout and a 5 s heartbeat interval.
-    ///
-    /// Equivalent to `AnchorManagerBuilder::default().worker_id(id).transport(t).build()`.
-    pub fn new(
+    /// A manager with the builder defaults (a 120 s unattached timeout and a
+    /// 5 s heartbeat interval) and no messenger, for local tests.
+    #[cfg(test)]
+    pub(crate) fn new(
         worker_id: velo_ext::WorkerId,
         transport: Arc<dyn crate::streaming::transport::FrameTransport>,
     ) -> Self {
@@ -1523,43 +1521,8 @@ impl AnchorManager {
             .map_err(|_| anyhow::anyhow!("a messenger mux is already installed on this manager"))
     }
 
-    /// Bind a mux slot for `handle` and start its feed now, so its sender
-    /// never has to ask for one.
-    ///
-    /// Returns the terms that sender must open on, to be carried to it in
-    /// whatever envelope the application already sends — see
-    /// [`crate::streaming::control::StreamOpenTicket`] and its counterpart
-    /// [`open_anchor_stream`](Self::open_anchor_stream). Everything the
-    /// `_anchor_attach` handler would have done on the round trip happens here
-    /// instead, so the sender's first record is its first message.
-    ///
-    /// `None` means *no ticket was minted; attach the ordinary way*, and as a
-    /// return it is never an error. With no mux installed nothing here can run
-    /// and every stream takes the per-stream path — which is what keeps
-    /// `MuxConfig::enabled` the complete rollback for this path too, and why
-    /// that `None` alone is silent.
-    ///
-    /// `None` is also the answer for a handle this manager cannot pre-bind: one
-    /// belonging to another worker, an MPSC anchor, an anchor already attached
-    /// or already pre-bound, or one that has since been removed. Those are
-    /// logged at debug and recorded as `outcome="error"` under
-    /// `velo_streaming_anchor_operations_total{operation="prebind"}`, because
-    /// unlike the rollback they are a caller mistake rather than a
-    /// configuration.
-    ///
-    /// Must be called from a runtime context: it spawns the stream watchdog,
-    /// exactly as the attach handler does for a mux bind.
-    ///
-    /// The ticket waits for the configured reservation timeout (180 seconds
-    /// by default). Holders can extend it with [`Self::renew_reservations`].
-    /// Heartbeat detection starts when `OpenSlot` claims the bind. The ordinary
-    /// unattached timeout stays paused while the reservation exists.
-    /// Renewing a claimed, expired, cancelled, or replaced reservation is a no-op.
-    ///
-    /// The ticket names the mux lane with the least load on this node: its
-    /// live slots from every peer, plus its pre-binds not yet claimed,
-    /// released or expired. [`prebind_anchor_keyed`](Self::prebind_anchor_keyed)
-    /// places it by a key instead.
+    /// Backs [`Velo::prebind_anchor`](crate::Velo::prebind_anchor), whose docs carry the
+    /// contract.
     pub fn prebind_anchor(
         &self,
         handle: StreamAnchorHandle,
@@ -2443,35 +2406,8 @@ impl AnchorManager {
         }
     }
 
-    /// Open the sender half of a stream whose slot the receiver already bound.
-    ///
-    /// The zero-RTT twin of [`attach_stream_anchor`](Self::attach_stream_anchor):
-    /// the same tail with the `_anchor_attach` round trip cut out, because
-    /// `ticket` already carries the answer that round trip existed to fetch.
-    /// The receiver minted it with [`prebind_anchor`](Self::prebind_anchor);
-    /// the application carried it here.
-    ///
-    /// The worker's first batch opens the pre-bound slot by the ticket's
-    /// routing session id, which is the claim — bind-on-`OpenSlot` is how a mux
-    /// bind has always been taken up, and nothing about that changes.
-    ///
-    /// `Ok` means the local egress slot is staged, not that the receiver has
-    /// accepted the ticket: the `OpenSlot` this call stages is eager and
-    /// unacked, the same as an ordinary attach's, so a ticket whose bind was
-    /// already released or has expired still returns `Ok` here and only
-    /// surfaces later, as a send failure on the returned `StreamSender`.
-    ///
-    /// Slot lifecycle signals reach the producer even before its first send.
-    ///
-    /// # Errors
-    /// - [`AttachError::TransportError`] if `handle` names this node's own
-    ///   worker id (a ticket is for a *different* worker to open; a
-    ///   same-worker sender should use
-    ///   [`attach_stream_anchor`](Self::attach_stream_anchor) instead), if
-    ///   the ticket names `messenger-mux-v2` but this node has no mux
-    ///   installed, if the ticket names a transport key this node cannot
-    ///   resolve, or if staging the local slot fails after retrying a
-    ///   batcher that keeps retiring underneath it.
+    /// Backs [`Velo::open_anchor_stream`](crate::Velo::open_anchor_stream), whose docs carry the
+    /// contract.
     pub async fn open_anchor_stream<T: serde::Serialize>(
         &self,
         handle: StreamAnchorHandle,
@@ -2608,30 +2544,8 @@ impl AnchorManager {
         Ok(sender)
     }
 
-    /// Attach a sender to an existing anchor, establishing the transport connection.
-    ///
-    /// This is the primary sender-side entry point (API-05). It:
-    /// 1. Detects remote handles (`handle.worker_id != self.worker_id`) and routes through
-    ///    the remote attach path for cross-worker AM dispatch.
-    /// 2. For local handles: validates the anchor exists and is unattached,
-    ///    atomically marks the anchor as attached, and returns a
-    ///    [`StreamSender<T>`](crate::streaming::sender::StreamSender) for pushing typed frames.
-    ///
-    /// The StreamSender writes to the entry's `frame_tx` so items flow directly
-    /// to the [`StreamAnchor<T>`] consumer. The transport connection is used for
-    /// cross-worker flows.
-    ///
-    /// # Errors
-    /// - [`AttachError::AnchorNotFound`] if the handle is not in the registry (local path)
-    /// - [`AttachError::AlreadyAttached`] if another sender is already connected, which
-    ///   includes a pre-bound slot an `OpenSlot` has already claimed (local path)
-    /// - [`AttachError::TransportError`] for all remote path errors (messenger unavailable,
-    ///   AM send failed, remote error response)
-    ///
-    /// Over the mux, the consumer places the stream on the lane with the
-    /// fewest streams from this worker;
-    /// [`attach_stream_anchor_keyed`](Self::attach_stream_anchor_keyed) places
-    /// it by a key instead.
+    /// Backs [`Velo::attach_anchor`](crate::Velo::attach_anchor), whose docs carry the
+    /// contract.
     pub async fn attach_stream_anchor<T: serde::Serialize>(
         &self,
         handle: StreamAnchorHandle,
@@ -5412,9 +5326,9 @@ mod tests {
 
         m_consumer
             .register_streaming_handler(
-                crate::messenger::Handler::typed_unary_async(
+                crate::Handler::typed_unary_async(
                     "_anchor_attach",
-                    |_ctx: crate::messenger::TypedContext<
+                    |_ctx: crate::TypedContext<
                         crate::streaming::control::AnchorAttachRequest,
                     >| async {
                         Ok(crate::streaming::control::AnchorAttachResponse::Ok {
@@ -5509,7 +5423,7 @@ mod tests {
     /// An `AnchorManager` built by hand over `TcpFrameTransport` has no one
     /// to name the transport as one that reports retirement from its pump:
     /// only the `Velo` builder does that. Its senders report `Sent` as the
-    /// terminal enters the egress channel, which the docs say.
+    /// terminal enters the egress channel. Only unit tests build one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_hand_built_manager_retires_as_the_terminal_is_queued() {
         use crate::streaming::sender::RetiresOn;

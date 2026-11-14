@@ -15,16 +15,17 @@
 //! consumer side.
 
 pub mod anchor;
-pub mod control;
+pub(crate) mod control;
 pub mod frame;
 pub mod sender;
 pub mod types;
 
+#[cfg(test)]
+mod legacy_receiver_tests;
+#[cfg(test)]
+mod remote_attach_tests;
+
 pub use anchor::{MpscStreamAnchor, MpscStreamController};
-pub use control::{
-    MpscAnchorAttachRequest, MpscAnchorAttachResponse, MpscAnchorCancelRequest,
-    MpscAnchorDetachRequest,
-};
 pub use frame::MpscFrame;
 pub use sender::MpscStreamSender;
 pub use types::{MpscAnchorConfig, SenderId};

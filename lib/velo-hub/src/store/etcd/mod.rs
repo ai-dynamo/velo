@@ -89,7 +89,8 @@ use parking_lot::Mutex;
 use tokio::sync::watch;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use velo::{InstanceId, PeerDiscovery, PeerInfo, WorkerId};
+use velo::discovery::PeerDiscovery;
+use velo::{InstanceId, PeerInfo, WorkerId};
 
 use super::{
     Continuity, HubStore, Incarnation, OpId, RegistrationRecord, RemovalHook, StoreError,

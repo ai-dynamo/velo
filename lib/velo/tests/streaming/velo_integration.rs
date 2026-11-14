@@ -3,83 +3,36 @@
 
 //! Integration tests for the full control-plane AM dispatch path (TEST-02).
 //!
-//! Tests two-worker simulation using real messengers + TCP loopback with the complete
-//! AnchorManager control-plane wired up end-to-end. The data plane is
-//! `TcpFrameTransport`; what is under test is the control plane, which is
+//! Two `Velo` nodes on TCP loopback, with the per-stream TCP transport as the
+//! data plane. What is under test is the control plane, which is
 //! transport-agnostic:
-//! - Worker A creates an AnchorManager, calls `register_handlers`, and creates an anchor.
+//! - Worker A creates an anchor.
 //! - The handle is transferred to Worker B as a raw u128 (simulating cross-worker serialization).
-//! - Worker B calls `attach_stream_anchor` with the transferred handle (worker_id mismatch triggers
+//! - Worker B attaches with the transferred handle (worker_id mismatch triggers
 //!   the remote path): sends `_anchor_attach` AM to Worker A, Worker A's handler binds the transport
 //!   and spawns reader_pump, returns the stream endpoint, Worker B connects and receives StreamSender.
 //! - Worker B sends N items + finalize via StreamSender.
 //! - Worker A's StreamAnchor yields all N items then None.
 //!
-//! This validates the full stack: register_handlers -> remote attach_stream_anchor ->
-//! _anchor_attach AM dispatch -> reader_pump -> StreamAnchor receives remote frames.
+//! This validates the full stack: remote attach -> _anchor_attach AM dispatch
+//! -> reader_pump -> StreamAnchor receives remote frames.
 
 mod common;
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use velo::Velo;
-use velo::messenger::Messenger;
-use velo::streaming::{
-    AnchorManagerBuilder, FrameTransport, StreamAnchorHandle, StreamFrame, TcpFrameTransport,
-};
-use velo::transports::tcp::TcpTransportBuilder;
-use velo_ext::{PeerInfo, WorkerId};
-
-/// Create a TcpTransport bound to an OS-assigned port (no TOCTOU race).
-fn new_tcp_transport() -> Arc<velo::transports::tcp::TcpTransport> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    Arc::new(
-        TcpTransportBuilder::new()
-            .from_listener(listener)
-            .unwrap()
-            .build()
-            .unwrap(),
-    )
-}
-
-/// Two mux-only `Velo`s that know each other over TCP loopback, and their
-/// messengers. Each test builds its own `AnchorManager` over a messenger,
-/// which replaces the anchor handlers the `Velo` registered. The caller keeps
-/// the `Velo`s alive for the length of the test.
-async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>, [Velo; 2]) {
-    let v1 = mux_only_node().await;
-    let v2 = mux_only_node().await;
-    v2.register_peer(v1.peer_info()).expect("register v1 on v2");
-    v1.register_peer(v2.peer_info()).expect("register v2 on v1");
-    // Wait for TCP connections to establish.
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    (
-        Arc::clone(v1.messenger()),
-        Arc::clone(v2.messenger()),
-        [v1, v2],
-    )
-}
-
-/// A `Velo` with no per-stream listener of its own: the tests bring their own
-/// `TcpFrameTransport`.
-async fn mux_only_node() -> Velo {
-    Velo::builder()
-        .add_transport(new_tcp_transport())
-        .mux_only()
-        .build()
-        .await
-        .expect("build velo")
-}
+use velo::streaming::TCP_STREAM_KEY;
+use velo::{StreamAnchorHandle, StreamFrame};
+use velo_ext::WorkerId;
 
 // ---------------------------------------------------------------------------
 // TEST-02: Two-worker full AM dispatch integration test
 // ---------------------------------------------------------------------------
 //
 // Validates the full control-plane path:
-//   1. Worker A creates AnchorManager, calls register_handlers, creates an anchor.
+//   1. Worker A creates an anchor.
 //   2. The handle is transferred as u128 to Worker B (simulates cross-worker serialization).
-//   3. Worker B calls attach_stream_anchor (remote path fires):
+//   3. Worker B calls attach_anchor (remote path fires):
 //      - sends _anchor_attach AM to Worker A
 //      - Worker A's handler binds transport + spawns reader_pump, returns endpoint
 //      - Worker B connects transport and receives StreamSender
@@ -88,28 +41,10 @@ async fn mux_only_node() -> Velo {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_02_remote_attach() {
-    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
-    let worker_id_a = messenger_a.instance_id().worker_id();
-    let worker_id_b = messenger_b.instance_id().worker_id();
+    let (node_a, node_b) = common::tcp_stream_pair().await;
+    let worker_id_a = node_a.instance_id().worker_id();
 
-    // Worker A: create the streaming transport and AnchorManager
-    let stream_a = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
-        .await
-        .expect("stream listener A");
-    let am_a: Arc<velo::streaming::AnchorManager> = Arc::new(
-        AnchorManagerBuilder::default()
-            .worker_id(worker_id_a)
-            .transport(Arc::clone(&stream_a) as Arc<dyn FrameTransport>)
-            .build()
-            .expect("AM worker A"),
-    );
-
-    // Worker A: register all five control-plane handlers on messenger_a
-    am_a.register_handlers(Arc::clone(&messenger_a))
-        .expect("register_handlers on worker A");
-
-    // Worker A: create anchor
-    let mut anchor_stream = am_a.create_anchor::<u32>();
+    let mut anchor_stream = node_a.create_anchor::<u32>();
     let handle = anchor_stream.handle();
 
     // Simulate cross-worker handle transfer (u128 round-trip)
@@ -124,46 +59,19 @@ async fn test_02_remote_attach() {
 
     // Worker B: create the streaming transport and AnchorManager.
     //
-    // The nodes are mux-only, so `Velo::register_peer` covered only the
-    // control plane. The streaming transport keeps its own
-    // WorkerId -> SocketAddr cache, so the two sides have to be
-    // cross-registered before `connect()` can resolve a peer. This test builds
-    // the AnchorManager directly and so does it by hand.
-    let stream_b = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
-        .await
-        .expect("stream listener B");
-    stream_b
-        .register(&PeerInfo::new(
-            messenger_a.instance_id(),
-            stream_a.address(),
-        ))
-        .expect("register worker A stream endpoint on B");
-    stream_a
-        .register(&PeerInfo::new(
-            messenger_b.instance_id(),
-            stream_b.address(),
-        ))
-        .expect("register worker B stream endpoint on A");
-    let am_b: Arc<velo::streaming::AnchorManager> = Arc::new(
-        AnchorManagerBuilder::default()
-            .worker_id(worker_id_b)
-            .transport(Arc::clone(&stream_b) as Arc<dyn FrameTransport>)
-            .build()
-            .expect("AM worker B"),
-    );
-
-    // Worker B: register handlers (sets messenger_lock so attach_remote can send _anchor_attach AM)
-    am_b.register_handlers(Arc::clone(&messenger_b))
-        .expect("register_handlers on worker B");
-
-    // Worker B: attach via remote path (handle_transferred.worker_id == worker_id_a != worker_id_b)
-    // This triggers attach_remote: sends _anchor_attach AM to Worker A,
-    // Worker A's handler binds transport + spawns reader_pump, returns endpoint,
-    // Worker B connects transport and receives StreamSender.
-    let sender = am_b
-        .attach_stream_anchor::<u32>(handle_transferred)
+    // `Messenger::register_peer` only covers the control plane; the streaming
+    // transport keeps its own WorkerId -> SocketAddr cache, so the two sides
+    // have to be cross-registered before `connect()` can resolve a peer.
+    // `Velo::register_peer` fans this out automatically; this test builds the
+    // AnchorManager directly and so does it by hand.
+    let sender = node_b
+        .attach_anchor::<u32>(handle_transferred)
         .await
         .expect("remote attach must succeed");
+    assert_eq!(
+        sender.negotiated_transport().map(|key| key.as_str()),
+        Some(TCP_STREAM_KEY)
+    );
 
     // Worker B: send 5 items
     for i in 0u32..5 {
@@ -197,16 +105,6 @@ async fn test_02_remote_attach() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Shared macro suite: NOT included here
-// ---------------------------------------------------------------------------
-//
-// `run_transport_tests!` drives `attach_stream_anchor` against a transport that
-// ignores endpoint resolution entirely, which is `MockFrameTransport`'s whole
-// job. Shared scenario coverage therefore lives in `mock_transport.rs`, which
-// runs all eight macro-generated tests; TEST-02 above is what validates a real
-// remote data plane end to end.
-
 /// A remote stream that sends nothing for many heartbeat intervals stays
 /// alive: the producer's heartbeats keep the consumer's watchdog fed.
 ///
@@ -219,51 +117,15 @@ async fn a_silent_remote_stream_outlives_the_watchdog_window() {
     use futures::StreamExt;
     use velo::streaming::AnchorConfig;
 
-    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
-    let stream_a = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
-        .await
-        .expect("stream listener A");
-    let stream_b = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
-        .await
-        .expect("stream listener B");
-    stream_b
-        .register(&PeerInfo::new(
-            messenger_a.instance_id(),
-            stream_a.address(),
-        ))
-        .expect("register A on B");
-    stream_a
-        .register(&PeerInfo::new(
-            messenger_b.instance_id(),
-            stream_b.address(),
-        ))
-        .expect("register B on A");
-    let am_a = Arc::new(
-        AnchorManagerBuilder::default()
-            .worker_id(messenger_a.instance_id().worker_id())
-            .transport(Arc::clone(&stream_a) as Arc<dyn FrameTransport>)
-            .build()
-            .expect("AM worker A"),
-    );
-    am_a.register_handlers(Arc::clone(&messenger_a))
-        .expect("register_handlers on A");
-    let am_b = Arc::new(
-        AnchorManagerBuilder::default()
-            .worker_id(messenger_b.instance_id().worker_id())
-            .transport(Arc::clone(&stream_b) as Arc<dyn FrameTransport>)
-            .build()
-            .expect("AM worker B"),
-    );
-    am_b.register_handlers(Arc::clone(&messenger_b))
-        .expect("register_handlers on B");
+    let (node_a, node_b) = common::tcp_stream_pair().await;
 
     let interval = Duration::from_millis(100);
-    let mut anchor = am_a.create_anchor_with_config::<u32>(AnchorConfig {
+    let mut anchor = node_a.create_anchor_with_config::<u32>(AnchorConfig {
         heartbeat_interval: Some(interval),
         ..Default::default()
     });
-    let sender = am_b
-        .attach_stream_anchor::<u32>(anchor.handle())
+    let sender = node_b
+        .attach_anchor::<u32>(anchor.handle())
         .await
         .expect("remote attach");
 

@@ -89,17 +89,17 @@ use velo_ext::{InstanceId, PeerInfo, TransportKey, WorkerAddress, WorkerId};
 use address::WorkerAddressBuilder;
 
 // Re-export interface discovery types (used by host-affinity tests + ZMQ NUMA hints)
-pub use utils::interfaces::{InterfaceEndpoint, InterfaceFilter};
 
 // Trait surface — fully defined in `velo-ext`. Re-exported here as a
 // convenience for callers reaching into `velo::transports::*` for transport
 // orchestration, but `velo_ext::*` is the canonical source.
 pub use transport::{
-    AdmissionError, AdmissionGate, AdmissionState, AdmitOutcome, DataStreams, HealthCheckError,
-    InFlightGuard, InboundMessage, MessageType, SendAdmission, SendOutcome, ShutdownPolicy,
-    ShutdownState, Transport, TransportAdapter, TransportError, TransportErrorHandler,
-    make_channels,
+    AdmissionError, AdmissionGate, AdmitOutcome, DataStreams, HealthCheckError, InFlightGuard,
+    InboundMessage, MessageType, SendAdmission, SendOutcome, ShutdownState, TransportAdapter,
+    TransportError, TransportErrorHandler, make_channels,
 };
+// Their public path is the crate root (`velo::Transport`, ...).
+pub(crate) use transport::{AdmissionState, ShutdownPolicy, Transport};
 
 /// Errors from the transport backend that routes a messenger's sends. A send
 /// that fails for one of these reasons carries it in its `anyhow::Error`.

@@ -169,6 +169,8 @@ path = "tests/streaming/byte_items.rs"
 [[test]]
 name = "streaming_cancel"
 path = "tests/streaming/cancel.rs"
+# test-helpers: `Velo::stream_senders_in_use`, to see the sender registered.
+required-features = ["test-helpers"]
 
 [[test]]
 name = "streaming_endurance"
@@ -179,8 +181,8 @@ name = "streaming_endurance_remote"
 path = "tests/streaming/endurance_remote.rs"
 
 [[test]]
-name = "streaming_mock_transport"
-path = "tests/streaming/mock_transport.rs"
+name = "streaming_local_suite"
+path = "tests/streaming/local_suite.rs"
 
 [[test]]
 name = "streaming_observability"
@@ -218,6 +220,8 @@ path = "tests/streaming/default_node_peers.rs"
 name = "streaming_mux_kill_switch"
 # One test in a binary of its own: it sets a process-wide environment variable.
 path = "tests/streaming/mux_kill_switch.rs"
+# test-helpers: `Velo::stream_transport_keys`, to see the mux left out.
+required-features = ["test-helpers"]
 
 [[test]]
 name = "streaming_mux_flush"
@@ -227,10 +231,14 @@ required-features = ["test-helpers"]
 [[test]]
 name = "streaming_mpsc_integration"
 path = "tests/streaming/mpsc_integration.rs"
+# test-helpers: `Velo::stream_senders_in_use`, to see a sender leave the registry.
+required-features = ["test-helpers"]
 
 [[test]]
 name = "streaming_mpsc_remote_integration"
 path = "tests/streaming/mpsc_remote_integration.rs"
+# test-helpers: the MPSC wire messages in `velo::test_helpers`, sent by hand.
+required-features = ["test-helpers"]
 
 [[test]]
 name = "streaming_retired"
@@ -247,6 +255,8 @@ name = "streaming_staged_limit"
 # Its own binary: a global allocator that records the consumer's largest
 # allocation.
 path = "tests/streaming/staged_limit.rs"
+# test-helpers: `Velo::staged_payload_len`, to see what the producer still holds.
+required-features = ["test-helpers"]
 
 [[test]]
 name = "streaming_timing"
@@ -281,6 +291,19 @@ path = "tests/rendezvous_rdma.rs"
 # failing GET cannot be produced over `UCX_TLS=tcp`, and the fallbacks they
 # drive are exactly the code that must not rot.
 required-features = ["ucx", "test-helpers"]
+
+[[test]]
+name = "rendezvous_integration"
+path = "tests/rendezvous_integration.rs"
+# test-helpers: the acquire wire messages in `velo::test_helpers`, sent by hand.
+required-features = ["test-helpers"]
+
+[[test]]
+name = "streaming_transport"
+path = "tests/streaming_transport.rs"
+# test-helpers: `Velo::stream_transport_keys` and
+# `default_stream_transport_key`, to see which transports a builder installs.
+required-features = ["test-helpers"]
 
 [[test]]
 name = "request_timeout"

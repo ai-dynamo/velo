@@ -14,12 +14,12 @@ use crate::observability::VeloMetrics;
 use crate::transports::{Transport, VeloBackend};
 use velo_ext::{InstanceId, PeerInfo};
 
-use crate::PeerDiscovery;
-#[cfg(feature = "services")]
-use crate::messenger::VeloEvents;
+use crate::discovery::PeerDiscovery;
 use crate::messenger::client::ActiveMessageClient;
 #[cfg(feature = "services")]
 use crate::messenger::client::builders::MessageBuilder;
+#[cfg(feature = "services")]
+use crate::messenger::events::VeloEvents;
 use crate::messenger::handlers::{Handler, HandlerManager};
 use crate::messenger::server::ActiveMessageServer;
 

@@ -4,9 +4,10 @@
 //! Anchor setup cost, in isolation.
 //!
 //! Drives only the anchor path: create an SPSC anchor, attach a sender on the
-//! same worker, finalize, and read the terminal. No network and no mux, so
-//! the numbers show what anchor create, attach and finish cost, and what an
-//! unattached anchor holds while it waits.
+//! same worker, finalize, and read the terminal. One `Velo` node, and every
+//! attach is local, so no frame crosses a transport. The numbers show what
+//! anchor create, attach and finish cost, and what an unattached anchor holds
+//! while it waits.
 //!
 //! ```bash
 //! cargo run --release --example anchor_setup_bench -- --tasks 64 --streams 20000
@@ -18,10 +19,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use clap::Parser;
 use futures::StreamExt;
-use futures::future::BoxFuture;
-use velo::WorkerId;
-use velo::ext::{TransportKey, WorkerAddress};
-use velo::streaming::{AnchorManager, FrameTransport, StreamFrame};
+use velo::Velo;
+use velo::StreamFrame;
 
 #[derive(Parser, Debug)]
 struct Args {
@@ -39,32 +38,6 @@ struct Args {
     held: usize,
 }
 
-/// A transport that is never used: every attach here is on the same worker.
-struct NoTransport;
-
-impl FrameTransport for NoTransport {
-    fn key(&self) -> TransportKey {
-        TransportKey::new("none")
-    }
-
-    fn address(&self) -> WorkerAddress {
-        WorkerAddress::empty()
-    }
-
-    fn bind(&self, _: u64, _: u64) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>> {
-        Box::pin(async { anyhow::bail!("not used") })
-    }
-
-    fn connect(
-        &self,
-        _: WorkerId,
-        _: u64,
-        _: u64,
-    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
-        Box::pin(async { anyhow::bail!("not used") })
-    }
-}
-
 /// Resident set size of this process, in MiB.
 ///
 /// Read from `VmRSS`, which the kernel reports in KiB. `/proc/self/statm`
@@ -80,12 +53,12 @@ fn rss_mib() -> f64 {
     kib / 1024.0
 }
 
-async fn lifecycles(manager: Arc<AnchorManager>, streams: usize) -> Result<Vec<u64>> {
+async fn lifecycles(node: Velo, streams: usize) -> Result<Vec<u64>> {
     let mut nanos = Vec::with_capacity(streams);
     for _ in 0..streams {
         let start = Instant::now();
-        let mut anchor = manager.create_anchor::<u32>();
-        let sender = manager.attach_stream_anchor::<u32>(anchor.handle()).await?;
+        let mut anchor = node.create_anchor::<u32>();
+        let sender = node.attach_anchor::<u32>(anchor.handle()).await?;
         sender.finalize()?;
         match anchor.next().await {
             Some(Ok(StreamFrame::Finalized)) => {}
@@ -108,27 +81,30 @@ fn runtime(threads: usize) -> Result<tokio::runtime::Runtime> {
         .build()?)
 }
 
-fn manager() -> Arc<AnchorManager> {
-    Arc::new(AnchorManager::new(
-        WorkerId::from_u64(1),
-        Arc::new(NoTransport),
-    ))
+/// One node on a loopback TCP transport. The transport carries nothing
+/// here: a `Velo` needs one to build.
+async fn node() -> Result<Velo> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let tcp = velo::transports::tcp::TcpTransportBuilder::new()
+        .from_listener(listener)?
+        .build()?;
+    Velo::builder().add_transport(Arc::new(tcp)).build().await
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
 
     // What unattached anchors hold while they wait. First, on a runtime and a
-    // manager of its own, so no task or allocation of the lifecycle phase is
+    // node of its own, so no task or allocation of the lifecycle phase is
     // counted.
     runtime(args.threads)?.block_on(async {
-        let manager = manager();
+        let node = node().await?;
         let metrics = tokio::runtime::Handle::current().metrics();
         let tasks_before = metrics.num_alive_tasks();
         let rss_before = rss_mib();
         let start = Instant::now();
         let held: Vec<_> = (0..args.held)
-            .map(|_| manager.create_anchor::<u32>())
+            .map(|_| node.create_anchor::<u32>())
             .collect();
         let create = start.elapsed();
         // Let any spawned per-anchor tasks reach their first poll.
@@ -140,14 +116,15 @@ fn main() -> Result<()> {
             metrics.num_alive_tasks() as i64 - tasks_before as i64,
             rss_mib() - rss_before,
         );
-    });
+        Ok::<_, anyhow::Error>(())
+    })?;
 
     // Lifecycle throughput and latency.
     runtime(args.threads)?.block_on(async {
-        let manager = manager();
+        let node = node().await?;
         let start = Instant::now();
         let handles: Vec<_> = (0..args.tasks)
-            .map(|_| tokio::spawn(lifecycles(Arc::clone(&manager), args.streams)))
+            .map(|_| tokio::spawn(lifecycles(node.clone(), args.streams)))
             .collect();
         let mut nanos = Vec::with_capacity(args.tasks * args.streams);
         for handle in handles {

@@ -21,11 +21,13 @@ Velo 0.19 gives Velo and Messenger explicit drop lifetimes, removes value-level 
 
 Velo 0.21 makes `Velo` a handle. `VeloBuilder::build()` returns `Velo`, not `Arc<Velo>`. To share it, clone it. See [Migrate to the Velo handle](docs/src/guides/migrate-velo-handle.md).
 
-Velo 0.22.1 deprecates `Velo::anchor_manager()` and `Velo::rendezvous_manager()`. Their methods are on `Velo`, with three new ones: `create_anchor_with_config`, `active_anchor_count`, `renew_reservations`. Also new: `staging_threshold` and the owner's `unregister_data`. See [Move off the manager accessors](docs/src/guides/migrate-manager-accessors.md).
+Velo 0.22.1 deprecates `Velo::anchor_manager()` and `Velo::rendezvous_manager()`, and 0.23.0 removes them. Their methods are on `Velo`, with three new ones: `create_anchor_with_config`, `active_anchor_count`, `renew_reservations`. Also new: `staging_threshold` and the owner's `unregister_data`. See [Move off the manager accessors](docs/src/guides/migrate-manager-accessors.md).
 
-Velo 0.23 opens no per-stream listener by default: the messenger mux carries every remote stream. Call `stream_config` or `stream_bind_addr` to serve peers without the mux, or to turn the mux off. See [0.23.0: the per-stream listener is opt-in](docs/src/guides/migrate-services.md#0230-the-per-stream-listener-is-opt-in).
+Velo 0.23.0 makes three breaking changes:
 
-Velo 0.23.0 removes the `Messenger` front door that 0.22.1 deprecated: `Messenger::builder`, `MessengerBuilder`, the peer, drain and shutdown methods of `Messenger`, and `Velo::graceful_shutdown`. Build and manage an instance through `Velo`. `Velo::shutdown` is the one shutdown. See [Move off the Messenger front door](docs/src/guides/migrate-messenger-front-door.md).
+- It opens no per-stream listener by default: the messenger mux carries every remote stream. Call `stream_config` or `stream_bind_addr` to serve peers without the mux, or to turn the mux off. See [0.23.0: the per-stream listener is opt-in](docs/src/guides/migrate-services.md#0230-the-per-stream-listener-is-opt-in).
+- It removes the `Messenger` front door that 0.22.1 deprecated: `Messenger::builder`, `MessengerBuilder`, the peer, drain and shutdown methods of `Messenger`, and `Velo::graceful_shutdown`. Build and manage an instance through `Velo`. `Velo::shutdown` is the one shutdown. See [Move off the Messenger front door](docs/src/guides/migrate-messenger-front-door.md).
+- Each public item has one path. The anchor and rendezvous managers, the wire messages, and `FrameTransport` are no longer public; velo-ext 0.6.0 drops `FrameTransport`, so stream transports are in-tree only. See [Move to the public paths of 0.23.0](docs/src/guides/migrate-public-paths.md).
 
 Use `Velo::shutdown(policy)` to close resources and join owned tasks while Tokio keeps running. The instance and its handles stay valid after shutdown, and shutdown does not release them from memory. Accepted requests remain counted until their replies are submitted, including error replies. See [Shutdown and drain](docs/src/concepts/shutdown.md).
 
@@ -38,7 +40,7 @@ Batched streams give each stream a window of 32 records in flight by default. A 
 | Crate | For | Contents |
 |---|---|---|
 | `velo` | Application authors | The runtime: messaging, streaming, rendezvous, events, queues, discovery, all in-tree transports (TCP, UDS, NATS, gRPC, ZMQ, UCX, QUIC), metrics |
-| `velo-ext` | Authors of out-of-tree plugins | The stable trait surface: `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`, and the types they use |
+| `velo-ext` | Authors of out-of-tree plugins | The stable trait surface: `Transport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`, and the types they use |
 | `velo-hub-ext` | Programs that speak the hub's wire protocol without the velo runtime | The hub's wire protocol on `velo-ext` alone: paths, request and response bodies, errors, and ids. `velo-hub` re-exports it as `velo_hub::protocol`. Not published yet. |
 | `velo-hub` | Authors of a hub service, and programs that use a hub | A hub (`server`): peer and service discovery, registration, and liveness for a velo application, plus hosted extensions. Its etcd store (`etcd`): registrations that survive a hub restart. Its client (`client`): registration, peer and service discovery through the hub, and calls to extensions. Not published yet. |
 

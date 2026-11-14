@@ -41,10 +41,9 @@
 
 use std::sync::Arc;
 
+use crate::messenger::ActiveMessageClient;
 use crate::messenger::large_payload::PayloadTooLarge;
-use crate::messenger::{
-    ActiveMessageClient, AmSendBuilder, Messenger, TypedUnaryBuilder, UnaryBuilder,
-};
+use crate::{AmSendBuilder, TypedUnaryBuilder, UnaryBuilder};
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
 use velo_ext::WorkerId;
@@ -69,13 +68,6 @@ use crate::rendezvous::protocol::RvLeaseRenewRequest;
 pub struct Consumer;
 
 impl Consumer {
-    /// Query metadata about remote data (no read lock acquired).
-    pub async fn metadata(messenger: &Arc<Messenger>, handle: DataHandle) -> Result<DataMetadata> {
-        Self::metadata_request(messenger.client(), handle)?
-            .send()
-            .await
-    }
-
     /// The metadata query, built without sending it.
     pub(crate) fn metadata_request(
         client: &Arc<ActiveMessageClient>,
@@ -90,17 +82,9 @@ impl Consumer {
         )
     }
 
-    /// Pull data from a remote handle into a new `Bytes`.
-    ///
-    /// Acquires a read lock, moves the data by whichever path the owner
-    /// offered, and returns owned bytes. The read lock remains held until
-    /// `detach()` or `release()` is called.
-    pub async fn get(manager: &RendezvousManager, handle: DataHandle) -> Result<(Bytes, u64)> {
-        Self::get_within(manager, handle, u64::MAX, None).await
-    }
-
-    /// As [`get`](Self::get), for a consumer that may give up and say
-    /// nothing, as the messenger's resolver does.
+    /// Pull data from a remote handle into a new `Bytes`. The read lock stays
+    /// held until the caller detaches or releases. Built for a consumer that
+    /// may give up and say nothing, as the messenger's resolver does.
     ///
     /// It refuses a payload of more than `limit` bytes before anything of its
     /// size is allocated. The size checked is the one the owner states in its
@@ -373,18 +357,6 @@ impl Consumer {
         }
     }
 
-    /// Increment the refcount on a remote handle.
-    ///
-    /// Waits for an ack from the owner confirming the increment completed,
-    /// so callers can safely read metadata or pass the handle to another
-    /// consumer immediately after this returns.
-    pub async fn ref_handle(messenger: &Arc<Messenger>, handle: DataHandle) -> Result<()> {
-        Self::ref_request(messenger.client(), handle)?
-            .send()
-            .await?;
-        Ok(())
-    }
-
     /// The refcount increment, built without sending it.
     pub(crate) fn ref_request(
         client: &Arc<ActiveMessageClient>,
@@ -395,15 +367,6 @@ impl Consumer {
                 handle: RvHandleWire::from_handle(handle),
             })?))
             .worker(handle.worker_id()))
-    }
-
-    /// Release the read lock without decrementing refcount (can get again).
-    pub async fn detach(
-        messenger: &Arc<Messenger>,
-        handle: DataHandle,
-        lease_id: u64,
-    ) -> Result<()> {
-        detach(messenger.client(), handle, lease_id).await
     }
 
     /// The detach message, built without sending it. The send holds only the
@@ -422,17 +385,6 @@ impl Consumer {
                 })?))
                 .worker(handle.worker_id()),
         )
-    }
-
-    /// Release the read lock AND decrement refcount. Frees data when both hit 0.
-    pub async fn release(
-        messenger: &Arc<Messenger>,
-        handle: DataHandle,
-        lease_id: u64,
-    ) -> Result<()> {
-        Self::release_request(messenger.client(), handle, lease_id)?
-            .send()
-            .await
     }
 
     /// The release message, built without sending it.

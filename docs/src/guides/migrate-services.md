@@ -81,6 +81,8 @@ future, or losing the attach reply, is outside this cleanup guarantee.
 
 Before 0.23.0, `Velo::builder().build()` started a TCP stream listener beside the mux. From 0.23.0, it starts no stream listener, and the mux carries every remote stream.
 
+Two other 0.23.0 changes have their own guides: [Move off the Messenger front door](migrate-messenger-front-door.md) and [Move to the public paths of 0.23.0](migrate-public-paths.md).
+
 These nodes need no change:
 
 - A node that calls `stream_config` or `stream_bind_addr`. It keeps its per-stream listener. rhino and deepseek-ultrafast do this and keep working.

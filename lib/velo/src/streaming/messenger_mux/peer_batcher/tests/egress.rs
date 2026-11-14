@@ -1087,7 +1087,7 @@ async fn a_delayed_payload_refusal_reply_spares_a_reused_slot() {
         .await;
     let original = old_open.records[0].slot;
     apply(&old_open);
-    let oversized = rmp_serde::to_vec(&crate::streaming::StreamFrame::Item(vec![7u8; 512 * 1024]))
+    let oversized = rmp_serde::to_vec(&crate::StreamFrame::Item(vec![7u8; 512 * 1024]))
         .expect("oversized item");
     old_inlet.send(oversized).expect("queue oversized");
     old_inlet
@@ -1096,7 +1096,7 @@ async fn a_delayed_payload_refusal_reply_spares_a_reused_slot() {
     let unresolved = harness.next_batch().await;
     assert_eq!(unresolved.records.len(), 1);
     apply(&harness.next_batch().await);
-    let error = rmp_serde::to_vec(&crate::streaming::StreamFrame::<()>::TransportError(
+    let error = rmp_serde::to_vec(&crate::StreamFrame::<()>::TransportError(
         "payload over limit".into(),
     ))
     .expect("error frame");

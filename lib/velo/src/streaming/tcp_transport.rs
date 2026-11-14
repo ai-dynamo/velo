@@ -86,7 +86,7 @@ struct PendingStream {
 
 type SessionRegistry = DashMap<(u64, u64), PendingStream>;
 
-/// TCP-based [`FrameTransport`] backed by a single shared listener.
+/// The per-stream TCP transport, backed by a single shared listener.
 ///
 /// One listener + one accept loop per transport instance, regardless of how
 /// many concurrent streams are active. `bind()` is O(1).

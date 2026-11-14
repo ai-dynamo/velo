@@ -11,21 +11,18 @@
 
 mod common;
 
-use common::MockFrameTransport;
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
-use velo::streaming::{AnchorManager, StreamError};
-use velo_ext::WorkerId;
+use velo::StreamError;
 
 // TEST-09: Inactivity timeout
 // Anchor configured with 1s timeout; no sender attaches; stream yields None after ~1s.
 #[tokio::test] // current_thread — required for fake time
 async fn test_09_inactivity_timeout() {
+    // Build the node on real time: its startup does socket work.
+    let mgr = Arc::new(common::local_node().await);
     tokio::time::pause();
-
-    let transport = Arc::new(MockFrameTransport::new());
-    let mgr = Arc::new(AnchorManager::new(WorkerId::from_u64(1), transport));
 
     let mut anchor = mgr.create_anchor::<u32>();
     // Configure inactivity timeout of 1 second.
@@ -56,16 +53,15 @@ async fn test_09_inactivity_timeout() {
 // the heartbeat task and stream termination under fake time using the available API.
 #[tokio::test] // current_thread — required for fake time
 async fn test_10_heartbeat_timeout() {
+    // Build the node on real time: its startup does socket work.
+    let mgr = Arc::new(common::local_node().await);
     tokio::time::pause();
-
-    let transport = Arc::new(MockFrameTransport::new());
-    let mgr = Arc::new(AnchorManager::new(WorkerId::from_u64(1), transport));
 
     let mut anchor = mgr.create_anchor::<u32>();
     let handle = anchor.handle();
     // Attach a sender — this starts the heartbeat task (5s interval).
     let sender = mgr
-        .attach_stream_anchor::<u32>(handle)
+        .attach_anchor::<u32>(handle)
         .await
         .expect("attach must succeed");
 

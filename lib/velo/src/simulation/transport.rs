@@ -17,7 +17,7 @@ use crate::transports::{
 };
 use velo_ext::{InstanceId, PeerInfo, TransportKey, WorkerAddress};
 
-use crate::simulation::fabric::SimFabric;
+use crate::simulation::SimFabric;
 
 /// Simulated transport that delivers messages through the [`SimFabric`].
 ///
@@ -196,7 +196,7 @@ impl Transport for SimTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::simulation::network::BisectionBandwidth;
+    use crate::simulation::BisectionBandwidth;
     use loom_rs::sim::SimulationRuntime;
 
     #[test]

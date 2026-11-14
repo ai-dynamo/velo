@@ -12,9 +12,10 @@ mod common;
 
 use std::sync::Arc;
 use std::time::Duration;
+use velo::Transport;
 use velo::transports::HealthCheckError;
 use velo::transports::nats::{NatsTransport, NatsTransportBuilder};
-use velo::transports::{DataStreams, InboundMessage, MessageType, Transport, make_channels};
+use velo::transports::{DataStreams, InboundMessage, MessageType, make_channels};
 use velo_ext::InstanceId;
 
 use bytes::Bytes;
