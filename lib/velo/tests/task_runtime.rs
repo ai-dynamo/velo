@@ -754,3 +754,141 @@ async fn a_cancelled_build_keeps_the_runtime_until_started_transports_close() {
     );
     assert!(ready.finished.load(Ordering::SeqCst));
 }
+
+/// Demonstration of a limit: a NATS client the application connected keeps
+/// its I/O on the runtime that connected it, so under
+/// `TaskRuntime::Dedicated` a NATS write still waits for the application's
+/// runtime. velo cannot move a client it was handed. Run with `--ignored`.
+#[cfg(feature = "nats-transport")]
+#[test]
+#[ignore = "demonstration: the application's NATS client runs where the application connected it"]
+fn a_nats_client_runs_where_the_application_connected_it() {
+    use std::io::{BufRead, Read, Write};
+    use velo::Transport;
+    use velo::ext::{MessageType, TransportErrorHandler};
+
+    struct SendError(flume::Sender<String>);
+    impl TransportErrorHandler for SendError {
+        fn on_error(&self, _: Bytes, _: Bytes, error: String) {
+            let _ = self.0.send(error);
+        }
+    }
+
+    let _serial = SERIAL.blocking_lock();
+    wait_for_threads(0);
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let (wire_tx, wire) = flume::unbounded();
+    let (socket_tx, socket_rx) = flume::bounded(1);
+    // A local protocol peer avoids a dependency on a running NATS service.
+    let peer = std::thread::spawn(move || {
+        let (mut socket, _) = listener.accept().unwrap();
+        socket.set_read_timeout(Some(PATIENCE)).unwrap();
+        socket_tx.send(socket.try_clone().unwrap()).unwrap();
+        socket
+            .write_all(b"INFO {\"server_id\":\"review\",\"proto\":1,\"headers\":true,\"max_payload\":1048576}\r\n")
+            .unwrap();
+        let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+        loop {
+            let mut line = String::new();
+            match reader.read_line(&mut line) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+            let fields: Vec<_> = line.split_ascii_whitespace().collect();
+            match fields.first().copied() {
+                Some("PING") => socket.write_all(b"PONG\r\n").unwrap(),
+                Some("HPUB") => {
+                    let header_len: usize = fields[fields.len() - 2].parse().unwrap();
+                    let total_len: usize = fields.last().unwrap().parse().unwrap();
+                    let mut frame = vec![0; total_len + 2];
+                    reader.read_exact(&mut frame).unwrap();
+                    assert_eq!(&frame[total_len..], b"\r\n");
+                    wire_tx.send(frame[header_len..total_len].to_vec()).unwrap();
+                }
+                Some("CONNECT" | "SUB" | "UNSUB" | "PONG") => {}
+                other => panic!("unexpected NATS command: {other:?}"),
+            }
+        }
+    });
+    let application = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let (errors_tx, errors) = flume::unbounded();
+    let on_error: Arc<dyn TransportErrorHandler> = Arc::new(SendError(errors_tx));
+    let (velo, transport) = application.block_on(async {
+        let client = velo::transports::nats::utils::connect(&format!("nats://{address}"))
+            .await
+            .unwrap();
+        let transport =
+            Arc::new(velo::transports::nats::NatsTransportBuilder::new(client, "review").build());
+        let velo = Velo::builder()
+            .task_runtime(TaskRuntime::dedicated())
+            .add_transport(transport.clone())
+            .build()
+            .await
+            .unwrap();
+        velo.register_peer(velo.peer_info()).unwrap();
+        let outcome = transport.send_message(
+            velo.instance_id(),
+            Bytes::new(),
+            Bytes::from_static(b"warm"),
+            MessageType::Message,
+            Arc::clone(&on_error),
+        );
+        assert!(outcome.is_admitted());
+        assert_eq!(
+            tokio::time::timeout(PATIENCE, wire.recv_async())
+                .await
+                .unwrap()
+                .unwrap(),
+            b"warm"
+        );
+        (velo, transport)
+    });
+
+    // A current-thread runtime runs nothing between calls to block_on.
+    assert!(
+        transport
+            .send_message(
+                velo.instance_id(),
+                Bytes::new(),
+                Bytes::from_static(b"held"),
+                MessageType::Message,
+                on_error,
+            )
+            .is_admitted()
+    );
+    let during_hold = wire.recv_timeout(Duration::from_millis(500));
+    if during_hold.is_err() {
+        let after_hold = application.block_on(async {
+            tokio::time::timeout(PATIENCE, wire.recv_async())
+                .await
+                .unwrap()
+                .unwrap()
+        });
+        assert_eq!(
+            after_hold, b"held",
+            "resuming the application did not flush the frame"
+        );
+    }
+    application.block_on(velo.shutdown(ShutdownPolicy::WaitForever));
+    socket_rx
+        .recv_timeout(PATIENCE)
+        .unwrap()
+        .shutdown(std::net::Shutdown::Both)
+        .unwrap();
+    peer.join().unwrap();
+    wait_for_threads(0);
+    assert!(
+        errors.is_empty(),
+        "NATS send failed: {:?}",
+        errors.try_recv()
+    );
+    assert_eq!(
+        during_hold,
+        Ok(b"held".to_vec()),
+        "the dedicated NATS transport still needs the application's runtime to write"
+    );
+}

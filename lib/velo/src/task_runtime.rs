@@ -40,6 +40,12 @@ use crate::transports::VeloBackend;
 /// stall it. But a hold of every worker at once for longer than a few
 /// heartbeat intervals can still end a stream as if its producer had died.
 ///
+/// A transport built on a client the application connected keeps that
+/// client's I/O where the application connected it: the NATS transport takes
+/// an `async_nats::Client`, so its reads and writes still need the runtime
+/// that called `connect`. Connect it on a runtime the application does not
+/// hold to keep it clear.
+///
 /// # What it costs
 ///
 /// Each wake between the application and velo becomes a wake across threads.

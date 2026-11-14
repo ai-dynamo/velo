@@ -794,6 +794,12 @@ impl NatsTransportBuilder {
     /// Create a new builder with the given NATS client and cluster ID.
     ///
     /// The default transport key is `"nats"`. Use [`with_key`](Self::with_key) to override.
+    ///
+    /// The client's I/O runs on the runtime that connected it, whatever
+    /// [`TaskRuntime`](crate::TaskRuntime) the instance uses. To keep NATS
+    /// traffic clear of the application's runtime under
+    /// `TaskRuntime::Dedicated`, connect the client on a runtime the
+    /// application does not hold.
     pub fn new(client: Arc<async_nats::Client>, cluster_id: impl Into<String>) -> Self {
         Self {
             client,
