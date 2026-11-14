@@ -2,8 +2,8 @@
 
 velo runs its own tasks on a tokio runtime that it builds, `TaskRuntime::Dedicated { threads: 1 }`, unless the application opts out with `VeloBuilder::task_runtime(TaskRuntime::Application)`. This chapter gives the reason, the two sets of measurements behind the default, what they did not cover, and the questions they left open.
 
-- **The default removes a stall.** On the application's runtime, an application task that wakes a velo task and then holds its thread delays that velo task for the whole hold. On the dedicated runtime no such hold delayed velo.
-- **In dynamo's load test the default cost less.** dynamo's frontend used 6% to 25% less CPU per output token, with throughput and latency the same as on the application's runtime.
+- **A dedicated runtime removes a stall.** On the application's runtime, an application task that wakes a velo task and then holds its thread delays that velo task for the whole hold. On a dedicated runtime (measured as arm C1 below) no such hold delayed velo.
+- **In dynamo's load test the dedicated runtime cost less.** With arm C1, dynamo's frontend used 6% to 25% less CPU per output token, with throughput and latency the same as on the application's runtime.
 - **A single unary caller pays.** In velo's own benchmark, one caller making one unary call at a time took 3.5 times as long per call, at 4.3 times the CPU.
 - **Opt out** with `TaskRuntime::Application` when latency depends on unary calls made one at a time, as in dynamo-gdl and kvbm. Measure both settings first.
 - **Use one thread.** A second thread helped streams only with more busy peers than threads, and it helped 64 concurrent unary callers. In dynamo's test it was worse than one everywhere.
