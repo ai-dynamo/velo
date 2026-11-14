@@ -200,3 +200,38 @@ fn concurrent_frees_leave_the_gauge_at_zero() {
         "(round, gauge) with every slot freed"
     );
 }
+
+#[test]
+#[ignore = "F1: discarded stores keep their slot contribution in reused metrics"]
+fn replacing_a_manager_with_the_same_metrics_counts_only_live_slots() {
+    let registry = Registry::new();
+    let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());
+    let first = super::RendezvousManager::with_metrics(
+        velo_ext::WorkerId::from_u64(1),
+        Arc::clone(&metrics),
+    );
+    first.register_data(Bytes::from_static(PAYLOAD));
+    assert_eq!(active_slots(&registry), 1.0);
+    let discarded = Arc::downgrade(first.data_store());
+    drop(first);
+    assert!(discarded.upgrade().is_none(), "the first store was dropped");
+
+    let replacement =
+        super::RendezvousManager::with_metrics(velo_ext::WorkerId::from_u64(1), metrics);
+    let handle = replacement.register_data(Bytes::from_static(PAYLOAD));
+    assert!(
+        replacement
+            .data_store()
+            .metadata(handle.unpack().1)
+            .is_some()
+    );
+    assert_eq!(replacement.data_store().slots.len(), 1);
+    let with_one_slot = active_slots(&registry);
+    assert!(replacement.unregister_data(handle));
+    assert!(replacement.data_store().slots.is_empty());
+    assert_eq!(
+        (with_one_slot, active_slots(&registry)),
+        (1.0, 0.0),
+        "registrations and frees must not keep counting the discarded store's slot"
+    );
+}
