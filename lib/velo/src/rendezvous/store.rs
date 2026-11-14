@@ -341,10 +341,9 @@ impl DataStore {
 
     /// A store that emits into `metrics`.
     pub(crate) fn with_metrics(metrics: Option<Arc<VeloMetrics>>) -> Self {
-        Self {
-            metrics,
-            ..Self::new()
-        }
+        let mut store = Self::new();
+        store.metrics = metrics;
+        store
     }
 
     /// The metrics handle, if this instance was built with one.
@@ -1088,6 +1087,17 @@ async fn sweep_while_pending(store: Weak<DataStore>, stop: tokio_util::sync::Can
 impl Default for DataStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for DataStore {
+    /// Count the slots still staged out of the gauge, which counts by steps
+    /// of one: a node rebuilt on the same metrics would start from them.
+    /// `&mut self` means no other call can change the slots now.
+    fn drop(&mut self) {
+        if let Some(m) = &self.metrics {
+            m.sub_rendezvous_active_slots(self.slots.len());
+        }
     }
 }
 

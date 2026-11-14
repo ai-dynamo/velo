@@ -201,8 +201,10 @@ fn concurrent_frees_leave_the_gauge_at_zero() {
     );
 }
 
+/// A store dropped with slots still staged counts them out of the gauge. A
+/// node rebuilt on the same metrics handle would otherwise start from the old
+/// store's count, and every later step would move from that wrong base.
 #[test]
-#[ignore = "F1: discarded stores keep their slot contribution in reused metrics"]
 fn replacing_a_manager_with_the_same_metrics_counts_only_live_slots() {
     let registry = Registry::new();
     let metrics = Arc::new(VeloMetrics::register(&registry).unwrap());

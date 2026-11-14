@@ -2482,6 +2482,11 @@ impl VeloMetrics {
         self.rendezvous_active_slots.dec();
     }
 
+    /// Count `slots` staged slots out at once, when their store is dropped.
+    pub(crate) fn sub_rendezvous_active_slots(&self, slots: usize) {
+        self.rendezvous_active_slots.sub(slots as f64);
+    }
+
     /// Publish how many regions the backend currently holds registered.
     ///
     /// The backend's own count, not this side's bookkeeping — the same number
