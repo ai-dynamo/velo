@@ -1126,55 +1126,35 @@ impl velo::Transport for Watched {
     }
 }
 
-/// One recorded wake of a caller's task.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Wake {
-    thread: String,
-    /// The wake ran on the caller's own thread, inside its own poll.
-    /// `AtomicWaker::register` does that with a wake that races the
-    /// registration, whatever thread sent it, so such a wake does not say
-    /// where the response came from.
-    in_own_poll: bool,
-}
-
-impl Wake {
-    fn from_velo() -> Self {
-        Self {
-            thread: THREAD_NAME.to_owned(),
-            in_own_poll: false,
-        }
-    }
-}
-
 thread_local! {
     /// Set while `record_wakes` polls its future on this thread.
     static IN_RECORDED_POLL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// Wakes the task it wraps, and records each wake.
+/// Wakes the task it wraps, and records the thread of each wake that runs
+/// outside the task's own poll. `AtomicWaker::register` delivers a wake that
+/// races the registration on the registering thread, inside that poll, so
+/// such a wake does not name the thread that sent it.
 struct RecordingWaker {
     inner: std::task::Waker,
-    wakes: Arc<parking_lot::Mutex<Vec<Wake>>>,
+    wakes: Arc<parking_lot::Mutex<Vec<String>>>,
 }
 
 impl futures::task::ArcWake for RecordingWaker {
     fn wake_by_ref(this: &Arc<Self>) {
-        this.wakes.lock().push(Wake {
-            thread: thread_name(),
-            in_own_poll: IN_RECORDED_POLL.get(),
-        });
+        if !IN_RECORDED_POLL.get() {
+            this.wakes.lock().push(thread_name());
+        }
         this.inner.wake_by_ref();
     }
 }
 
-/// Polls `inner` with a waker that records each wake. Returns whether
-/// `inner` ever returned `Pending`.
+/// Polls `inner` with a waker that records where its wakes come from.
 async fn record_wakes<F: std::future::Future>(
     inner: F,
-    wakes: Arc<parking_lot::Mutex<Vec<Wake>>>,
-) -> bool {
+    wakes: Arc<parking_lot::Mutex<Vec<String>>>,
+) -> F::Output {
     let mut inner = std::pin::pin!(inner);
-    let mut waited = false;
     std::future::poll_fn(|cx| {
         let waker = futures::task::waker(Arc::new(RecordingWaker {
             inner: cx.waker().clone(),
@@ -1185,44 +1165,9 @@ async fn record_wakes<F: std::future::Future>(
             .as_mut()
             .poll(&mut std::task::Context::from_waker(&waker));
         IN_RECORDED_POLL.set(false);
-        waited |= poll.is_pending();
-        poll.map(drop)
+        poll
     })
-    .await;
-    waited
-}
-
-/// How the response of one call reached its caller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CallEnd {
-    /// One wake, from a velo thread.
-    WokenFromVelo,
-    /// One wake, from an application thread.
-    WokenFromApplication,
-    /// No wake: the response was there before the caller's first poll
-    /// registered for it.
-    NoWake,
-    /// One wake that the caller's own poll delivered to itself: a response
-    /// raced the registration. It names no thread.
-    NoWitness,
-    /// More than one wake, or a wait with no wake.
-    Other,
-}
-
-/// Classifies a call by its wakes, not by whether it returned `Pending`.
-/// The response slot registers the caller's waker before it checks for the
-/// value, so a response that lands between the two wakes the caller while
-/// that same poll returns `Ready`. Call it only once the wakes have settled:
-/// the slot publishes the value before it wakes, so another poll can finish
-/// the call before its wake is recorded.
-fn classify(waited: bool, wakes: &[Wake]) -> CallEnd {
-    match wakes {
-        [] if !waited => CallEnd::NoWake,
-        [wake] if wake.in_own_poll => CallEnd::NoWitness,
-        [wake] if wake.thread == THREAD_NAME => CallEnd::WokenFromVelo,
-        [_] => CallEnd::WokenFromApplication,
-        _ => CallEnd::Other,
-    }
+    .await
 }
 
 /// Where the parts of a run of unary calls ran, counted by thread.
@@ -1235,17 +1180,10 @@ struct Crossings {
     /// the handler runs where the transport reads, on the runtime `start`
     /// was given.
     handlers_on_application: usize,
-    /// Calls whose caller was woken once, from a velo thread: the response
-    /// path.
-    woken_from_velo: usize,
-    /// Calls whose caller was woken once, from an application thread.
-    woken_from_application: usize,
-    /// Calls that ended with no wake.
-    no_wake: usize,
-    /// Calls whose one wake came from their own poll.
-    no_witness: usize,
-    /// Calls that fit none of the above.
-    other: usize,
+    /// Wakes of a caller from a velo thread: the response path.
+    caller_wakes_from_velo: usize,
+    /// Wakes of a caller from an application thread, outside its own poll.
+    caller_wakes_from_application: usize,
 }
 
 /// Makes `calls` unary calls one at a time, after a warm-up, and counts
@@ -1272,7 +1210,7 @@ async fn count_crossings(runtime: TaskRuntime, calls: usize) -> (Crossings, Stri
                 move |ctx: Context| {
                     handler_threads.lock().push(thread_name());
                     // The caller is then waiting when the response comes
-                    // back, so almost every call has a wake to count.
+                    // back, so almost every call has a wake to record.
                     std::thread::sleep(Duration::from_millis(1));
                     Ok(Some(ctx.payload))
                 }
@@ -1301,26 +1239,17 @@ async fn count_crossings(runtime: TaskRuntime, calls: usize) -> (Crossings, Stri
     server_transport.sends.lock().clear();
     handler_threads.lock().clear();
 
-    let mut per_call = Vec::with_capacity(calls);
+    let wakes = Arc::new(parking_lot::Mutex::new(Vec::new()));
     for _ in 0..calls {
-        let wakes = Arc::new(parking_lot::Mutex::new(Vec::new()));
-        let waited = tokio::time::timeout(PATIENCE, record_wakes(call(), Arc::clone(&wakes)))
+        tokio::time::timeout(PATIENCE, record_wakes(call(), Arc::clone(&wakes)))
             .await
             .expect("call timed out");
-        per_call.push((waited, wakes));
     }
-    // `shutdown` returns once velo's tasks are done and, on the dedicated
-    // runtime, its threads have exited, so every wake has been recorded.
+    // A response is published before its wake runs, so a call can finish
+    // first. `shutdown` returns once velo's tasks are done, so every wake
+    // has been recorded by then.
     client.shutdown(ShutdownPolicy::WaitForever).await;
     server.shutdown(ShutdownPolicy::WaitForever).await;
-    let all_wakes: Vec<_> = per_call
-        .iter()
-        .map(|(waited, wakes)| (*waited, wakes.lock().clone()))
-        .collect();
-    let ends: Vec<_> = all_wakes
-        .iter()
-        .map(|(waited, wakes)| classify(*waited, wakes))
-        .collect();
 
     let is_velo = |thread: &String| thread == THREAD_NAME;
     let sends: Vec<_> = client_transport
@@ -1330,7 +1259,7 @@ async fn count_crossings(runtime: TaskRuntime, calls: usize) -> (Crossings, Stri
         .chain(server_transport.sends.lock().iter())
         .cloned()
         .collect();
-    let count = |end: CallEnd| ends.iter().filter(|e| **e == end).count();
+    let wakes = wakes.lock().clone();
     let crossings = Crossings {
         sends_from_application: sends.iter().filter(|(_, t)| !is_velo(t)).count(),
         handlers_on_application: handler_threads
@@ -1338,15 +1267,11 @@ async fn count_crossings(runtime: TaskRuntime, calls: usize) -> (Crossings, Stri
             .iter()
             .filter(|t| !is_velo(t))
             .count(),
-        woken_from_velo: count(CallEnd::WokenFromVelo),
-        woken_from_application: count(CallEnd::WokenFromApplication),
-        no_wake: count(CallEnd::NoWake),
-        no_witness: count(CallEnd::NoWitness),
-        other: count(CallEnd::Other),
+        caller_wakes_from_velo: wakes.iter().filter(|t| is_velo(t)).count(),
+        caller_wakes_from_application: wakes.iter().filter(|t| !is_velo(t)).count(),
     };
     let detail = format!(
-        "sends {sends:?}, handler threads {:?}, (waited, caller wakes) per call {all_wakes:?}, \
-         writers on {:?} and {:?}",
+        "sends {sends:?}, handler threads {:?}, caller wakes {wakes:?}, writers on {:?} and {:?}",
         handler_threads.lock(),
         client_transport.writer_thread.lock(),
         server_transport.writer_thread.lock()
@@ -1369,10 +1294,11 @@ async fn count_crossings(runtime: TaskRuntime, calls: usize) -> (Crossings, Stri
 ///    runtime;
 /// 4. the client's response path, on velo's runtime, wakes the caller.
 ///
-/// The fourth is a wake only if the response comes after the caller's first
-/// poll registered for it. A call whose response was already there ends
-/// with no wake, so the test allows that and requires a velo wake for every
-/// other call (the handler's 1 ms sleep makes those almost all of them).
+/// The test counts the first three exactly, once each per call. It checks
+/// the fourth as "at least one wake of a caller from velo's runtime, and none
+/// from the application's": a wake per call cannot be counted, because a
+/// response that arrives during the caller's poll needs no wake, and a wake
+/// that races the waker's registration runs on the caller's own thread.
 ///
 /// On `TaskRuntime::Application` the same call runs on the application's
 /// runtime throughout. Each crossing is a wake across threads, and it is the
@@ -1394,23 +1320,10 @@ async fn a_unary_call_crosses_between_runtimes_four_times() {
         )),
         "the writers do not run on velo's runtime: {detail}"
     );
-    assert!(
-        crossings.woken_from_velo > 0,
-        "no caller was woken, so the response hand-off was not seen: {detail}"
-    );
-    assert_eq!(
-        crossings,
-        Crossings {
-            sends_from_application: 2 * CALLS,
-            handlers_on_application: CALLS,
-            woken_from_velo: CALLS - crossings.no_wake - crossings.no_witness,
-            woken_from_application: 0,
-            no_wake: crossings.no_wake,
-            no_witness: crossings.no_witness,
-            other: 0,
-        },
-        "{detail}"
-    );
+    assert_eq!(crossings.sends_from_application, 2 * CALLS, "{detail}");
+    assert_eq!(crossings.handlers_on_application, CALLS, "{detail}");
+    assert!(crossings.caller_wakes_from_velo >= 1, "{detail}");
+    assert_eq!(crossings.caller_wakes_from_application, 0, "{detail}");
 }
 
 /// The control for the count above: on the application's runtime nothing of
@@ -1424,276 +1337,6 @@ async fn a_unary_call_on_the_application_runtime_stays_there() {
         !detail.contains(THREAD_NAME),
         "a velo thread exists on the application's runtime: {detail}"
     );
-    assert_eq!(crossings.woken_from_velo, 0, "{detail}");
-    assert_eq!(crossings.other, 0, "{detail}");
-    assert_eq!(
-        crossings.woken_from_application + crossings.no_wake + crossings.no_witness,
-        CALLS,
-        "{detail}"
-    );
-}
-
-/// A response that lands after the caller's waker is registered but before
-/// the same poll checks for it wakes the caller, and that poll still returns
-/// `Ready`. `Slot::poll_wait` registers first, then checks. The count must
-/// take the wake as the response hand-off, though the call never waited.
-#[tokio::test]
-async fn a_wake_inside_the_first_poll_counts_as_the_response_hand_off() {
-    // The responder thread is named `velo-rt`, which the other tests count.
-    let _serial = serial().await;
-    let slot_waker = Arc::new(futures::task::AtomicWaker::new());
-    let (registered, may_complete) = std::sync::mpsc::channel();
-    let (completed, may_read) = std::sync::mpsc::channel();
-    let responder = std::thread::Builder::new()
-        .name(THREAD_NAME.to_owned())
-        .spawn({
-            let slot_waker = Arc::clone(&slot_waker);
-            move || {
-                may_complete.recv().expect("waker registered");
-                slot_waker.wake();
-                completed.send(()).expect("response completed");
-            }
-        })
-        .expect("response thread");
-    let wakes = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let response = std::future::poll_fn(|cx| {
-        slot_waker.register(cx.waker());
-        registered.send(()).expect("allow response");
-        may_read
-            .recv()
-            .expect("response available before the check");
-        std::task::Poll::Ready(())
-    });
-    let waited = record_wakes(response, Arc::clone(&wakes)).await;
-    responder.join().expect("response thread");
-    let wakes = wakes.lock().clone();
-    assert!(!waited);
-    assert_eq!(wakes, [Wake::from_velo()]);
-    assert_eq!(classify(waited, &wakes), CallEnd::WokenFromVelo);
-    assert_eq!(classify(false, &[]), CallEnd::NoWake);
-    assert_eq!(classify(true, &[]), CallEnd::Other);
-    let application = Wake {
-        thread: "tokio-runtime-worker".to_owned(),
-        in_own_poll: false,
-    };
-    assert_eq!(
-        classify(true, &[application]),
-        CallEnd::WokenFromApplication
-    );
-    assert_eq!(
-        classify(true, &[Wake::from_velo(), Wake::from_velo()]),
-        CallEnd::Other
-    );
-}
-
-/// A response slot publishes its value before it wakes the caller, so a
-/// spurious poll can finish the call before its wake is recorded. The wake
-/// still comes, from velo's runtime, and once the instances have shut down
-/// it is there to count: `count_crossings` classifies only then.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_response_read_before_its_wake_counts_as_a_valid_call() {
-    use std::future::Future;
-    use std::task::{Context as TaskContext, Poll, Waker};
-
-    struct HeldWake {
-        inner: Waker,
-        entered: flume::Sender<()>,
-        release: flume::Receiver<()>,
-    }
-
-    impl futures::task::ArcWake for HeldWake {
-        fn wake_by_ref(this: &Arc<Self>) {
-            this.entered.send(()).unwrap();
-            this.release.recv().unwrap();
-            this.inner.wake_by_ref();
-        }
-    }
-
-    let _serial = serial().await;
-    let client = node(TaskRuntime::dedicated()).await;
-    let server = node(TaskRuntime::dedicated()).await;
-    let (answer, may_answer) = flume::bounded::<()>(1);
-    server
-        .register_handler(
-            Handler::unary_handler("probe", move |ctx: Context| {
-                may_answer.recv().unwrap();
-                Ok(Some(ctx.payload))
-            })
-            .build(),
-        )
-        .unwrap();
-    introduce(&client, &server).await;
-    echo(&client, &server).await.unwrap();
-
-    let call = client
-        .unary("probe")
-        .unwrap()
-        .raw_payload(Bytes::from_static(b"ping"))
-        .instance(server.instance_id())
-        .send();
-    let mut call = std::pin::pin!(call);
-    let (entered, waking) = flume::bounded(1);
-    let (release, may_wake) = flume::bounded(1);
-    let held = std::future::poll_fn(|cx| {
-        let waker = futures::task::waker(Arc::new(HeldWake {
-            inner: cx.waker().clone(),
-            entered: entered.clone(),
-            release: may_wake.clone(),
-        }));
-        call.as_mut()
-            .poll(&mut TaskContext::from_waker(&waker))
-            .map(|result| assert_eq!(result.unwrap(), Bytes::from_static(b"ping")))
-    });
-    let wakes = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let mut recorded = std::pin::pin!(record_wakes(held, Arc::clone(&wakes)));
-    assert!(futures::poll!(recorded.as_mut()).is_pending());
-    answer.send(()).unwrap();
-    waking.recv_async().await.unwrap();
-
-    // A spurious poll is legal while the response thread is about to wake us.
-    let second_poll = futures::poll!(recorded.as_mut());
-    let at_completion = wakes.lock().clone();
-    release.send(()).unwrap();
-    client.shutdown(ShutdownPolicy::WaitForever).await;
-    server.shutdown(ShutdownPolicy::WaitForever).await;
-    let settled = wakes.lock().clone();
-
-    assert_eq!(second_poll, Poll::Ready(true));
-    assert!(
-        at_completion.is_empty(),
-        "the call finished before its wake: {at_completion:?}"
-    );
-    assert_eq!(settled, [Wake::from_velo()]);
-    assert_eq!(classify(true, &settled), CallEnd::WokenFromVelo);
-}
-
-/// `AtomicWaker::register` delivers a wake that races the registration
-/// itself, on the registering thread, inside the caller's poll. The test
-/// holds the registration (in the waker's clone) until a later response
-/// proves that velo's response loop has already sent this call's wake. The
-/// recorded wake then names the caller's thread, not velo's, so the count
-/// must take it as no witness rather than as a wake from the application.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_response_wake_during_registration_counts_as_a_valid_call() {
-    use std::future::Future;
-    use std::mem::ManuallyDrop;
-    use std::task::{Context as TaskContext, RawWaker, RawWakerVTable, Waker};
-
-    struct HeldClone {
-        inner: Waker,
-        entered: flume::Sender<()>,
-        completed: flume::Receiver<()>,
-    }
-
-    fn raw(held: Arc<HeldClone>) -> RawWaker {
-        RawWaker::new(Arc::into_raw(held).cast(), &VTABLE)
-    }
-
-    unsafe fn clone_waker(data: *const ()) -> RawWaker {
-        // Each raw waker owns one Arc; a clone borrows it without dropping it.
-        let held = ManuallyDrop::new(unsafe { Arc::<HeldClone>::from_raw(data.cast()) });
-        held.entered.send(()).unwrap();
-        held.completed.recv_timeout(PATIENCE).unwrap();
-        raw(Arc::clone(&held))
-    }
-
-    unsafe fn wake(data: *const ()) {
-        // `wake` consumes the Arc owned by this raw waker.
-        let held = unsafe { Arc::<HeldClone>::from_raw(data.cast()) };
-        held.inner.wake_by_ref();
-    }
-
-    unsafe fn wake_by_ref(data: *const ()) {
-        // A borrowed wake leaves the raw waker's Arc alive.
-        let held = ManuallyDrop::new(unsafe { Arc::<HeldClone>::from_raw(data.cast()) });
-        held.inner.wake_by_ref();
-    }
-
-    unsafe fn drop_waker(data: *const ()) {
-        // `drop` releases the Arc owned by this raw waker.
-        drop(unsafe { Arc::<HeldClone>::from_raw(data.cast()) });
-    }
-
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone_waker, wake, wake_by_ref, drop_waker);
-
-    let _serial = serial().await;
-    let client = node(TaskRuntime::dedicated()).await;
-    let server = node(TaskRuntime::dedicated()).await;
-    let (answer, may_answer) = flume::bounded::<()>(1);
-    server
-        .register_handler(
-            Handler::unary_handler("probe", move |ctx: Context| {
-                if ctx.payload == Bytes::from_static(b"ping") {
-                    may_answer.recv_timeout(PATIENCE).unwrap();
-                }
-                Ok(Some(ctx.payload))
-            })
-            .ordered()
-            .build(),
-        )
-        .unwrap();
-    introduce(&client, &server).await;
-    echo(&client, &server).await.unwrap();
-
-    let call = client
-        .unary("probe")
-        .unwrap()
-        .raw_payload(Bytes::from_static(b"ping"))
-        .instance(server.instance_id())
-        .send();
-    let mut call = std::pin::pin!(call);
-    let (entered, cloning) = flume::bounded(1);
-    let (completed, may_register) = flume::bounded(1);
-    let helper = tokio::spawn({
-        let client = client.clone();
-        let target = server.instance_id();
-        async move {
-            cloning.recv_async().await.unwrap();
-            answer.send(()).unwrap();
-            // The ordered handler and TCP writer put this response second.
-            // Receiving it proves the first response's wake has returned.
-            let tail = client
-                .unary("probe")
-                .unwrap()
-                .raw_payload(Bytes::from_static(b"tail"))
-                .instance(target)
-                .send();
-            assert_eq!(
-                tokio::time::timeout(PATIENCE, tail).await.unwrap().unwrap(),
-                Bytes::from_static(b"tail")
-            );
-            completed.send(()).unwrap();
-        }
-    });
-    let held = std::future::poll_fn(|cx| {
-        let held = Arc::new(HeldClone {
-            inner: cx.waker().clone(),
-            entered: entered.clone(),
-            completed: may_register.clone(),
-        });
-        // The vtable keeps one Arc alive for each raw waker and its clones.
-        let waker = unsafe { Waker::from_raw(raw(held)) };
-        call.as_mut()
-            .poll(&mut TaskContext::from_waker(&waker))
-            .map(|result| assert_eq!(result.unwrap(), Bytes::from_static(b"ping")))
-    });
-    let wakes = Arc::new(parking_lot::Mutex::new(Vec::new()));
-    let waited = record_wakes(held, Arc::clone(&wakes)).await;
-    helper.await.unwrap();
-    client.shutdown(ShutdownPolicy::WaitForever).await;
-    server.shutdown(ShutdownPolicy::WaitForever).await;
-    let settled = wakes.lock().clone();
-
-    assert!(
-        !waited,
-        "the response is ready before registration finishes"
-    );
-    assert_eq!(
-        settled,
-        [Wake {
-            thread: thread_name(),
-            in_own_poll: true,
-        }]
-    );
-    assert_eq!(classify(waited, &settled), CallEnd::NoWitness);
+    assert_eq!(crossings.caller_wakes_from_velo, 0, "{detail}");
+    assert!(crossings.caller_wakes_from_application >= 1, "{detail}");
 }

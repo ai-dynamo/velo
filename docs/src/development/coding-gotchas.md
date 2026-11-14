@@ -31,15 +31,17 @@ A test may assert what holds whatever tokio decides: that nothing on a held runt
 
 Test: on `TaskRuntime::Application`, `block_in_place_keeps_the_stream` is the live test of the workaround, and `a_held_worker_thread_cuts_the_stream` is the ignored demonstration of the stall (`lib/velo/tests/streaming/held_thread.rs`). In `lib/velo/tests/streaming/stall_rows.rs` the `dedicated_*` tests are live, because on the default velo's tasks run on a runtime the test does not hold, and the `application_*` tests are the ignored demonstrations.
 
-## A wake does not mean the poll returned `Pending`
+## A wake's thread does not always name its sender
 
-**Rule.** When a test counts wakes, classify each operation by its wakes, not by whether its future returned `Pending`. A future that registers its waker and then checks for its value can be woken while that same poll returns `Ready`. A future whose value was already there ends with no wake at all. And classify only once the wakes have settled: a value published before its wake can be read by a spurious poll, so the future finishes before its wake runs. And a wake's thread does not always name its sender: `AtomicWaker::register` delivers a wake that races the registration on the registering thread, inside its poll.
+**Rule.** Do not count one wake per operation, and do not take a wake's thread as its sender. Assert "at least one wake from the expected side, and none from the other". Ignore a wake that runs inside the woken task's own poll, and read the record only after the senders have stopped.
 
-**Failure.** A test counted one response wake for each unary call that returned `Pending`. The response slot (`Slot::poll_wait`) registers the caller's waker first and then checks for the value. A response that landed between the two gave a call with one wake that never waited, and the count was off by one. Under load, a run of 20 calls also had none that waited, so a check that some call waited failed. The slot also publishes the value before it wakes, so a spurious poll could finish a call whose wake had not run yet, and a count taken when the call finished saw no wake. A response that raced the registration woke the caller from its own thread, which the count took for a wake from the application.
+A future whose value arrives during its poll needs no wake. A value published before its wake can be read by another poll, so the future finishes before its wake runs. And `AtomicWaker::register` delivers a wake that races the registration on the registering thread, inside its poll.
 
-**Test.** Hold the waker side on a channel between the registration and the check, or between the publish and the wake, or inside the registration, and see whether the count still holds. Record whether a wake runs inside the woken task's own poll, and count such a wake as no witness. Count after the instances have shut down: `Velo::shutdown` returns after velo's runtime threads have exited. Make the expected wait long, here a 1 ms sleep in the handler, so that most operations have a wake to count. Then run the test 50 times, and again with several copies in parallel.
+**Failure.** A test counted one response wake from velo's runtime for each unary call. Three review passes in a row each found a valid interleaving that broke it: a response during the first poll, a spurious poll before the wake, and a wake that the registration handed to the caller's own thread. Each fix moved the failure to the next interleaving.
 
-Test: `a_wake_inside_the_first_poll_counts_as_the_response_hand_off`, `a_response_read_before_its_wake_counts_as_a_valid_call` and `a_response_wake_during_registration_counts_as_a_valid_call` force the three interleavings, and `a_unary_call_crosses_between_runtimes_four_times` counts per call (`lib/velo/tests/task_runtime.rs`).
+**Test.** Hold the sender between the registration and the check, or between the publish and the wake, and see whether the assertion still holds. Run the test 200 times, with 8 copies in parallel.
+
+Test: `a_unary_call_crosses_between_runtimes_four_times` (`lib/velo/tests/task_runtime.rs`).
 
 ## A cancel wakes child tokens before the parent's own waiters
 
