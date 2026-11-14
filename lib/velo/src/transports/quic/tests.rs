@@ -1060,7 +1060,22 @@ async fn laned_pair(
     DataStreams,
     InstanceId,
 ) {
-    let (client, client_streams, _) = started_with(QuicTransportBuilder::new().lanes(lanes)).await;
+    laned_pair_with(lanes, |b| b).await
+}
+
+/// [`laned_pair`], with the client's builder passed through `configure`.
+async fn laned_pair_with(
+    lanes: u16,
+    configure: impl FnOnce(QuicTransportBuilder) -> QuicTransportBuilder,
+) -> (
+    Arc<QuicTransport>,
+    DataStreams,
+    QuicTransport,
+    DataStreams,
+    InstanceId,
+) {
+    let (client, client_streams, _) =
+        started_with(configure(QuicTransportBuilder::new().lanes(lanes))).await;
     let (server, server_streams, server_id) = started().await;
     client
         .register(peer_with_fingerprint(
@@ -1221,20 +1236,22 @@ async fn send_message_is_lane_zero_and_lanes_wrap() {
 ///
 /// This pins the state after `closed()` returns; the force close of a stuck
 /// lane other than 0 is what `closed_force_closes_a_stuck_lane_other_than_zero`
-/// covers. The endpoint check needs every connection to finish draining within
-/// `CLOSE_WAIT`, 2 s.
+/// covers.
 ///
-/// The accounting also needs the peer to acknowledge what the writers wrote
-/// within `FINISH_GRACE`, 1 s. Past that the writer warns that the stream end
-/// was not acknowledged and closes, and those frames are neither delivered nor
-/// failed. On loopback that is milliseconds of work, so a failure here next to
-/// that warning points at the grace, not at lanes.
+/// The waits are the two shutdown graces: `closed()` gives up on a connection
+/// that has not drained within `CLOSE_WAIT` (2 s), and a writer gives up on
+/// the peer's acknowledgement after `FINISH_GRACE` (1 s), leaving its frames
+/// neither delivered nor failed. On a loaded host the drain can take longer,
+/// and the test then fails though every lane was waited for. So this client
+/// runs with a 30 s finish grace and a 60 s close wait. A `closed()` that does
+/// not wait for a lane still fails here, and a passing run takes no longer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closed_waits_for_every_lane() {
     const LANES: u16 = 4;
     const FRAMES: usize = 256;
     const PAYLOAD: usize = 64 * 1024;
-    let (client, _client_streams, server, server_streams, server_id) = laned_pair(LANES).await;
+    let (client, _client_streams, server, server_streams, server_id) =
+        laned_pair_with(LANES, |b| b.close_grace(Duration::from_secs(30))).await;
     let errors = Arc::new(Errors::default());
 
     let send = |lane: u16, seq: usize, bytes: usize| {
@@ -1289,20 +1306,31 @@ async fn closed_waits_for_every_lane() {
         );
     }
 
-    while let Ok(Ok((header, _))) = tokio::time::timeout(
-        Duration::from_secs(3),
-        server_streams.response_stream.recv_async(),
-    )
-    .await
-    {
+    // Every frame was acknowledged or failed when `closed()` returned, but the
+    // server may still be handing the last ones to its stream. Wait for the
+    // count, not for a quiet spell: the timeout only catches a hang.
+    let failed = errors.0.lock().unwrap().len();
+    while delivered + failed < FRAMES {
+        let (header, _) = tokio::time::timeout(
+            Duration::from_secs(30),
+            server_streams.response_stream.recv_async(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("{delivered} delivered + {failed} failed of {FRAMES} sent, and no more arrive")
+        })
+        .unwrap();
         per_lane[usize::from(u16::from_be_bytes([header[0], header[1]]))] += 1;
         delivered += 1;
     }
-    let failed = errors.0.lock().unwrap().len();
     assert_eq!(
         delivered + failed,
         FRAMES,
         "{delivered} delivered + {failed} failed != {FRAMES} sent"
+    );
+    assert!(
+        server_streams.response_stream.is_empty(),
+        "more frames arrived than were sent"
     );
     server.shutdown();
 }
