@@ -107,7 +107,7 @@ What it costs: each wake between the application and velo now crosses threads. I
 
 To keep the old behaviour, opt out:
 
-```rust
+```rust,ignore
 let velo = Velo::builder()
     .task_runtime(TaskRuntime::Application)
     // ...
@@ -125,7 +125,7 @@ Also check:
 - Code that counts the process's threads sees one more, `velo-rt`, per instance, and a short-lived `velo-rt-stop` thread when an instance stops.
 - A NATS transport keeps its I/O where the application connected its `async_nats::Client`. velo does not connect the client itself, because the same client usually serves NATS discovery and queues too. To keep NATS traffic clear of the application's runtime, connect the client on a small runtime of its own, and keep that runtime as long as the client (stop it with `shutdown_background`, because dropping a runtime inside an async task panics):
 
-  ```rust
+  ```rust,ignore
   let nats_rt = tokio::runtime::Builder::new_multi_thread()
       .worker_threads(1)
       .enable_all()
