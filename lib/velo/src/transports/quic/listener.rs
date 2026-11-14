@@ -98,36 +98,65 @@ pub(super) async fn run_accept_loop(endpoint: quinn::Endpoint, ctx: AcceptContex
 ///
 /// So the readers do not stop on the teardown token. A wake order is not a run
 /// order: on a multi-thread runtime a reader that woke after this task can
-/// still run first. They stop on `readers`, which this task cancels only after
-/// it has closed the connection, so the order is certain on any runtime.
+/// still run first. They stop on a token that [`CloseThenStop`] cancels only
+/// after it has closed the connection, so the order is certain on any runtime.
 async fn serve_connection(connection: quinn::Connection, ctx: AcceptContext) {
     let peer = connection.remote_address();
-    // Not a child of the teardown token: a node-wide cancel must not reach the
-    // readers before `close()`. The guard also stops them when this task ends
-    // any other way: the connection is lost, or the task is dropped.
-    let readers = CancellationToken::new();
-    let _stop_readers = readers.clone().drop_guard();
+    let mut guard = CloseThenStop {
+        connection: Some(connection.clone()),
+        readers: CancellationToken::new(),
+    };
     loop {
         let stream = tokio::select! {
             biased;
-            _ = ctx.teardown.cancelled() => {
-                connection.close(quinn::VarInt::from_u32(0), b"shutdown");
-                break;
-            }
+            _ = ctx.teardown.cancelled() => break,
             stream = connection.accept_bi() => stream,
         };
         match stream {
             Ok((send, recv)) => {
-                tokio::spawn(serve_stream(send, recv, ctx.clone(), readers.clone(), peer));
+                tokio::spawn(serve_stream(
+                    send,
+                    recv,
+                    ctx.clone(),
+                    guard.readers.clone(),
+                    peer,
+                ));
             }
             Err(e) => {
                 debug!(
                     "QUIC: connection from {peer} ended: {e:#} (close reason: {:?})",
                     connection.close_reason()
                 );
+                // Already ended. quinn's `close()` would replace its error with
+                // `LocallyClosed`, and a reader not yet woken would read a lost
+                // connection as an orderly end.
+                guard.connection = None;
                 break;
             }
         }
+    }
+}
+
+/// Closes a connection and then stops its stream readers, however the
+/// connection task ends: teardown, a lost connection, a panic, or the task
+/// dropped.
+///
+/// The readers' token is not a child of the teardown token, so a node-wide
+/// cancel cannot reach them before the close.
+struct CloseThenStop {
+    /// `None` once the connection has ended without us.
+    connection: Option<quinn::Connection>,
+    readers: CancellationToken,
+}
+
+impl Drop for CloseThenStop {
+    fn drop(&mut self) {
+        if let Some(connection) = &self.connection
+            && connection.close_reason().is_none()
+        {
+            connection.close(quinn::VarInt::from_u32(0), b"shutdown");
+        }
+        self.readers.cancel();
     }
 }
 
@@ -268,9 +297,16 @@ mod tests {
         );
     }
 
-    /// A blocked drain reply keeps the connection open when another reader stops.
+    /// A connection task that is dropped, not torn down, still closes the
+    /// connection before it stops its readers.
+    ///
+    /// Any one reader keeps the connection open while it holds its streams. A
+    /// reader blocked on a `ShuttingDown` reply that the peer's one-byte
+    /// window cannot take does not see its stop at once. If the dropped task
+    /// only stopped the readers, an idle reader would drop its stream on that
+    /// open connection, and the peer would get STOP_SENDING. Run once through
+    /// teardown as the control, and once with the task dropped.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "F1: task drop cancels readers before closing a connection held by a blocked reply"]
     async fn dropping_a_connection_task_closes_before_stopping_its_readers() {
         async fn check(drop_task: bool) {
             struct RejectingMessage(Arc<tokio::sync::Notify>);
