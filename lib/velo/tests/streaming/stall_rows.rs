@@ -17,11 +17,14 @@
 //! steals from. Row 5 stalls there because the transport's reader and its
 //! socket belong to the held runtime.
 //!
-//! On [`TaskRuntime::Dedicated`] every row is a live test: the woken velo task
-//! and the reader run on velo's own runtime, which the application cannot
-//! hold, so no run may wait for the hold.
+//! On the default, [`TaskRuntime::Dedicated`] with one thread, every row is a
+//! live test: the woken velo task and the reader run on velo's own runtime,
+//! which the application cannot hold, so no run may wait for the hold. The
+//! live rows build with [`TaskRuntime::default`], so they also guard the
+//! default.
 //!
-//! On [`TaskRuntime::Application`] every row is an ignored demonstration. A
+//! On [`TaskRuntime::Application`], the opt-out, every row is an ignored
+//! demonstration. A
 //! test cannot force a tokio scheduling outcome by arranging wakes: another
 //! wake can reach the velo task first (book, "Coding gotchas"). Run them with
 //! `--ignored` to see the stall.
@@ -577,45 +580,45 @@ enum Inbound {
     Record,
 }
 
-// --- On a dedicated runtime: live -----------------------------------------
+// --- On the default, a dedicated runtime: live ----------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dedicated_stream_send_never_waits_for_a_held_thread() {
-    assert_none_waited("row 1", &stream_send(TaskRuntime::dedicated()).await);
+    assert_none_waited("row 1", &stream_send(TaskRuntime::default()).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dedicated_unary_call_never_waits_for_a_held_thread() {
-    assert_none_waited("row 2", &unary_call(TaskRuntime::dedicated()).await);
+    assert_none_waited("row 2", &unary_call(TaskRuntime::default()).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dedicated_handler_response_never_waits_for_a_held_thread() {
-    assert_none_waited("row 3", &handler_response(TaskRuntime::dedicated()).await);
+    assert_none_waited("row 3", &handler_response(TaskRuntime::default()).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn dedicated_credit_sweep_never_waits_for_a_held_thread() {
-    assert_none_waited("row 4", &buffered_read(TaskRuntime::dedicated()).await);
+    assert_none_waited("row 4", &buffered_read(TaskRuntime::default()).await);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dedicated_transport_reads_while_every_worker_is_held() {
-    let delay = inbound_read(tcp_dyn, TaskRuntime::dedicated(), 2, Inbound::Message).await;
+    let delay = inbound_read(tcp_dyn, TaskRuntime::default(), 2, Inbound::Message).await;
     assert_none_waited("row 5", &[delay]);
 }
 
 /// The mux's batch lanes are velo's ingress and run on its runtime too.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dedicated_mux_delivers_while_every_worker_is_held() {
-    let delay = inbound_read(tcp_dyn, TaskRuntime::dedicated(), 2, Inbound::Record).await;
+    let delay = inbound_read(tcp_dyn, TaskRuntime::default(), 2, Inbound::Record).await;
     assert_none_waited("row 5, records", &[delay]);
 }
 
 #[cfg(feature = "quic")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn dedicated_quic_transport_reads_while_every_worker_is_held() {
-    let delay = inbound_read(quic, TaskRuntime::dedicated(), 2, Inbound::Message).await;
+    let delay = inbound_read(quic, TaskRuntime::default(), 2, Inbound::Message).await;
     assert_none_waited("row 5, QUIC", &[delay]);
 }
 
@@ -629,7 +632,7 @@ async fn dedicated_two_threads_stream_send_never_waits_for_a_held_thread() {
     );
 }
 
-// --- On the application's runtime: ignored demonstrations ------------------
+// --- On TaskRuntime::Application, the opt-out: ignored demonstrations ------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "demonstration: tokio's scheduling decides whether the batcher is in the held worker's LIFO slot (book, Coding gotchas); run with --ignored to see the stall"]

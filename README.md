@@ -23,15 +23,16 @@ Velo 0.21 makes `Velo` a handle. `VeloBuilder::build()` returns `Velo`, not `Arc
 
 Velo 0.22.1 deprecates `Velo::anchor_manager()` and `Velo::rendezvous_manager()`, and 0.23.0 removes them. Their methods are on `Velo`, with three new ones: `create_anchor_with_config`, `active_anchor_count`, `renew_reservations`. Also new: `staging_threshold` and the owner's `unregister_data`. See [Move off the manager accessors](docs/src/guides/migrate-manager-accessors.md).
 
-Velo 0.23.0 makes three breaking changes:
+Velo 0.23.0 makes three breaking changes and one change of default:
 
 - It opens no per-stream listener by default: the messenger mux carries every remote stream. Call `stream_config` or `stream_bind_addr` to serve peers without the mux, or to turn the mux off. See [0.23.0: the per-stream listener is opt-in](docs/src/guides/migrate-services.md#0230-the-per-stream-listener-is-opt-in).
 - It removes the `Messenger` front door that 0.22.1 deprecated: `Messenger::builder`, `MessengerBuilder`, the peer, drain and shutdown methods of `Messenger`, and `Velo::graceful_shutdown`. Build and manage an instance through `Velo`. `Velo::shutdown` is the one shutdown. See [Move off the Messenger front door](docs/src/guides/migrate-messenger-front-door.md).
 - Each public item has one path. The anchor and rendezvous managers, the wire messages, and `FrameTransport` are no longer public; velo-ext 0.6.0 drops `FrameTransport`, so stream transports are in-tree only. See [Move to the public paths of 0.23.0](docs/src/guides/migrate-public-paths.md).
+- It runs velo's own tasks on a one-thread runtime it owns (`TaskRuntime::Dedicated { threads: 1 }`), so an application task that holds its worker thread cannot stall them. A single caller's unary calls cost more there; opt out with `VeloBuilder::task_runtime(TaskRuntime::Application)`. See [0.23.0: velo's tasks run on a runtime it owns](docs/src/guides/migrate-services.md#0230-velos-tasks-run-on-a-runtime-it-owns).
 
 Use `Velo::shutdown(policy)` to close resources and join owned tasks while Tokio keeps running. The instance and its handles stay valid after shutdown, and shutdown does not release them from memory. Accepted requests remain counted until their replies are submitted, including error replies. See [Shutdown and drain](docs/src/concepts/shutdown.md).
 
-An application task that holds its worker thread right after it calls velo (a blocking call, a long encode) can stall velo's tasks on the default runtime. Keep such work in `spawn_blocking` or `block_in_place`, or build the node with `VeloBuilder::task_runtime(TaskRuntime::Dedicated { threads: 1 })`, which runs velo's own tasks on a runtime it builds and shuts down, at a cost in time and CPU at low concurrency. See [Known limitations](docs/src/appendix/limitations.md#a-task-that-holds-its-worker-thread-stalls-velos-tasks).
+On `TaskRuntime::Application`, an application task that holds its worker thread right after it calls velo (a blocking call, a long encode) can stall velo's tasks. An instance that opts out must keep such work in `spawn_blocking` or `block_in_place`. The default runtime avoids the stall. See [Known limitations](docs/src/appendix/limitations.md#a-task-that-holds-its-worker-thread-stalls-velos-tasks).
 
 Call `Velo::unregister_peer` when a peer leaves. A restarted peer has a new instance id, so without the call a long-lived node keeps state and connections for every peer it ever served. See [Forget a peer](docs/src/concepts/discovery.md#forget-a-peer).
 

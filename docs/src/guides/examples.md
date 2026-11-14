@@ -25,6 +25,8 @@ cargo run --example mpsc_fanin --all-features -- --producers 4 --items 40
 
 `ping_pong` and `throughput` take `--transport {tcp,uds,zmq,nats,grpc,quic,ucx}`. The default is `tcp`. The `nats` transport needs a `nats-server` on `127.0.0.1:4222`.
 
+`ping_pong` also takes `--task-runtime {dedicated,application}`. The default, `dedicated`, runs velo's own tasks on a runtime velo owns; `application` opts out and keeps each call on the caller's runtime. One caller making one call at a time is where the two differ most, so run both before you choose.
+
 ## The latency budget (`tx_budget`)
 
 `tx_budget` adds one layer on each rung. The difference between two rungs is the cost of the layer that was added.

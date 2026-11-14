@@ -19,7 +19,9 @@ use crate::transports::VeloBackend;
 /// messenger mux, and the mux's batch lanes. Handlers always run on the
 /// application's runtime, the one that calls [`VeloBuilder::build`].
 ///
-/// Set it with [`VeloBuilder::task_runtime`].
+/// Set it with [`VeloBuilder::task_runtime`]. The default is
+/// [`TaskRuntime::Dedicated`] with one thread. [`TaskRuntime::Application`]
+/// is the opt-out.
 ///
 /// # Why a dedicated runtime
 ///
@@ -60,6 +62,13 @@ use crate::transports::VeloBackend;
 /// - Under concurrency it did better: 40% more records per second at 64
 ///   closed-loop streams, 1.2 to 1.6 times the calls at 64 unary callers, and
 ///   a flat p99 when the application's runtime was saturated.
+/// - In dynamo's frontend load test on the same node (dynamo's frontend and
+///   mock engines, its response plane over velo, aiperf at concurrency 1 to
+///   256), the frontend used 6% to 25% less CPU per output token.
+///
+/// An application whose latency rests on single unary calls made one at a
+/// time should measure both and may opt out with
+/// [`TaskRuntime::Application`].
 ///
 /// # Threads
 ///
@@ -87,14 +96,16 @@ use crate::transports::VeloBackend;
 #[non_exhaustive]
 pub enum TaskRuntime {
     /// Run velo's tasks on the runtime that calls
-    /// [`VeloBuilder::build`](crate::VeloBuilder::build). The default.
+    /// [`VeloBuilder::build`](crate::VeloBuilder::build). The opt-out: it
+    /// keeps a unary call on one worker, so a single caller's calls are faster
+    /// and cheaper.
     ///
     /// Application code must not hold a worker thread right after it calls
     /// velo. See the type's documentation.
     Application,
     /// Run velo's tasks on a multi-thread runtime that velo builds and shuts
     /// down, with `threads` worker threads named `velo-rt`. `threads` must be
-    /// 1 or 2. [`TaskRuntime::dedicated`] gives 1.
+    /// 1 or 2. [`TaskRuntime::dedicated`] gives 1, and so does the default.
     Dedicated {
         /// Worker threads: 1 or 2.
         threads: usize,
@@ -124,11 +135,10 @@ impl TaskRuntime {
     }
 }
 
-/// [`TaskRuntime::Application`].
-// Making the dedicated runtime the default is a change to this one impl.
+/// [`TaskRuntime::Dedicated`] with one thread.
 impl Default for TaskRuntime {
     fn default() -> Self {
-        Self::Application
+        Self::dedicated()
     }
 }
 
@@ -356,8 +366,11 @@ mod tests {
     }
 
     #[test]
-    fn the_default_is_the_application_runtime() {
-        assert_eq!(TaskRuntime::default(), TaskRuntime::Application);
+    fn the_default_is_one_dedicated_thread() {
+        assert_eq!(
+            TaskRuntime::default(),
+            TaskRuntime::Dedicated { threads: 1 }
+        );
     }
 
     /// A slot dropped inside an async task must not panic: `Runtime`'s own

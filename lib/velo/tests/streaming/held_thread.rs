@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! A task that holds its tokio worker thread right after it wakes a velo task
-//! stalls that velo task until it lets go.
+//! On [`TaskRuntime::Application`], a task that holds its tokio worker thread
+//! right after it wakes a velo task stalls that velo task until it lets go.
+//! The default, a dedicated runtime, avoids this (`stall_rows.rs` holds the
+//! live tests); these tests build with `Application` because they are about
+//! the rule its users must follow.
 //!
 //! On a multi-thread runtime, tokio puts a parked task woken from a worker
 //! thread in that worker's LIFO slot (while the slot is enabled; tokio turns
@@ -34,10 +37,10 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 use futures::StreamExt;
-use velo::Velo;
 use velo::streaming::AnchorConfig;
 use velo::transports::tcp::TcpTransportBuilder;
 use velo::{StreamAnchor, StreamFrame};
+use velo::{TaskRuntime, Velo};
 
 const PATIENCE: Duration = Duration::from_secs(5);
 const HEARTBEAT: Duration = Duration::from_millis(50);
@@ -60,6 +63,7 @@ async fn node() -> Velo {
     Velo::builder()
         .add_transport(tcp())
         .mux_only()
+        .task_runtime(TaskRuntime::Application)
         .build()
         .await
         .expect("build velo")

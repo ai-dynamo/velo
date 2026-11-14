@@ -223,8 +223,10 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispa
         let handler = self.handler.clone();
         let ctx = call.into_context(Arc::clone(system));
         // On the messenger's runtime, not the current one: this runs on the
-        // inbound loop, which may be on velo's own runtime. From a worker of
-        // the messenger's runtime it is the same local push as `tokio::spawn`.
+        // inbound loop, which is on velo's own runtime by default, so the
+        // spawn is a remote push to the application's runtime. Under
+        // `TaskRuntime::Application` the loop runs on a worker of the
+        // messenger's runtime, and it is the same local push as `tokio::spawn`.
         system.runtime().spawn(async move {
             run_handler(&*handler, ctx, DispatchFailure::HandlerPanic).await;
         });

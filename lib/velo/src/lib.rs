@@ -530,12 +530,14 @@ impl VeloBuilder {
     /// the messenger mux and its batch lanes. Handlers run on the runtime
     /// that calls [`build`](Self::build) either way.
     ///
-    /// The default, [`TaskRuntime::Application`], runs them on that runtime
-    /// too. [`TaskRuntime::Dedicated`] runs them on a runtime this instance
-    /// builds and shuts down, so an application task that holds its worker
-    /// thread cannot stall them; [`TaskRuntime`] gives what that costs.
-    /// [`build`](Self::build) fails if `Dedicated` asks for other than 1 or 2
-    /// threads.
+    /// The default, [`TaskRuntime::Dedicated`] with one thread, runs them on a
+    /// runtime this instance builds and shuts down, so an application task
+    /// that holds its worker thread cannot stall them.
+    /// [`TaskRuntime::Application`] runs them on the runtime that calls
+    /// `build`: a single caller's unary calls are faster there, but the
+    /// application must not hold a worker right after it calls velo.
+    /// [`TaskRuntime`] gives what each costs. [`build`](Self::build) fails if
+    /// `Dedicated` asks for other than 1 or 2 threads.
     pub fn task_runtime(mut self, runtime: TaskRuntime) -> Self {
         self.task_runtime = runtime;
         self

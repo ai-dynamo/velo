@@ -398,11 +398,20 @@ struct LoopbackTransport {
     /// its own thread, so this fires even while the instance's runtime is
     /// frozen.
     torn_down: tokio::sync::Notify,
+    /// The runtime `start` was given: the one the inbound loop runs on.
+    runtime: std::sync::OnceLock<tokio::runtime::Handle>,
 }
 
 impl LoopbackTransport {
     fn adapter(&self) -> &velo::transports::TransportAdapter {
         self.adapter.get().expect("transport was never started")
+    }
+
+    /// The runtime of the instance's inbound loop: velo's own runtime by
+    /// default, the instance's runtime under `TaskRuntime::Application`.
+    /// Freezing it is what parks the loop.
+    fn runtime(&self) -> &tokio::runtime::Handle {
+        self.runtime.get().expect("transport was never started")
     }
 
     fn hold_payload(&self, payload: &'static [u8]) {
@@ -475,9 +484,10 @@ impl Transport for LoopbackTransport {
         &self,
         _instance_id: InstanceId,
         channels: velo::transports::TransportAdapter,
-        _rt: tokio::runtime::Handle,
+        rt: tokio::runtime::Handle,
     ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
         let _ = self.adapter.set(channels);
+        let _ = self.runtime.set(rt);
         Box::pin(async { Ok(()) })
     }
 
@@ -509,10 +519,13 @@ impl Transport for LoopbackTransport {
 ///
 /// Starving the consumer is the whole trick: it dispatches within microseconds
 /// of a message landing, so the only way to still *have* a backlog at teardown
-/// is to stop it running. The instance therefore gets its own single-worker
-/// runtime, and a task blocking on a channel freezes that worker. Admission
-/// and the shutdown driver both run on the test's runtime, so neither freezes
-/// with it — which is exactly the interleaving the fix has to survive.
+/// is to stop it running. The consumer runs on the runtime the transport's
+/// `start` was given, which has one worker: velo's own one-thread runtime by
+/// default (the instance's single-worker runtime under
+/// `TaskRuntime::Application`). A task blocking on a channel freezes that
+/// worker. Admission and the shutdown driver both run on the test's runtime,
+/// so neither freezes with it — which is exactly the interleaving the fix has
+/// to survive.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn shutdown_timeout_drops_queued_work() {
     let server_rt = tokio::runtime::Builder::new_multi_thread()
@@ -627,11 +640,11 @@ async fn shutdown_timeout_drops_queued_work() {
         "the hold marker matched more than the two intended frames"
     );
 
-    // Freeze the instance's only worker: its consumer task cannot run again
+    // Freeze the consumer's only worker: its consumer task cannot run again
     // until the test releases it.
     let (frozen_tx, frozen_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    server_rt.spawn(async move {
+    transport.runtime().spawn(async move {
         frozen_tx.send(()).expect("freeze handshake");
         let _ = release_rx.recv();
     });
@@ -651,7 +664,7 @@ async fn shutdown_timeout_drops_queued_work() {
     );
 
     // Shut down from the test's runtime while the consumer cannot run. The
-    // drain and the teardown need no worker of the instance's runtime; the
+    // drain and the teardown need no worker of the frozen runtime; the
     // streaming half of shutdown, which comes after, joins tasks that do. So
     // wait for the teardown, then thaw, then let shutdown finish.
     let shutdown = tokio::spawn({
@@ -797,9 +810,9 @@ async fn an_undecodable_frame_still_leaves_the_inbound_queue() {
 /// able to disbelieve.
 ///
 /// Starving the loop is the whole trick, and it is the same one
-/// `shutdown_timeout_drops_queued_work` uses: the instance gets a
-/// single-worker runtime and a task blocking that worker freezes its dispatch
-/// loop, while admission runs on the test's own runtime.
+/// `shutdown_timeout_drops_queued_work` uses: a task blocking the one worker
+/// of the runtime the transport started on freezes the dispatch loop, while
+/// admission runs on the test's own runtime.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_parked_dispatch_loop_leaves_admitted_messages_uncounted() {
     const QUEUED: usize = 3;
@@ -881,7 +894,7 @@ async fn a_parked_dispatch_loop_leaves_admitted_messages_uncounted() {
 
     let (frozen_tx, frozen_rx) = std::sync::mpsc::channel::<()>();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    server_rt.spawn(async move {
+    transport.runtime().spawn(async move {
         frozen_tx.send(()).expect("freeze handshake");
         let _ = release_rx.recv();
     });

@@ -81,7 +81,7 @@ future, or losing the attach reply, is outside this cleanup guarantee.
 
 Before 0.23.0, `Velo::builder().build()` started a TCP stream listener beside the mux. From 0.23.0, it starts no stream listener, and the mux carries every remote stream.
 
-Two other 0.23.0 changes have their own guides: [Move off the Messenger front door](migrate-messenger-front-door.md) and [Move to the public paths of 0.23.0](migrate-public-paths.md).
+Two other 0.23.0 changes have their own guides: [Move off the Messenger front door](migrate-messenger-front-door.md) and [Move to the public paths of 0.23.0](migrate-public-paths.md). 0.23.0 also moves velo's own tasks to a runtime it owns; see [0.23.0: velo's tasks run on a runtime it owns](#0230-velos-tasks-run-on-a-runtime-it-owns).
 
 These nodes need no change:
 
@@ -96,3 +96,30 @@ Add `stream_config` or `stream_bind_addr` to a default node in these cases:
 - This node must be able to turn the mux off. With the mux off by `MuxConfig { enabled: false, .. }` or `VELO_MESSENGER_MUX_DISABLE=1`, and no stream config, `build()` fails. The error names `stream_config` and `stream_bind_addr`.
 
 So the kill switch is a rollback only for a node that opted in to the per-stream path. On a default node, a rollback is a code change: add `stream_bind_addr`, then set the switch and restart.
+
+## 0.23.0: velo's tasks run on a runtime it owns
+
+Before 0.23.0, velo ran its own tasks (the transports, the inbound loop, the messenger mux and its batch lanes) on the runtime that called `build`. From 0.23.0, `VeloBuilder::task_runtime` defaults to `TaskRuntime::Dedicated { threads: 1 }`: velo builds a one-thread runtime named `velo-rt` for these tasks and stops it in `Velo::shutdown` or on the last drop. Handlers still run on the runtime that called `build`. The code does not change; the behaviour does.
+
+What it buys: an application task that holds its worker thread right after it calls velo (a blocking call, a long encode) no longer stalls velo's tasks. See [Known limitations](../appendix/limitations.md#a-task-that-holds-its-worker-thread-stalls-velos-tasks).
+
+What it costs: each wake between the application and velo now crosses threads. In velo's own benchmark on one exclusive 72-core node, a single caller making one unary call at a time took about 3.5 to 4 times as long per call. Under concurrency the dedicated runtime did better, and in dynamo's frontend load test the frontend used 6% to 25% less CPU per output token. `TaskRuntime`'s documentation has the setup and the other numbers.
+
+To keep the old behaviour, opt out:
+
+```rust
+let velo = Velo::builder()
+    .task_runtime(TaskRuntime::Application)
+    // ...
+    .build()
+    .await?;
+```
+
+An instance that opts out must keep blocking work off the tasks that call velo (`spawn_blocking` or `block_in_place`).
+
+Measure your own workload if its latency rests on velo unary calls made one at a time. dynamo-gdl and kvbm make such calls: run their latency benchmarks on both settings, and opt out if `Application` is faster for them.
+
+Also check:
+
+- Tests that pause tokio's clock (`start_paused`, `tokio::time::pause`) control only their own runtime's clock, not velo's. A test that pauses time while velo runs a timer of its own may need `TaskRuntime::Application`.
+- Code that counts the process's threads sees one more, `velo-rt`, per instance, and a short-lived `velo-rt-stop` thread when an instance stops.

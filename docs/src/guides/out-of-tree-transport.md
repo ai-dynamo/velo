@@ -21,7 +21,7 @@ Streams need no trait of their own. A stream rides the messenger mux over your `
 ## Procedure for a messenger transport
 
 1. Implement `Transport` for your type.
-2. Spawn your tasks on the runtime handle that `start` gives you, or from a task already on it. Do not call `tokio::spawn` from a send path, because a send path runs on the caller's runtime. Under `TaskRuntime::Dedicated` that handle is velo's own runtime, and the application cannot hold its threads. The runtime polls `start` with that handle entered, so what `start` itself spawns or binds lands there too.
+2. Spawn your tasks on the runtime handle that `start` gives you, or from a task already on it. Do not call `tokio::spawn` from a send path, because a send path runs on the caller's runtime. By default (`TaskRuntime::Dedicated`) that handle is velo's own runtime, and the application cannot hold its threads. The runtime polls `start` with that handle entered, so what `start` itself spawns or binds lands there too.
 3. Send each inbound `MessageType::Message` frame through `TransportAdapter::admit_message`. Do not check `ShutdownState::is_draining()` first. See [Shutdown and drain](../concepts/shutdown.md).
 4. If `admit_message` returns `AdmitOutcome::Draining` and your transport has a return path, send a `MessageType::ShuttingDown` frame with the header of the rejected request. If there is no return path, record the rejection and drop the frame.
 5. If `admit_message` returns `AdmitOutcome::Disconnected`, the runtime has stopped. Record `TransportRejection::RouteFailed` through the observability handle and drop the frame.

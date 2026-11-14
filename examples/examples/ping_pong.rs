@@ -6,6 +6,11 @@
 //! Measures round-trip time (RTT) for unary messages between two `Velo`
 //! instances running in the same process on separate single-threaded tokio
 //! runtimes.
+//!
+//! One caller making one call at a time is the shape where velo's default
+//! task runtime costs the most: each call crosses to velo's own thread and
+//! back. `--task-runtime application` opts out, so the call stays on the
+//! caller's runtime. Run both to see the difference on your machine.
 
 use std::time::{Duration, Instant};
 
@@ -13,7 +18,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use clap::Parser;
 use tokio::time::sleep;
-use velo::{Handler, Velo};
+use velo::{Handler, TaskRuntime, Velo};
 use velo_examples::{TransportArgs, new_transport};
 
 #[derive(Parser, Debug)]
@@ -24,13 +29,36 @@ struct Args {
     #[arg(long, default_value = "1000")]
     rounds: u32,
 
+    /// Where velo runs its own tasks.
+    #[arg(long, value_enum, default_value_t = RuntimeArg::Dedicated)]
+    task_runtime: RuntimeArg,
+
     #[command(flatten)]
     tx: TransportArgs,
+}
+
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+enum RuntimeArg {
+    /// The default: a runtime velo owns, with one thread.
+    Dedicated,
+    /// The opt-out: the runtime that builds the instance.
+    Application,
+}
+
+impl From<RuntimeArg> for TaskRuntime {
+    fn from(arg: RuntimeArg) -> Self {
+        match arg {
+            RuntimeArg::Dedicated => TaskRuntime::default(),
+            RuntimeArg::Application => TaskRuntime::Application,
+        }
+    }
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
     println!("Using {:?} transport", args.tx.transport);
+    println!("Using the {:?} task runtime", args.task_runtime);
+    let task_runtime = TaskRuntime::from(args.task_runtime);
 
     let runtime_server = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -49,6 +77,7 @@ fn main() -> Result<()> {
                 .expect("build server transport");
             let velo = Velo::builder()
                 .add_transport(transport)
+                .task_runtime(task_runtime)
                 .build()
                 .await
                 .expect("build server velo");
@@ -73,7 +102,11 @@ fn main() -> Result<()> {
     let client_handle = std::thread::spawn(move || {
         runtime_client.block_on(async {
             let transport = new_transport(transport_type, "ping-pong").await?;
-            let velo = Velo::builder().add_transport(transport).build().await?;
+            let velo = Velo::builder()
+                .add_transport(transport)
+                .task_runtime(task_runtime)
+                .build()
+                .await?;
 
             sleep(Duration::from_millis(100)).await;
 
