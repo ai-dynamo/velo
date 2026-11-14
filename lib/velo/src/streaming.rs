@@ -43,6 +43,7 @@ pub(crate) mod heartbeat;
 pub(crate) mod messenger_mux;
 pub mod mpsc;
 pub(crate) mod negotiation;
+pub(crate) mod peer_table;
 pub mod sender;
 pub(crate) mod sweep;
 mod tasks;

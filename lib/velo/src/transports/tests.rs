@@ -1156,3 +1156,782 @@ async fn cancelled_start_stops_only_completed_transports() {
     assert!(ready.shut_down.load(Ordering::Relaxed));
     assert!(!pending.shut_down.load(Ordering::Relaxed));
 }
+
+/// Records what the backend told it, in order.
+#[derive(Default)]
+struct RecordingObserver {
+    events: parking_lot::Mutex<Vec<(&'static str, InstanceId)>>,
+}
+
+impl PeerTableObserver for RecordingObserver {
+    fn registered(&self, peer: &PeerInfo) {
+        self.events.lock().push(("registered", peer.instance_id()));
+    }
+
+    fn unregistered(&self, instance_id: InstanceId) {
+        self.events.lock().push(("unregistered", instance_id));
+    }
+}
+
+/// The backend's peer table is the one every registration path goes
+/// through, so it is where the stream transport's table is kept in step.
+/// The observer hears of a peer only once a messenger transport accepted it,
+/// so a refused peer is not half-registered, and it hears of every
+/// unregister, which is idempotent there as it is here. Only one observer
+/// can be installed, and it first hears of the peers registered before it.
+#[tokio::test]
+async fn the_peer_table_observer_follows_registration() {
+    let accepting = MockTransport::new("tcp", true);
+    let (backend, _streams) = VeloBackend::new(vec![accepting as Arc<dyn Transport>], None)
+        .await
+        .unwrap();
+    let early = make_peer_info(&["tcp"]);
+    let early_id = early.instance_id();
+    backend.register_peer(early).unwrap();
+    let observer = Arc::new(RecordingObserver::default());
+    backend
+        .set_peer_observer(Arc::clone(&observer) as Arc<dyn PeerTableObserver>)
+        .unwrap();
+    assert!(
+        backend
+            .set_peer_observer(Arc::new(RecordingObserver::default()))
+            .is_err()
+    );
+
+    let peer = make_peer_info(&["tcp"]);
+    let id = peer.instance_id();
+    backend.register_peer(peer).unwrap();
+    backend.unregister_peer(id);
+    backend.unregister_peer(id);
+    assert_eq!(
+        *observer.events.lock(),
+        [
+            ("registered", early_id),
+            ("registered", id),
+            ("unregistered", id),
+            ("unregistered", id)
+        ]
+    );
+
+    let refusing = MockTransport::new("tcp", false);
+    let (backend, _streams) = VeloBackend::new(vec![refusing as Arc<dyn Transport>], None)
+        .await
+        .unwrap();
+    let observer = Arc::new(RecordingObserver::default());
+    backend
+        .set_peer_observer(Arc::clone(&observer) as Arc<dyn PeerTableObserver>)
+        .unwrap();
+    assert!(backend.register_peer(make_peer_info(&["tcp"])).is_err());
+    assert!(observer.events.lock().is_empty());
+}
+
+/// Register and unregister may finish in either order, but their final
+/// messenger and stream tables must agree.
+#[tokio::test]
+async fn a_delayed_unregister_does_not_erase_a_new_stream_registration() {
+    struct PausedUnregister {
+        inner: Arc<MockTransport>,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    }
+
+    impl Transport for PausedUnregister {
+        fn key(&self) -> TransportKey {
+            self.inner.key()
+        }
+
+        fn address(&self) -> WorkerAddress {
+            self.inner.address()
+        }
+
+        fn register(&self, peer: PeerInfo) -> Result<(), TransportError> {
+            self.inner.register(peer)
+        }
+
+        fn unregister(&self, peer: InstanceId) {
+            self.inner.unregister(peer);
+            self.entered.send(()).unwrap();
+            self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+
+        fn send_message(
+            &self,
+            target: InstanceId,
+            header: Bytes,
+            payload: Bytes,
+            kind: MessageType,
+            on_error: Arc<dyn TransportErrorHandler>,
+        ) -> SendOutcome {
+            self.inner
+                .send_message(target, header, payload, kind, on_error)
+        }
+
+        fn start(
+            &self,
+            id: InstanceId,
+            adapter: TransportAdapter,
+            runtime: tokio::runtime::Handle,
+        ) -> BoxFuture<'_, anyhow::Result<()>> {
+            self.inner.start(id, adapter, runtime)
+        }
+
+        fn shutdown(&self) {
+            self.inner.shutdown();
+        }
+
+        fn begin_drain(&self) {
+            self.inner.begin_drain();
+        }
+
+        fn closed(&self) -> BoxFuture<'_, ()> {
+            self.inner.closed()
+        }
+
+        fn check_health(
+            &self,
+            id: InstanceId,
+            timeout: Duration,
+        ) -> BoxFuture<'_, Result<(), HealthCheckError>> {
+            self.inner.check_health(id, timeout)
+        }
+    }
+
+    let (entered_tx, entered_rx) = flume::bounded(1);
+    let (release_tx, release_rx) = flume::bounded(1);
+    let transport = Arc::new(PausedUnregister {
+        inner: MockTransport::new("tcp", true),
+        entered: entered_tx,
+        release: release_rx,
+    });
+    let (backend, _streams) = VeloBackend::new(vec![transport], None).await.unwrap();
+    let backend = Arc::new(backend);
+    let stream = crate::streaming::TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .unwrap();
+    let remote = crate::streaming::TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .unwrap();
+    let erased: Arc<dyn crate::streaming::FrameTransport> = stream.clone();
+    backend
+        .set_peer_observer(Arc::new(
+            crate::streaming::peer_table::StreamPeerTable::new(Arc::downgrade(&erased)),
+        ))
+        .unwrap();
+    let peer =
+        crate::streaming::peer_table::complete_peer_info(make_peer_info(&["tcp"]), remote.as_ref());
+    let id = peer.instance_id();
+    backend.register_peer(peer.clone()).unwrap();
+    assert!(stream.knows_peer(id.worker_id()));
+
+    let unregistering = Arc::clone(&backend);
+    let unregister = std::thread::spawn(move || unregistering.unregister_peer(id));
+    tokio::time::timeout(Duration::from_secs(5), entered_rx.recv_async())
+        .await
+        .unwrap()
+        .unwrap();
+    let registering = Arc::clone(&backend);
+    let (registered_tx, registered_rx) = flume::bounded(1);
+    let register = std::thread::spawn(move || {
+        registering.register_peer(peer).unwrap();
+        registered_tx.send(()).unwrap();
+    });
+    // A serialized implementation can finish registering after the release.
+    // The deadline releases unregister in that case without assuming an order.
+    let _ = tokio::time::timeout(Duration::from_secs(1), registered_rx.recv_async()).await;
+    release_tx.send(()).unwrap();
+    unregister.join().unwrap();
+    register.join().unwrap();
+
+    let messenger_knows = backend.is_registered(id);
+    let stream_knows = stream.knows_peer(id.worker_id());
+    let connect_error = if messenger_knows {
+        let bound = crate::streaming::FrameTransport::bind(remote.as_ref(), 1, 1)
+            .await
+            .unwrap();
+        let connected = erased.connect(id.worker_id(), 1, 1).await;
+        let error = connected.as_ref().err().map(|error| format!("{error:#}"));
+        drop(connected);
+        drop(bound);
+        error
+    } else {
+        None
+    };
+    stream.shutdown().await;
+    remote.shutdown().await;
+    backend.graceful_shutdown(ShutdownPolicy::WaitForever).await;
+    assert_eq!(
+        stream_knows, messenger_knows,
+        "the delayed unregister erases the re-registered peer's stream route; connect error: {connect_error:?}"
+    );
+    assert!(connect_error.is_none(), "{connect_error:?}");
+}
+
+/// A transport can queue `_hello` as soon as it starts. A successful
+/// handshake must leave its stream endpoint registered after the build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_hello_queued_at_startup_reaches_the_stream_table() {
+    struct QueuedHello {
+        inner: Arc<MockTransport>,
+        header: Bytes,
+        payload: Bytes,
+        answered: flume::Sender<()>,
+    }
+
+    impl Transport for QueuedHello {
+        fn key(&self) -> TransportKey {
+            self.inner.key()
+        }
+
+        fn address(&self) -> WorkerAddress {
+            self.inner.address()
+        }
+
+        fn register(&self, peer: PeerInfo) -> Result<(), TransportError> {
+            self.inner.register(peer)
+        }
+
+        fn send_message(
+            &self,
+            target: InstanceId,
+            header: Bytes,
+            payload: Bytes,
+            kind: MessageType,
+            on_error: Arc<dyn TransportErrorHandler>,
+        ) -> SendOutcome {
+            if matches!(kind, MessageType::Response) {
+                serde_json::from_slice::<crate::messenger::server::system_handlers::HandlersResponse>(
+                    &payload,
+                )
+                .unwrap();
+                self.answered.send(()).unwrap();
+            }
+            self.inner
+                .send_message(target, header, payload, kind, on_error)
+        }
+
+        fn start(
+            &self,
+            id: InstanceId,
+            adapter: TransportAdapter,
+            runtime: tokio::runtime::Handle,
+        ) -> BoxFuture<'_, anyhow::Result<()>> {
+            Box::pin(async move {
+                self.inner.start(id, adapter.clone(), runtime).await?;
+                assert!(matches!(
+                    adapter.admit_message(self.header.clone(), self.payload.clone()),
+                    AdmitOutcome::Admitted
+                ));
+                Ok(())
+            })
+        }
+
+        fn shutdown(&self) {
+            self.inner.shutdown();
+        }
+
+        fn begin_drain(&self) {
+            self.inner.begin_drain();
+        }
+
+        fn closed(&self) -> BoxFuture<'_, ()> {
+            self.inner.closed()
+        }
+
+        fn check_health(
+            &self,
+            id: InstanceId,
+            timeout: Duration,
+        ) -> BoxFuture<'_, Result<(), HealthCheckError>> {
+            self.inner.check_health(id, timeout)
+        }
+    }
+
+    let remote = crate::streaming::TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
+        .await
+        .unwrap();
+    let peer =
+        crate::streaming::peer_table::complete_peer_info(make_peer_info(&["tcp"]), remote.as_ref());
+    let id = peer.instance_id();
+    let responses = crate::messenger::common::responses::ResponseManager::with_capacity(
+        id.worker_id().as_u64(),
+        1,
+        None,
+    );
+    let response = responses.register_outcome().unwrap();
+    let message = crate::messenger::common::messages::ActiveMessage {
+        metadata: crate::messenger::common::messages::MessageMetadata::new_unary(
+            response.response_id(),
+            "_hello".to_string(),
+            None,
+        ),
+        payload: Bytes::from(
+            serde_json::to_vec(&crate::messenger::server::system_handlers::HelloRequest {
+                peer_info: peer,
+            })
+            .unwrap(),
+        ),
+    };
+    let (header, payload, _) = message.encode().unwrap();
+    for attempt in 0..100 {
+        let (answered_tx, answered_rx) = flume::bounded(1);
+        let transport = Arc::new(QueuedHello {
+            inner: MockTransport::new("tcp", true),
+            header: header.clone(),
+            payload: payload.clone(),
+            answered: answered_tx,
+        });
+        let node = crate::Velo::builder()
+            .add_transport(transport)
+            .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
+            .build()
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), answered_rx.recv_async())
+            .await
+            .unwrap()
+            .unwrap();
+        let messenger_knows = node.messenger().backend().is_registered(id);
+        let Some(crate::OwnedStreamTransport::Tcp(stream)) = &node.inner.stream_owner.transport
+        else {
+            unreachable!();
+        };
+        let stream_knows = stream.knows_peer(id.worker_id());
+        let connect_error = if stream_knows {
+            None
+        } else {
+            Some(
+                crate::streaming::FrameTransport::connect(stream.as_ref(), id.worker_id(), 1, 1)
+                    .await
+                    .unwrap_err()
+                    .to_string(),
+            )
+        };
+        node.shutdown(ShutdownPolicy::WaitForever).await;
+        if !stream_knows {
+            remote.shutdown().await;
+        }
+        assert!(messenger_knows);
+        assert!(
+            stream_knows,
+            "startup _hello missed the stream table on attempt {attempt}; connect error: {connect_error:?}"
+        );
+    }
+    remote.shutdown().await;
+}
+
+/// A failed send's error handler can register another peer without entering the failed gate.
+#[tokio::test]
+async fn unregister_allows_send_error_handlers_to_register_another_peer() {
+    struct RegisterOnError {
+        backend: Arc<VeloBackend>,
+        peer: PeerInfo,
+        completed: AtomicUsize,
+        workers: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    }
+
+    impl TransportErrorHandler for RegisterOnError {
+        fn on_error(&self, _: Bytes, _: Bytes, _: String) {
+            let backend = Arc::clone(&self.backend);
+            let peer = self.peer.clone();
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (done_tx, done_rx) = flume::bounded(1);
+            self.workers.lock().push(std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                backend.register_peer(peer).unwrap();
+                let _ = done_tx.send(());
+            }));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Bound a re-entrant registration so the test can release unregister and join the worker.
+            if done_rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+                self.completed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp = Arc::new(
+        crate::transports::tcp::TcpTransportBuilder::new()
+            .from_listener(listener)
+            .unwrap()
+            .channel_capacity(1)
+            .build()
+            .unwrap(),
+    );
+    let (backend, _streams) = VeloBackend::new(vec![tcp.clone()], None).await.unwrap();
+    let backend = Arc::new(backend);
+    let peer = PeerInfo::new(InstanceId::new_v4(), tcp.address());
+    let id = peer.instance_id();
+    backend.register_peer(peer).unwrap();
+    let alternate = PeerInfo::new(InstanceId::new_v4(), tcp.address());
+    let alternate_id = alternate.instance_id();
+    let errors = Arc::new(RegisterOnError {
+        backend: Arc::clone(&backend),
+        peer: alternate,
+        completed: AtomicUsize::new(0),
+        workers: Default::default(),
+    });
+    errors.on_error(Bytes::new(), Bytes::new(), "control".into());
+    assert_eq!(errors.completed.load(Ordering::Relaxed), 1);
+
+    // No yield on this runtime: the writer and gate driver cannot drain the one-slot channel yet.
+    assert!(
+        backend
+            .send_message(
+                id,
+                Bytes::new(),
+                Bytes::new(),
+                MessageType::Message,
+                Arc::new(NoopErrorHandler)
+            )
+            .unwrap()
+            .is_admitted()
+    );
+    let pending = backend
+        .send_message(
+            id,
+            Bytes::new(),
+            Bytes::new(),
+            MessageType::Message,
+            errors.clone(),
+        )
+        .unwrap()
+        .into_pending()
+        .expect("the second send must wait in the gate");
+    assert_eq!(pending.state(), AdmissionState::Pending);
+    backend.unregister_peer(id);
+    for worker in std::mem::take(&mut *errors.workers.lock()) {
+        worker.join().unwrap();
+    }
+    assert_eq!(pending.state(), AdmissionState::Failed);
+    assert!(backend.is_registered(alternate_id));
+    backend.graceful_shutdown(ShutdownPolicy::WaitForever).await;
+    assert_eq!(
+        errors.completed.load(Ordering::Relaxed),
+        2,
+        "the send error handler's registration blocks until unregister releases the peer-table lock"
+    );
+}
+
+/// A send error handler can register another peer while unregister waits for that send's route.
+#[tokio::test]
+async fn unregister_does_not_block_registration_from_an_active_send_error_handler() {
+    struct RegisterOnError {
+        backend: Arc<VeloBackend>,
+        peer: PeerInfo,
+        pause: AtomicBool,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+        completed: AtomicUsize,
+        errors: parking_lot::Mutex<Vec<String>>,
+        workers: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    }
+
+    impl TransportErrorHandler for RegisterOnError {
+        fn on_error(&self, _: Bytes, _: Bytes, error: String) {
+            self.errors.lock().push(error);
+            if self.pause.load(Ordering::Relaxed) {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            let backend = Arc::clone(&self.backend);
+            let peer = self.peer.clone();
+            let (done_tx, done_rx) = flume::bounded(1);
+            self.workers.lock().push(std::thread::spawn(move || {
+                backend.register_peer(peer).unwrap();
+                let _ = done_tx.send(());
+            }));
+            // Bound the callback so the test releases the send and joins every worker.
+            if done_rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+                self.completed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp = Arc::new(
+        crate::transports::tcp::TcpTransportBuilder::new()
+            .from_listener(listener)
+            .unwrap()
+            .build()
+            .unwrap(),
+    );
+    let (backend, _streams) = VeloBackend::new(vec![tcp.clone()], None).await.unwrap();
+    let backend = Arc::new(backend);
+    let peer = PeerInfo::new(InstanceId::new_v4(), tcp.address());
+    let id = peer.instance_id();
+    backend.register_peer(peer).unwrap();
+
+    // A different route shard keeps the control independent of the send's read lock.
+    let alternate = {
+        let _held = backend.primary_transport.get(&id).unwrap();
+        loop {
+            let candidate = InstanceId::new_v4();
+            if matches!(
+                backend.primary_transport.try_get_mut(&candidate),
+                dashmap::try_result::TryResult::Absent
+            ) {
+                break PeerInfo::new(candidate, tcp.address());
+            }
+        }
+    };
+    let alternate_id = alternate.instance_id();
+    let (entered_tx, entered_rx) = flume::bounded(1);
+    let (release_tx, release_rx) = flume::bounded(1);
+    let errors = Arc::new(RegisterOnError {
+        backend: Arc::clone(&backend),
+        peer: alternate,
+        pause: AtomicBool::new(false),
+        entered: entered_tx,
+        release: release_rx,
+        completed: AtomicUsize::new(0),
+        errors: Default::default(),
+        workers: Default::default(),
+    });
+    errors.on_error(Bytes::new(), Bytes::new(), "control".into());
+    assert_eq!(errors.completed.load(Ordering::Relaxed), 1);
+    errors.pause.store(true, Ordering::Relaxed);
+
+    // A send during teardown fails inline, while the backend still has the peer's route.
+    tcp.shutdown();
+    let sending_backend = Arc::clone(&backend);
+    let sending_errors = Arc::clone(&errors);
+    let sending = std::thread::spawn(move || {
+        sending_backend
+            .send_message(
+                id,
+                Bytes::new(),
+                Bytes::new(),
+                MessageType::Message,
+                sending_errors,
+            )
+            .unwrap();
+    });
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let unregistering_backend = Arc::clone(&backend);
+    let unregistering = std::thread::spawn(move || unregistering_backend.unregister_peer(id));
+
+    // Give unregister time to block on the route the send holds. Removing a
+    // lock the backend adds around its route writes makes this fail.
+    std::thread::sleep(Duration::from_millis(200));
+    release_tx.send(()).unwrap();
+    sending.join().unwrap();
+    unregistering.join().unwrap();
+    for worker in std::mem::take(&mut *errors.workers.lock()) {
+        worker.join().unwrap();
+    }
+    assert!(errors.errors.lock()[1].contains("transport shut down"));
+    assert!(backend.is_registered(alternate_id));
+    backend.graceful_shutdown(ShutdownPolicy::WaitForever).await;
+    assert_eq!(
+        errors.completed.load(Ordering::Relaxed),
+        2,
+        "unregister holds the peer lock while waiting for the send's route guard, so the send error handler cannot register another peer"
+    );
+}
+
+/// Two unregister calls can overlap while TCP still holds queued sends.
+#[tokio::test]
+async fn an_absent_route_does_not_block_a_queued_send_error_handler() {
+    struct PausedUnregister {
+        inner: Arc<crate::transports::tcp::TcpTransport>,
+        first: AtomicBool,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    }
+
+    impl Transport for PausedUnregister {
+        fn key(&self) -> TransportKey {
+            self.inner.key()
+        }
+
+        fn address(&self) -> WorkerAddress {
+            self.inner.address()
+        }
+
+        fn register(&self, peer: PeerInfo) -> Result<(), TransportError> {
+            self.inner.register(peer)
+        }
+
+        fn unregister(&self, peer: InstanceId) {
+            if self.first.swap(false, Ordering::Relaxed) {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            self.inner.unregister(peer);
+        }
+
+        fn send_message(
+            &self,
+            target: InstanceId,
+            header: Bytes,
+            payload: Bytes,
+            kind: MessageType,
+            on_error: Arc<dyn TransportErrorHandler>,
+        ) -> SendOutcome {
+            self.inner
+                .send_message(target, header, payload, kind, on_error)
+        }
+
+        fn start(
+            &self,
+            id: InstanceId,
+            adapter: TransportAdapter,
+            runtime: tokio::runtime::Handle,
+        ) -> BoxFuture<'_, anyhow::Result<()>> {
+            self.inner.start(id, adapter, runtime)
+        }
+
+        fn shutdown(&self) {
+            self.inner.shutdown();
+        }
+
+        fn begin_drain(&self) {
+            self.inner.begin_drain();
+        }
+
+        fn closed(&self) -> BoxFuture<'_, ()> {
+            self.inner.closed()
+        }
+
+        fn check_health(
+            &self,
+            id: InstanceId,
+            timeout: Duration,
+        ) -> BoxFuture<'_, Result<(), HealthCheckError>> {
+            self.inner.check_health(id, timeout)
+        }
+    }
+
+    struct RegisterOnError {
+        backend: Arc<VeloBackend>,
+        peer: PeerInfo,
+        removed: InstanceId,
+        completed: AtomicUsize,
+        route_locked: AtomicBool,
+        workers: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    }
+
+    impl TransportErrorHandler for RegisterOnError {
+        fn on_error(&self, _: Bytes, _: Bytes, _: String) {
+            self.route_locked.store(
+                matches!(
+                    self.backend.primary_transport.try_get_mut(&self.removed),
+                    dashmap::try_result::TryResult::Locked
+                ),
+                Ordering::Relaxed,
+            );
+            let backend = Arc::clone(&self.backend);
+            let peer = self.peer.clone();
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (done_tx, done_rx) = flume::bounded(1);
+            self.workers.lock().push(std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                backend.register_peer(peer).unwrap();
+                let _ = done_tx.send(());
+            }));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Bound the callback so unregister returns and every worker can be joined.
+            if done_rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+                self.completed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp = Arc::new(
+        crate::transports::tcp::TcpTransportBuilder::new()
+            .from_listener(listener)
+            .unwrap()
+            .channel_capacity(1)
+            .build()
+            .unwrap(),
+    );
+    let (entered_tx, entered_rx) = flume::bounded(1);
+    let (release_tx, release_rx) = flume::bounded(1);
+    let transport = Arc::new(PausedUnregister {
+        inner: tcp,
+        first: AtomicBool::new(true),
+        entered: entered_tx,
+        release: release_rx,
+    });
+    let (backend, _streams) = VeloBackend::new(vec![transport.clone()], None)
+        .await
+        .unwrap();
+    let backend = Arc::new(backend);
+    let peer = PeerInfo::new(InstanceId::new_v4(), transport.address());
+    let id = peer.instance_id();
+    backend.register_peer(peer).unwrap();
+
+    // No send holds a route during the callbacks below. Pick a peer on the removed route's shard.
+    let alternate = {
+        let _held = backend.primary_transport.get(&id).unwrap();
+        loop {
+            let candidate = InstanceId::new_v4();
+            if matches!(
+                backend.primary_transport.try_get_mut(&candidate),
+                dashmap::try_result::TryResult::Locked
+            ) {
+                break PeerInfo::new(candidate, transport.address());
+            }
+        }
+    };
+    let alternate_id = alternate.instance_id();
+    let errors = Arc::new(RegisterOnError {
+        backend: Arc::clone(&backend),
+        peer: alternate,
+        removed: id,
+        completed: AtomicUsize::new(0),
+        route_locked: AtomicBool::new(false),
+        workers: Default::default(),
+    });
+    errors.on_error(Bytes::new(), Bytes::new(), "control".into());
+    assert_eq!(errors.completed.load(Ordering::Relaxed), 1);
+    assert!(!errors.route_locked.load(Ordering::Relaxed));
+
+    // No runtime yield: the writer cannot drain the one-slot channel before unregister.
+    assert!(
+        backend
+            .send_message(
+                id,
+                Bytes::new(),
+                Bytes::new(),
+                MessageType::Message,
+                Arc::new(NoopErrorHandler),
+            )
+            .unwrap()
+            .is_admitted()
+    );
+    let pending = backend
+        .send_message(
+            id,
+            Bytes::new(),
+            Bytes::new(),
+            MessageType::Message,
+            errors.clone(),
+        )
+        .unwrap()
+        .into_pending()
+        .expect("the second send waits in the gate");
+    assert_eq!(pending.state(), AdmissionState::Pending);
+
+    let unregistering_backend = Arc::clone(&backend);
+    let unregistering = std::thread::spawn(move || unregistering_backend.unregister_peer(id));
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(!backend.is_registered(id));
+    // The first call removed the route but has not failed the TCP queue yet.
+    backend.unregister_peer(id);
+    release_tx.send(()).unwrap();
+    unregistering.join().unwrap();
+    for worker in std::mem::take(&mut *errors.workers.lock()) {
+        worker.join().unwrap();
+    }
+    assert_eq!(pending.state(), AdmissionState::Failed);
+    assert!(backend.is_registered(alternate_id));
+    backend.graceful_shutdown(ShutdownPolicy::WaitForever).await;
+    assert_eq!(
+        errors.completed.load(Ordering::Relaxed),
+        2,
+        "the second unregister keeps its vacant route guard across TCP's error callback; route locked in callback: {}",
+        errors.route_locked.load(Ordering::Relaxed),
+    );
+}
