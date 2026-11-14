@@ -5,11 +5,15 @@
 //! runtime that velo builds and shuts down. See [`TaskRuntime`].
 
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::runtime::{Handle, Runtime};
 
-use futures::future::BoxFuture;
+use futures::FutureExt;
+use futures::future::{BoxFuture, Shared};
+
+use crate::transports::VeloBackend;
 
 /// Where velo runs its own tasks: the transports, the inbound loop, the
 /// messenger mux, and the mux's batch lanes. Handlers always run on the
@@ -136,9 +140,19 @@ const DROP_CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// A runtime velo built for its own tasks. Owned by `VeloInner`, so by every
 /// clone of one `Velo`.
 pub(crate) struct VeloRuntime {
-    /// Taken by the first stop. A tokio mutex, so a second
-    /// [`stop`](Self::stop) waits until the first has joined the threads.
-    slot: tokio::sync::Mutex<Option<RuntimeSlot>>,
+    state: parking_lot::Mutex<State>,
+    #[cfg(test)]
+    handle: Handle,
+}
+
+enum State {
+    Running(RuntimeSlot),
+    /// A stop has taken the runtime. Every later [`VeloRuntime::stop`] waits
+    /// on this, so none returns before the threads have exited, even when
+    /// the caller that started the stop was cancelled.
+    Stopping(Shared<BoxFuture<'static, ()>>),
+    /// Stopped from a drop; no caller waits.
+    Stopped,
 }
 
 /// Owns the runtime until a stop takes it. Dropped with the runtime still in
@@ -165,7 +179,9 @@ impl VeloRuntime {
         let handle = runtime.handle().clone();
         Ok((
             Self {
-                slot: tokio::sync::Mutex::new(Some(RuntimeSlot(Some(runtime)))),
+                state: parking_lot::Mutex::new(State::Running(RuntimeSlot(Some(runtime)))),
+                #[cfg(test)]
+                handle: handle.clone(),
             },
             handle,
         ))
@@ -175,15 +191,30 @@ impl VeloRuntime {
     /// [`STOP_GRACE`]. Call it only after every velo task that must finish has
     /// finished: the runtime drops the tasks it still has.
     pub(crate) async fn stop(&self) {
-        let mut slot = self.slot.lock().await;
-        let Some(runtime) = slot.take() else {
-            return;
+        let stopping = {
+            let mut state = self.state.lock();
+            match std::mem::replace(&mut *state, State::Stopped) {
+                State::Running(runtime) => {
+                    let (done, stopped) = tokio::sync::oneshot::channel();
+                    stop_on_thread(runtime, None, Some(done));
+                    // An error means the stop thread could not start; the
+                    // slot then shut the runtime down without waiting.
+                    let stopping = async move {
+                        let _ = stopped.await;
+                    }
+                    .boxed()
+                    .shared();
+                    *state = State::Stopping(stopping.clone());
+                    stopping
+                }
+                State::Stopping(stopping) => {
+                    *state = State::Stopping(stopping.clone());
+                    stopping
+                }
+                State::Stopped => return,
+            }
         };
-        let (done, stopped) = tokio::sync::oneshot::channel();
-        stop_on_thread(runtime, None, Some(done));
-        // An error means the stop thread could not start; the slot then shut
-        // the runtime down without waiting.
-        let _ = stopped.await;
+        stopping.await;
     }
 
     /// Stops the runtime from a drop: on a background thread, runs `teardown`
@@ -194,8 +225,48 @@ impl VeloRuntime {
     /// outlive it. A runtime shut down first would leave a hook with dead
     /// timer and I/O drivers.
     pub(crate) fn stop_detached(&mut self, teardown: BoxFuture<'static, ()>) {
-        if let Some(runtime) = self.slot.get_mut().take() {
+        if let State::Running(runtime) = std::mem::replace(self.state.get_mut(), State::Stopped) {
             stop_on_thread(runtime, Some(teardown), None);
+        }
+    }
+}
+
+/// The runtime of a [`VeloBuilder::build`](crate::VeloBuilder::build) in
+/// progress. A build that fails after the transports started drops this, and
+/// it stops the runtime as the last drop of a `Velo` does: after the
+/// transports' teardown and close. Dropping the runtime alone would drop the
+/// tasks that hold the `Messenger` first, and the `Messenger`'s own drop would
+/// then run the shutdown hooks against a stopped runtime.
+pub(crate) struct BuildingRuntime {
+    runtime: Option<VeloRuntime>,
+    /// Set once the transports have started.
+    backend: Option<Arc<VeloBackend>>,
+}
+
+impl BuildingRuntime {
+    pub(crate) fn new(runtime: Option<VeloRuntime>) -> Self {
+        Self {
+            runtime,
+            backend: None,
+        }
+    }
+
+    /// The transports on `backend` have started on this runtime.
+    pub(crate) fn started(&mut self, backend: &Arc<VeloBackend>) {
+        self.backend = Some(Arc::clone(backend));
+    }
+
+    /// The build succeeded: the instance owns the runtime from here.
+    pub(crate) fn finish(mut self) -> Option<VeloRuntime> {
+        self.backend = None;
+        self.runtime.take()
+    }
+}
+
+impl Drop for BuildingRuntime {
+    fn drop(&mut self) {
+        if let (Some(runtime), Some(backend)) = (self.runtime.as_mut(), self.backend.take()) {
+            runtime.stop_detached(Box::pin(async move { backend.teardown_and_close().await }));
         }
     }
 }
@@ -287,5 +358,65 @@ mod tests {
         .await;
         assert_eq!(name.as_deref(), Some(THREAD_NAME));
         runtime.stop().await;
+    }
+
+    /// A `shutdown` cancelled after it has taken the runtime must not let the
+    /// next `shutdown` return before the runtime's threads have exited: the
+    /// stop in flight is shared, not lost with the cancelled caller.
+    #[tokio::test]
+    async fn a_cancelled_shutdown_still_makes_the_next_caller_wait() {
+        struct HoldDrop {
+            entered: Option<tokio::sync::oneshot::Sender<()>>,
+            release: flume::Receiver<()>,
+        }
+
+        impl Drop for HoldDrop {
+            fn drop(&mut self) {
+                let _ = self.entered.take().unwrap().send(());
+                let _ = self.release.recv_timeout(Duration::from_secs(5));
+            }
+        }
+
+        let velo = crate::Velo::builder()
+            .task_runtime(TaskRuntime::dedicated())
+            .build()
+            .await
+            .unwrap();
+        let handle = velo.inner.task_runtime.as_ref().unwrap().handle.clone();
+        let (entered, dropping) = tokio::sync::oneshot::channel();
+        let (release, held) = flume::bounded(1);
+        let (ready, running) = tokio::sync::oneshot::channel();
+        let task = handle.spawn(async move {
+            let _guard = HoldDrop {
+                entered: Some(entered),
+                release: held,
+            };
+            ready.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        running.await.unwrap();
+        let first = tokio::spawn({
+            let velo = velo.clone();
+            async move { velo.shutdown(crate::ShutdownPolicy::WaitForever).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), dropping)
+            .await
+            .expect("runtime shutdown never dropped its task")
+            .unwrap();
+        first.abort();
+        assert!(first.await.unwrap_err().is_cancelled());
+
+        // The worker cannot exit until this test releases its destructor.
+        let mut second = Box::pin(velo.shutdown(crate::ShutdownPolicy::WaitForever));
+        let returned_early = futures::poll!(tokio::task::unconstrained(second.as_mut())).is_ready();
+        release.send(()).unwrap();
+        if !returned_early {
+            second.await;
+        }
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(
+            !returned_early,
+            "the second stop returned while the first stop still held a runtime worker"
+        );
     }
 }

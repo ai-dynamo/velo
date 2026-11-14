@@ -635,16 +635,18 @@ impl VeloBuilder {
             messenger_mux_disabled_by_env(),
             mode,
         )?;
-        // Built before the messenger, so the transports start on it. Dropped on
-        // a failed build without blocking (see `VeloRuntime`).
-        let (task_runtime, parts) = match self.task_runtime {
+        // Built before the messenger, so the transports start on it. A failed
+        // build stops it without blocking (see `BuildingRuntime`).
+        let (runtime, parts) = match self.task_runtime {
             TaskRuntime::Application => (None, self.inner),
             TaskRuntime::Dedicated { threads } => {
                 let (runtime, handle) = crate::task_runtime::VeloRuntime::build(threads)?;
                 (Some(runtime), self.inner.task_runtime(handle))
             }
         };
+        let mut task_runtime = crate::task_runtime::BuildingRuntime::new(runtime);
         let messenger = parts.build().await?;
+        task_runtime.started(messenger.backend());
         let worker_id = messenger.instance_id().worker_id();
         let mux = if config.enabled {
             let mux = crate::streaming::messenger_mux::MessengerMuxTransport::new(
@@ -845,7 +847,7 @@ impl VeloBuilder {
                     #[cfg(test)]
                     runs: std::sync::atomic::AtomicUsize::new(0),
                 },
-                task_runtime,
+                task_runtime: task_runtime.finish(),
             }),
         })
     }

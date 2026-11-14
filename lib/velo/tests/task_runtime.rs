@@ -324,6 +324,46 @@ async fn the_last_drop_tears_down_before_the_runtime_stops() {
     );
 }
 
+/// A build that fails after the transports started (here the mux refuses a
+/// zero sweep interval) stops the runtime as the last drop does: after the
+/// transports' teardown and close, so no hook runs against a stopped
+/// runtime, and without blocking or panicking.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_build_tears_down_before_the_runtime_stops() {
+    let _serial = serial().await;
+    let spawned_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let closed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let error = Velo::builder()
+        .add_transport(Arc::new(NeedsRuntime {
+            spawned_ran: Arc::clone(&spawned_ran),
+            closed: Arc::clone(&closed),
+        }))
+        .mux_only()
+        .messenger_mux(velo::streaming::MuxConfig {
+            credit_sweep_interval: Duration::ZERO,
+            ..velo::streaming::MuxConfig::default()
+        })
+        .expect("mux config")
+        .task_runtime(TaskRuntime::dedicated())
+        .build()
+        .await
+        .err()
+        .expect("a zero sweep interval is refused");
+    assert!(
+        error.to_string().contains("credit_sweep_interval"),
+        "{error}"
+    );
+    wait_for_threads(0);
+    assert!(
+        spawned_ran.load(Ordering::SeqCst),
+        "the shutdown hook ran after velo's runtime stopped"
+    );
+    assert!(
+        closed.load(Ordering::SeqCst),
+        "velo's runtime stopped before the transport closed"
+    );
+}
+
 /// A `Messenger` clone kept past the last drop does not keep velo's runtime
 /// running: the teardown starts once the drop has waited a bounded time for
 /// the `Messenger`'s own drop, and the clone stops working.
@@ -485,4 +525,114 @@ async fn build_refuses_a_thread_count_other_than_one_or_two() {
         assert!(error.to_string().contains("1 to 2 threads"), "{error}");
         wait_for_threads(0);
     }
+}
+
+/// A failed build keeps velo's runtime running while a transport's shutdown
+/// hook is still running: a task the hook hands to the runtime then is not
+/// cancelled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_build_keeps_the_runtime_until_teardown_finishes() {
+    struct HeldHook {
+        inner: NeedsRuntime,
+        runtime: std::sync::OnceLock<tokio::runtime::Handle>,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    }
+
+    impl velo::Transport for HeldHook {
+        fn key(&self) -> velo::ext::TransportKey {
+            self.inner.key()
+        }
+
+        fn address(&self) -> velo::WorkerAddress {
+            self.inner.address()
+        }
+
+        fn register(&self, peer: velo::PeerInfo) -> Result<(), velo::ext::TransportError> {
+            self.inner.register(peer)
+        }
+
+        fn send_message(
+            &self,
+            id: velo::InstanceId,
+            header: Bytes,
+            payload: Bytes,
+            kind: velo::ext::MessageType,
+            on_error: Arc<dyn velo::ext::TransportErrorHandler>,
+        ) -> velo::ext::SendOutcome {
+            self.inner.send_message(id, header, payload, kind, on_error)
+        }
+
+        fn start(
+            &self,
+            id: velo::InstanceId,
+            channels: velo::ext::TransportAdapter,
+            runtime: tokio::runtime::Handle,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+            self.runtime.set(runtime.clone()).unwrap();
+            self.inner.start(id, channels, runtime)
+        }
+
+        fn shutdown(&self) {
+            self.entered.send(()).unwrap();
+            let _ = self.release.recv_timeout(PATIENCE);
+            self.inner.shutdown();
+        }
+
+        fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
+            self.inner.closed()
+        }
+
+        fn check_health(
+            &self,
+            id: velo::InstanceId,
+            timeout: Duration,
+        ) -> futures::future::BoxFuture<'_, Result<(), velo::ext::HealthCheckError>> {
+            self.inner.check_health(id, timeout)
+        }
+    }
+
+    let _serial = serial().await;
+    let (entered, in_hook) = flume::bounded(1);
+    let (release, held) = flume::bounded(1);
+    let transport = Arc::new(HeldHook {
+        inner: NeedsRuntime {
+            spawned_ran: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        },
+        runtime: std::sync::OnceLock::new(),
+        entered,
+        release: held,
+    });
+    let mut build = Box::pin(
+        Velo::builder()
+            .add_transport(transport.clone())
+            .task_runtime(TaskRuntime::dedicated())
+            .messenger_mux(velo::streaming::MuxConfig {
+                credit_sweep_interval: Duration::ZERO,
+                ..Default::default()
+            })
+            .unwrap()
+            .build(),
+    );
+    let result = futures::poll!(build.as_mut());
+    assert!(!matches!(result, std::task::Poll::Ready(Ok(_))));
+    tokio::time::timeout(PATIENCE, in_hook.recv_async())
+        .await
+        .expect("the failed build never began teardown")
+        .unwrap();
+
+    // The transport still holds its shutdown hook, so its driver must live.
+    let probe = tokio::time::timeout(PATIENCE, transport.runtime.get().unwrap().spawn(async {}))
+        .await
+        .expect("the runtime probe never completed");
+    release.send(()).unwrap();
+    if result.is_pending() {
+        assert!(build.await.is_err());
+    }
+    wait_for_threads(0);
+    assert!(
+        probe.is_ok(),
+        "the failed build stopped its runtime before the transport's shutdown hook finished: {probe:?}"
+    );
 }
