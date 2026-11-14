@@ -21,18 +21,19 @@ Streams need no trait of their own. A stream rides the messenger mux over your `
 ## Procedure for a messenger transport
 
 1. Implement `Transport` for your type.
-2. Send each inbound `MessageType::Message` frame through `TransportAdapter::admit_message`. Do not check `ShutdownState::is_draining()` first. See [Shutdown and drain](../concepts/shutdown.md).
-3. If `admit_message` returns `AdmitOutcome::Draining` and your transport has a return path, send a `MessageType::ShuttingDown` frame with the header of the rejected request. If there is no return path, record the rejection and drop the frame.
-4. If `admit_message` returns `AdmitOutcome::Disconnected`, the runtime has stopped. Record `TransportRejection::RouteFailed` through the observability handle and drop the frame.
-5. Route the other inbound types to their streams on the adapter: `Response` to the response stream, `Ack` and `Event` to the event stream, and `ShuttingDown` to the shutdown stream.
-6. Store the handle that `set_observability` gives you. Record each inbound frame as you route it.
-7. On the `Admitted` arm, and only there, record the frame as inbound `message`.
-8. In `shutdown`, stop your tasks and threads. The runtime calls it at most once, with its Tokio runtime handle entered, on a dedicated thread, so you may block there, for example to join a thread. Two cases run it on the caller instead. Any failure while the transports start (another transport fails to start, a duplicate key, an address that cannot be merged) or a build that is cancelled then runs it on the building task. A thread that cannot be created runs it on whatever dropped or shut down the instance. After the final owner is dropped, the runtime may already be gone, so a task that `shutdown` spawns may never run. If `shutdown` panics, the runtime still calls the other transports' hooks, and then the shutdown call panics.
-9. If your transport keeps state for each peer, override `unregister` to drop it and close the peer's connections. It must be cheap and idempotent. See [Peer routing](../concepts/transports.md#peer-routing).
+2. Spawn your tasks on the runtime handle that `start` gives you, or from a task already on it; do not call `tokio::spawn` from a send path, which runs on the caller's runtime. Under `TaskRuntime::Dedicated` that handle is velo's own runtime, and the application cannot hold its threads. The runtime polls `start` with that handle entered, so what `start` itself spawns or binds lands there too.
+3. Send each inbound `MessageType::Message` frame through `TransportAdapter::admit_message`. Do not check `ShutdownState::is_draining()` first. See [Shutdown and drain](../concepts/shutdown.md).
+4. If `admit_message` returns `AdmitOutcome::Draining` and your transport has a return path, send a `MessageType::ShuttingDown` frame with the header of the rejected request. If there is no return path, record the rejection and drop the frame.
+5. If `admit_message` returns `AdmitOutcome::Disconnected`, the runtime has stopped. Record `TransportRejection::RouteFailed` through the observability handle and drop the frame.
+6. Route the other inbound types to their streams on the adapter: `Response` to the response stream, `Ack` and `Event` to the event stream, and `ShuttingDown` to the shutdown stream.
+7. Store the handle that `set_observability` gives you. Record each inbound frame as you route it.
+8. On the `Admitted` arm, and only there, record the frame as inbound `message`.
+9. In `shutdown`, stop your tasks and threads. The runtime calls it at most once, with its Tokio runtime handle entered, on a dedicated thread, so you may block there, for example to join a thread. Two cases run it on the caller instead. Any failure while the transports start (another transport fails to start, a duplicate key, an address that cannot be merged) or a build that is cancelled then runs it on the building task. A thread that cannot be created runs it on whatever dropped or shut down the instance. After the final owner is dropped, the runtime may already be gone, so a task that `shutdown` spawns may never run. If `shutdown` panics, the runtime still calls the other transports' hooks, and then the shutdown call panics.
+10. If your transport keeps state for each peer, override `unregister` to drop it and close the peer's connections. It must be cheap and idempotent. See [Peer routing](../concepts/transports.md#peer-routing).
 
-Step 7 matters because the inbound queue depth is a difference between two counters. If your transport admits a frame and does not record it, the depth goes negative. See [Observability](../operations/observability.md).
+Step 8 matters because the inbound queue depth is a difference between two counters. If your transport admits a frame and does not record it, the depth goes negative. See [Observability](../operations/observability.md).
 
-Step 6 matters because the runtime creates a series for each direction and message type in advance. If only `message` moves, the dashboard reads "no responses arrived", not "responses are not instrumented".
+Step 7 matters because the runtime creates a series for each direction and message type in advance. If only `message` moves, the dashboard reads "no responses arrived", not "responses are not instrumented".
 
 ```rust,ignore
 use std::sync::{Arc, OnceLock};
