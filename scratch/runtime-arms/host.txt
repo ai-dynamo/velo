@@ -1,0 +1,26 @@
+date: 2026-11-14T11:48:50Z
+host: pmgb300ws-0320
+6.17.0-1029-nvidia-64k
+CPU(s):                                  72
+Model name:                              Neoverse-V2
+CPU(s) scaling MHz:                      100%
+NUMA node(s):                            9
+NUMA node0 CPU(s):                       0-71
+NUMA node1 CPU(s):                       
+NUMA node2 CPU(s):                       
+NUMA node3 CPU(s):                       
+NUMA node4 CPU(s):                       
+NUMA node5 CPU(s):                       
+NUMA node6 CPU(s):                       
+NUMA node7 CPU(s):                       
+NUMA node8 CPU(s):                       
+governor: performance (cpu0: performance)
+thp: always [madvise] never
+perf_event_paranoid: 4
+net.core.rmem_max: 212992
+net.core.wmem_max: 212992
+net.ipv4.tcp_rmem: 65536	131072	33554432
+rustc: rustc 1.99.1 (58cf8f9c3 2026-10-13)
+tokio: version = "1.54.0"
+git: 613727c3dcd5f4184a3a03e0d719b7447412d22e
+ 11:48:50 up 11 days,  4:25,  2 users,  load average: 1.95, 2.73, 3.13
