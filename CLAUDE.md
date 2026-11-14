@@ -45,6 +45,7 @@ Rules:
 - **The book carries only the bare necessities**: how it works, why (with the rejected alternative), measured numbers with their setup, and negative results. No detailed plans, no phase or workstream labels ("Phase 3", "W2a", "a.5"), no PR numbers, no handoff notes. History belongs in git.
 - **Write the book, READMEs, and comments with the `simple-english` skill.** Comments are terse but readable: they say why, or which failure the code avoids.
 - **Hard-earned lessons go into tests.** A test's doc comment can be long, because it carries the knowledge forward; a comment alone enforces nothing.
+- **Races and flaky tests go into `docs/src/development/coding-gotchas.md`**: the rule, the failure, how to test for it, and one test that shows it. Read it before you code, review, or test here.
 - **Every merge to `main` updates the book and the top-level `README.md`**, and removes `agent-docs/` from the branch.
 
 ## Build & Test
