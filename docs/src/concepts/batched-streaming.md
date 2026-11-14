@@ -477,11 +477,11 @@ The sender reads the answer:
 - `messenger-mux-v2` with a window opens a slot that already holds that window.
 - `messenger-mux-v2` with no window (`initial_credit` zero) is refused. No shipped receiver answers this, and a node with a mux cannot advertise a zero window. A fallback to another transport reaches nothing that listens, and the stream hangs until the watchdog fires.
 
-By default, a node with the mux enabled registers both `messenger-mux-v2` and its configured per-stream transport, so it still serves older peers. A node built with `.mux_only()` installs no per-stream listener and refuses peers that need one. `resolve_transport` fails on an unknown key in a non-empty registry, so a receiver that answers the mux on its own breaks every older sender. SPSC and MPSC anchors both negotiate the mux.
+A node built with `stream_config` or `stream_bind_addr` registers both `messenger-mux-v2` and its per-stream transport, so it still serves peers without the mux. A node built without one, the default, or with `.mux_only()`, installs no per-stream listener and refuses peers that need one. The refusal names `stream_config` and `stream_bind_addr`. `resolve_transport` fails on an unknown key in a non-empty registry, so a receiver that answers the mux on its own breaks every older sender. SPSC and MPSC anchors both negotiate the mux.
 
 `StreamSender::negotiated_transport()` returns the key that the attach settled on. It returns `None` for a same-worker attach, which uses no transport. Compare it with the public constant `MESSENGER_MUX_KEY`.
 
-For a node with a per-stream listener, `MuxConfig::enabled = false`, or `VELO_MESSENGER_MUX_DISABLE=1` at startup, is the rollback. The node stops advertising `messenger-mux-v2`, and the next attach negotiates the per-stream path with no code or wire change. For mux-only nodes, either setting makes startup fail. Remove `.mux_only()` to restore the listener before using this rollback. See [Zero-RTT stream setup](#zero-rtt-stream-setup) for the order when tickets are in use.
+For a node with a per-stream listener, `MuxConfig::enabled = false`, or `VELO_MESSENGER_MUX_DISABLE=1` at startup, is the rollback. The node stops advertising `messenger-mux-v2`, and the next attach negotiates the per-stream path with no code or wire change. A node without a per-stream listener has nothing to roll back to, so either setting makes its startup fail with an error that names `stream_config` and `stream_bind_addr`. Add one of them, and remove `.mux_only()`, before using this rollback. See [Zero-RTT stream setup](#zero-rtt-stream-setup) for the order when tickets are in use.
 
 ## Observability
 

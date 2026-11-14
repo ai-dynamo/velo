@@ -23,6 +23,8 @@ Velo 0.21 makes `Velo` a handle. `VeloBuilder::build()` returns `Velo`, not `Arc
 
 Velo 0.22.1 deprecates `Velo::anchor_manager()` and `Velo::rendezvous_manager()`. Their methods are on `Velo`, with three new ones: `create_anchor_with_config`, `active_anchor_count`, `renew_reservations`. Also new: `staging_threshold` and the owner's `unregister_data`. See [Move off the manager accessors](docs/src/guides/migrate-manager-accessors.md).
 
+Velo 0.23 opens no per-stream listener by default: the messenger mux carries every remote stream. Call `stream_config` or `stream_bind_addr` to serve peers without the mux, or to turn the mux off. See [0.23.0: the per-stream listener is opt-in](docs/src/guides/migrate-services.md#0230-the-per-stream-listener-is-opt-in).
+
 Use `Velo::shutdown(policy)` to close resources and join owned tasks while Tokio keeps running. The instance and its handles stay valid after shutdown, and shutdown does not release them from memory. Accepted requests remain counted until their replies are submitted, including error replies. See [Shutdown and drain](docs/src/concepts/shutdown.md).
 
 Call `Velo::unregister_peer` when a peer leaves. A restarted peer has a new instance id, so without the call a long-lived node keeps state and connections for every peer it ever served. See [Forget a peer](docs/src/concepts/discovery.md#forget-a-peer).
@@ -54,7 +56,7 @@ A staged payload is freed when its last reference and its last reader are both g
 
 The local ID in an anchor handle is random. The handle is all that a peer needs to attach to an anchor or open its mux slot, and velo does not authenticate peers, so a host that can reach a node cannot guess the handle of another request's stream. See [Streaming](docs/src/concepts/streaming.md).
 
-Build with `default-features = false` to omit distributed events, work queues, and built-in discovery services. The default `services` feature keeps those APIs available. Use `.mux_only()` to avoid an extra stream listener when all peers support the messenger mux. See [Services and mux-only mode](docs/src/guides/migrate-services.md).
+Build with `default-features = false` to omit distributed events, work queues, and built-in discovery services. The default `services` feature keeps those APIs available. See [Services and stream transports](docs/src/guides/migrate-services.md).
 
 ## Quick start
 

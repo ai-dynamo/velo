@@ -13,7 +13,7 @@ The default features are `http`, `nats-transport`, `grpc`, and `services`. Add o
 
 | Feature | What it adds |
 |---|---|
-| `services` (default) | Distributed events, work queues, and filesystem discovery. See [Services and mux-only mode](migrate-services.md). |
+| `services` (default) | Distributed events, work queues, and filesystem discovery. See [Services and stream transports](migrate-services.md). |
 | `nats-transport` (default) | NATS messenger transport |
 | `grpc` (default) | gRPC messenger transport and gRPC frame transport |
 | `http` (default) | The `axum` dependency. The HTTP messenger transport is not built at this time. |

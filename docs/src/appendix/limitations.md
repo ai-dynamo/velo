@@ -60,8 +60,10 @@ installed the transport. An `AnchorManager` built by hand, with
 terminal enters the egress channel, while the pump still has to write it.
 The same holds for a frame transport from outside velo.
 
-**When.** A producer that builds its `AnchorManager` itself, or a
-`FrameTransport` implementation from another crate.
+**When.** Only on the per-stream path, which a node has when it opts in
+with `stream_config` or `stream_bind_addr`: a producer that builds its
+`AnchorManager` itself, or a `FrameTransport` implementation from another
+crate.
 
 **Why.** `FrameTransport` is published in `velo-ext`, so the retirement does
 not go through it. The `Velo` builder names the in-crate transports to the
@@ -80,8 +82,10 @@ before the producer's last write still leaves the producer with
 `Retirement::Sent`. Over the mux and on the same worker the same case gives
 `Discarded`.
 
-**When.** A stream that rides per-stream TCP (the mux off, or a peer without
-it), and a consumer that leaves while the producer still writes.
+**When.** Only on the per-stream path, which a node has when it opts in
+with `stream_config` or `stream_bind_addr`: a stream that rides per-stream
+TCP (the mux off, or a peer without it), and a consumer that leaves while
+the producer still writes.
 
 **Why.** The consumer's pump learns of the drop only from the next frame it
 tries to forward, so the producer's write succeeds, and a successful write
@@ -98,8 +102,10 @@ consumer's drop fires, when the difference matters.
 **What happens.** Over per-stream gRPC, a producer on this velo reads
 `Retirement::Sent` although the consumer never got the stream.
 
-**When.** The consumer's node runs a velo from before 0.21, and its consumer
-left before the stream ended, or the server could not receive a frame.
+**When.** Only on the per-stream path, which a producer's node has when it
+opts in with `stream_config`: the consumer's node runs a velo from before
+0.21, and its consumer left before the stream ended, or the server could not
+receive a frame.
 
 **Why.** `Sent` over gRPC means that the server ended the call cleanly, which
 it does only once it has taken the whole request stream. A server from
