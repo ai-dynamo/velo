@@ -2601,7 +2601,10 @@ async fn a_consumer_that_never_polls_holds_its_sender_to_the_window() {
 /// With `adopt`, an attach adopts the pre-bind before the sender opens its
 /// slot, which consumes the `PreBind`: the stream then has no `PreBind` to
 /// close its slot when it ends, exactly like an ordinary attach.
-async fn watched_anchor<T: serde::de::DeserializeOwned>(
+///
+/// The sender has not connected yet. Also returns the session id it connects
+/// with, and the bind's drain signal.
+async fn watched_anchor_unconnected<T: serde::de::DeserializeOwned>(
     config: MuxConfig,
     heartbeat: Duration,
     adopt: bool,
@@ -2610,7 +2613,8 @@ async fn watched_anchor<T: serde::de::DeserializeOwned>(
     AnchorManager,
     crate::streaming::anchor::StreamAnchor<T>,
     u64,
-    flume::Sender<Vec<u8>>,
+    u64,
+    Arc<ingress::DrainSignal>,
 ) {
     let pair = mux_pair(config).await;
     let manager = AnchorManagerBuilder::default()
@@ -2629,6 +2633,14 @@ async fn watched_anchor<T: serde::de::DeserializeOwned>(
     });
     let (_, local_id) = anchor.handle().unpack();
     let ticket = manager.prebind_anchor(anchor.handle()).expect("ticket");
+    // Taken before the adopt: until then the bind is pre-bound and unclaimed,
+    // so its watchdog cannot fire and remove the entry.
+    let drain = manager
+        .registry
+        .get(&local_id)
+        .and_then(|entry| entry.feed.current())
+        .map(|feed| Arc::clone(&feed.drain))
+        .expect("the pre-bind installs a feed");
     if adopt {
         let request = crate::streaming::control::AnchorAttachRequest {
             handle: anchor.handle(),
@@ -2648,9 +2660,33 @@ async fn watched_anchor<T: serde::de::DeserializeOwned>(
             "the pre-bind's own key is offered, so this attach adopts it"
         );
     }
+    (
+        pair,
+        manager,
+        anchor,
+        local_id,
+        ticket.routing_session_id,
+        drain,
+    )
+}
+
+/// [`watched_anchor_unconnected`], with the sender connected.
+async fn watched_anchor<T: serde::de::DeserializeOwned>(
+    config: MuxConfig,
+    heartbeat: Duration,
+    adopt: bool,
+) -> (
+    Pair,
+    AnchorManager,
+    crate::streaming::anchor::StreamAnchor<T>,
+    u64,
+    flume::Sender<Vec<u8>>,
+) {
+    let (pair, manager, anchor, local_id, session_id, _) =
+        watched_anchor_unconnected::<T>(config, heartbeat, adopt).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
+        .connect(pair.consumer_worker, local_id, session_id)
         .await
         .expect("connect");
     (pair, manager, anchor, local_id, tx)
@@ -2907,21 +2943,33 @@ async fn an_ended_consumer_releases_its_slot_while_the_anchor_is_held() {
 /// nothing a delivery could fail on. With no `PreBind` (adopted here, as on an
 /// ordinary attach), the watchdog has to close the slot, or the slot and its
 /// peer batcher stay live.
+///
+/// After the adopt, the watchdog counts silent windows from the start, so on
+/// a loaded host it can fire before the test sends anything, or before the
+/// `OpenSlot` arrives. The test used to fail there on a send and on waiting to
+/// see the slot live, both short-lived states. It now waits only for facts
+/// that stay true: the anchor is gone, the sender has learned its stream
+/// ended, and no slot is live. That holds in both orders: a firing after the
+/// open closes the slot, and an `OpenSlot` that arrives after the firing is
+/// refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_watchdog_firing_closes_its_slot() {
     let heartbeat = Duration::from_millis(50);
-    let (pair, manager, anchor, local_id, tx) =
-        watched_anchor::<u32>(test_config(), heartbeat, true).await;
+    let (pair, manager, anchor, local_id, session_id, _) =
+        watched_anchor_unconnected::<u32>(test_config(), heartbeat, true).await;
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, local_id, session_id)
+        .await
+        .expect("connect");
     for n in 0..3 {
-        tx.send_async(item(n)).await.expect("send item");
+        // Fails only once the watchdog has ended the stream.
+        if tx.send_async(item(n)).await.is_err() {
+            break;
+        }
     }
-    eventually(|| {
-        pair.consumer
-            .live_ingress_slots(lane0(pair.producer_worker))
-            == 1
-    })
-    .await;
     eventually(|| !manager.registry.contains_key(&local_id)).await;
+    eventually(|| tx.is_disconnected()).await;
     eventually(|| {
         pair.consumer
             .live_ingress_slots(lane0(pair.producer_worker))
