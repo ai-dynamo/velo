@@ -6,7 +6,7 @@ velo runs its own tasks on a tokio runtime that it builds, `TaskRuntime::Dedicat
 - **In dynamo's load test the default cost less.** dynamo's frontend used 6% to 25% less CPU per output token, with throughput and latency the same as on the application's runtime.
 - **A single unary caller pays.** In velo's own benchmark, one caller making one unary call at a time took 3.5 times as long per call, at 4.3 times the CPU.
 - **Opt out** with `TaskRuntime::Application` when latency depends on unary calls made one at a time, as in dynamo-gdl and kvbm. Measure both settings first.
-- **Use one thread.** A second thread helped only with more busy peer lanes than threads. In dynamo's test it was worse than one everywhere.
+- **Use one thread.** A second thread helped streams only with more busy peers than threads, and it helped 64 concurrent unary callers. In dynamo's test it was worse than one everywhere.
 
 ## The stall
 
@@ -146,7 +146,8 @@ A wake from velo's runtime into the busy application runtime goes to tokio's sha
 - **At one stream, C1 costs little.** It has a lower p50 than A (32.9 µs against 37.2 µs) and 9% less CPU per record. Its p99 is higher (53 µs against 44 µs), but the ranges overlap.
 - **Under concurrency, the C arms win.** At 64 streams, C1 moves 40% more records than A, at a lower p99 and 13% less CPU per record. With 4 busy peers, C2 moves 2.6 times as many. At 64 unary callers, C1 serves 1.2 times as many calls as A, and C2 serves 1.6 times as many.
 - **Flood and the serving shape favor A.** In a flood, the C arms move 13% to 14% fewer records at 9% to 11% more CPU. In the serving shape, C1 uses 29% more CPU per token than A and C2 54% more. The inter-token p50 rises 13%, and the p99 falls 5% to 7%.
-- **Threads past the number of busy peer lanes do not help.** With one busy peer lane, C1 beats C2 and C4 in throughput and p99. With four, C2 is best and C4 is no better. CPU per record rises from one thread to two in every load but the flood, where it does not move.
+- **On streams, threads past the number of busy peers do not help.** At 64 streams from one peer, C1 beats C2 and C4 in throughput and p99. With four peers, C2 is best and C4 is no better. At one stream the throughput ranges of the C arms overlap.
+- **Unary calls from many callers scale with threads.** At 64 callers, C2 serves 1.3 times C1's calls and C4 1.6 times, at 16% and 21% more CPU per call. CPU per record or call rises from one thread to two in every load but the flood, where it does not move.
 - **A saturated application runtime hurts A more than C.** At one stream, A's p99 rises from 44 µs to 113 µs, and C1's stays at 54.5 µs. At one unary caller, C1's p50 is 18 µs slower than A's, but its p99 is 52 µs lower.
 
 ## dynamo's load test
@@ -209,7 +210,7 @@ Opt out with `TaskRuntime::Application` when latency depends on velo unary calls
 - **A yield after the wake (arm D).** It removes row 1 only. In the serving shape it wakes the batcher about once per token instead of once per 11 tokens, which costs 31% more CPU per token and 15% more time to first token (p50 311 ms against 270 ms).
 - **A `LocalSet` for velo's tasks.** It is `!Send` and must be driven by one thread. A wake from another thread goes to its remote queue and wakes that thread (tokio `task/local.rs`), as the wakes into arm C's runtime do. On a thread of its own it is a one-thread private runtime, which is arm C1. On an application worker it can be held like arm A. So it is not a separate arm.
 - **Stealing from the LIFO slot.** tokio 1.51.0 made the slot stealable, and 1.51.2 and 1.52.2 reverted that for its cost. `disable_lifo_slot` needs `tokio_unstable`.
-- **More than two threads.** C4 was no better than C2 with four busy peers, and no better than C1 with one, at more CPU. `build` refuses a count other than 1 or 2.
+- **More than two threads.** On streams, C4 was no better than C2 with four busy peers and no better than C1 with one peer, at more CPU. Only 64 unary callers gained from it: 1.2 times C2's calls, at 4% more CPU per call. `build` refuses a count other than 1 or 2.
 
 ## Reproduce
 
