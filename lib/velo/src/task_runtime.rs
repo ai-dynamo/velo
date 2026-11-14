@@ -83,10 +83,11 @@ use crate::transports::VeloBackend;
 /// # Threads
 ///
 /// [`TaskRuntime::Dedicated`] takes 1 or 2 threads. [`VeloBuilder::build`]
-/// refuses any other count. More threads helped only while there were more
-/// busy peer lanes than threads: with one busy peer, 1 thread beat 2 and 4 in
-/// throughput and p99. With four busy peers, 2 threads did best and 4 were no
-/// better on streams. CPU per record rose with each thread added.
+/// refuses any other count. On streams with one busy peer lane, 1 thread
+/// beat 2 and 4 in throughput and p99. With four busy peers, 2 threads did
+/// best and 4 were no better. Unary calls from 64 callers scaled with
+/// threads: 2 threads served 1.3 times the calls of 1. CPU per record or call
+/// rose from one thread to two in every load but a flood.
 ///
 /// # Lifetime
 ///
