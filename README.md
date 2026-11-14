@@ -48,6 +48,8 @@ A stream item larger than the eager limit (256 KiB by default) goes through rend
 
 A payload that goes through rendezvous states its own size, and the receiver allocates that size before it reads a byte. `VeloBuilder::staged_payload_max` sets the largest one a node takes. A larger one is refused before anything of its size is allocated: a request gets an error that names both sizes, and a stream item ends its own stream with that error while other streams go on. See [The receiver's limit](docs/src/concepts/rendezvous.md#the-receivers-limit).
 
+A staged payload is freed when its last reference and its last reader are both gone, whichever goes last. An owner can drop its reference while a reader holds a lease: the reader's detach, release, or reaped lease then frees it. See [When a slot is freed](docs/src/concepts/rendezvous.md#when-a-slot-is-freed).
+
 The local ID in an anchor handle is random. The handle is all that a peer needs to attach to an anchor or open its mux slot, and velo does not authenticate peers, so a host that can reach a node cannot guess the handle of another request's stream. See [Streaming](docs/src/concepts/streaming.md).
 
 Build with `default-features = false` to omit distributed events, work queues, and built-in discovery services. The default `services` feature keeps those APIs available. Use `.mux_only()` to avoid an extra stream listener when all peers support the messenger mux. See [Services and mux-only mode](docs/src/guides/migrate-services.md).

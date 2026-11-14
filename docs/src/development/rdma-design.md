@@ -173,6 +173,7 @@ Two things keep it out of reach, and the syntactic rkey pre-parse is not one of 
 The pre-parse checks framing. A stale rkey with perfect framing passes it. Consequences:
 
 - The shutdown straggler, the reaper force-release, and shutdown demotion all release memory under a peer that can still hold a descriptor. On InfiniBand that peer's GET can abort the peer's process, not only fail.
+- The reaper force-release also frees a slot whose owner has already dropped its reference, when it reaps the slot's last lease. A reaped lease does not prove that the GET finished, so the same risk applies.
 - A consumer-side rkey cache removes both safety legs at once. It makes an rkey outlive its operation, and it skips revalidation. Arena reclamation is safe only because an empty arena has no live descriptor, and a cached rkey breaks that too. An rkey cache is a safety change, not a profile-gated optimization.
 - The `mlx5` completion path differs from `rc_verbs`. This finding needs a rerun on the accelerated lane.
 
