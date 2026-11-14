@@ -295,10 +295,13 @@ impl VeloBackend {
                     );
                     transport_metrics.insert(key.clone(), handle);
                 }
-                crate::task_runtime::entered(
-                    &runtime,
-                    transport.start(instance_id, adapter.clone(), runtime.clone()),
-                )
+                // `start` is called inside the entered future, not before it,
+                // so what it does before it returns its future is covered too.
+                crate::task_runtime::entered(&runtime, async {
+                    transport
+                        .start(instance_id, adapter.clone(), runtime.clone())
+                        .await
+                })
                 .await?;
                 started
                     .transports

@@ -287,6 +287,103 @@ async fn start_runs_with_the_given_runtime_entered() {
     other.shutdown_background();
 }
 
+/// A task spawned before `start` returns its future belongs to the task runtime too.
+#[tokio::test]
+async fn start_construction_spawns_on_the_task_runtime() {
+    struct InlineStart {
+        inner: Arc<MockTransport>,
+        expected: OnceLock<tokio::runtime::Id>,
+        spawned_on: OnceLock<tokio::runtime::Id>,
+    }
+
+    impl Transport for InlineStart {
+        fn key(&self) -> TransportKey {
+            self.inner.key()
+        }
+
+        fn address(&self) -> WorkerAddress {
+            self.inner.address()
+        }
+
+        fn register(&self, peer: PeerInfo) -> Result<(), TransportError> {
+            self.inner.register(peer)
+        }
+
+        fn send_message(
+            &self,
+            id: InstanceId,
+            header: Bytes,
+            payload: Bytes,
+            kind: MessageType,
+            on_error: Arc<dyn TransportErrorHandler>,
+        ) -> SendOutcome {
+            self.inner.send_message(id, header, payload, kind, on_error)
+        }
+
+        fn start(
+            &self,
+            id: InstanceId,
+            channels: TransportAdapter,
+            runtime: tokio::runtime::Handle,
+        ) -> BoxFuture<'_, anyhow::Result<()>> {
+            self.expected.set(runtime.id()).unwrap();
+            let spawned = tokio::spawn(async { tokio::runtime::Handle::current().id() });
+            let start = self.inner.start(id, channels, runtime);
+            Box::pin(async move {
+                start.await?;
+                self.spawned_on.set(spawned.await?).unwrap();
+                Ok(())
+            })
+        }
+
+        fn begin_drain(&self) {
+            self.inner.begin_drain();
+        }
+
+        fn shutdown(&self) {
+            self.inner.shutdown();
+        }
+
+        fn closed(&self) -> BoxFuture<'_, ()> {
+            self.inner.closed()
+        }
+
+        fn check_health(
+            &self,
+            id: InstanceId,
+            timeout: Duration,
+        ) -> BoxFuture<'_, Result<(), HealthCheckError>> {
+            self.inner.check_health(id, timeout)
+        }
+    }
+
+    let transport = Arc::new(InlineStart {
+        inner: MockTransport::new("inline-start", true),
+        expected: OnceLock::new(),
+        spawned_on: OnceLock::new(),
+    });
+    let velo = crate::Velo::builder()
+        .task_runtime(crate::TaskRuntime::dedicated())
+        .add_transport(transport.clone())
+        .build()
+        .await
+        .unwrap();
+    velo.shutdown(ShutdownPolicy::WaitForever).await;
+    assert_eq!(
+        transport.inner.start_context.get(),
+        transport.expected.get()
+    );
+    assert_ne!(
+        transport.expected.get(),
+        Some(&tokio::runtime::Handle::current().id())
+    );
+    assert_eq!(
+        transport.spawned_on.get(),
+        transport.expected.get(),
+        "a task spawned while constructing the start future ran on the application's runtime"
+    );
+}
+
 /// A start that fails after another transport started runs that transport's
 /// shutdown hook with the runtime it started on entered, as a teardown after
 /// a successful start does.
