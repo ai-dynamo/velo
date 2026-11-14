@@ -86,6 +86,7 @@ async fn mux_pair(config: MuxConfig) -> Pair {
         config.clone(),
         Some(Arc::clone(&metrics)),
         crate::streaming::ReservationConfig::default().prebind_timeout,
+        None,
     )
     .expect("consumer mux");
     let producer = MessengerMuxTransport::new(
@@ -93,6 +94,7 @@ async fn mux_pair(config: MuxConfig) -> Pair {
         config,
         Some(Arc::clone(&metrics)),
         crate::streaming::ReservationConfig::default().prebind_timeout,
+        None,
     )
     .expect("producer mux");
     let consumer_worker = m_consumer.instance_id().worker_id();
@@ -204,6 +206,7 @@ async fn a_stale_payload_refusal_spares_a_stream_in_a_new_epoch() {
         test_config(),
         None,
         crate::streaming::ReservationConfig::default().prebind_timeout,
+        None,
     )
     .expect("mux");
     let key = lane0(WorkerId::from_u64(0xABCD));
@@ -528,6 +531,7 @@ fn aborting_a_retiring_batchers_final_flush_stops_the_mux() {
             },
             None,
             crate::streaming::ReservationConfig::default().prebind_timeout,
+            None,
         )
         .unwrap();
         let hooks = Arc::new(TestHooks::default());
@@ -589,6 +593,7 @@ async fn a_batcher_dropped_by_stop_sending_leaves_slots_to_shutdown() {
         MuxConfig::default(),
         None,
         crate::streaming::ReservationConfig::default().prebind_timeout,
+        None,
     )
     .unwrap();
     let hooks = Arc::new(TestHooks::default());
@@ -809,6 +814,7 @@ async fn a_zero_sweep_interval_is_refused_when_the_mux_is_built() {
         },
         None,
         crate::streaming::ReservationConfig::default().prebind_timeout,
+        None,
     )
     .err()
     .expect("a zero sweep interval cannot tick, so the build must say so");
@@ -825,6 +831,7 @@ async fn a_zero_sweep_interval_is_refused_when_the_mux_is_built() {
         },
         None,
         crate::streaming::ReservationConfig::default().prebind_timeout,
+        None,
     )
     .expect("the same messenger takes a mux with a positive interval");
 }
@@ -1086,6 +1093,7 @@ async fn a_remote_stream_preserves_send_order_under_a_slow_consumer() {
         test_config(),
         None,
         crate::streaming::ReservationConfig::default().prebind_timeout,
+        None,
     )
     .expect("mux a");
     let mux_producer = MessengerMuxTransport::new(
@@ -1093,6 +1101,7 @@ async fn a_remote_stream_preserves_send_order_under_a_slow_consumer() {
         test_config(),
         None,
         crate::streaming::ReservationConfig::default().prebind_timeout,
+        None,
     )
     .expect("mux b");
 
@@ -1220,6 +1229,7 @@ async fn one_flush_reaches_every_peer_batcher() {
         config.clone(),
         Some(Arc::clone(&metrics)),
         crate::streaming::ReservationConfig::default().prebind_timeout,
+        None,
     )
     .expect("producer mux");
 
@@ -1232,6 +1242,7 @@ async fn one_flush_reaches_every_peer_batcher() {
             config.clone(),
             None,
             crate::streaming::ReservationConfig::default().prebind_timeout,
+            None,
         )
         .expect("consumer mux");
         let worker = messenger.instance_id().worker_id();
@@ -1339,6 +1350,7 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
         config.clone(),
         Some(Arc::clone(&consumer_metrics)),
         crate::streaming::ReservationConfig::default().prebind_timeout,
+        None,
     )
     .expect("consumer mux");
     let producer = MessengerMuxTransport::new(
@@ -1346,6 +1358,7 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
         config,
         None,
         crate::streaming::ReservationConfig::default().prebind_timeout,
+        None,
     )
     .expect("producer mux");
 
@@ -1801,7 +1814,7 @@ async fn prebinding_node_with_window(
         .build()
         .await
         .expect("messenger");
-    let mux = MessengerMuxTransport::new(Arc::clone(&messenger), config, None, accept_window)
+    let mux = MessengerMuxTransport::new(Arc::clone(&messenger), config, None, accept_window, None)
         .expect("mux");
     let mut builder = AnchorManagerBuilder::default()
         .worker_id(messenger.instance_id().worker_id())
