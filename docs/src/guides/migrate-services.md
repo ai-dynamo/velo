@@ -103,7 +103,7 @@ Before 0.23.0, velo ran its own tasks (the transports, the inbound loop, the mes
 
 What it buys: an application task that holds its worker thread right after it calls velo (a blocking call, a long encode) no longer stalls velo's tasks, and a hold of every application worker no longer ends a stream for want of heartbeats. See [Known limitations](../appendix/limitations.md#a-task-that-holds-its-worker-thread-stalls-velos-tasks).
 
-What it costs: each wake between the application and velo now crosses threads. In velo's own benchmark on one exclusive 72-core node, a single caller making one unary call at a time took about 3.5 to 4 times as long per call. Under concurrency the dedicated runtime did better, and in dynamo's frontend load test the frontend used 6% to 25% less CPU per output token. `TaskRuntime`'s documentation has the setup and the other numbers.
+What it costs: each wake between the application and velo now crosses threads. In velo's own benchmark on one exclusive 72-core node, a single caller making one unary call at a time took about 3.5 times as long per call, at about 4 times the CPU. Under concurrency the dedicated runtime did better, and in dynamo's frontend load test the frontend used 6% to 25% less CPU per output token. `TaskRuntime`'s documentation has the setup and the other numbers.
 
 To keep the old behaviour, opt out:
 
