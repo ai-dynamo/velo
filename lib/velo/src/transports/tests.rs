@@ -1731,7 +1731,6 @@ async fn unregister_does_not_block_registration_from_an_active_send_error_handle
 
 /// Two unregister calls can overlap while TCP still holds queued sends.
 #[tokio::test]
-#[ignore = "F5: a vacant route guard blocks peer registration from TCP's queued send error handler"]
 async fn an_absent_route_does_not_block_a_queued_send_error_handler() {
     struct PausedUnregister {
         inner: Arc<crate::transports::tcp::TcpTransport>,

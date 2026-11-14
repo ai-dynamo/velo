@@ -778,8 +778,10 @@ impl VeloBackend {
         if let Some(observer) = self.peer_observer.get() {
             observer.unregistered(instance_id);
         }
-        if let dashmap::Entry::Occupied(route) = route {
-            route.remove();
+        // A vacant entry holds the shard too: drop it here, not at return.
+        match route {
+            dashmap::Entry::Occupied(route) => drop(route.remove()),
+            dashmap::Entry::Vacant(route) => drop(route),
         }
         self.alternative_transports.remove(&instance_id);
         self.workers
