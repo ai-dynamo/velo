@@ -249,7 +249,6 @@ async fn shutting_down_after_sent_keeps_the_tail() {
         // in a fraction of a second rather than the default seconds.
         let mut anchor = consumer
             .velo
-            .anchor_manager()
             .create_anchor_with_config::<u32>(AnchorConfig {
                 heartbeat_interval: Some(Duration::from_millis(50)),
                 ..AnchorConfig::default()

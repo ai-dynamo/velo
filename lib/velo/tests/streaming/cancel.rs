@@ -443,12 +443,10 @@ async fn cancel_with_a_record_in_flight_already_errors() {
 async fn cancel_reaches_an_idle_worker_within_a_bound() {
     let (consumer, producer) = velo_pair().await;
 
-    let mut anchor = consumer
-        .anchor_manager()
-        .create_anchor_with_config::<u32>(AnchorConfig {
-            heartbeat_interval: Some(SETTLE * 6),
-            ..AnchorConfig::default()
-        });
+    let mut anchor = consumer.create_anchor_with_config::<u32>(AnchorConfig {
+        heartbeat_interval: Some(SETTLE * 6),
+        ..AnchorConfig::default()
+    });
     let handle = transfer(anchor.handle());
     let ticket = consumer
         .prebind_anchor(handle)

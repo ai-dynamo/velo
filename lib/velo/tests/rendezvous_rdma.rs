@@ -266,6 +266,13 @@ where
 
 /// Whether the owner has freed a slot. Local, so it reflects the owner's own
 /// state rather than a round trip that might race with it.
+/// Arm a fault hook on `velo`'s rendezvous manager. The hook is test-only
+/// and has no `Velo` form.
+#[allow(deprecated)]
+fn arm_rdma_hook(velo: &Velo, hook: RdmaTestHook) {
+    velo.rendezvous_manager().arm_rdma_hook(hook);
+}
+
 async fn slot_is_gone(node: &Node, handle: DataHandle) -> bool {
     node.velo.metadata(handle).await.is_err()
 }
@@ -477,6 +484,96 @@ async fn an_external_region_anchor_serves_the_chunked_path() {
             .expect("unregister after the anchor was released"),
         Deregistered::Drained,
         "the anchor's in-flight guard outlived the slot that held it"
+    );
+
+    shutdown(pair).await;
+}
+
+/// Give `handle` back as its owner, on a plain thread with no tokio runtime,
+/// the way an owner's `Drop` would.
+fn unregister_outside_any_runtime(velo: &Velo, handle: DataHandle) -> bool {
+    let velo = velo.clone();
+    std::thread::spawn(move || {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        velo.unregister_data(handle)
+    })
+    .join()
+    .expect("the owner's thread")
+}
+
+/// An anchor staged in a caller's region holds the region's in-flight count
+/// until its slot is freed. The owner's `unregister_data` frees it, so the
+/// region's drain finishes at once instead of running out its timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_owner_call_lets_a_region_unregister_without_waiting() {
+    let node = Node::start(None).await;
+    let guard = node
+        .velo
+        .register_owned(pattern(512 * 1024).into_boxed_slice())
+        .await
+        .map_err(|e| e.cause)
+        .expect("register the caller's memory");
+    let handle = node
+        .velo
+        .register_data_in_region(&guard, 0..512 * 1024)
+        .expect("stage an anchor inside the region");
+
+    assert!(unregister_outside_any_runtime(&node.velo, handle));
+
+    assert!(
+        slot_is_gone(&node, handle).await,
+        "no reader, so freed at once"
+    );
+    assert_eq!(
+        guard.unregister(T).await.expect("unregister"),
+        Deregistered::Drained,
+        "the owner's call left the anchor's in-flight guard on the region"
+    );
+    node.velo
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(10)))
+        .await;
+}
+
+/// With a reader attached, the owner's call keeps the slot, and the reader's
+/// detach frees it and its hold on the region.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_region_anchor_given_back_while_read_is_freed_by_the_last_reader() {
+    let pair = Pair::with_incapable_consumer().await;
+    let guard = pair
+        .owner
+        .velo
+        .register_owned(pattern(512 * 1024).into_boxed_slice())
+        .await
+        .map_err(|e| e.cause)
+        .expect("register the caller's memory");
+    let handle = pair
+        .owner
+        .velo
+        .register_data_in_region(&guard, 0..512 * 1024)
+        .expect("stage an anchor inside the region");
+    let (_, lease) = pair.consumer.velo.get(handle).await.expect("get");
+
+    assert!(unregister_outside_any_runtime(&pair.owner.velo, handle));
+    assert!(
+        !slot_is_gone(&pair.owner, handle).await,
+        "the reader's lease keeps the slot"
+    );
+
+    pair.consumer
+        .velo
+        .detach(handle, lease)
+        .await
+        .expect("detach");
+    wait_until(
+        "the last reader's detach frees the slot",
+        || slot_is_gone(&pair.owner, handle),
+        || "the slot is still staged".to_string(),
+    )
+    .await;
+    assert_eq!(
+        guard.unregister(T).await.expect("unregister"),
+        Deregistered::Drained,
+        "the freed anchor's in-flight guard outlived its slot"
     );
 
     shutdown(pair).await;
@@ -843,10 +940,7 @@ async fn a_malformed_descriptor_falls_back_to_chunked() {
     .enumerate()
     {
         let handle = pair.owner.velo.register_data_pinned(&payload).await;
-        pair.consumer
-            .velo
-            .rendezvous_manager()
-            .arm_rdma_hook(hook.clone());
+        arm_rdma_hook(&pair.consumer.velo, hook.clone());
 
         let (data, lease) = pair
             .consumer
@@ -894,10 +988,7 @@ async fn a_failed_get_falls_back_chunked_exactly_once() {
 
     let payload = pattern(768 * 1024);
     let handle = pair.owner.velo.register_data_pinned(&payload).await;
-    pair.consumer
-        .velo
-        .rendezvous_manager()
-        .arm_rdma_hook(RdmaTestHook::FailGet);
+    arm_rdma_hook(&pair.consumer.velo, RdmaTestHook::FailGet);
 
     let (data, lease) = pair
         .consumer
@@ -1024,10 +1115,7 @@ async fn a_failed_write_after_the_fallback_returns_its_fresh_lease() {
 
     let payload = pattern(512 * 1024);
     let handle = pair.owner.velo.register_data_pinned(&payload).await;
-    pair.consumer
-        .velo
-        .rendezvous_manager()
-        .arm_rdma_hook(RdmaTestHook::FailGet);
+    arm_rdma_hook(&pair.consumer.velo, RdmaTestHook::FailGet);
 
     let mut too_small = [0u8; 64];
     let mut dest: &mut [u8] = &mut too_small;
@@ -1162,10 +1250,7 @@ async fn lease_renewal_carries_a_slow_transfer_past_several_deadlines() {
 
     let payload = pattern(512 * 1024);
     let handle = pair.owner.velo.register_data_pinned(&payload).await;
-    pair.consumer
-        .velo
-        .rendezvous_manager()
-        .arm_rdma_hook(RdmaTestHook::SlowGet(TRANSFER_DELAY));
+    arm_rdma_hook(&pair.consumer.velo, RdmaTestHook::SlowGet(TRANSFER_DELAY));
 
     let started = std::time::Instant::now();
     let (data, lease) = pair.consumer.velo.get(handle).await.expect("get");
@@ -1317,10 +1402,10 @@ async fn a_cancelled_transfer_does_not_release_its_destination() {
 
     let payload = pattern(CUT);
     let handle = pair.owner.velo.register_data_pinned(&payload).await;
-    pair.consumer
-        .velo
-        .rendezvous_manager()
-        .arm_rdma_hook(RdmaTestHook::SlowGet(Duration::from_millis(700)));
+    arm_rdma_hook(
+        &pair.consumer.velo,
+        RdmaTestHook::SlowGet(Duration::from_millis(700)),
+    );
 
     // Dropped while the transfer is still running, and only once it holds its
     // destination.
@@ -1392,10 +1477,10 @@ async fn shutdown_waits_for_a_live_transfer_before_unmapping_its_arena() {
 
     let payload = pattern(512 * 1024);
     let handle = pair.owner.velo.register_data_pinned(&payload).await;
-    pair.consumer
-        .velo
-        .rendezvous_manager()
-        .arm_rdma_hook(RdmaTestHook::SlowGet(Duration::from_millis(900)));
+    arm_rdma_hook(
+        &pair.consumer.velo,
+        RdmaTestHook::SlowGet(Duration::from_millis(900)),
+    );
 
     // Abandoned while the transfer is running: the detached task still holds
     // its destination inside the consumer's arena.

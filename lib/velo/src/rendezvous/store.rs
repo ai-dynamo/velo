@@ -150,6 +150,9 @@ pub(crate) struct DataSlot {
     pub refcount: AtomicU32,
     /// Active read lock count. Prevents cleanup while transfers are in flight.
     pub read_lock_count: AtomicU32,
+    /// Set once the owner has dropped the reference `register` gave it, so a
+    /// second owner call cannot take a reader's reference instead.
+    pub owner_released: AtomicBool,
     /// Cached total length for metadata queries.
     pub total_len: u64,
     /// When this slot was created.
@@ -389,6 +392,7 @@ impl DataStore {
                 body,
                 refcount: AtomicU32::new(1),
                 read_lock_count: AtomicU32::new(0),
+                owner_released: AtomicBool::new(false),
                 total_len,
                 created_at: Instant::now(),
                 ttl,
@@ -669,6 +673,38 @@ impl DataStore {
             true
         } else {
             false
+        }
+    }
+
+    /// Drop the reference the owner got from `register`, once.
+    ///
+    /// Returns true if this call dropped it. A second call, a call for a slot
+    /// that is gone, or a call after the count was taken to 0 some other way
+    /// changes nothing and returns false. The flag is what keeps a repeat
+    /// call from taking a reference that `ref_increment` gave a reader.
+    ///
+    /// Frees the slot now if no reader holds a lease. Otherwise the call that
+    /// ends the last lease frees it ([`end_lease`](Self::end_lease)). As
+    /// there, a call that takes its count to 0 always goes to `try_free`,
+    /// which compares both counts under the shard's write lock.
+    ///
+    /// Synchronous and runtime-free, so an owner can call it from `Drop`.
+    pub(crate) fn release_owner_reference(&self, local_id: u64) -> bool {
+        {
+            let Some(slot) = self.slots.get(&local_id) else {
+                return false;
+            };
+            if slot.owner_released.swap(true, Ordering::Relaxed) {
+                return false;
+            }
+        }
+        match self.take_one(local_id, Count::References) {
+            Some((0, _)) => {
+                self.try_free(local_id);
+                true
+            }
+            Some(_) => true,
+            None => false,
         }
     }
 

@@ -1093,7 +1093,6 @@ async fn bulk_reservation_renewal_is_harmless_during_and_after_attachment() {
     }
     producer
         .velo
-        .anchor_manager()
         .renew_reservations(&reservations)
         .await
         .expect("two batches");
@@ -1101,10 +1100,7 @@ async fn bulk_reservation_renewal_is_harmless_during_and_after_attachment() {
     let opening = producer
         .velo
         .open_anchor_stream::<u32>(anchor.handle(), tickets.pop().expect("ticket"));
-    let renewal = producer
-        .velo
-        .anchor_manager()
-        .renew_reservations(&reservations);
+    let renewal = producer.velo.renew_reservations(&reservations);
     let (sender, renewed) = tokio::join!(opening, renewal);
     renewed.expect("renewal racing attachment");
     let sender = sender.expect("sender");
@@ -1117,7 +1113,6 @@ async fn bulk_reservation_renewal_is_harmless_during_and_after_attachment() {
     ));
     producer
         .velo
-        .anchor_manager()
         .renew_reservations(&reservations)
         .await
         .expect("attached no-op");
@@ -1131,7 +1126,6 @@ async fn bulk_reservation_renewal_is_harmless_during_and_after_attachment() {
     drop(anchors);
     producer
         .velo
-        .anchor_manager()
         .renew_reservations(&reservations)
         .await
         .expect("removed no-op");
@@ -1177,7 +1171,7 @@ async fn remote_renewal_keeps_prepared_reservations_past_their_lifetime() {
         tickets.push(ticket);
         anchors.push(anchor);
     }
-    let renewer = producer.velo.anchor_manager();
+    let renewer = &producer.velo;
     for _ in 0..8 {
         tokio::time::sleep(lifetime / 4).await;
         renewer
@@ -1205,7 +1199,7 @@ async fn remote_renewal_keeps_prepared_reservations_past_their_lifetime() {
         opened.push((anchor, sender));
     }
     // Renewal stops: the unopened reservations expire; the open ones stay.
-    let manager = consumer.velo.anchor_manager();
+    let manager = &consumer.velo;
     let deadline = tokio::time::Instant::now() + lifetime * 5;
     while manager.active_anchor_count() > opened.len() {
         assert!(
