@@ -13,6 +13,7 @@
 
 use std::sync::Arc;
 
+use crate::messenger::MessengerParts;
 use anyhow::Result;
 
 // ── Subsystem modules (each was previously a sibling crate) ────────────────
@@ -45,6 +46,7 @@ pub use velo_ext::{
 pub use velo_ext as ext;
 
 // Messenger surface
+#[allow(deprecated)] // re-exported until 0.23.0 removes `MessengerBuilder`
 pub use crate::messenger::{
     Admitted, AmHandlerBuilder, AmSendBuilder, AmSyncBuilder, AsyncExecutor, Context, FireResult,
     Handler, HandlerExecutor, Messenger, MessengerBuilder, OrderedConfig, OrderingKey,
@@ -309,7 +311,7 @@ impl Drop for StreamOwner {
 
 /// Builder for configuring and creating a [`Velo`] instance.
 pub struct VeloBuilder {
-    inner: MessengerBuilder,
+    inner: MessengerParts,
     stream_config: Option<StreamConfig>,
     mux_config: Option<crate::streaming::MuxConfig>,
     reservation_config: crate::streaming::ReservationConfig,
@@ -339,7 +341,7 @@ impl VeloBuilder {
     /// Create a new empty builder.
     pub fn new() -> Self {
         Self {
-            inner: MessengerBuilder::new(),
+            inner: MessengerParts::new(),
             stream_config: None,
             mux_config: None,
             reservation_config: Default::default(),
@@ -648,12 +650,12 @@ impl VeloBuilder {
             Some(limit) => resolver.with_limit(limit),
             None => resolver,
         });
-        messenger.set_large_payload_support(stager, resolver);
+        messenger.set_large_payload_support_inner(stager, resolver);
 
         // Build the RDMA registration layer, if a UCX transport was
         // added through `add_ucx_transport`.
         //
-        // Ordering: `MessengerBuilder::build` above has already called
+        // Ordering: `MessengerParts::build` above has already called
         // `Transport::start` on every transport (`transports.rs`), so the RMA
         // endpoint this wraps is live. Constructing it earlier would not be
         // unsound — `RdmaEndpoint` is two `Arc`s and answers `NotStarted` until
@@ -808,7 +810,7 @@ impl Velo {
     /// keep flowing. See
     /// [`Messenger::begin_drain`].
     pub fn begin_drain(&self) {
-        self.inner.messenger.begin_drain();
+        self.inner.messenger.begin_drain_inner();
     }
 
     /// Perform a graceful shutdown of the messenger transports: gate inbound
@@ -894,7 +896,17 @@ impl Velo {
     /// Panics if a transport's shutdown hook panicked. The other hooks still
     /// ran, but shutdown cannot report the instance, or its RDMA memory, as
     /// released. A later call panics at once, without draining again.
+    #[deprecated(
+        since = "0.22.1",
+        note = "Use `Velo::shutdown`. 0.23.0 folds `graceful_shutdown` into `shutdown`"
+    )]
     pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
+        self.graceful_shutdown_inner(policy).await;
+    }
+
+    /// The messenger half of [`shutdown`](Self::shutdown), and what
+    /// [`graceful_shutdown`](Self::graceful_shutdown) runs.
+    pub(crate) async fn graceful_shutdown_inner(&self, policy: ShutdownPolicy) {
         // Serialised, and run once. `Velo` is `Clone`, so two clones can arrive
         // here together; the sequence below takes a transport join handle and
         // then declares memory released on the strength of that join having
@@ -997,7 +1009,7 @@ impl Velo {
     /// ran, but shutdown cannot report the instance, or its RDMA memory, as
     /// released. A later call panics at once, without draining again.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
-        self.graceful_shutdown(policy).await;
+        self.graceful_shutdown_inner(policy).await;
         self.inner.anchor_manager.shutdown().await;
         if let Some(transport) = &self.inner.stream_owner.transport {
             transport.shutdown().await;
@@ -1174,7 +1186,7 @@ impl Velo {
                 ));
             }
         }
-        self.inner.messenger.register_peer(peer_info)
+        self.inner.messenger.register_peer_inner(peer_info)
     }
 
     /// Forget a peer that [`register_peer`](Self::register_peer) added.
@@ -1195,7 +1207,7 @@ impl Velo {
     /// per-peer receive tables that this does not drop.
     pub fn unregister_peer(&self, instance_id: InstanceId) {
         self.inner.stream_transport.unregister(instance_id);
-        self.inner.messenger.unregister_peer(instance_id);
+        self.inner.messenger.unregister_peer_inner(instance_id);
     }
 
     /// Discover a peer by instance_id and register it for communication.
@@ -1818,7 +1830,7 @@ mod tests {
                 .build()
                 .unwrap(),
         );
-        let messenger = Messenger::builder()
+        let messenger = MessengerParts::new()
             .add_transport(transport)
             .build()
             .await
@@ -1976,6 +1988,7 @@ mod tests {
     /// the first rather than starting a teardown of its own. Holding the lock
     /// stands in for a first caller that is mid-sequence.
     #[tokio::test]
+    #[allow(deprecated)] // tests the lock of the deprecated `Velo::graceful_shutdown`
     async fn clones_serialise_graceful_shutdown_on_one_lock() {
         let velo = tcp_stream_node(None).await;
         let clone = velo.clone();
@@ -3006,14 +3019,14 @@ mod tests {
             sends: Arc::clone(&sends),
             adapter: std::sync::OnceLock::new(),
         });
-        let messenger = Messenger::builder()
+        let messenger = MessengerParts::new()
             .add_transport(transport)
             .build()
             .await
             .unwrap();
         let peer_instance = crate::InstanceId::new_v4();
         messenger
-            .register_peer(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
+            .register_peer_inner(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
             .unwrap();
         (messenger, peer_instance, sends)
     }
@@ -3272,14 +3285,14 @@ mod tests {
             sends: Default::default(),
             adapter: std::sync::OnceLock::new(),
         });
-        let messenger = Messenger::builder()
+        let messenger = MessengerParts::new()
             .add_transport(transport.clone())
             .build()
             .await
             .unwrap();
         let resolver = Arc::new(NeverResolves::default());
         let resolver_alive = Arc::downgrade(&resolver);
-        messenger.set_large_payload_support(resolver.clone(), resolver);
+        messenger.set_large_payload_support_inner(resolver.clone(), resolver);
         let backend = Arc::clone(messenger.backend());
         let headers = std::collections::HashMap::from([(
             crate::messenger::large_payload::RV_HEADER_KEY.to_string(),

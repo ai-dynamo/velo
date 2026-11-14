@@ -893,8 +893,7 @@ async fn the_rendezvous_tick_reclaims_arenas_without_being_asked() {
     );
     assert_eq!(transport.live_regions(), 0);
 
-    velo.graceful_shutdown(velo_ext::ShutdownPolicy::Timeout(T))
-        .await;
+    velo.shutdown(velo_ext::ShutdownPolicy::Timeout(T)).await;
     assert_eq!(transport.live_rkeys(), 0);
 }
 
@@ -1589,8 +1588,7 @@ async fn velo_graceful_shutdown_deregisters_before_transport_teardown() {
         "the budget must charge at least the requested length"
     );
 
-    velo.graceful_shutdown(velo_ext::ShutdownPolicy::Timeout(T))
-        .await;
+    velo.shutdown(velo_ext::ShutdownPolicy::Timeout(T)).await;
 
     assert!(
         watch.is_deregistered(),
@@ -1672,8 +1670,7 @@ async fn velo_without_ucx_transport_refuses_registration() {
     assert_eq!(velo.rdma_registered_bytes(), 0);
 
     // And shutdown still works, with no registry to sweep.
-    velo.graceful_shutdown(velo_ext::ShutdownPolicy::Timeout(T))
-        .await;
+    velo.shutdown(velo_ext::ShutdownPolicy::Timeout(T)).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -2317,6 +2314,7 @@ async fn unregister_owned_refuses_before_deregistering() {
 /// independent backstop if it ever does interleave: it refuses while the
 /// backend still reports registrations.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[allow(deprecated)] // tests the deprecated `Velo::graceful_shutdown` itself
 async fn concurrent_graceful_shutdowns_are_serialised() {
     const CALLERS: usize = 8;
 

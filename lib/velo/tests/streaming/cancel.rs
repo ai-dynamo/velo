@@ -209,6 +209,7 @@ fn new_tcp_transport() -> Arc<velo::transports::tcp::TcpTransport> {
 }
 
 /// Set up two Messenger instances connected over TCP loopback.
+#[allow(deprecated)] // an `AnchorManager` built by hand over a bare `Messenger`, which `Velo` registers itself
 async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
     let t1 = new_tcp_transport();
     let t2 = new_tcp_transport();
