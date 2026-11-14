@@ -168,7 +168,7 @@ async fn start_transport(transport: Arc<UcxTransport>) -> Node {
     let instance_id = InstanceId::new_v4();
     let (adapter, streams) = make_channels();
     tokio::time::timeout(
-        T,
+        STARTUP,
         transport.start(instance_id, adapter, tokio::runtime::Handle::current()),
     )
     .await
@@ -212,6 +212,16 @@ async fn recv_message(
 }
 
 const T: Duration = Duration::from_secs(10);
+
+/// A hang guard for `start`, not a speed check.
+///
+/// Startup runs `ucp_config_read`, `ucp_init` and `ucp_worker_create` on the
+/// new progress thread, and that slows down as more UCX workers share the
+/// CPUs. With 24 copies of this module on 8 CPUs it took 1.1 s at the median
+/// and 5.2 s at most (4,176 starts). Copies that were not pinned, at a load
+/// near 300, passed `T` (10 s) and failed with nothing wrong. A real hang
+/// still fails here.
+const STARTUP: Duration = Duration::from_secs(60);
 
 #[tokio::test(flavor = "multi_thread")]
 async fn message_round_trip_and_stream_routing() {
