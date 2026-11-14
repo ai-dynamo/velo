@@ -1604,9 +1604,8 @@ impl Velo {
     /// rendezvous instead of sending it inline.
     ///
     /// A payload is staged when its length is greater than this value. It is
-    /// the threshold of the stager this node installed, which can differ from
-    /// [`rendezvous::transparent::DEFAULT_THRESHOLD`] (see
-    /// [`RendezvousStager::with_threshold`](crate::rendezvous::RendezvousStager::with_threshold)).
+    /// 256 KiB today ([`rendezvous::transparent::DEFAULT_THRESHOLD`]), and
+    /// `VeloBuilder` has no setting for it.
     pub fn staging_threshold(&self) -> usize {
         self.inner
             .messenger

@@ -64,7 +64,7 @@ For a slot staged with `register_data_in_region`, freeing the slot gives back it
 
 ### The staging threshold
 
-`staging_threshold()` returns the threshold of the stager this node installed. A payload longer than it is staged through rendezvous. A payload of that length or shorter goes inline. Read it from the node instead of copying `DEFAULT_THRESHOLD`, because a stager built with `RendezvousStager::with_threshold` uses another value.
+`staging_threshold()` returns the threshold this node stages above: 256 KiB today, with no builder setting for it. A payload longer than it is staged through rendezvous. A payload of that length or shorter goes inline. Read it from the node instead of copying `DEFAULT_THRESHOLD`.
 
 ## Direct manager access
 
