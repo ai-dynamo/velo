@@ -102,8 +102,8 @@ pub(super) async fn run_accept_loop(endpoint: quinn::Endpoint, ctx: AcceptContex
 /// after it has closed the connection, so the order is certain on any runtime.
 async fn serve_connection(connection: quinn::Connection, ctx: AcceptContext) {
     let peer = connection.remote_address();
-    let mut guard = CloseThenStop {
-        connection: Some(connection.clone()),
+    let guard = CloseThenStop {
+        connection: connection.clone(),
         readers: CancellationToken::new(),
     };
     loop {
@@ -127,9 +127,6 @@ async fn serve_connection(connection: quinn::Connection, ctx: AcceptContext) {
                     "QUIC: connection from {peer} ended: {e:#} (close reason: {:?})",
                     connection.close_reason()
                 );
-                // Ended without us: leave the readers to drain what quinn
-                // has already acknowledged, and end on their own.
-                guard.connection = None;
                 break;
             }
         }
@@ -137,33 +134,33 @@ async fn serve_connection(connection: quinn::Connection, ctx: AcceptContext) {
 }
 
 /// Closes a connection and then stops its stream readers when the connection
-/// task ends it: at teardown, on a panic, or when the task is dropped.
+/// task ends a connection that is still open: at teardown, on a panic, or
+/// when the task is dropped.
 ///
 /// The readers' token is not a child of the teardown token, so a node-wide
 /// cancel cannot reach them before the close.
 ///
-/// A connection that ends without us, closed by the peer or lost, keeps its
-/// readers. The peer may close as soon as we acknowledge its last frames, and
-/// a reader can still have those frames in its buffer. Stopped, it would lose
-/// frames the peer counts as delivered. On a closed connection a read returns
-/// the buffered bytes and then the end, so each reader ends on its own.
+/// A connection that has ended without us, closed by the peer or lost, keeps
+/// its readers, however the task ends. The peer may close as soon as we
+/// acknowledge its last frames, and a reader can still have those frames in
+/// its buffer. Stopped, it would lose frames the peer counts as delivered. On
+/// a closed connection a read returns the buffered bytes and then the end, so
+/// each reader ends on its own. `accept_bi` fails only once the connection has
+/// ended, so its error path is this case too.
 struct CloseThenStop {
-    /// `None` once the connection has ended without us.
-    connection: Option<quinn::Connection>,
+    connection: quinn::Connection,
     readers: CancellationToken,
 }
 
 impl Drop for CloseThenStop {
     fn drop(&mut self) {
-        let Some(connection) = &self.connection else {
+        // Also keeps us from calling `close()` on an ended connection, which
+        // would replace its error with `LocallyClosed`.
+        if self.connection.close_reason().is_some() {
             return;
-        };
-        // quinn's `close()` replaces the error of a connection that has
-        // already ended with `LocallyClosed`, which a reader would read as an
-        // orderly end.
-        if connection.close_reason().is_none() {
-            connection.close(quinn::VarInt::from_u32(0), b"shutdown");
         }
+        self.connection
+            .close(quinn::VarInt::from_u32(0), b"shutdown");
         self.readers.cancel();
     }
 }
@@ -426,7 +423,6 @@ mod tests {
     ///
     /// The control observes the peer close, then tears down while the reader is paused.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "F3: a dropped task cancels readers after a peer close, discarding acknowledged frames"]
     async fn dropping_a_peer_closed_connection_task_preserves_acknowledged_frames() {
         struct PausedReader {
             entered: tokio::sync::Notify,
