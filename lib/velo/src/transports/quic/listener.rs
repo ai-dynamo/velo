@@ -127,9 +127,8 @@ async fn serve_connection(connection: quinn::Connection, ctx: AcceptContext) {
                     "QUIC: connection from {peer} ended: {e:#} (close reason: {:?})",
                     connection.close_reason()
                 );
-                // Already ended. quinn's `close()` would replace its error with
-                // `LocallyClosed`, and a reader not yet woken would read a lost
-                // connection as an orderly end.
+                // Ended without us: leave the readers to drain what quinn
+                // has already acknowledged, and end on their own.
                 guard.connection = None;
                 break;
             }
@@ -137,12 +136,17 @@ async fn serve_connection(connection: quinn::Connection, ctx: AcceptContext) {
     }
 }
 
-/// Closes a connection and then stops its stream readers, however the
-/// connection task ends: teardown, a lost connection, a panic, or the task
-/// dropped.
+/// Closes a connection and then stops its stream readers when the connection
+/// task ends it: at teardown, on a panic, or when the task is dropped.
 ///
 /// The readers' token is not a child of the teardown token, so a node-wide
 /// cancel cannot reach them before the close.
+///
+/// A connection that ends without us, closed by the peer or lost, keeps its
+/// readers. The peer may close as soon as we acknowledge its last frames, and
+/// a reader can still have those frames in its buffer. Stopped, it would lose
+/// frames the peer counts as delivered. On a closed connection a read returns
+/// the buffered bytes and then the end, so each reader ends on its own.
 struct CloseThenStop {
     /// `None` once the connection has ended without us.
     connection: Option<quinn::Connection>,
@@ -151,9 +155,13 @@ struct CloseThenStop {
 
 impl Drop for CloseThenStop {
     fn drop(&mut self) {
-        if let Some(connection) = &self.connection
-            && connection.close_reason().is_none()
-        {
+        let Some(connection) = &self.connection else {
+            return;
+        };
+        // quinn's `close()` replaces the error of a connection that has
+        // already ended with `LocallyClosed`, which a reader would read as an
+        // orderly end.
+        if connection.close_reason().is_none() {
             connection.close(quinn::VarInt::from_u32(0), b"shutdown");
         }
         self.readers.cancel();
@@ -502,7 +510,6 @@ mod tests {
     /// Resuming the reader must deliver all eight frames. The control resumes
     /// it before the peer closes.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    #[ignore = "F2: a peer close cancels readers before acknowledged frames reach the adapter"]
     async fn a_peer_close_preserves_acknowledged_frames() {
         struct PausedReader {
             entered: tokio::sync::Notify,
