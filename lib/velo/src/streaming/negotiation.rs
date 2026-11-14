@@ -16,9 +16,10 @@
 //! Every asymmetry here exists to keep a mixed deployment working. The receiver
 //! prefers `messenger-mux-v2` **only** when the sender named it, because
 //! `resolve_transport` hard-errors on a key it does not know and a receiver that
-//! answered the mux unilaterally would break every older sender. A node with the
-//! default builder registers both the mux and a per-stream transport to serve
-//! older peers. An explicit mux-only builder rejects peers without mux support.
+//! answered the mux unilaterally would break every older sender. A node built
+//! with a stream config registers both the mux and a per-stream transport to
+//! serve older peers. A node without one, the default, has the mux alone and
+//! rejects peers without mux support.
 //!
 //! The credit fields carry the rest of the agreement, and their two zeros mean
 //! different things: no window means *not offering the mux*, no byte cap means
@@ -119,7 +120,8 @@ pub(crate) struct Terms {
 /// The mux wins when both sides named it. Otherwise the sender must support
 /// the local default transport. An empty offer comes from an older sender,
 /// which did not negotiate: preserve that peer's default-transport behavior.
-/// A mux-only instance has no per-stream transport and rejects that sender.
+/// An instance whose default transport is the mux has no per-stream
+/// transport and rejects that sender.
 ///
 /// When the mux wins, the stream is placed on a lane for `peer`, the sender
 /// that asked, by `lane_key` if it gave one
@@ -146,9 +148,13 @@ pub(crate) fn select(
             target: Target::Mux(Arc::clone(mux), lane),
         });
     }
+    // The message reaches the sender as its attach error; it names the
+    // receiver's fix, because the sender cannot make one.
     anyhow::ensure!(
         default_transport.key().as_str() != MESSENGER_MUX_KEY,
-        "peer does not support the messenger mux required by this instance"
+        "peer does not support the messenger mux, and this instance has no per-stream \
+         transport to serve it on: build this instance with stream_config or \
+         stream_bind_addr to accept streams from peers without the mux"
     );
     anyhow::ensure!(
         offered.is_empty() || offered.contains(&default_transport.key()),

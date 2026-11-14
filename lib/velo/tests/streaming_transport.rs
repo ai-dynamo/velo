@@ -246,57 +246,121 @@ async fn test_velo_facade_mpsc_with_config() {
 // Default-config coverage
 // ---------------------------------------------------------------------------
 
-/// `Velo::builder().add_transport(t).build()` — no `.stream_config()` and no
-/// `.messenger_mux()` call — must wire a TCP streaming transport under the
-/// `tcp-stream` key and the mux under `messenger-mux-v2`, and register both.
-/// The default-config path otherwise has zero coverage: every other test in
-/// this file calls `.stream_config(...)` explicitly, so a regression that
-/// swapped either builder default would slip through CI.
+/// `Velo::builder().add_transport(t).build()`, with no `.stream_config()`
+/// and no `.messenger_mux()` call, installs the mux as its only stream
+/// transport. It opens no per-stream listener and advertises no stream
+/// endpoint. A per-stream listener is something a node asks for.
 #[tokio::test(flavor = "multi_thread")]
-async fn test_velo_builder_default_stream_config_is_tcp() {
-    let transport = {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        Arc::new(
-            velo::transports::tcp::TcpTransportBuilder::new()
-                .from_listener(listener)
-                .unwrap()
-                .build()
-                .unwrap(),
-        )
-    };
-
-    let velo = velo::Velo::builder()
-        .add_transport(transport)
-        .build()
-        .await
-        .unwrap();
+async fn the_default_builder_installs_only_the_mux() {
+    let velo = tcp_node(velo::Velo::builder()).await;
 
     // The transport registry has no `Velo` form.
     #[allow(deprecated)]
-    let registry = &velo.anchor_manager().transport_registry;
-    assert!(
-        registry.contains_key("tcp-stream"),
-        "default StreamConfig must wire TcpFrameTransport (key='tcp-stream'); registry: {:?}",
-        registry.keys().collect::<Vec<_>>()
+    let manager = velo.anchor_manager();
+    assert_eq!(
+        manager.transport_registry.keys().collect::<Vec<_>>(),
+        [velo::streaming::MESSENGER_MUX_KEY],
+        "a default node installs the mux and nothing else"
     );
-    assert!(
-        registry.contains_key(velo::streaming::MESSENGER_MUX_KEY),
-        "the builder must install the mux by default; registry: {:?}",
-        registry.keys().collect::<Vec<_>>()
+    assert_eq!(
+        manager.transport.key().as_str(),
+        velo::streaming::MESSENGER_MUX_KEY,
+        "the mux is the default node's stream transport"
     );
-    assert_eq!(registry.len(), 2);
-
-    // The local PeerInfo's WorkerAddress must include the streaming entry too,
-    // so peers can resolve our streaming endpoint via PeerDiscovery.
     let advertised = velo
         .peer_info()
         .worker_address()
         .available_transports()
         .expect("decode advertised transports");
     assert!(
-        advertised.iter().any(|k| k.as_str() == "tcp-stream"),
-        "default-config peer_info must advertise 'tcp-stream' alongside messenger keys; got {advertised:?}"
+        !advertised
+            .iter()
+            .any(|k| k.as_str() == "tcp-stream" || k.as_str() == "grpc-stream"),
+        "a default node advertises no stream endpoint; got {advertised:?}"
     );
+    velo.shutdown(velo::ShutdownPolicy::WaitForever).await;
+}
+
+/// `stream_config` and `stream_bind_addr` still install the per-stream
+/// transport beside the mux, register both, and advertise the stream
+/// endpoint, so a node that opts in serves peers without the mux.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_explicit_stream_config_installs_the_per_stream_transport() {
+    let opted_in = [
+        (
+            velo::Velo::builder()
+                .stream_config(velo::StreamConfig::Tcp(None))
+                .unwrap(),
+            "tcp-stream",
+        ),
+        (
+            velo::Velo::builder().stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into()),
+            "tcp-stream",
+        ),
+        #[cfg(feature = "grpc")]
+        (
+            velo::Velo::builder()
+                .stream_config(velo::StreamConfig::Grpc(Some(velo::GrpcConfig {
+                    bind_addr: "127.0.0.1:0".parse().unwrap(),
+                })))
+                .unwrap(),
+            "grpc-stream",
+        ),
+    ];
+    for (builder, key) in opted_in {
+        let velo = tcp_node(builder).await;
+        // The transport registry has no `Velo` form.
+        #[allow(deprecated)]
+        let manager = velo.anchor_manager();
+        let mut keys = manager
+            .transport_registry
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        let mut expected = vec![
+            key.to_string(),
+            velo::streaming::MESSENGER_MUX_KEY.to_string(),
+        ];
+        expected.sort();
+        assert_eq!(
+            keys, expected,
+            "{key}: the per-stream transport and the mux"
+        );
+        assert_eq!(manager.transport.key().as_str(), key);
+        let advertised = velo
+            .peer_info()
+            .worker_address()
+            .available_transports()
+            .expect("decode advertised transports");
+        assert!(
+            advertised.iter().any(|k| k.as_str() == key),
+            "an opted-in node advertises {key}; got {advertised:?}"
+        );
+        velo.shutdown(velo::ShutdownPolicy::WaitForever).await;
+    }
+}
+
+/// With the mux off and no stream config a node would have no remote stream
+/// transport at all. `build` refuses it before it starts a transport, and
+/// the error names the two calls that opt in to the per-stream path, so the
+/// fix is in the message.
+#[tokio::test]
+async fn a_disabled_mux_without_a_stream_config_fails_the_build() {
+    let error = match velo::Velo::builder()
+        .messenger_mux(velo::streaming::MuxConfig {
+            enabled: false,
+            ..Default::default()
+        })
+        .unwrap()
+        .build()
+        .await
+    {
+        Ok(_) => panic!("a node with no stream transport was built"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("stream_config"), "{error}");
+    assert!(error.contains("stream_bind_addr"), "{error}");
 }
 
 // ---------------------------------------------------------------------------
@@ -357,6 +421,7 @@ async fn test_discover_and_register_peer_fans_out_to_streaming() {
         tcp_node(
             velo::Velo::builder()
                 .discovery(discovery.clone() as Arc<dyn PeerDiscovery>)
+                .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
                 .messenger_mux(velo::streaming::MuxConfig {
                     enabled: false,
                     ..Default::default()
@@ -416,11 +481,17 @@ async fn test_discover_and_register_peer_fans_out_to_streaming() {
 // The mux is the default
 // ---------------------------------------------------------------------------
 
+/// Two nodes on the default builder, or, with `mux`, two that set the mux
+/// config in code and opt in to the per-stream path, which a disabled mux
+/// needs.
 async fn default_pair(mux: Option<velo::streaming::MuxConfig>) -> (velo::Velo, velo::Velo) {
     let mk = || async {
         let mut builder = velo::Velo::builder();
         if let Some(config) = mux.clone() {
-            builder = builder.messenger_mux(config).unwrap();
+            builder = builder
+                .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
+                .messenger_mux(config)
+                .unwrap();
         }
         tcp_node(builder).await
     };
@@ -470,8 +541,9 @@ async fn two_default_nodes_stream_over_the_mux() {
     );
 }
 
-/// `enabled: false` on both nodes is the rollback: the attach negotiates the
-/// per-stream transport, and the stream still flows.
+/// `enabled: false` on both nodes that opted in to the per-stream path is
+/// the rollback: the attach negotiates the per-stream transport, and the
+/// stream still flows.
 #[tokio::test(flavor = "multi_thread")]
 async fn turning_the_mux_off_falls_back_to_the_per_stream_transport() {
     let off = velo::streaming::MuxConfig {
@@ -592,12 +664,16 @@ async fn mux_only_carries_streams_and_large_messages() {
     .expect("mux-only operations must finish");
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn mux_only_rejects_peers_that_need_a_stream_listener() {
+/// A node with the mux as its only stream transport refuses an attach from a
+/// peer that does not offer the mux, for SPSC and MPSC, and the refusal
+/// names the calls that would let it serve that peer. The reverse attach
+/// fails on the peer, which finds no transport in common.
+async fn refuses_peers_that_need_a_stream_listener(receiver: velo::VeloBuilder) {
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
-        let mux = tcp_node(velo::Velo::builder().mux_only()).await;
+        let mux = tcp_node(receiver).await;
         let legacy = tcp_node(
             velo::Velo::builder()
+                .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
                 .messenger_mux(velo::streaming::MuxConfig {
                     enabled: false,
                     ..Default::default()
@@ -607,27 +683,29 @@ async fn mux_only_rejects_peers_that_need_a_stream_listener() {
         .await;
         mux.register_peer(legacy.peer_info()).unwrap();
         legacy.register_peer(mux.peer_info()).unwrap();
+        let refused = |error: String| {
+            assert!(
+                error.contains("does not support the messenger mux"),
+                "{error}"
+            );
+            assert!(error.contains("stream_config"), "{error}");
+            assert!(error.contains("stream_bind_addr"), "{error}");
+        };
         let anchor = mux.create_anchor::<u32>();
-        let error = legacy
-            .attach_anchor::<u32>(anchor.handle())
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("does not support the messenger mux"),
-            "{error}"
+        refused(
+            legacy
+                .attach_anchor::<u32>(anchor.handle())
+                .await
+                .unwrap_err()
+                .to_string(),
         );
         let mpsc = mux.create_mpsc_anchor::<u32>();
-        let error = legacy
-            .attach_mpsc_anchor::<u32>(mpsc.handle())
-            .await
-            .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("does not support the messenger mux"),
-            "{error}"
+        refused(
+            legacy
+                .attach_mpsc_anchor::<u32>(mpsc.handle())
+                .await
+                .unwrap_err()
+                .to_string(),
         );
         let legacy_anchor = legacy.create_anchor::<u32>();
         let error = mux
@@ -644,6 +722,18 @@ async fn mux_only_rejects_peers_that_need_a_stream_listener() {
     })
     .await
     .expect("incompatible peers must fail promptly");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn mux_only_rejects_peers_that_need_a_stream_listener() {
+    refuses_peers_that_need_a_stream_listener(velo::Velo::builder().mux_only()).await;
+}
+
+/// A default node has no per-stream listener, so it refuses a peer without
+/// the mux the way a `mux_only()` node does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_default_node_rejects_peers_that_need_a_stream_listener() {
+    refuses_peers_that_need_a_stream_listener(velo::Velo::builder()).await;
 }
 
 #[tokio::test]

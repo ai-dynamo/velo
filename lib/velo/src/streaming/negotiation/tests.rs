@@ -212,6 +212,28 @@ fn a_nonempty_offer_must_include_the_selected_transport() {
     assert!(select(&[], None, &legacy(), peer(), None).is_ok());
 }
 
+/// A node whose stream transport is the mux, the default since the
+/// per-stream path became opt-in, has nothing to serve a sender without the
+/// mux on. The refusal names the calls that would give it something, because
+/// it reaches the sender as the attach error, far from the receiver's code.
+#[tokio::test]
+async fn a_mux_default_refuses_a_sender_without_the_mux_and_names_the_opt_in() {
+    let mux = mux(MuxConfig::default()).await;
+    let default_transport = Arc::clone(&mux) as Arc<dyn FrameTransport>;
+    for offered in [keys(&["tcp-stream"]), keys(&[])] {
+        let Err(error) = select(&offered, Some(&mux), &default_transport, peer(), None) else {
+            panic!("{offered:?}: a sender without the mux was accepted");
+        };
+        let error = error.to_string();
+        assert!(
+            error.contains("does not support the messenger mux"),
+            "{error}"
+        );
+        assert!(error.contains("stream_config"), "{error}");
+        assert!(error.contains("stream_bind_addr"), "{error}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // What a sender does with the answer
 // ---------------------------------------------------------------------------

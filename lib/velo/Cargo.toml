@@ -210,6 +210,11 @@ path = "tests/streaming/mux_rendezvous.rs"
 required-features = ["test-helpers"]
 
 [[test]]
+name = "streaming_default_node_peers"
+# One test in a binary of its own: it installs a global tracing subscriber.
+path = "tests/streaming/default_node_peers.rs"
+
+[[test]]
 name = "streaming_mux_kill_switch"
 # One test in a binary of its own: it sets a process-wide environment variable.
 path = "tests/streaming/mux_kill_switch.rs"

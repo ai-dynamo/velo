@@ -149,16 +149,18 @@ impl Default for GrpcConfig {
 ///
 /// # Default
 ///
-/// Unless [`VeloBuilder::mux_only`] is set, if neither
-/// [`VeloBuilder::stream_config`] nor [`VeloBuilder::stream_bind_addr`]
-/// is called, the builder defaults to [`StreamConfig::Tcp(None)`](StreamConfig::Tcp)
-/// — bind `0.0.0.0:<ephemeral>` and advertise every UP non-loopback interface
-/// via [`Vec<InterfaceEndpoint>`](crate::transports::utils::interfaces::InterfaceEndpoint)
+/// None. A builder that calls neither [`VeloBuilder::stream_config`] nor
+/// [`VeloBuilder::stream_bind_addr`] opens no per-stream listener: the
+/// messenger mux carries its remote streams, and a peer without the mux
+/// cannot attach to it. Set a `StreamConfig` to serve such peers, or to keep
+/// streaming with the mux turned off.
+///
+/// `StreamConfig::Tcp(None)` binds `0.0.0.0:<ephemeral>` and advertises every
+/// UP non-loopback interface via
+/// [`Vec<InterfaceEndpoint>`](crate::transports::utils::interfaces::InterfaceEndpoint)
 /// in the local [`WorkerAddress`]. The peer-side `register()` walks the
 /// advertised list and calls `select_best_endpoint` (NUMA + subnet match)
-/// against its own interfaces to choose a routable address — multi-node
-/// correctness comes from interface advertisement, not from defaulting away
-/// from TCP.
+/// against its own interfaces to choose a routable address.
 ///
 /// # Variants
 ///
@@ -390,7 +392,14 @@ impl VeloBuilder {
         self
     }
 
-    /// Set the streaming transport configuration.
+    /// Opt in to the per-stream path: install a TCP or gRPC stream listener
+    /// beside the messenger mux.
+    ///
+    /// Without this call, or [`stream_bind_addr`](Self::stream_bind_addr),
+    /// the node opens no stream listener, and a peer that does not offer the
+    /// mux cannot attach to it. With it, each attach picks the mux or this
+    /// transport from what the peer offers, and turning the mux off falls
+    /// back to this transport.
     ///
     /// Only one transport server is allowed per Velo instance. Returns [`Err`]
     /// if called more than once on the same builder.
@@ -404,8 +413,9 @@ impl VeloBuilder {
         Ok(self)
     }
 
-    /// Convenience: pin the TCP streaming listener to a single interface IP
-    /// (instead of the default `0.0.0.0` + multi-interface advertise).
+    /// Opt in to the per-stream path with a TCP stream listener pinned to one
+    /// interface IP, instead of `0.0.0.0` and every interface advertised.
+    /// See [`stream_config`](Self::stream_config).
     pub fn stream_bind_addr(self, addr: std::net::IpAddr) -> Self {
         self.stream_config(StreamConfig::Tcp(Some(TcpConfig::new(addr))))
             .unwrap()
@@ -420,18 +430,24 @@ impl VeloBuilder {
     /// to tune it, or with `enabled: false` to turn it off, in which case
     /// nothing is registered and nothing is advertised.
     ///
-    /// Unless `mux_only()` is selected, the per-stream transport stays
-    /// configured either way — a mux-enabled
-    /// node registers both, and each attach picks between them from what the
-    /// peer advertised, so a peer without the mux is still served. **Rollback
-    /// is the same flag**: set it to `false` and the node stops advertising
-    /// `messenger-mux-v2`, so the next attach negotiates the per-stream path.
-    /// No code change, no wire change, and no coordination with peers, because
-    /// a key that is never advertised is never selected. An application that
-    /// never calls this can still turn the mux off: set
+    /// A node that opted in to the per-stream path with
+    /// [`stream_config`](Self::stream_config) or
+    /// [`stream_bind_addr`](Self::stream_bind_addr) registers both
+    /// transports, and each attach picks between them from what the peer
+    /// advertised, so a peer without the mux is still served. On such a node
+    /// **rollback is the same flag**: set it to `false` and the node stops
+    /// advertising `messenger-mux-v2`, so the next attach negotiates the
+    /// per-stream path. No wire change and no coordination with peers,
+    /// because a key that is never advertised is never selected. An
+    /// application that never calls this can still turn the mux off: set
     /// `VELO_MESSENGER_MUX_DISABLE=1` and restart. The variable is read once,
     /// per [`build`](Self::build), and it wins over `enabled: true` set in
-    /// code. With `mux_only()`, disabling the mux makes the build fail.
+    /// code.
+    ///
+    /// A node with no stream config has no per-stream transport to fall back
+    /// to, so turning its mux off, by either form, makes
+    /// [`build`](Self::build) fail with an error that names `stream_config`
+    /// and `stream_bind_addr`. So does `mux_only()`.
     ///
     /// Only one mux may be installed per instance: its `_stream_batch` handler
     /// is registered on the messenger for its lifetime. The messenger would
@@ -449,9 +465,11 @@ impl VeloBuilder {
 
     /// Use only the messenger mux for remote streams, with no extra listener.
     ///
-    /// Peers must support the messenger mux. An explicit `stream_config` or
+    /// A builder with no stream config already does this. `mux_only()` also
+    /// makes the choice explicit: an explicit `stream_config` or
     /// `stream_bind_addr`, a disabled mux, or an active
-    /// `VELO_MESSENGER_MUX_DISABLE` makes `build` return an error.
+    /// `VELO_MESSENGER_MUX_DISABLE` makes `build` return an error that names
+    /// `mux_only`. Peers must support the messenger mux.
     pub fn mux_only(mut self) -> Self {
         self.mux_only = true;
         self
@@ -517,21 +535,38 @@ impl VeloBuilder {
 
     /// Build the Velo system with the configured transports and discovery.
     ///
-    /// Validates the streaming mode before starting transports. Default builds
-    /// install the mux beside a per-stream TCP or gRPC listener. `mux_only`
-    /// installs only the mux. Both modes retain the full rendezvous API.
+    /// Validates the streaming mode before starting transports. A builder with
+    /// no stream config, and one that calls `mux_only`, installs only the mux.
+    /// A builder with `stream_config` or `stream_bind_addr` installs the mux
+    /// beside a per-stream TCP or gRPC listener. Every mode retains the full
+    /// rendezvous API.
+    ///
+    /// # Errors
+    ///
+    /// Fails before it starts a transport when the mux is turned off, by
+    /// `MuxConfig { enabled: false, .. }` or `VELO_MESSENGER_MUX_DISABLE`, and
+    /// no stream config is set, because the node would have no remote stream
+    /// transport. Also fails when `mux_only` is combined with a stream config
+    /// or a disabled mux.
     pub async fn build(self) -> Result<Velo> {
         anyhow::ensure!(
             !self.mux_only || self.stream_config.is_none(),
             "mux_only cannot be combined with stream_config or stream_bind_addr"
         );
         self.reservation_config.validate()?;
+        let mode = if self.mux_only {
+            StreamMode::MuxOnly
+        } else if self.stream_config.is_some() {
+            StreamMode::PerStream
+        } else {
+            StreamMode::MuxDefault
+        };
         // Read the override once at build so this instance keeps the same
         // transport offers for every attach.
         let config = resolve_mux_config(
             self.mux_config.unwrap_or_default(),
             messenger_mux_disabled_by_env(),
-            self.mux_only,
+            mode,
         )?;
         let messenger = self.inner.build().await?;
         let worker_id = messenger.instance_id().worker_id();
@@ -547,41 +582,42 @@ impl VeloBuilder {
             None
         };
 
-        // Default builds keep a per-stream listener for peers without the mux.
-        // In mux-only mode, the mux itself fills the default transport field.
-        // Set metrics before type erasure: the public FrameTransport trait
-        // must not require Prometheus in external implementations.
+        // A node with a stream config keeps a per-stream listener for peers
+        // without the mux. Otherwise the mux itself fills the default
+        // transport field. Set metrics before type erasure: the public
+        // FrameTransport trait must not require Prometheus in external
+        // implementations.
         let (stream_transport, owned_stream_transport): (
             Arc<dyn crate::streaming::FrameTransport>,
             Option<OwnedStreamTransport>,
-        ) = if self.mux_only {
-            let mux = mux
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("mux_only requires the messenger mux"))?;
-            (Arc::clone(mux) as _, None)
-        } else {
-            match self.stream_config.unwrap_or(StreamConfig::Tcp(None)) {
-                StreamConfig::Tcp(tcp_cfg) => {
-                    let bind_addr = tcp_cfg.unwrap_or_default().bind_addr;
-                    let tcp = crate::streaming::TcpFrameTransport::new(bind_addr).await?;
-                    if let Some(metrics) = &self.metrics {
-                        tcp.set_metrics(Arc::clone(metrics));
-                    }
-                    (tcp.clone() as _, Some(OwnedStreamTransport::Tcp(tcp)))
+        ) = match self.stream_config {
+            None => {
+                // `resolve_mux_config` refused a disabled mux in this mode.
+                let mux = mux.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("no stream config requires the messenger mux")
+                })?;
+                (Arc::clone(mux) as _, None)
+            }
+            Some(StreamConfig::Tcp(tcp_cfg)) => {
+                let bind_addr = tcp_cfg.unwrap_or_default().bind_addr;
+                let tcp = crate::streaming::TcpFrameTransport::new(bind_addr).await?;
+                if let Some(metrics) = &self.metrics {
+                    tcp.set_metrics(Arc::clone(metrics));
                 }
-                #[cfg(feature = "grpc")]
-                StreamConfig::Grpc(grpc_cfg) => {
-                    let bind_addr = grpc_cfg.unwrap_or_default().bind_addr;
-                    let grpc = crate::streaming::GrpcFrameTransport::new(bind_addr)
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!("Failed to start gRPC streaming transport: {e}")
-                        })?;
-                    if let Some(metrics) = &self.metrics {
-                        grpc.set_metrics(Arc::clone(metrics));
-                    }
-                    (grpc.clone() as _, Some(OwnedStreamTransport::Grpc(grpc)))
+                (tcp.clone() as _, Some(OwnedStreamTransport::Tcp(tcp)))
+            }
+            #[cfg(feature = "grpc")]
+            Some(StreamConfig::Grpc(grpc_cfg)) => {
+                let bind_addr = grpc_cfg.unwrap_or_default().bind_addr;
+                let grpc = crate::streaming::GrpcFrameTransport::new(bind_addr)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to start gRPC streaming transport: {e}")
+                    })?;
+                if let Some(metrics) = &self.metrics {
+                    grpc.set_metrics(Arc::clone(metrics));
                 }
+                (grpc.clone() as _, Some(OwnedStreamTransport::Grpc(grpc)))
             }
         };
         // Every way the messenger learns a peer reaches the stream
@@ -600,7 +636,7 @@ impl VeloBuilder {
             stream_transport.key().as_str().to_string(),
             Arc::clone(&stream_transport),
         );
-        if !self.mux_only
+        if owned_stream_transport.is_some()
             && let Some(mux) = &mux
         {
             registry.insert(
@@ -747,15 +783,45 @@ fn rdma_rendezvous_disabled_by_env() -> bool {
     )
 }
 
+/// Which remote stream transports [`VeloBuilder::build`] installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamMode {
+    /// `mux_only()`: the mux alone, chosen explicitly.
+    MuxOnly,
+    /// No stream config: the mux alone, by default.
+    MuxDefault,
+    /// `stream_config` or `stream_bind_addr`: a per-stream listener, with
+    /// the mux beside it unless the mux is off.
+    PerStream,
+}
+
+/// The mux config `build` installs, with the kill switch applied, or the
+/// reason the node cannot start.
+///
+/// Kept apart from the environment read so the whole grid of mode, config
+/// and switch can be tested without setting a process-wide variable.
 fn resolve_mux_config(
     mut config: crate::streaming::MuxConfig,
     disabled_by_env: bool,
-    mux_only: bool,
+    mode: StreamMode,
 ) -> Result<crate::streaming::MuxConfig> {
-    anyhow::ensure!(
-        !mux_only || (config.enabled && !disabled_by_env),
-        "mux_only requires the messenger mux; it was disabled by config or VELO_MESSENGER_MUX_DISABLE"
-    );
+    let mux_off = !config.enabled || disabled_by_env;
+    match mode {
+        StreamMode::MuxOnly => anyhow::ensure!(
+            !mux_off,
+            "mux_only requires the messenger mux; it was disabled by config or VELO_MESSENGER_MUX_DISABLE"
+        ),
+        // Checked before any transport starts: without the mux this node
+        // would have no remote stream transport, and every attach to it would
+        // fail long after startup.
+        StreamMode::MuxDefault => anyhow::ensure!(
+            !mux_off,
+            "the messenger mux is disabled (by MuxConfig::enabled or VELO_MESSENGER_MUX_DISABLE) \
+             and no per-stream transport is configured: call stream_config or stream_bind_addr \
+             on the builder to stream without the mux"
+        ),
+        StreamMode::PerStream => {}
+    }
     if disabled_by_env && config.enabled {
         tracing::info!("VELO_MESSENGER_MUX_DISABLE is set: disabling the messenger mux");
         config.enabled = false;
@@ -1073,10 +1139,12 @@ impl Velo {
     /// Get the peer information for this instance.
     ///
     /// The returned [`PeerInfo`] carries the messenger transport entries.
-    /// Default builds also publish a per-stream endpoint, such as `tcp-stream`
-    /// or `grpc-stream`, for [`crate::streaming::FrameTransport::register`].
-    /// In [`VeloBuilder::mux_only`] mode the primary stream transport is the
-    /// mux, which uses the messenger endpoints and adds no streaming endpoint.
+    /// A node built with [`VeloBuilder::stream_config`] or
+    /// [`VeloBuilder::stream_bind_addr`] also publishes a per-stream endpoint,
+    /// such as `tcp-stream` or `grpc-stream`, for
+    /// [`crate::streaming::FrameTransport::register`]. Otherwise the primary
+    /// stream transport is the mux, which uses the messenger endpoints and
+    /// adds no streaming endpoint.
     pub fn peer_info(&self) -> PeerInfo {
         self.inner.messenger.backend().advertised_peer_info()
     }
@@ -1746,14 +1814,44 @@ impl Velo {
 mod tests {
     use super::*;
 
+    /// Every mode against both kill-switch forms, the config field and the
+    /// environment variable. Only a node that opted in to the per-stream path
+    /// starts with the mux off; the other two would have no remote stream
+    /// transport, and each says which call to make.
     #[test]
-    fn mux_only_rejects_the_environment_kill_switch() {
-        assert!(resolve_mux_config(Default::default(), true, true).is_err());
-        assert!(
-            !resolve_mux_config(Default::default(), true, false)
-                .unwrap()
-                .enabled
-        );
+    fn the_kill_switch_needs_a_stream_config() {
+        for mode in [
+            StreamMode::MuxOnly,
+            StreamMode::MuxDefault,
+            StreamMode::PerStream,
+        ] {
+            for enabled in [true, false] {
+                for disabled_by_env in [false, true] {
+                    let config = crate::streaming::MuxConfig {
+                        enabled,
+                        ..Default::default()
+                    };
+                    let case = format!("{mode:?}, enabled {enabled}, env {disabled_by_env}");
+                    let resolved = resolve_mux_config(config, disabled_by_env, mode);
+                    let mux_off = !enabled || disabled_by_env;
+                    match (mode, mux_off) {
+                        (_, false) => assert!(resolved.unwrap().enabled, "{case}"),
+                        (StreamMode::PerStream, true) => {
+                            assert!(!resolved.unwrap().enabled, "{case}")
+                        }
+                        (StreamMode::MuxOnly, true) => {
+                            let error = resolved.unwrap_err().to_string();
+                            assert!(error.contains("mux_only"), "{case}: {error}");
+                        }
+                        (StreamMode::MuxDefault, true) => {
+                            let error = resolved.unwrap_err().to_string();
+                            assert!(error.contains("stream_config"), "{case}: {error}");
+                            assert!(error.contains("stream_bind_addr"), "{case}: {error}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Every kill switch fires on an affirmative and on nothing else.
@@ -2059,8 +2157,11 @@ mod tests {
                     .unwrap(),
             )
         };
+        // Opt in to the per-stream path: this test checks that shutdown
+        // closes its listener.
         let velo = Velo::builder()
             .add_transport(transport)
+            .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
             .build()
             .await
             .unwrap();

@@ -1124,8 +1124,9 @@ pub struct AnchorManager {
     pub(crate) mpsc_registry: Arc<DashMap<u64, crate::streaming::mpsc::anchor::MpscAnchorEntry>>,
 
     /// Default transport for local setup and legacy negotiation. This is the
-    /// mux in `VeloBuilder::mux_only()` mode; otherwise it is the configured
-    /// per-stream transport. The registry lists every installed transport.
+    /// configured per-stream transport when the `Velo` builder set a stream
+    /// config, and the mux otherwise. The registry lists every installed
+    /// transport.
     pub transport: Arc<dyn crate::streaming::transport::FrameTransport>,
 
     /// Transport registry: maps scheme (e.g., "tcp", "velo") to the FrameTransport

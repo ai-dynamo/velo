@@ -201,15 +201,17 @@ pub struct MuxConfig {
     /// **Defaults to `true`.** The per-stream transport opens a connection for
     /// each stream; at a few thousand new streams a second that exhausts the
     /// local port range, and the mux carries the same streams over the
-    /// connection each peer already has. The mux still negotiates per attach,
-    /// so a peer that does not offer it is served on the per-stream transport.
+    /// connection each peer already has. On a node built with a stream config
+    /// the mux still negotiates per attach, so a peer that does not offer it
+    /// is served on the per-stream transport.
     ///
-    /// This flag is also the rollback: set it to `false` and the node stops
-    /// registering `messenger-mux-v2` and stops advertising it on attach, so
-    /// the next attach negotiates the per-stream path with no code change and
-    /// no wire change. `VELO_MESSENGER_MUX_DISABLE=1` does the same at
-    /// build time, for an application that does not expose this field; it
-    /// wins over `enabled: true` set in code.
+    /// On such a node this flag is also the rollback: set it to `false` and
+    /// the node stops registering `messenger-mux-v2` and stops advertising it
+    /// on attach, so the next attach negotiates the per-stream path with no
+    /// wire change. `VELO_MESSENGER_MUX_DISABLE=1` does the same at build
+    /// time, for an application that does not expose this field; it wins over
+    /// `enabled: true` set in code. A node with no stream config has no
+    /// per-stream path, so either form makes its `build` fail.
     ///
     /// Complete on the node that mints zero-RTT tickets — with no mux there is
     /// no ticket, and every stream attaches the ordinary way — but not
