@@ -29,6 +29,13 @@ use futures::future::BoxFuture;
 /// limitations" appendix describes the stall and the other workaround
 /// (`block_in_place` or `spawn_blocking`).
 ///
+/// Some of velo's work stays on the application's runtime: the streams'
+/// heartbeat, watchdog and deadline timers, and velo's own handlers (stream
+/// attach, rendezvous, first contact). A timer is woken by the runtime's
+/// driver, not into a held worker's LIFO slot, so one held worker does not
+/// stall it. But a hold of every worker at once for longer than a few
+/// heartbeat intervals can still end a stream as if its producer had died.
+///
 /// # What it costs
 ///
 /// Each wake between the application and velo becomes a wake across threads.
