@@ -136,7 +136,7 @@ Why separate methods: `next` cannot skip serde for `Bytes` alone. Rust has no sp
 
 Frames travel on one of two paths:
 
-- **A frame transport.** The builder sets it with `stream_config`. `StreamConfig::Tcp` is the default. `StreamConfig::Grpc` needs the `grpc` feature. Each stream sends its own frames. This path carries a stream when the peer does not offer the mux, or when the mux is off.
+- **A frame transport.** The builder installs it only when it calls `stream_config` or `stream_bind_addr`. `StreamConfig::Grpc` needs the `grpc` feature. Each stream sends its own frames. This path carries a stream when the peer does not offer the mux, or when the mux is off. Without it, a peer that does not offer the mux cannot attach, and the mux cannot be turned off.
 - **Batched streaming (the mux).** The builder installs it by default. `messenger_mux(MuxConfig)` changes its settings or turns it off. Records from many streams to the same peer share one messenger frame, with credit-based flow control for each stream. See [Batched streaming](batched-streaming.md).
 
 ```rust,ignore

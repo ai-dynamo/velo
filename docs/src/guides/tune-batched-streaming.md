@@ -6,9 +6,11 @@ The mux is on by default, and most deployments change nothing. Keep the defaults
 
 ## The mux is on by default
 
-A `Velo` builder installs the mux with `MuxConfig::default()`. The per-stream transport stays configured beside it, because negotiation needs it to serve peers that do not offer the mux. An attach uses the mux only when both sides advertise `messenger-mux-v2`. Every other pair uses the per-stream path.
+A `Velo` builder installs the mux with `MuxConfig::default()`. With no stream config, the mux is the node's only stream transport, and a peer that does not offer the mux cannot attach. A builder that calls `stream_config` or `stream_bind_addr` also installs a per-stream transport. On that node, an attach uses the mux only when both sides advertise `messenger-mux-v2`. Every other pair uses the per-stream path.
 
 To turn the mux off without a code change, set `VELO_MESSENGER_MUX_DISABLE=1` and restart the process. Only `1`, `true`, `yes` and `on` (any case) count. Velo reads the variable once, when it builds the node. The variable wins over `enabled: true` set in code, so a benchmark that must measure the mux must not inherit it.
+
+The switch needs a stream config. A node with no `stream_config` or `stream_bind_addr` has no per-stream transport to fall back to, so with the mux off, by the variable or by `enabled: false`, its `build()` fails. The error names `stream_config` and `stream_bind_addr`. Add one of them before you rely on the switch.
 
 A node with the mux runs one sweep task, which wakes five times a second, and registers 16 batch handlers (`_stream_batch` for lane 0 and `_stream_batch.1` to `_stream_batch.15`), even if it never streams. A handler costs a map entry until its first batch.
 
@@ -20,7 +22,7 @@ use velo::{StreamConfig, TcpConfig, Velo};
 
 let velo = Velo::builder()
     .add_transport(transport)
-    // The per-stream path stays configured. Negotiation picks per attach.
+    // A disabled mux needs the per-stream path. Negotiation picks per attach.
     .stream_config(StreamConfig::Tcp(Some(TcpConfig::new(bind_addr))))?
     .messenger_mux(MuxConfig {
         enabled: false, // Turn the mux off. Omit this line to keep it on.
@@ -180,6 +182,8 @@ A ticket sender observes `stop_token()` and `cancellation_token()` through the m
 The ticket stays valid for the configured accept window (180 seconds by default). After the window, the consumer reaps the bind and sees `SenderDropped`.
 
 ## Roll back
+
+A rollback needs a per-stream path on every node that rolls back. A node without `stream_config` or `stream_bind_addr` fails to start with the mux off: add one first.
 
 1. Set `enabled: false`, or set `VELO_MESSENGER_MUX_DISABLE=1`, on the nodes that mint tickets.
 2. Restart those nodes.

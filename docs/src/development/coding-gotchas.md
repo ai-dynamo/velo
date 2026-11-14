@@ -572,3 +572,16 @@ endpoint is closed.
 Tests: `transports::ucx::transport::tests::an_endpoint_is_not_reaped_while_its_peer_sets_up`
 and `transports::ucx::transport::tests::an_endpoint_whose_peer_never_sends_is_reaped_after_the_setup_bound`
 (`lib/velo/src/transports/ucx/tests.rs`).
+
+## A per-thread log capture misses events in a shared test binary
+
+**Rule.** To assert on what velo logs, give the test a binary of its own, install the capture with `tracing::subscriber::set_global_default`, and assert one line that must appear before you assert that a line is absent. Do not capture with `tracing::subscriber::set_default` in a binary whose other tests log at the same time.
+
+`tracing` keeps its per-callsite filter state for the whole process, and every test thread that logs shares it. A per-thread subscriber is one input to that state among the threads that log beside it.
+
+**Failure.** A test that set a per-thread subscriber and then built two nodes captured nothing at all, not even the transports' start-up lines, in 4 of 5 runs of its module beside the other tests. Run alone, it passed. Its "no warning" check would have passed for nothing. Only the check that a debug line appears caught it.
+
+**Test.** Run the capture test with the rest of its binary, 50 times. A check that a line is absent proves nothing until a check in the same capture shows that a line is present.
+
+Test: `a_default_node_learns_peers_without_a_per_stream_transport`
+(`lib/velo/tests/streaming/default_node_peers.rs`).
