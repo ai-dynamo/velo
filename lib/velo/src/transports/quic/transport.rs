@@ -77,6 +77,13 @@ impl CloseGrace {
     }
 }
 
+/// Test seam: every connection a transport dials, when a test asked for them
+/// with `QuicTransportBuilder::record_dialed`. The test reads their quinn
+/// statistics. Off by default, because a held `quinn::Connection` keeps its
+/// connection alive.
+#[cfg(test)]
+pub(crate) type DialedConnections = Arc<parking_lot::Mutex<Vec<quinn::Connection>>>;
+
 mod builder;
 pub use builder::QuicTransportBuilder;
 
@@ -140,6 +147,8 @@ pub struct QuicTransport {
     metrics: OnceLock<Arc<dyn velo_ext::TransportObservability>>,
     dialed_ctx: OnceLock<DialedReaderContext>,
     close_grace: CloseGrace,
+    #[cfg(test)]
+    dialed: Option<DialedConnections>,
 }
 
 /// A registered peer: where to dial, and the TLS config that pins its
@@ -310,6 +319,8 @@ impl QuicTransport {
                     reader_ctx: self.dialed_ctx.get().cloned(),
                     metrics: self.metrics.get().cloned(),
                     close_grace: self.close_grace,
+                    #[cfg(test)]
+                    dialed: self.dialed.clone(),
                 },
             ),
             rt,
@@ -722,6 +733,8 @@ struct WriterTaskContext {
     reader_ctx: Option<DialedReaderContext>,
     metrics: Option<Arc<dyn velo_ext::TransportObservability>>,
     close_grace: CloseGrace,
+    #[cfg(test)]
+    dialed: Option<DialedConnections>,
 }
 
 /// Dial, then write frames until the channel closes, a write fails, or the
@@ -779,6 +792,8 @@ async fn connection_writer_inner(
         reader_ctx,
         metrics,
         close_grace,
+        #[cfg(test)]
+        dialed,
         ..
     } = ctx;
 
@@ -791,6 +806,10 @@ async fn connection_writer_inner(
             res.context("connect timeout")?.context("QUIC handshake failed")?
         },
     };
+    #[cfg(test)]
+    if let Some(dialed) = &dialed {
+        dialed.lock().push(connection.clone());
+    }
     let (mut send, recv) = connection
         .open_bi()
         .await

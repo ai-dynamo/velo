@@ -44,6 +44,8 @@ pub struct QuicTransportBuilder {
     shrink_threshold: usize,
     lanes: std::num::NonZeroU16,
     close_grace: super::CloseGrace,
+    #[cfg(test)]
+    dialed: Option<super::DialedConnections>,
 }
 
 impl QuicTransportBuilder {
@@ -68,6 +70,8 @@ impl QuicTransportBuilder {
             shrink_threshold: DEFAULT_SHRINK_THRESHOLD,
             lanes: std::num::NonZeroU16::MIN,
             close_grace: super::CloseGrace::DEFAULT,
+            #[cfg(test)]
+            dialed: None,
         }
     }
 
@@ -196,6 +200,13 @@ impl QuicTransportBuilder {
         self
     }
 
+    /// Test seam: push every connection this transport dials into `into`.
+    #[cfg(test)]
+    pub(crate) fn record_dialed(mut self, into: super::DialedConnections) -> Self {
+        self.dialed = Some(into);
+        self
+    }
+
     /// Read-buffer size above which a reader gives the excess back after a
     /// frame (default: the TCP transport's). The codec reserves the whole
     /// frame length, so without this one large frame pins that much memory
@@ -296,6 +307,8 @@ impl QuicTransportBuilder {
             metrics: OnceLock::new(),
             dialed_ctx: OnceLock::new(),
             close_grace: self.close_grace,
+            #[cfg(test)]
+            dialed: self.dialed,
         })
     }
 }

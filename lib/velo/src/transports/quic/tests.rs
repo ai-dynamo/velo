@@ -210,10 +210,23 @@ async fn started_with(builder: QuicTransportBuilder) -> (QuicTransport, DataStre
     (transport, streams, id)
 }
 
+/// 200 round trips of 64 KiB frames, then the packets quinn declared lost.
+///
+/// A send batch above the UDP datagram limit is refused by the kernel while
+/// quinn-udp reports success, so every flight is lost and quinn counts the
+/// loss. On loopback, with one 64 KiB frame in flight at a time, nothing else
+/// is lost. The test counts lost packets rather than timing the round trips:
+/// a lost flight costs a loss-probe timeout, but a loaded host is slow too,
+/// and time cannot tell the two apart.
 async fn large_frames_round_trip(max_mtu: Option<u16>) {
-    let configure = |b: QuicTransportBuilder| match max_mtu {
-        Some(m) => b.max_mtu(m),
-        None => b,
+    const ROUND_TRIPS: u32 = 200;
+    let dialed = super::DialedConnections::default();
+    let configure = |b: QuicTransportBuilder| {
+        let b = b.record_dialed(Arc::clone(&dialed));
+        match max_mtu {
+            Some(m) => b.max_mtu(m),
+            None => b,
+        }
     };
     let (a, a_streams, a_id) = started_with(configure(QuicTransportBuilder::new())).await;
     let (b, b_streams, b_id) = started_with(configure(QuicTransportBuilder::new())).await;
@@ -223,8 +236,9 @@ async fn large_frames_round_trip(max_mtu: Option<u16>) {
         .unwrap();
     let errors = Arc::new(Errors::default());
     let payload = Bytes::from(vec![7u8; 64 * 1024]);
-    let started_at = std::time::Instant::now();
-    for i in 0..200u32 {
+    // Only catches a hang: a lost flight costs tens of milliseconds.
+    let hang = Duration::from_secs(30);
+    for i in 0..ROUND_TRIPS {
         let _ = a.send_message(
             b_id,
             Bytes::from(i.to_le_bytes().to_vec()),
@@ -232,27 +246,25 @@ async fn large_frames_round_trip(max_mtu: Option<u16>) {
             MessageType::Event,
             errors.clone(),
         );
-        let (h, p) =
-            tokio::time::timeout(Duration::from_secs(5), b_streams.event_stream.recv_async())
-                .await
-                .unwrap_or_else(|_| panic!("request {i} stalled (max_mtu {max_mtu:?})"))
-                .unwrap();
+        let (h, p) = tokio::time::timeout(hang, b_streams.event_stream.recv_async())
+            .await
+            .unwrap_or_else(|_| panic!("request {i} stalled (max_mtu {max_mtu:?})"))
+            .unwrap();
         let _ = b.send_message(a_id, h, p, MessageType::Response, errors.clone());
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            a_streams.response_stream.recv_async(),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("response {i} stalled (max_mtu {max_mtu:?})"))
-        .unwrap();
+        tokio::time::timeout(hang, a_streams.response_stream.recv_async())
+            .await
+            .unwrap_or_else(|_| panic!("response {i} stalled (max_mtu {max_mtu:?})"))
+            .unwrap();
     }
-    // Each round trip takes well under a millisecond on loopback. A lost
-    // send batch costs a loss-probe timeout per flight, tens of ms each, and
-    // 200 round trips then take seconds.
-    let elapsed = started_at.elapsed();
+    let (connections, lost) = {
+        let dialed = dialed.lock();
+        let lost: u64 = dialed.iter().map(|c| c.stats().path.lost_packets).sum();
+        (dialed.len(), lost)
+    };
+    assert_eq!(connections, 2, "each side dials the other once");
     assert!(
-        elapsed < Duration::from_secs(2),
-        "200 round trips of 64 KiB took {elapsed:?} (max_mtu {max_mtu:?}); \
+        lost < u64::from(ROUND_TRIPS) / 10,
+        "{lost} packets lost in {ROUND_TRIPS} round trips of 64 KiB (max_mtu {max_mtu:?}); \
          a send batch above the UDP datagram limit is lost on every flight"
     );
     a.shutdown();
