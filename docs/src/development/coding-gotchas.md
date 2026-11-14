@@ -143,3 +143,15 @@ Test: `transports::tests::an_absent_route_does_not_block_a_queued_send_error_han
 
 Test: `a_default_node_learns_peers_without_a_per_stream_transport`
 (`lib/velo/tests/streaming/default_node_peers.rs`).
+
+## Work a cancelled caller must not cut short runs on a task, and the runtime stops after it
+
+**Rule.** When a future can be dropped part way (a cancelled `build`, a cancelled `shutdown`, a drop), work that must finish anyway does not run inline in that future. Run it on a task of the runtime it belongs to, and let the future only await that task. Stop a runtime only after that work is done: the last drop of a dedicated runtime waits for the teardown and each transport's close, and a stop in flight is shared, so a second caller waits for it.
+
+A future that is dropped drops what it was awaiting. A transport's close, a runtime join, or a teardown awaited inline is then lost, and a runtime stopped next takes the tasks that held the rest with it.
+
+**Failure.** A transport's shutdown hook runs against a runtime whose timer and I/O drivers are gone, so a task it spawns is cancelled and its close never finishes. Or the next `shutdown` returns while the runtime's threads still run.
+
+**Test.** Drop the `build` or `shutdown` future after one poll, with a transport whose close is held on a channel, then check that a task spawned on the runtime still runs. Count panics with a process-wide panic hook: a panic on a `velo-rt` thread or a teardown thread never reaches the test's `JoinHandle`.
+
+Test: `cancelling_a_failed_start_during_close_preserves_the_close` (`lib/velo/tests/task_runtime.rs`).

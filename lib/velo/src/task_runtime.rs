@@ -49,8 +49,8 @@ use crate::transports::VeloBackend;
 /// # What it costs
 ///
 /// Each wake between the application and velo becomes a wake across threads.
-/// Measured on loopback TCP with the mux, one dedicated thread against the
-/// application's runtime:
+/// Measured on one exclusive 72-core aarch64 node (tokio 1.54), over loopback
+/// TCP with the mux, one dedicated thread against the application's runtime:
 ///
 /// - A single caller making one unary call at a time took about 3.5 times as
 ///   long per call and about 4 times the CPU, because the call no longer runs
@@ -63,10 +63,10 @@ use crate::transports::VeloBackend;
 ///
 /// # Threads
 ///
-/// [`TaskRuntime::Dedicated`] takes 1 or 2 threads; [`VeloBuilder::build`]
+/// [`TaskRuntime::Dedicated`] takes 1 or 2 threads. [`VeloBuilder::build`]
 /// refuses any other count. More threads helped only while there were more
 /// busy peer lanes than threads: with one busy peer, 1 thread beat 2 and 4 in
-/// throughput and p99; with four busy peers, 2 threads did best and 4 were no
+/// throughput and p99. With four busy peers, 2 threads did best and 4 were no
 /// better on streams. CPU per record rose with each thread added.
 ///
 /// # Lifetime
@@ -90,7 +90,7 @@ pub enum TaskRuntime {
     /// [`VeloBuilder::build`](crate::VeloBuilder::build). The default.
     ///
     /// Application code must not hold a worker thread right after it calls
-    /// velo; see the type's documentation.
+    /// velo. See the type's documentation.
     Application,
     /// Run velo's tasks on a multi-thread runtime that velo builds and shuts
     /// down, with `threads` worker threads named `velo-rt`. `threads` must be
@@ -136,7 +136,7 @@ impl Default for TaskRuntime {
 pub(crate) const THREAD_NAME: &str = "velo-rt";
 
 /// How long a stop waits for the runtime's threads. A task that blocks a
-/// runtime thread past this keeps that thread; the stop does not wait for it.
+/// runtime thread past this keeps that thread, and the stop does not wait for it.
 const STOP_GRACE: Duration = Duration::from_secs(2);
 
 /// How long a stop from a drop waits for the transports' teardown and close.
@@ -156,7 +156,7 @@ enum State {
     /// on this, so none returns before the threads have exited, even when
     /// the caller that started the stop was cancelled.
     Stopping(Shared<BoxFuture<'static, ()>>),
-    /// Stopped from a drop; no caller waits.
+    /// Stopped from a drop. No caller waits.
     Stopped,
 }
 
