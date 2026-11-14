@@ -21,6 +21,7 @@
 - [Migrate ownership, dispatch, and cancellation to 0.19](guides/migrate-dispatch-and-cancellation.md)
 - [Migrate to the Velo handle in 0.21](guides/migrate-velo-handle.md)
 - [Services and mux-only mode](guides/migrate-services.md)
+- [Move off the Messenger front door in 0.22.1](guides/migrate-messenger-front-door.md)
 - [Write an out-of-tree transport](guides/out-of-tree-transport.md)
 - [Tune batched streaming](guides/tune-batched-streaming.md)
 - [Run rendezvous over RDMA](guides/ucx-rdma.md)
