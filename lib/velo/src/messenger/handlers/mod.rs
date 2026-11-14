@@ -200,6 +200,10 @@ pub struct OrderedConfig {
     pub(crate) max_concurrent: Option<usize>,
     pub(crate) max_queue_depth: Option<usize>,
     pub(crate) overflow: OverflowPolicy,
+    /// Run the lanes on velo's task runtime rather than the messenger's.
+    /// Only for velo's own handlers that do no application work: the mux's
+    /// batch lanes.
+    pub(crate) on_task_runtime: bool,
 }
 
 impl Default for OrderedConfig {
@@ -213,6 +217,7 @@ impl Default for OrderedConfig {
             max_concurrent: None,
             max_queue_depth: None,
             overflow: OverflowPolicy::Warn,
+            on_task_runtime: false,
         }
     }
 }

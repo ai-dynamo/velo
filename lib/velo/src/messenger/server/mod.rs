@@ -40,6 +40,7 @@ impl ActiveMessageServer {
         large_payload_resolver: Arc<
             std::sync::OnceLock<Arc<dyn crate::messenger::large_payload::LargePayloadResolver>>,
         >,
+        runtime: &tokio::runtime::Handle,
     ) -> Self {
         let shutdown_state = data_streams.shutdown_state.clone();
         let teardown = shutdown_state.teardown_token().clone();
@@ -52,31 +53,39 @@ impl ActiveMessageServer {
         // Spawn message handler with direct dispatch (hot path)
         // Public waits include receive loops. Internal shutdown joins only
         // these loops, so application tasks cannot extend its timeout.
-        tracker.spawn(public_tracker.track_future(create_message_handler(
-            message_rx,
-            hub.clone(),
-            observability.clone(),
-            large_payload_resolver,
-            shutdown_state,
-        )));
+        // On velo's task runtime. Handlers leave it: dispatchers spawn them on
+        // the messenger's runtime.
+        tracker.spawn_on(
+            public_tracker.track_future(create_message_handler(
+                message_rx,
+                hub.clone(),
+                observability.clone(),
+                large_payload_resolver,
+                shutdown_state,
+            )),
+            runtime,
+        );
 
-        tracker.spawn(
+        tracker.spawn_on(
             public_tracker.track_future(teardown.clone().run_until_cancelled_owned(
                 create_response_handler(response_manager.clone(), response_rx),
             )),
+            runtime,
         );
-        tracker.spawn(
+        tracker.spawn_on(
             public_tracker.track_future(teardown.clone().run_until_cancelled_owned(
                 create_ack_and_event_handler(response_manager.clone(), event_rx),
             )),
+            runtime,
         );
-        tracker.spawn(
+        tracker.spawn_on(
             public_tracker.track_future(
                 teardown.run_until_cancelled_owned(create_shutdown_handler(
                     response_manager,
                     shutdown_rx,
                 )),
             ),
+            runtime,
         );
         Self { tracker, hub }
     }

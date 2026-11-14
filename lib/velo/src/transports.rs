@@ -242,14 +242,20 @@ impl Drop for StartupTransports {
 }
 
 impl VeloBackend {
-    /// Create a new backend from a list of transports.
+    /// Create a new backend from a list of transports, started on `runtime`.
     ///
     /// Each transport is started (bound, listening) and its address is merged
     /// into a composite [`WorkerAddress`]. Returns the backend and the
     /// [`DataStreams`] receivers for inbound messages.
-    pub async fn new(
+    ///
+    /// Each `start` is polled with `runtime` entered, so the sockets, tasks and
+    /// timers it creates belong to `runtime` even when a transport, or a
+    /// library under it, spawns or binds through the current context. Their
+    /// shutdown hooks run with `runtime` entered too.
+    pub(crate) async fn new(
         backend_transports: Vec<Arc<dyn Transport>>,
         observability: Option<Arc<VeloMetrics>>,
+        runtime: tokio::runtime::Handle,
     ) -> anyhow::Result<(Self, DataStreams)> {
         let instance_id = InstanceId::new_v4();
 
@@ -265,8 +271,6 @@ impl VeloBackend {
             shutdown: Some(shutdown_state.clone()),
         };
 
-        let runtime = tokio::runtime::Handle::current();
-
         let startup = async {
             for transport in backend_transports {
                 let key = transport.key();
@@ -281,9 +285,11 @@ impl VeloBackend {
                     );
                     transport_metrics.insert(key.clone(), handle);
                 }
-                transport
-                    .start(instance_id, adapter.clone(), runtime.clone())
-                    .await?;
+                crate::task_runtime::entered(
+                    &runtime,
+                    transport.start(instance_id, adapter.clone(), runtime.clone()),
+                )
+                .await?;
                 started
                     .transports
                     .insert(key.clone(), Arc::clone(&transport));
@@ -957,6 +963,20 @@ impl VeloBackend {
         // process that exits right after this returns does not discard frames
         // a transport keeps in user space (QUIC). Each transport bounds its
         // own wait; the default returns at once.
+        self.closed().await;
+    }
+
+    /// Teardown, then each transport's [`Transport::closed`], without the
+    /// panic [`finish_shutdown`](Self::finish_shutdown) raises on a failed
+    /// teardown: for a drop, which has no caller to tell. A failed teardown
+    /// may never set up what `closed` waits on, so it skips the wait.
+    pub(crate) async fn teardown_and_close(&self) {
+        if self.request_teardown().await.is_ok() {
+            self.closed().await;
+        }
+    }
+
+    async fn closed(&self) {
         futures::future::join_all(self.transports.values().map(|t| t.closed())).await;
     }
 }

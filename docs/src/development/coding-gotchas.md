@@ -27,7 +27,9 @@ Another wake can reach the task first: a heartbeat, a credit reply, or a timer. 
 
 **Test.** Force the other interleaving: pause threads under a debugger, or add a concurrent wake. Then see whether the assertion still holds. Keep a demonstration of the stall as an ignored test.
 
-Test: `block_in_place_keeps_the_stream` is the live test of the workaround, and `a_held_worker_thread_cuts_the_stream` is the ignored demonstration of the stall (`lib/velo/tests/streaming/held_thread.rs`).
+A test may assert what holds whatever tokio decides: that nothing on a held runtime runs while every one of its workers is held, or that work on another runtime does not wait for the hold.
+
+Test: `block_in_place_keeps_the_stream` is the live test of the workaround, and `a_held_worker_thread_cuts_the_stream` is the ignored demonstration of the stall (`lib/velo/tests/streaming/held_thread.rs`). In `lib/velo/tests/streaming/stall_rows.rs` the `dedicated_*` tests are live, because velo's tasks run on a runtime the test does not hold, and the `application_*` tests are the ignored demonstrations.
 
 ## A cancel wakes child tokens before the parent's own waiters
 

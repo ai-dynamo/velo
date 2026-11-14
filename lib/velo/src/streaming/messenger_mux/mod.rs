@@ -132,7 +132,7 @@ use crate::messenger::large_payload::RefusedPayload;
 use crate::observability::{MuxMetricsHandle, VeloMetrics};
 use crate::streaming::deadline::DeadlineQueue;
 use crate::streaming::transport::FrameTransport;
-use crate::{Context, Handler};
+use crate::{Context, Handler, OrderedConfig};
 
 pub use self::config::{AutoFlush, FlushPolicy, MuxConfig};
 pub(crate) use self::lane::{LaneIndex, PeerLane, is_batch_handler};
@@ -399,7 +399,7 @@ impl MessengerMuxTransport {
             ..config
         };
         let (drain_tx, drain_rx) = drain_wake_lane();
-        let tasks = crate::streaming::tasks::StreamTasks::new(messenger.runtime().clone());
+        let tasks = crate::streaming::tasks::StreamTasks::new(messenger.task_runtime().clone());
         let core = Arc::new(MuxCore {
             messenger: Arc::clone(&messenger),
             config,
@@ -442,7 +442,11 @@ impl MessengerMuxTransport {
             // Ordered per sender. This is the whole reason the mux can drop the
             // reorder window the deprecated AM transport needed: batches from
             // one peer on one lane are handled by one task, in arrival order.
-            .ordered()
+            // The lanes are velo's ingress, so they run on velo's task runtime.
+            .ordered_with(OrderedConfig {
+                on_task_runtime: true,
+                ..OrderedConfig::by_sender()
+            })
             .build();
             // Records and credit of open streams: see
             // `register_drain_exempt_handler`.

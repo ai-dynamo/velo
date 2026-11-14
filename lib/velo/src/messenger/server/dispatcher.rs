@@ -222,7 +222,10 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispa
     fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>) {
         let handler = self.handler.clone();
         let ctx = call.into_context(Arc::clone(system));
-        tokio::spawn(async move {
+        // On the messenger's runtime, not the current one: this runs on the
+        // inbound loop, which may be on velo's own runtime. From a worker of
+        // the messenger's runtime it is the same local push as `tokio::spawn`.
+        system.runtime().spawn(async move {
             run_handler(&*handler, ctx, DispatchFailure::HandlerPanic).await;
         });
     }
@@ -382,7 +385,11 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
             consumer,
             LaneRouterConfig {
                 idle_ttl: self.config.idle_lane_ttl,
-                runtime: system.runtime().clone(),
+                runtime: if self.config.on_task_runtime {
+                    system.task_runtime().clone()
+                } else {
+                    system.runtime().clone()
+                },
                 tracker: system.tracker().clone(),
                 observer,
             },

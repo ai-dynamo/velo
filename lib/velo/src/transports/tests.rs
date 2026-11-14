@@ -44,6 +44,8 @@ struct MockTransport {
     queue: OnceLock<(AdmissionGate<()>, flume::Receiver<()>)>,
     /// Every peer `unregister` was called with, in order.
     unregistered: std::sync::Mutex<Vec<InstanceId>>,
+    /// The runtime current while the `start` future ran.
+    start_context: OnceLock<tokio::runtime::Id>,
 }
 
 impl MockTransport {
@@ -75,6 +77,7 @@ impl MockTransport {
             saturating: false,
             queue: OnceLock::new(),
             unregistered: Default::default(),
+            start_context: OnceLock::new(),
         })
     }
 
@@ -106,6 +109,7 @@ impl MockTransport {
             saturating: true,
             queue: OnceLock::new(),
             unregistered: Default::default(),
+            start_context: OnceLock::new(),
         })
     }
 
@@ -180,6 +184,9 @@ impl Transport for MockTransport {
             let _ = self.queue.set((AdmissionGate::new(tx, rt), rx));
         }
         Box::pin(async {
+            let _ = self
+                .start_context
+                .set(tokio::runtime::Handle::current().id());
             anyhow::ensure!(!self.fail_start, "mock startup failure");
             if self.pending_start {
                 std::future::pending::<()>().await;
@@ -256,12 +263,40 @@ fn make_peer_info(keys: &[&str]) -> PeerInfo {
     PeerInfo::new(instance_id, address)
 }
 
+/// `start` runs with the backend's runtime entered, not the caller's. A
+/// transport that spawns with `tokio::spawn` in `start`, or a library under it
+/// that binds a socket through the current context, then lands on the runtime
+/// it was given: velo's own under `TaskRuntime::Dedicated`.
+#[tokio::test]
+async fn start_runs_with_the_given_runtime_entered() {
+    let other = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    let t = MockTransport::new("tcp", true);
+    let (_backend, _streams) = VeloBackend::new(
+        vec![t.clone() as Arc<dyn Transport>],
+        None,
+        other.handle().clone(),
+    )
+    .await
+    .unwrap();
+    assert_ne!(other.handle().id(), tokio::runtime::Handle::current().id());
+    assert_eq!(t.start_context.get(), Some(&other.handle().id()));
+    other.shutdown_background();
+}
+
 #[tokio::test]
 async fn test_new_single_transport() {
     let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![t.clone() as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
 
     assert!(t.started.load(Ordering::Relaxed));
     // instance_id should be a valid v4 UUID (non-zero)
@@ -279,6 +314,7 @@ async fn test_new_multiple_transports() {
             t2.clone() as Arc<dyn Transport>,
         ],
         None,
+        tokio::runtime::Handle::current(),
     )
     .await
     .unwrap();
@@ -298,6 +334,7 @@ async fn test_register_peer_selects_primary_by_priority() {
             t2.clone() as Arc<dyn Transport>,
         ],
         None,
+        tokio::runtime::Handle::current(),
     )
     .await
     .unwrap();
@@ -316,9 +353,13 @@ async fn test_register_peer_selects_primary_by_priority() {
 async fn test_register_peer_no_compatible_transports() {
     // Transport rejects all registrations
     let t = MockTransport::new("tcp", false);
-    let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![t as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
 
     let peer = make_peer_info(&["tcp"]);
     let result = backend.register_peer(peer);
@@ -331,9 +372,13 @@ async fn test_register_peer_no_compatible_transports() {
 #[tokio::test]
 async fn test_register_peer_stores_worker_mapping() {
     let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![t as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
 
     let peer = make_peer_info(&["tcp"]);
     let peer_id = peer.instance_id();
@@ -349,9 +394,13 @@ async fn test_register_peer_stores_worker_mapping() {
 #[tokio::test]
 async fn a_send_on_a_lane_reaches_the_transport_on_that_lane() {
     let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![t.clone() as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
     let peer = make_peer_info(&["tcp"]);
     let peer_id = peer.instance_id();
     backend.register_peer(peer).unwrap();
@@ -390,9 +439,13 @@ async fn a_send_on_a_lane_reaches_the_transport_on_that_lane() {
 #[tokio::test]
 async fn test_send_message_routes_to_primary() {
     let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![t.clone() as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
 
     let peer = make_peer_info(&["tcp"]);
     let peer_id = peer.instance_id();
@@ -420,9 +473,13 @@ async fn test_send_message_pending_admission() {
     // A saturated per-target channel should surface SendOutcome::Pending, and
     // the admission must resolve once the channel has room again.
     let t = MockTransport::new_saturating("tcp");
-    let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![t.clone() as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
 
     let peer = make_peer_info(&["tcp"]);
     let peer_id = peer.instance_id();
@@ -462,9 +519,13 @@ async fn test_consumer_hook_does_not_suppress_backend_bookkeeping() {
     // attaching its own observer silently disabled the backend's error
     // reporting. This pins the additive contract end to end.
     let t = MockTransport::new_saturating("tcp");
-    let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![t.clone() as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
 
     let peer = make_peer_info(&["tcp"]);
     let peer_id = peer.instance_id();
@@ -529,6 +590,7 @@ async fn unregister_peer_drops_routes_and_tells_every_transport() {
             refuses.clone() as Arc<dyn Transport>,
         ],
         None,
+        tokio::runtime::Handle::current(),
     )
     .await
     .unwrap();
@@ -581,9 +643,13 @@ async fn unregister_peer_drops_routes_and_tells_every_transport() {
 #[tokio::test]
 async fn test_send_message_unregistered_peer() {
     let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![t as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
 
     let result = backend.send_message(
         InstanceId::new_v4(),
@@ -598,9 +664,13 @@ async fn test_send_message_unregistered_peer() {
 #[tokio::test]
 async fn test_send_message_with_transport_primary_match() {
     let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![t.clone() as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
 
     let peer = make_peer_info(&["tcp"]);
     let peer_id = peer.instance_id();
@@ -630,6 +700,7 @@ async fn test_send_message_with_transport_alternative() {
             t2.clone() as Arc<dyn Transport>,
         ],
         None,
+        tokio::runtime::Handle::current(),
     )
     .await
     .unwrap();
@@ -656,9 +727,13 @@ async fn test_send_message_with_transport_alternative() {
 #[tokio::test]
 async fn test_send_message_with_transport_not_found() {
     let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![t as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
 
     let peer = make_peer_info(&["tcp"]);
     let peer_id = peer.instance_id();
@@ -678,9 +753,13 @@ async fn test_send_message_with_transport_not_found() {
 #[tokio::test]
 async fn test_try_translate_worker_id_not_found() {
     let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![t as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
 
     let result = backend.try_translate_worker_id(InstanceId::new_v4().worker_id());
     assert!(matches!(
@@ -700,6 +779,7 @@ async fn failed_start_closes_all_transports_already_started() {
             failing.clone() as Arc<dyn Transport>,
         ],
         None,
+        tokio::runtime::Handle::current(),
     )
     .await;
     assert!(result.is_err());
@@ -717,6 +797,7 @@ async fn test_set_transport_priority_valid() {
     let (backend, _streams) = VeloBackend::new(
         vec![t1 as Arc<dyn Transport>, t2 as Arc<dyn Transport>],
         None,
+        tokio::runtime::Handle::current(),
     )
     .await
     .unwrap();
@@ -734,6 +815,7 @@ async fn test_set_transport_priority_rejects_duplicate_without_changing_priority
     let (backend, _streams) = VeloBackend::new(
         vec![tcp as Arc<dyn Transport>, ucx as Arc<dyn Transport>],
         None,
+        tokio::runtime::Handle::current(),
     )
     .await
     .unwrap();
@@ -750,9 +832,13 @@ async fn test_set_transport_priority_rejects_duplicate_without_changing_priority
 #[tokio::test]
 async fn test_set_transport_priority_wrong_length() {
     let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![t as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
 
     let result =
         backend.set_transport_priority(vec![TransportKey::from("tcp"), TransportKey::from("http")]);
@@ -765,9 +851,13 @@ async fn test_set_transport_priority_wrong_length() {
 #[tokio::test]
 async fn test_set_transport_priority_unknown_key() {
     let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![t as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
 
     let result = backend.set_transport_priority(vec![TransportKey::from("unknown")]);
     assert!(matches!(
@@ -786,6 +876,7 @@ async fn test_graceful_shutdown_calls_all_transports() {
             t2.clone() as Arc<dyn Transport>,
         ],
         None,
+        tokio::runtime::Handle::current(),
     )
     .await
     .unwrap();
@@ -1043,7 +1134,11 @@ async fn failed_build_with_a_panicking_hook_returns_without_closing() {
     Arc::get_mut(&mut failing).unwrap().fail_start = true;
     let result = tokio::time::timeout(
         Duration::from_secs(2),
-        VeloBackend::new(vec![started.clone(), failing.clone()], None),
+        VeloBackend::new(
+            vec![started.clone(), failing.clone()],
+            None,
+            tokio::runtime::Handle::current(),
+        ),
     )
     .await
     .expect("a failed build waited on a transport whose hook failed");
@@ -1133,9 +1228,13 @@ async fn velo_shutdown_retry_sees_a_failure_no_waiter_observed() {
 #[tokio::test]
 async fn test_peer_info_roundtrip() {
     let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![t as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
 
     let info = backend.peer_info();
     assert_eq!(info.instance_id(), backend.instance_id());
@@ -1146,7 +1245,11 @@ async fn cancelled_start_stops_only_completed_transports() {
     let ready = MockTransport::new("ready", true);
     let mut pending = MockTransport::new("pending", true);
     Arc::get_mut(&mut pending).unwrap().pending_start = true;
-    let mut build = Box::pin(VeloBackend::new(vec![ready.clone(), pending.clone()], None));
+    let mut build = Box::pin(VeloBackend::new(
+        vec![ready.clone(), pending.clone()],
+        None,
+        tokio::runtime::Handle::current(),
+    ));
     assert!(futures::poll!(build.as_mut()).is_pending());
     assert!(ready.started.load(Ordering::Relaxed));
     assert!(pending.started.load(Ordering::Relaxed));
@@ -1182,9 +1285,13 @@ impl PeerTableObserver for RecordingObserver {
 #[tokio::test]
 async fn the_peer_table_observer_follows_registration() {
     let accepting = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![accepting as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![accepting as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
     let early = make_peer_info(&["tcp"]);
     let early_id = early.instance_id();
     backend.register_peer(early).unwrap();
@@ -1214,9 +1321,13 @@ async fn the_peer_table_observer_follows_registration() {
     );
 
     let refusing = MockTransport::new("tcp", false);
-    let (backend, _streams) = VeloBackend::new(vec![refusing as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![refusing as Arc<dyn Transport>],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
     let observer = Arc::new(RecordingObserver::default());
     backend
         .set_peer_observer(Arc::clone(&observer) as Arc<dyn PeerTableObserver>)
@@ -1303,7 +1414,10 @@ async fn a_delayed_unregister_does_not_erase_a_new_stream_registration() {
         entered: entered_tx,
         release: release_rx,
     });
-    let (backend, _streams) = VeloBackend::new(vec![transport], None).await.unwrap();
+    let (backend, _streams) =
+        VeloBackend::new(vec![transport], None, tokio::runtime::Handle::current())
+            .await
+            .unwrap();
     let backend = Arc::new(backend);
     let stream = crate::streaming::TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
         .await
@@ -1557,7 +1671,10 @@ async fn unregister_allows_send_error_handlers_to_register_another_peer() {
             .build()
             .unwrap(),
     );
-    let (backend, _streams) = VeloBackend::new(vec![tcp.clone()], None).await.unwrap();
+    let (backend, _streams) =
+        VeloBackend::new(vec![tcp.clone()], None, tokio::runtime::Handle::current())
+            .await
+            .unwrap();
     let backend = Arc::new(backend);
     let peer = PeerInfo::new(InstanceId::new_v4(), tcp.address());
     let id = peer.instance_id();
@@ -1655,7 +1772,10 @@ async fn unregister_does_not_block_registration_from_an_active_send_error_handle
             .build()
             .unwrap(),
     );
-    let (backend, _streams) = VeloBackend::new(vec![tcp.clone()], None).await.unwrap();
+    let (backend, _streams) =
+        VeloBackend::new(vec![tcp.clone()], None, tokio::runtime::Handle::current())
+            .await
+            .unwrap();
     let backend = Arc::new(backend);
     let peer = PeerInfo::new(InstanceId::new_v4(), tcp.address());
     let id = peer.instance_id();
@@ -1854,9 +1974,13 @@ async fn an_absent_route_does_not_block_a_queued_send_error_handler() {
         entered: entered_tx,
         release: release_rx,
     });
-    let (backend, _streams) = VeloBackend::new(vec![transport.clone()], None)
-        .await
-        .unwrap();
+    let (backend, _streams) = VeloBackend::new(
+        vec![transport.clone()],
+        None,
+        tokio::runtime::Handle::current(),
+    )
+    .await
+    .unwrap();
     let backend = Arc::new(backend);
     let peer = PeerInfo::new(InstanceId::new_v4(), transport.address());
     let id = peer.instance_id();

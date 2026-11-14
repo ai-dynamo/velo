@@ -30,6 +30,7 @@ pub mod observability;
 pub mod queue;
 pub mod rendezvous;
 pub mod streaming;
+mod task_runtime;
 pub mod transports;
 
 #[cfg(feature = "simulation")]
@@ -67,6 +68,7 @@ pub use crate::messenger::handlers::{
     OverflowPolicy, SyncExecutor, TypedContext, TypedUnaryHandlerBuilder, UnaryHandlerBuilder,
     UnifiedResponse,
 };
+pub use crate::task_runtime::TaskRuntime;
 
 // Events
 #[cfg(feature = "services")]
@@ -262,7 +264,43 @@ struct VeloInner {
     /// running. It would free arena pages the NIC may still have. Every clone
     /// reaches the same `VeloInner`, so every clone contends on the same lock.
     shutdown: ShutdownOnce,
+    /// The runtime velo's own tasks run on, under [`TaskRuntime::Dedicated`].
+    task_runtime: Option<crate::task_runtime::VeloRuntime>,
 }
+
+/// Under [`TaskRuntime::Dedicated`], the last drop stops velo's runtime, on a
+/// background thread so the drop never blocks. The order is the default
+/// runtime's, with the runtime kept running until the end:
+///
+/// 1. The fields below drop. Dropping the streams tells remote producers
+///    their streams ended, through the transports, which are still up.
+/// 2. The `Messenger`'s own drop starts the transports' teardown. Mux tasks
+///    on velo's runtime hold the `Messenger`, so this waits for them to end.
+///    A `Messenger` that is still held after [`MESSENGER_DROP_WAIT`] (an
+///    application kept a clone) does not hold the teardown back.
+/// 3. The teardown and each transport's close run, as in [`Velo::shutdown`].
+/// 4. The runtime stops.
+///
+/// Stopping the runtime first would drop the mux tasks before the teardown
+/// started, and the shutdown hooks would then find its drivers shut down.
+impl Drop for VeloInner {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.task_runtime.as_mut() {
+            let backend = Arc::clone(self.messenger.backend());
+            runtime.stop_detached(Box::pin(async move {
+                let deadline = tokio::time::Instant::now() + MESSENGER_DROP_WAIT;
+                while !backend.teardown_requested() && tokio::time::Instant::now() < deadline {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                }
+                backend.teardown_and_close().await;
+            }));
+        }
+    }
+}
+
+/// How long the last drop of a `Velo` on a dedicated runtime waits for the
+/// `Messenger`'s own drop to start the teardown. See `VeloInner`'s drop.
+const MESSENGER_DROP_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Makes the messenger half of [`Velo::shutdown`] run exactly once, and makes
 /// concurrent callers wait for the run rather than start their own.
@@ -328,6 +366,8 @@ pub struct VeloBuilder {
     mux_config: Option<crate::streaming::MuxConfig>,
     reservation_config: crate::streaming::ReservationConfig,
     mux_only: bool,
+    /// See [`task_runtime`](Self::task_runtime).
+    task_runtime: TaskRuntime,
     metrics: Option<Arc<VeloMetrics>>,
     /// See [`staged_payload_max`](Self::staged_payload_max).
     staged_payload_max: Option<usize>,
@@ -358,6 +398,7 @@ impl VeloBuilder {
             mux_config: None,
             reservation_config: Default::default(),
             mux_only: false,
+            task_runtime: TaskRuntime::default(),
             metrics: None,
             staged_payload_max: None,
             staged_fetch_timeout: None,
@@ -485,6 +526,21 @@ impl VeloBuilder {
         self
     }
 
+    /// Choose where velo runs its own tasks: the transports, the inbound loop,
+    /// the messenger mux and its batch lanes. Handlers run on the runtime
+    /// that calls [`build`](Self::build) either way.
+    ///
+    /// The default, [`TaskRuntime::Application`], runs them on that runtime
+    /// too. [`TaskRuntime::Dedicated`] runs them on a runtime this instance
+    /// builds and shuts down, so an application task that holds its worker
+    /// thread cannot stall them; [`TaskRuntime`] gives what that costs.
+    /// [`build`](Self::build) fails if `Dedicated` asks for other than 1 or 2
+    /// threads.
+    pub fn task_runtime(mut self, runtime: TaskRuntime) -> Self {
+        self.task_runtime = runtime;
+        self
+    }
+
     /// Set the peer discovery backend.
     pub fn discovery(mut self, discovery: Arc<dyn PeerDiscovery>) -> Self {
         self.inner = self.inner.discovery(discovery);
@@ -564,6 +620,7 @@ impl VeloBuilder {
             "mux_only cannot be combined with stream_config or stream_bind_addr"
         );
         self.reservation_config.validate()?;
+        self.task_runtime.validate()?;
         let mode = if self.mux_only {
             StreamMode::MuxOnly
         } else if self.stream_config.is_some() {
@@ -578,7 +635,16 @@ impl VeloBuilder {
             messenger_mux_disabled_by_env(),
             mode,
         )?;
-        let messenger = self.inner.build().await?;
+        // Built before the messenger, so the transports start on it. Dropped on
+        // a failed build without blocking (see `VeloRuntime`).
+        let (task_runtime, parts) = match self.task_runtime {
+            TaskRuntime::Application => (None, self.inner),
+            TaskRuntime::Dedicated { threads } => {
+                let (runtime, handle) = crate::task_runtime::VeloRuntime::build(threads)?;
+                (Some(runtime), self.inner.task_runtime(handle))
+            }
+        };
+        let messenger = parts.build().await?;
         let worker_id = messenger.instance_id().worker_id();
         let mux = if config.enabled {
             let mux = crate::streaming::messenger_mux::MessengerMuxTransport::new(
@@ -772,6 +838,7 @@ impl VeloBuilder {
                     #[cfg(test)]
                     runs: std::sync::atomic::AtomicUsize::new(0),
                 },
+                task_runtime,
             }),
         })
     }
@@ -1097,6 +1164,14 @@ impl Velo {
     /// purpose. Velo will not tell a caller to free pages it cannot establish
     /// were released.
     ///
+    /// # A dedicated task runtime
+    ///
+    /// Under [`TaskRuntime::Dedicated`] this stops velo's runtime last, after
+    /// the transports have closed, and returns once its threads have exited.
+    /// A task that blocks one of them gets 2 seconds; the thread is then left
+    /// behind. Calls and streams on a clone fail from then on, as they do
+    /// after shutdown on the application's runtime.
+    ///
     /// # Called once, even from clones
     ///
     /// [`Velo`] is `Clone`, so concurrent callers are possible. They are
@@ -1132,6 +1207,11 @@ impl Velo {
             transport.shutdown().await;
         }
         self.inner.messenger.closed().await;
+        // Last: the transports have closed, and nothing above still needs a
+        // task on this runtime.
+        if let Some(runtime) = &self.inner.task_runtime {
+            runtime.stop().await;
+        }
     }
 
     /// Get the instance ID of this system.

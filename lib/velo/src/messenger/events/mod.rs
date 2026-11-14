@@ -1363,9 +1363,13 @@ mod tests {
         use super::VeloEvents;
         use crate::messenger::common::responses::ResponseManager;
 
-        let (backend, _streams) = crate::transports::VeloBackend::new(vec![new_transport()], None)
-            .await
-            .unwrap();
+        let (backend, _streams) = crate::transports::VeloBackend::new(
+            vec![new_transport()],
+            None,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
         let backend = Arc::new(backend);
         let worker_id = backend.instance_id().worker_id();
         let system_id = NonZero::new(worker_id.as_u64()).unwrap();

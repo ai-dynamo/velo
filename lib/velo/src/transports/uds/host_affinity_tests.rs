@@ -36,7 +36,9 @@ async fn build_backend(uds_path: std::path::PathBuf) -> (VeloBackend, DataStream
             .unwrap(),
     );
     let transports: Vec<Arc<dyn Transport>> = vec![uds, tcp];
-    VeloBackend::new(transports, None).await.unwrap()
+    VeloBackend::new(transports, None, tokio::runtime::Handle::current())
+        .await
+        .unwrap()
 }
 
 /// Build a PeerInfo whose address advertises UDS at `uds_path` (may or may not

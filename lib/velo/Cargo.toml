@@ -201,6 +201,16 @@ name = "streaming_held_thread"
 path = "tests/streaming/held_thread.rs"
 
 [[test]]
+name = "streaming_stall_rows"
+path = "tests/streaming/stall_rows.rs"
+# test-helpers: `MetricSnapshot`, to see a record or a frame arrive.
+required-features = ["test-helpers"]
+
+[[test]]
+name = "task_runtime"
+path = "tests/task_runtime.rs"
+
+[[test]]
 name = "streaming_mux_credit"
 path = "tests/streaming/mux_credit.rs"
 required-features = ["test-helpers"]
