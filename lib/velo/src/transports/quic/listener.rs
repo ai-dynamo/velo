@@ -422,6 +422,158 @@ mod tests {
         check(true).await;
     }
 
+    /// Dropping a task after the peer closes must preserve acknowledged frames.
+    ///
+    /// The control observes the peer close, then tears down while the reader is paused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "F3: a dropped task cancels readers after a peer close, discarding acknowledged frames"]
+    async fn dropping_a_peer_closed_connection_task_preserves_acknowledged_frames() {
+        struct PausedReader {
+            entered: tokio::sync::Notify,
+            first: std::sync::atomic::AtomicBool,
+            released: parking_lot::Mutex<bool>,
+            release: parking_lot::Condvar,
+        }
+        impl velo_ext::TransportObservability for PausedReader {
+            fn record_frame(&self, _: velo_ext::Direction, _: &str, _: usize) {
+                if !self.first.swap(true, Ordering::SeqCst) {
+                    tokio::task::block_in_place(|| {
+                        self.entered.notify_one();
+                        let mut released = self.released.lock();
+                        while !*released {
+                            self.release.wait(&mut released);
+                        }
+                    });
+                }
+            }
+            fn record_rejection(&self, _: velo_ext::TransportRejection) {}
+            fn set_registered_peers(&self, _: usize) {}
+            fn set_active_connections(&self, _: usize) {}
+            fn record_send_backpressure(&self) {}
+        }
+        struct ReleaseReader(Arc<PausedReader>);
+        impl Drop for ReleaseReader {
+            fn drop(&mut self) {
+                *self.0.released.lock() = true;
+                self.0.release.notify_all();
+            }
+        }
+
+        async fn check(drop_task: bool) {
+            const FRAMES: usize = 8;
+            let identity = tls::Identity::generate().unwrap();
+            let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(
+                tls::server_crypto(&identity).unwrap(),
+            )
+            .unwrap();
+            let server = quinn::Endpoint::server(
+                quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .unwrap();
+            let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            client.set_default_client_config(
+                tls::pinned_client_config(identity.fingerprint).unwrap(),
+            );
+            let accept = tokio::spawn({
+                let server = server.clone();
+                async move { server.accept().await.unwrap().await.unwrap() }
+            });
+            let connection = client
+                .connect(server.local_addr().unwrap(), "velo")
+                .unwrap()
+                .await
+                .unwrap();
+            let server_connection = accept.await.unwrap();
+            let (mut send, _recv) = connection.open_bi().await.unwrap();
+            let (adapter, streams) = velo_ext::make_channels();
+            let paused = Arc::new(PausedReader {
+                entered: tokio::sync::Notify::new(),
+                first: std::sync::atomic::AtomicBool::new(false),
+                released: parking_lot::Mutex::new(false),
+                release: parking_lot::Condvar::new(),
+            });
+            let release = ReleaseReader(paused.clone());
+            let teardown = CancellationToken::new();
+            let ctx = AcceptContext {
+                adapter,
+                error_handler: Arc::new(FailErrors),
+                transport_key: "quic".into(),
+                metrics: Some(paused.clone()),
+                teardown: teardown.clone(),
+                shrink_threshold: usize::MAX,
+            };
+            let mut task = Box::pin(serve_connection(server_connection.clone(), ctx));
+            TcpFrameCodec::encode_frame(&mut send, MessageType::Event, b"0", b"payload")
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = &mut task => panic!("the connection must stay open"),
+                    _ = paused.entered.notified() => {}
+                }
+            })
+            .await
+            .expect("the reader is paused while routing its first frame");
+            for seq in 1..FRAMES {
+                TcpFrameCodec::encode_frame(
+                    &mut send,
+                    MessageType::Event,
+                    &[seq as u8],
+                    b"payload",
+                )
+                .await
+                .unwrap();
+            }
+            send.finish().unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), send.stopped())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                None,
+                "the listener acknowledged every byte and the FIN"
+            );
+            connection.close(0u32.into(), b"done");
+            let reason = tokio::time::timeout(Duration::from_secs(5), server_connection.closed())
+                .await
+                .expect("quinn observes the peer's close while the connection task is held back");
+            assert!(matches!(
+                reason,
+                quinn::ConnectionError::ApplicationClosed(_)
+            ));
+            assert!(!teardown.is_cancelled());
+            if !drop_task {
+                tokio::time::timeout(Duration::from_secs(5), &mut task)
+                    .await
+                    .expect("control: the task observes the peer's close");
+            }
+            drop(task);
+            if !drop_task {
+                teardown.cancel();
+            }
+            drop(release);
+
+            let mut delivered = 0;
+            while tokio::time::timeout(Duration::from_secs(5), streams.event_stream.recv_async())
+                .await
+                .expect("all readers must finish")
+                .is_ok()
+            {
+                delivered += 1;
+            }
+            server.close(0u32.into(), b"done");
+            client.close(0u32.into(), b"done");
+            assert_eq!(
+                delivered, FRAMES,
+                "connection task dropped={drop_task}: acknowledged frames were discarded outside teardown"
+            );
+        }
+
+        check(false).await;
+        check(true).await;
+    }
+
     /// A stream builds its teardown future once, not once per frame: the QUIC
     /// twin of `tcp::listener::a_connection_arms_its_teardown_once`, which
     /// says why. QUIC used to rebuild it per frame on the node-wide token (65
