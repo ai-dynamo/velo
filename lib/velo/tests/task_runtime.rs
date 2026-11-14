@@ -3,7 +3,8 @@
 
 //! The lifecycle of the runtime `TaskRuntime::Dedicated` builds: velo builds
 //! it in `build`, stops it at the end of `shutdown`, and stops it without
-//! blocking on the last drop.
+//! blocking on the last drop. The last two tests count where the parts of a
+//! unary call run on each setting.
 //!
 //! The tests count this process's threads named `velo-rt` in
 //! `/proc/self/task`, so each takes [`serial`] first: another test's runtime
@@ -1010,5 +1011,339 @@ fn a_nats_client_runs_where_the_application_connected_it() {
         during_hold,
         Ok(b"held".to_vec()),
         "the dedicated NATS transport still needs the application's runtime to write"
+    );
+}
+
+/// The name of the thread this runs on.
+fn thread_name() -> String {
+    std::thread::current().name().unwrap_or("?").to_owned()
+}
+
+/// A TCP transport that records the thread of every request and response
+/// it is asked to send, and the thread its writers run on: the TCP transport
+/// spawns each connection's writer on the handle `start` gives it.
+struct Watched {
+    inner: Arc<velo::transports::tcp::TcpTransport>,
+    sends: Arc<parking_lot::Mutex<Vec<(velo::ext::MessageType, String)>>>,
+    writer_thread: Arc<parking_lot::Mutex<Option<String>>>,
+}
+
+impl Watched {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: tcp(),
+            sends: Arc::default(),
+            writer_thread: Arc::default(),
+        })
+    }
+
+    fn record(&self, message_type: velo::ext::MessageType) {
+        if matches!(
+            message_type,
+            velo::ext::MessageType::Message | velo::ext::MessageType::Response
+        ) {
+            self.sends.lock().push((message_type, thread_name()));
+        }
+    }
+}
+
+impl velo::Transport for Watched {
+    fn key(&self) -> velo::ext::TransportKey {
+        self.inner.key()
+    }
+    fn address(&self) -> velo::WorkerAddress {
+        self.inner.address()
+    }
+    fn register(&self, peer: velo::PeerInfo) -> Result<(), velo::ext::TransportError> {
+        self.inner.register(peer)
+    }
+    fn unregister(&self, instance_id: velo::InstanceId) {
+        self.inner.unregister(instance_id)
+    }
+    fn send_message(
+        &self,
+        instance_id: velo::InstanceId,
+        header: Bytes,
+        payload: Bytes,
+        message_type: velo::ext::MessageType,
+        on_error: Arc<dyn velo::ext::TransportErrorHandler>,
+    ) -> velo::ext::SendOutcome {
+        self.record(message_type);
+        self.inner
+            .send_message(instance_id, header, payload, message_type, on_error)
+    }
+    fn lanes(&self, target: velo::InstanceId) -> std::num::NonZeroU16 {
+        self.inner.lanes(target)
+    }
+    fn send_message_on_lane(
+        &self,
+        instance_id: velo::InstanceId,
+        lane: u16,
+        header: Bytes,
+        payload: Bytes,
+        message_type: velo::ext::MessageType,
+        on_error: Arc<dyn velo::ext::TransportErrorHandler>,
+    ) -> velo::ext::SendOutcome {
+        self.record(message_type);
+        self.inner
+            .send_message_on_lane(instance_id, lane, header, payload, message_type, on_error)
+    }
+    fn max_message_size(&self, target: velo::InstanceId) -> Option<usize> {
+        self.inner.max_message_size(target)
+    }
+    fn start(
+        &self,
+        instance_id: velo::InstanceId,
+        channels: velo::ext::TransportAdapter,
+        rt: tokio::runtime::Handle,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+        let writer_thread = Arc::clone(&self.writer_thread);
+        rt.spawn(async move {
+            *writer_thread.lock() = Some(thread_name());
+        });
+        self.inner.start(instance_id, channels, rt)
+    }
+    fn shutdown(&self) {
+        self.inner.shutdown()
+    }
+    fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
+        self.inner.closed()
+    }
+    fn set_observability(&self, observability: Arc<dyn velo::ext::TransportObservability>) {
+        self.inner.set_observability(observability)
+    }
+    fn begin_drain(&self) {
+        self.inner.begin_drain()
+    }
+    fn check_health(
+        &self,
+        instance_id: velo::InstanceId,
+        timeout: Duration,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), velo::ext::HealthCheckError>> + Send + '_>,
+    > {
+        self.inner.check_health(instance_id, timeout)
+    }
+}
+
+/// Wakes the task it wraps, and records the thread each wake came from.
+struct RecordingWaker {
+    inner: std::task::Waker,
+    wakes: Arc<parking_lot::Mutex<Vec<String>>>,
+}
+
+impl futures::task::ArcWake for RecordingWaker {
+    fn wake_by_ref(this: &Arc<Self>) {
+        this.wakes.lock().push(thread_name());
+        this.inner.wake_by_ref();
+    }
+}
+
+/// Polls `inner` with a waker that records the thread of each wake.
+/// Returns whether `inner` ever returned `Pending`, so waited for a wake: a
+/// call whose response arrived while its first poll still ran finishes on
+/// that poll, with no wake to count.
+async fn record_wakes<F: std::future::Future>(
+    inner: F,
+    wakes: Arc<parking_lot::Mutex<Vec<String>>>,
+) -> bool {
+    let mut inner = std::pin::pin!(inner);
+    let mut waited = false;
+    std::future::poll_fn(|cx| {
+        let waker = futures::task::waker(Arc::new(RecordingWaker {
+            inner: cx.waker().clone(),
+            wakes: Arc::clone(&wakes),
+        }));
+        let poll = inner
+            .as_mut()
+            .poll(&mut std::task::Context::from_waker(&waker));
+        waited |= poll.is_pending();
+        poll.map(drop)
+    })
+    .await;
+    waited
+}
+
+/// Where one unary call ran, counted by thread.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Crossings {
+    /// Requests and responses handed to the transport from an application
+    /// thread. Each one wakes a writer on the runtime `start` was given.
+    sends_from_application: usize,
+    /// Handler runs on an application thread. The inbound loop that spawns
+    /// the handler runs where the transport reads, on the runtime `start`
+    /// was given.
+    handlers_on_application: usize,
+    /// Calls whose caller waited for its response.
+    calls_that_waited: usize,
+    /// Wakes of the caller's task from a velo thread: the response path.
+    caller_wakes_from_velo: usize,
+    /// Wakes of the caller's task from any other thread.
+    caller_wakes_from_application: usize,
+}
+
+/// Makes `calls` unary calls one at a time, after a warm-up, and counts
+/// where each part ran.
+async fn count_crossings(runtime: TaskRuntime, calls: usize) -> (Crossings, String) {
+    let client_transport = Watched::new();
+    let server_transport = Watched::new();
+    let build = |transport: Arc<Watched>| async move {
+        Velo::builder()
+            .add_transport(transport)
+            .mux_only()
+            .task_runtime(runtime)
+            .build()
+            .await
+            .expect("build velo")
+    };
+    let client = build(Arc::clone(&client_transport)).await;
+    let server = build(Arc::clone(&server_transport)).await;
+    let handler_threads = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    server
+        .register_handler(
+            Handler::unary_handler("probe", {
+                let handler_threads = Arc::clone(&handler_threads);
+                move |ctx: Context| {
+                    handler_threads.lock().push(thread_name());
+                    Ok(Some(ctx.payload))
+                }
+            })
+            .build(),
+        )
+        .expect("probe");
+    introduce(&client, &server).await;
+    let call = || async {
+        client
+            .unary("probe")
+            .expect("unary")
+            .raw_payload(Bytes::from_static(b"ping"))
+            .instance(server.instance_id())
+            .send()
+            .await
+            .expect("call")
+    };
+    // The first call dials the connection; it is not the steady state.
+    for _ in 0..3 {
+        tokio::time::timeout(PATIENCE, call())
+            .await
+            .expect("warm-up");
+    }
+    client_transport.sends.lock().clear();
+    server_transport.sends.lock().clear();
+    handler_threads.lock().clear();
+
+    let wakes = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let mut calls_that_waited = 0;
+    for _ in 0..calls {
+        let waited = tokio::time::timeout(PATIENCE, record_wakes(call(), Arc::clone(&wakes)))
+            .await
+            .expect("call timed out");
+        calls_that_waited += usize::from(waited);
+    }
+
+    let is_velo = |thread: &String| thread == THREAD_NAME;
+    let sends: Vec<_> = client_transport
+        .sends
+        .lock()
+        .iter()
+        .chain(server_transport.sends.lock().iter())
+        .cloned()
+        .collect();
+    let wakes = wakes.lock().clone();
+    let crossings = Crossings {
+        sends_from_application: sends.iter().filter(|(_, t)| !is_velo(t)).count(),
+        handlers_on_application: handler_threads
+            .lock()
+            .iter()
+            .filter(|t| !is_velo(t))
+            .count(),
+        calls_that_waited,
+        caller_wakes_from_velo: wakes.iter().filter(|t| is_velo(t)).count(),
+        caller_wakes_from_application: wakes.iter().filter(|t| !is_velo(t)).count(),
+    };
+    let detail = format!(
+        "sends {sends:?}, handler threads {:?}, caller wakes {wakes:?}, writers on {:?} and {:?}",
+        handler_threads.lock(),
+        client_transport.writer_thread.lock(),
+        server_transport.writer_thread.lock()
+    );
+    assert_eq!(
+        sends.len(),
+        2 * calls,
+        "one request and one response per call: {detail}"
+    );
+    client.shutdown(ShutdownPolicy::WaitForever).await;
+    server.shutdown(ShutdownPolicy::WaitForever).await;
+    (crossings, detail)
+}
+
+/// On the default runtime, a unary call to a handler crosses between the
+/// application's runtime and velo's four times:
+///
+/// 1. the caller hands the request to the client's writer, on velo's runtime;
+/// 2. the server's inbound loop, on velo's runtime, spawns the handler on the
+///    application's runtime;
+/// 3. the handler hands its response to the server's writer, on velo's
+///    runtime;
+/// 4. the client's response path, on velo's runtime, wakes the caller.
+///
+/// The fourth is a wake only when the caller is waiting. A response can
+/// arrive while the caller's first poll still runs, and that call finishes
+/// with no wake, so the test counts the calls that waited and expects one
+/// wake from velo for each.
+///
+/// On `TaskRuntime::Application` the same call runs on the application's
+/// runtime throughout. Each crossing is a wake across threads, and it is the
+/// cost of the default for a single caller: the book's "A runtime for velo's
+/// own tasks" chapter gives the measured time and CPU. A change that adds a
+/// crossing on this path changes that cost and must show here.
+///
+/// The count is of hand-offs, not of time: a hand-off to a velo thread is a
+/// send made on an application thread, because the transport's writer runs on
+/// velo's runtime (the probe in `Watched::start` checks that).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_unary_call_crosses_between_runtimes_four_times() {
+    let _serial = serial().await;
+    const CALLS: usize = 20;
+    let (crossings, detail) = count_crossings(TaskRuntime::dedicated(), CALLS).await;
+    let waited = crossings.calls_that_waited;
+    assert!(
+        waited > 0,
+        "no call waited, so no wake was counted: {detail}"
+    );
+    assert!(
+        detail.ends_with(&format!(
+            "writers on Some({THREAD_NAME:?}) and Some({THREAD_NAME:?})"
+        )),
+        "the writers do not run on velo's runtime: {detail}"
+    );
+    assert_eq!(
+        crossings,
+        Crossings {
+            sends_from_application: 2 * CALLS,
+            handlers_on_application: CALLS,
+            calls_that_waited: waited,
+            caller_wakes_from_velo: waited,
+            caller_wakes_from_application: 0,
+        },
+        "{detail}"
+    );
+}
+
+/// The control for the count above: on the application's runtime nothing of
+/// the call runs on a velo thread, so nothing crosses.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_unary_call_on_the_application_runtime_stays_there() {
+    let _serial = serial().await;
+    const CALLS: usize = 20;
+    let (crossings, detail) = count_crossings(TaskRuntime::Application, CALLS).await;
+    assert!(
+        !detail.contains(THREAD_NAME),
+        "a velo thread exists on the application's runtime: {detail}"
+    );
+    assert_eq!(crossings.caller_wakes_from_velo, 0, "{detail}");
+    assert_eq!(
+        crossings.caller_wakes_from_application, crossings.calls_that_waited,
+        "{detail}"
     );
 }
