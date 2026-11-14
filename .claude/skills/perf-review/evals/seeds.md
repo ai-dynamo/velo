@@ -48,8 +48,8 @@ seed" tells the reviewer to look for something.
 
 | Id | Edit | The review must report |
 |---|---|---|
-| S1 | `lib/velo/src/transports/tcp/listener.rs`, `handle_connection`: delete `let teardown = connection_teardown(&shutdown_state);` and its `tokio::pin!`. Make the select arm `_ = shutdown_state.teardown_token().cancelled() => {`. | P8, blocker. It says that CI catches it (`a_connection_arms_its_teardown_once` sees 0 arms). |
-| S2 | Same loop; keep the seam. At the top of the `Some(Ok((msg_type, header, payload)))` arm, add `if shutdown_state.teardown_token().is_cancelled() { break; }`. | P9 or P11, major or above. No pin covers it. |
+| S1 | `lib/velo/src/transports/ingress.rs`, `serve_frames`: delete `let teardown = connection_teardown(teardown);` and its `tokio::pin!`. Make the select arm `_ = teardown.cancelled() => {`. | P8, blocker. It says that CI catches it (the `*_arms_its_teardown_once` tests see 0 arms). |
+| S2 | Same loop; keep the seam. Add a `shutdown: &CancellationToken` parameter, pass `shutdown_state.teardown_token()` from the TCP `handle_connection`, and at the top of the `Some(Ok((msg_type, header, payload)))` arm add `if shutdown.is_cancelled() { break; }`. | P9 or P11, major or above. No pin covers it. |
 | S3 | `lib/velo/src/transports/tcp/framing.rs`, `TcpFrameCodec::decode`: replace each `src.split_to(n).freeze()` with `Bytes::copy_from_slice(&src[..n])` followed by `src.advance(n)`. Run with `--measure`. | P1 and rule 5, major or above. A count settles it: `allocations_in` over 8 decoded frames gives 16 at head and 1 at base. No timing is needed. |
 | S4 | `lib/velo/src/streaming/control/pump.rs`, `reader_pump`: replace the half-window re-arm (`if armed_until.saturating_duration_since(last_frame) < rearm_threshold { ... }`) with an unconditional `armed_until = last_frame + heartbeat_deadline; sleep.as_mut().reset(armed_until);`, with no `note_timer_arm()`. | Blocker, for rule 2 and the seam bypass (P24). Adding `note_timer_arm()` back after the new reset makes both pins fail. The cost is R21 (a lock-free CAS), not R7. |
 | S5 | Delete the `size_socket_buffers` call before `listen` in `lib/velo/src/transports/tcp/transport/builder.rs` and both calls in `TcpListener::run_server`. In the accept arm of `run_server`, add `size_socket_buffers(&stream, self.socket_buffers);`. | P20 and rule 3, blocker. The tier is argued from the cost (per byte), not from the code site (per connection). |
@@ -59,8 +59,8 @@ seed" tells the reviewer to look for something.
 | N1 | Reword one sentence in `docs/src/operations/benchmarking.md`. | "No hot path touched", with no agents. |
 | N2 | In `handle_connection`, reword the `warn!` for a failed `set_nodelay`. | 0 confirmed: it is an error path. |
 | N3 | No seed: review the real perf win `2d0d3e8^..2d0d3e8`. | Nothing at major or above. The claims are listed. One minor is true and may appear: the decoder now reserves the whole announced frame (up to 16 MiB) when the preamble arrives. |
-| N4 | In `handle_connection`, before the loop, add `let label = Arc::new(peer_addr.to_string()); debug!(peer = %label, "loop start");`. | Nothing at major or above; at most one minor. |
-| A1 | No seed: `perf-review audit lib/velo/src/transports`. | Must find the per-frame `cancelled()` on the node-wide token in UDS `handle_connection` and QUIC `serve_stream` (P8, high impact, effort S), and the gRPC writer's per-frame `cancelled()` and three `to_vec` copies per frame. Must not propose dropping the `AdmissionGate` mutex without its ordering constraint and R12, or `write_vectored`. At most 8 agents. |
+| N4 | In the TCP `handle_connection`, before the `serve_frames` call, add `let label = Arc::new(peer_addr.to_string()); debug!(peer = %label, "loop start");`. | Nothing at major or above; at most one minor. |
+| A1 | No seed: `perf-review audit lib/velo/src/transports`. | Must find the gRPC writer's per-frame `cancelled()` and three `to_vec` copies per frame. Must not propose dropping the `AdmissionGate` mutex without its ordering constraint and R12, or `write_vectored`. At most 8 agents. |
 | A2 | Optional: `perf-review audit lib/velo/src/messenger`. | Finds the `with_label_values` lookup in `record_client_resolution` on each direct send (P5). |
 
 ## Pass bar

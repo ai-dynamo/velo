@@ -8,60 +8,19 @@
 //! to the appropriate transport streams.
 
 use anyhow::{Context, Result};
-use futures::StreamExt;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::{TcpListener as TokioTcpListener, TcpStream};
 use tokio::runtime::{Handle, Runtime};
-use tokio_util::codec::Framed;
+use tokio_util::codec::FramedRead;
 use tracing::{debug, error, info, warn};
 
-use crate::observability::TransportRejection;
-use crate::transports::ingress::{Routed, route_frame};
+use crate::transports::ingress::{EchoShuttingDown, FrameRoute, serve_frames};
 
-use velo_ext::{MessageType, ShutdownState, TransportAdapter, TransportErrorHandler};
+use velo_ext::{ShutdownState, TransportAdapter, TransportErrorHandler};
 
-use super::framing::{TcpFrameCodec, maybe_shrink_read_buffer, parse_shrink_threshold};
-
-#[cfg(test)]
-tokio::task_local! {
-    /// Counts how many times a connection handler has built its teardown
-    /// future. The teardown token is node-wide, so every build registers a
-    /// waiter on one `Notify` that all connections share, and every drop
-    /// removes it again under that `Notify`'s lock.
-    static TEARDOWN_ARMS: std::sync::Arc<std::sync::atomic::AtomicU64>;
-}
-
-#[cfg(test)]
-fn note_teardown_arm() {
-    let _ = TEARDOWN_ARMS.try_with(|n| n.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
-}
-
-/// Compiles away: the seam must cost the shipped listener nothing.
-#[cfg(not(test))]
-#[inline(always)]
-fn note_teardown_arm() {}
-
-/// The one place a connection builds its teardown future, so the count the
-/// test reads is the count of builds, not of a separate call that could drift
-/// from them.
-///
-/// On a child token, not the node-wide one. The loop polls this future on
-/// every frame, and each poll locks the token's tree node and, while waiting,
-/// its `Notify` waiter list. On the shared token both are shared by every
-/// connection on the node; a child token has its own of each, so the per-frame
-/// locks are uncontended. Cancelling the node-wide token still reaches every
-/// child.
-fn connection_teardown(
-    shutdown_state: &ShutdownState,
-) -> tokio_util::sync::WaitForCancellationFutureOwned {
-    note_teardown_arm();
-    shutdown_state
-        .teardown_token()
-        .child_token()
-        .cancelled_owned()
-}
+use super::framing::{TcpFrameCodec, parse_shrink_threshold};
 
 /// Per-connection configuration handed to [`TcpListener::handle_connection`].
 struct ConnectionContext {
@@ -272,7 +231,7 @@ impl TcpListener {
 
     /// Handle a single TCP connection
     async fn handle_connection(
-        stream: TcpStream,
+        mut stream: TcpStream,
         peer_addr: SocketAddr,
         ctx: ConnectionContext,
     ) -> Result<()> {
@@ -306,92 +265,23 @@ impl TcpListener {
             warn!("Failed to set TCP keepalive on {}: {}", peer_addr, e);
         }
 
-        // Create framed stream with zero-copy codec
-        let mut framed = Framed::new(stream, TcpFrameCodec::new());
-        // Built once per connection: the token is node-wide, so a future
-        // rebuilt per frame would register and remove a waiter on one
-        // `Notify` shared by every connection, under its lock, per frame.
-        let teardown = connection_teardown(&shutdown_state);
-        tokio::pin!(teardown);
-
+        // Borrowed halves: no `Arc`, and no write shutdown when they drop.
+        let (read_half, write_half) = stream.split();
         debug!("Connection from {} ready for frames", peer_addr);
-
-        loop {
-            tokio::select! {
-                // Prioritize teardown so a saturated connection cannot starve shutdown.
-                biased;
-                _ = &mut teardown => {
-                    debug!("Connection handler for {} torn down", peer_addr);
-                    break;
-                }
-                frame_result = framed.next() => {
-                    match frame_result {
-                        Some(Ok((msg_type, header, payload))) => {
-                            let frame_size = header.len() + payload.len();
-                            // Route frame to appropriate stream based on type.
-                            // `route_frame` owns the drain gate for Message
-                            // frames — it acquires the in-flight guard before
-                            // it re-reads the flag, so an admitted message is
-                            // counted work even while it is only queued.
-                            // Response/Ack/Event frames always pass through.
-                            match route_frame(
-                                msg_type,
-                                header,
-                                payload,
-                                &adapter,
-                                &error_handler,
-                                &transport_key,
-                                metrics.as_ref(),
-                            )
-                            .await
-                            {
-                                Ok(Routed::Delivered) => {}
-                                Ok(Routed::DrainRejected { header }) => {
-                                    debug!(
-                                        "Rejecting Message frame from {} during drain (sending ShuttingDown)",
-                                        peer_addr
-                                    );
-                                    // Echo original header back for correlation, empty payload
-                                    if let Err(e) = TcpFrameCodec::encode_frame(
-                                        framed.get_mut(),
-                                        MessageType::ShuttingDown,
-                                        &header,
-                                        &[],
-                                    )
-                                    .await
-                                    {
-                                        warn!(
-                                            "Failed to send ShuttingDown frame to {}: {}",
-                                            peer_addr, e
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to route {:?} frame from {}: {}",
-                                        msg_type, peer_addr, e
-                                    );
-                                }
-                            }
-
-                            maybe_shrink_read_buffer(framed.read_buffer_mut(), shrink_threshold, frame_size);
-                        }
-                        Some(Err(e)) => {
-                            if let Some(metrics) = metrics.as_ref() {
-                                metrics.record_rejection(TransportRejection::DecodeError);
-                            }
-                            error!("Frame decode error from {}: {}", peer_addr, e);
-                            break;
-                        }
-                        None => {
-                            // Connection closed gracefully (FIN received)
-                            debug!("Connection from {} closed gracefully", peer_addr);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        serve_frames(
+            FramedRead::new(read_half, TcpFrameCodec::new()),
+            EchoShuttingDown(write_half),
+            shutdown_state.teardown_token(),
+            FrameRoute {
+                adapter: &adapter,
+                error_handler: &error_handler,
+                transport_key: &transport_key,
+                metrics: metrics.as_ref(),
+                shrink_threshold,
+            },
+            peer_addr,
+        )
+        .await;
 
         Ok(())
     }
@@ -595,9 +485,11 @@ impl Default for TcpListenerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transports::ingress::TEARDOWN_ARMS;
     use crate::transports::transport::make_channels;
     use bytes::Bytes;
     use std::net::{IpAddr, Ipv4Addr};
+    use velo_ext::MessageType;
 
     struct TestErrorHandler;
 

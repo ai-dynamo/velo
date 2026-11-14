@@ -1,20 +1,22 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Inbound frame routing shared by the messenger TCP, UDS, and QUIC listeners,
-//! and the reader for the read half of dialed TCP, UDS, and QUIC connections.
+//! The inbound frame loop shared by the messenger TCP, UDS, and QUIC
+//! listeners and by the read half of dialed TCP, UDS, and QUIC connections.
 //!
-//! Accepted sockets have always been read — that is what the listeners do.
+//! [`serve_frames`] reads frames off one connection and routes each through
+//! [`route_frame`]. It is generic over the reader and over how to answer a
+//! request refused during drain ([`DrainReply`]): an accepted connection
+//! writes a `ShuttingDown` frame back on itself ([`EchoShuttingDown`]); a
+//! dialed connection has no way back and drops it ([`NoReply`]).
+//!
 //! Dialed sockets used to be write-only: the connection writer pushed frames
 //! at the peer and nothing ever read the reverse direction. But the peer's
 //! listener *does* write one thing back on that socket — the ShuttingDown
 //! correlation reply it sends when it rejects a `Message` during drain.
 //! Unread, those replies rot in the dialing side's kernel receive buffer and
-//! the sender never learns its message was dropped.
-//!
-//! [`run_dialed_reader`] is the missing read half: it decodes frames off a
-//! dialed socket and routes them through the same [`route_frame`] path the
-//! listeners use, so a drain rejection lands on the sender's shutdown stream
+//! the sender never learns its message was dropped. [`run_dialed_reader`]
+//! reads them, so a drain rejection lands on the sender's shutdown stream
 //! where the messenger correlates it. It changes nothing on the wire — it
 //! only reads bytes the peer was already sending.
 
@@ -23,10 +25,10 @@ use std::sync::Arc;
 use anyhow::Result;
 use bytes::Bytes;
 use futures::StreamExt;
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::FramedRead;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, warn};
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
+use tracing::{debug, error, warn};
 
 use velo_ext::{AdmitOutcome, MessageType, TransportAdapter, TransportErrorHandler};
 
@@ -156,6 +158,162 @@ pub(crate) async fn route_frame(
     }
 }
 
+#[cfg(test)]
+tokio::task_local! {
+    /// Counts how many times a frame loop has built its teardown future.
+    pub(crate) static TEARDOWN_ARMS: Arc<std::sync::atomic::AtomicU64>;
+}
+
+#[cfg(test)]
+fn note_teardown_arm() {
+    let _ = TEARDOWN_ARMS.try_with(|n| n.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+}
+
+/// Compiles away: the seam must cost the shipped loop nothing.
+#[cfg(not(test))]
+#[inline(always)]
+fn note_teardown_arm() {}
+
+/// The one place a frame loop builds its teardown future, so the count a test
+/// reads is the count of builds, not of a separate call that could drift from
+/// them.
+///
+/// Built once per connection, and on a child token. The loop polls this
+/// future before every frame, and each poll of a waiting future locks the
+/// token's `Notify` waiter list. The listeners' token is node-wide, so a
+/// future rebuilt per frame, or polled on the node-wide token, takes a lock
+/// that every connection on the node shares, per frame. A child token has its
+/// own, so the per-frame lock is uncontended. Cancelling the parent still
+/// reaches every child.
+fn connection_teardown(teardown: &CancellationToken) -> WaitForCancellationFutureOwned {
+    note_teardown_arm();
+    teardown.child_token().cancelled_owned()
+}
+
+/// How a frame loop answers a `Message` that the drain gate refused.
+///
+/// A generic parameter of [`serve_frames`], not a trait object, so each
+/// transport gets its own copy of the loop and the loop adds no indirect call
+/// per frame.
+pub(crate) trait DrainReply {
+    /// Tell the peer its request was refused. `header` is the request's
+    /// header, which the peer needs to correlate the answer.
+    async fn reject(&mut self, header: Bytes) -> std::io::Result<()>;
+}
+
+/// Writes a `ShuttingDown` frame that echoes the refused request's header,
+/// with an empty payload, on the connection the request came in on. The
+/// sender then fails the request at once instead of waiting for its timeout.
+pub(crate) struct EchoShuttingDown<W>(pub W);
+
+impl<W: AsyncWrite + Unpin> DrainReply for EchoShuttingDown<W> {
+    async fn reject(&mut self, header: Bytes) -> std::io::Result<()> {
+        TcpFrameCodec::encode_frame(&mut self.0, MessageType::ShuttingDown, &header, &[]).await
+    }
+}
+
+/// For a loop with no way back to the sender. [`route_frame`] has already
+/// recorded the rejection, so the frame is dropped and the sender waits out
+/// its own timeout.
+pub(crate) struct NoReply;
+
+impl DrainReply for NoReply {
+    async fn reject(&mut self, _header: Bytes) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// What [`serve_frames`] routes into, and how.
+pub(crate) struct FrameRoute<'a> {
+    pub adapter: &'a TransportAdapter,
+    pub error_handler: &'a Arc<dyn TransportErrorHandler>,
+    pub transport_key: &'a str,
+    pub metrics: Option<&'a Arc<dyn velo_ext::TransportObservability>>,
+    /// See [`maybe_shrink_read_buffer`].
+    pub shrink_threshold: usize,
+}
+
+/// Read frames off one connection and route them, until the peer closes it, a
+/// frame fails to decode, or `teardown` is cancelled.
+///
+/// This is the one inbound frame loop: the TCP, UDS and QUIC listeners and the
+/// read half of dialed connections all run it. Each `Message` goes through
+/// [`route_frame`], so through [`TransportAdapter::admit_message`]; one the
+/// drain gate refuses is answered with `reply`.
+///
+/// The reader, the reply and the peer label are generic, so each caller gets
+/// its own copy of the loop, and the loop adds no indirect call per frame. The
+/// one it has, `record_frame` on the observability handle, is in
+/// [`route_frame`], and only when metrics are on.
+pub(crate) async fn serve_frames<R, D, P>(
+    mut framed: FramedRead<R, TcpFrameCodec>,
+    mut reply: D,
+    teardown: &CancellationToken,
+    route: FrameRoute<'_>,
+    peer: P,
+) where
+    R: AsyncRead + Unpin,
+    D: DrainReply,
+    P: std::fmt::Display,
+{
+    let key = route.transport_key;
+    let teardown = connection_teardown(teardown);
+    tokio::pin!(teardown);
+
+    loop {
+        let frame = tokio::select! {
+            // Teardown first, so a saturated connection cannot starve shutdown.
+            biased;
+            _ = &mut teardown => {
+                debug!("{key}: frame loop for {peer} torn down");
+                break;
+            }
+            frame = framed.next() => frame,
+        };
+        match frame {
+            Some(Ok((msg_type, header, payload))) => {
+                let frame_size = header.len() + payload.len();
+                match route_frame(
+                    msg_type,
+                    header,
+                    payload,
+                    route.adapter,
+                    route.error_handler,
+                    key,
+                    route.metrics,
+                )
+                .await
+                {
+                    Ok(Routed::Delivered) => {}
+                    Ok(Routed::DrainRejected { header }) => {
+                        debug!("{key}: refusing a Message from {peer} during drain");
+                        if let Err(e) = reply.reject(header).await {
+                            warn!("{key}: failed to send ShuttingDown to {peer}: {e}");
+                        }
+                    }
+                    Err(e) => warn!("{key}: failed to route {msg_type:?} from {peer}: {e}"),
+                }
+                maybe_shrink_read_buffer(
+                    framed.read_buffer_mut(),
+                    route.shrink_threshold,
+                    frame_size,
+                );
+            }
+            Some(Err(e)) => {
+                if let Some(metrics) = route.metrics {
+                    metrics.record_rejection(TransportRejection::DecodeError);
+                }
+                error!("{key}: frame decode error from {peer}: {e}");
+                break;
+            }
+            None => {
+                debug!("{key}: {peer} closed the connection");
+                break;
+            }
+        }
+    }
+}
+
 /// Everything a dialed connection's read loop needs besides the socket.
 ///
 /// Built once per transport in `start()` (that is when the adapter exists) and
@@ -182,8 +340,9 @@ pub(crate) struct DialedReaderContext {
 /// nothing dials a socket to serve requests on it — but it is not impossible,
 /// so it goes through the same admission gate as everything else. There is no
 /// per-connection reply plumbing here, so a drain rejection is dropped after
-/// recording it, and the peer waits out its own timeout; the alternative,
-/// letting it in ungated, would put uncounted work on the inbound queue.
+/// recording it ([`NoReply`]), and the peer waits out its own timeout; the
+/// alternative, letting it in ungated, would put uncounted work on the inbound
+/// queue.
 pub(crate) async fn run_dialed_reader<R>(
     read_half: R,
     ctx: DialedReaderContext,
@@ -193,66 +352,20 @@ pub(crate) async fn run_dialed_reader<R>(
 ) where
     R: AsyncRead + Unpin,
 {
-    let mut framed = FramedRead::new(read_half, TcpFrameCodec::new());
-
-    loop {
-        tokio::select! {
-            // Prioritize cancellation so a saturated connection cannot starve
-            // shutdown.
-            biased;
-            _ = conn_cancel.cancelled() => break,
-            frame_result = framed.next() => {
-                match frame_result {
-                    Some(Ok((msg_type, header, payload))) => {
-                        let frame_size = header.len() + payload.len();
-                        match route_frame(
-                            msg_type,
-                            header,
-                            payload,
-                            &ctx.adapter,
-                            &ctx.error_handler,
-                            &ctx.transport_key,
-                            metrics.as_ref(),
-                        )
-                        .await
-                        {
-                            Ok(Routed::Delivered) => {}
-                            Ok(Routed::DrainRejected { .. }) => {
-                                // No reply path on a dialed socket — the
-                                // rejection is already recorded, so drop it.
-                                debug!(
-                                    "Dropped inbound Message from dialed connection to {} during drain",
-                                    peer
-                                );
-                            }
-                            Err(e) => {
-                                warn!(
-                                    "Failed to route {:?} frame from dialed connection to {}: {}",
-                                    msg_type, peer, e
-                                );
-                            }
-                        }
-                        maybe_shrink_read_buffer(
-                            framed.read_buffer_mut(),
-                            ctx.shrink_threshold,
-                            frame_size,
-                        );
-                    }
-                    Some(Err(e)) => {
-                        if let Some(metrics) = metrics.as_ref() {
-                            metrics.record_rejection(TransportRejection::DecodeError);
-                        }
-                        warn!("Frame decode error on dialed connection to {}: {}", peer, e);
-                        break;
-                    }
-                    None => {
-                        debug!("Dialed connection to {} closed by peer", peer);
-                        break;
-                    }
-                }
-            }
-        }
-    }
+    serve_frames(
+        FramedRead::new(read_half, TcpFrameCodec::new()),
+        NoReply,
+        &conn_cancel,
+        FrameRoute {
+            adapter: &ctx.adapter,
+            error_handler: &ctx.error_handler,
+            transport_key: &ctx.transport_key,
+            metrics: metrics.as_ref(),
+            shrink_threshold: ctx.shrink_threshold,
+        },
+        &peer,
+    )
+    .await;
 
     conn_cancel.cancel();
 }
@@ -390,19 +503,29 @@ mod tests {
         let recorder = Arc::new(RecordingErrorHandler::default());
         let conn_cancel = CancellationToken::new();
 
-        run_dialed_reader(
-            std::io::Cursor::new(wire),
-            DialedReaderContext {
-                adapter: adapter.clone(),
-                error_handler: recorder.clone(),
-                transport_key: "test".to_string(),
-                shrink_threshold: DEFAULT_SHRINK_THRESHOLD,
-            },
-            None,
-            conn_cancel.clone(),
-            "peer".to_string(),
-        )
-        .await;
+        let arms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        TEARDOWN_ARMS
+            .scope(
+                arms.clone(),
+                run_dialed_reader(
+                    std::io::Cursor::new(wire),
+                    DialedReaderContext {
+                        adapter: adapter.clone(),
+                        error_handler: recorder.clone(),
+                        transport_key: "test".to_string(),
+                        shrink_threshold: DEFAULT_SHRINK_THRESHOLD,
+                    },
+                    None,
+                    conn_cancel.clone(),
+                    "peer".to_string(),
+                ),
+            )
+            .await;
+        assert_eq!(
+            arms.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the dialed reader runs the shared loop, which builds its teardown once"
+        );
 
         assert!(
             streams.message_stream.is_empty(),
