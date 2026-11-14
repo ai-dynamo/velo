@@ -11,11 +11,19 @@
 //! | 3 | an ordered handler returns its response, and the next call on its lane blocks | the connection's writer | the response |
 //! | 4 | a consumer reads a record already waiting | the node-wide credit sweep | the credit, so the next record |
 //! | 5 | every application worker is held | nothing: a peer sends | the transport's read of the frames, and the mux's delivery of records |
+//! | 6 | every worker of the producer's application runtime is held, for longer than the stream watchdog's limit, while a stream is idle | nothing | the producer's heartbeats, so the consumer's watchdog ends the stream as `Dropped` |
+//! | 7 | every application worker is held | nothing: a peer contacts the node for the first time | velo's own handlers (`_hello`, `_list_handlers`), so the peer's `wait_for_handler` |
 //!
 //! Rows 1 to 4 stall on the application's runtime when tokio has put the
 //! woken velo task in the held worker's LIFO slot, which no other worker
 //! steals from. Row 5 stalls there because the transport's reader and its
-//! socket belong to the held runtime.
+//! socket belong to the held runtime. Row 6 fails there because the
+//! producer's heartbeat sweep is on the held runtime, while the consumer's
+//! watchdog, on a runtime nobody holds, counts the silent windows. Row 7
+//! stalls there because velo's own handlers are on the held runtime.
+//!
+//! Row 5 runs over every transport velo has: each must read on the runtime
+//! its `start` was given, not on a runtime the application holds.
 //!
 //! On the default, [`TaskRuntime::Dedicated`] with one thread, every row is a
 //! live test: the woken velo task and the reader run on velo's own runtime,
@@ -102,6 +110,39 @@ fn quic() -> Arc<dyn velo::Transport> {
 
 fn tcp_dyn() -> Arc<dyn velo::Transport> {
     tcp()
+}
+
+#[cfg(feature = "grpc")]
+fn grpc() -> Arc<dyn velo::Transport> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    Arc::new(
+        velo::transports::grpc::GrpcTransportBuilder::new()
+            .from_listener(listener)
+            .expect("from_listener")
+            .build()
+            .expect("build transport"),
+    )
+}
+
+#[cfg(feature = "zmq")]
+fn zmq() -> Arc<dyn velo::Transport> {
+    Arc::new(
+        velo::transports::zmq::ZmqTransportBuilder::new()
+            .bind_endpoint("tcp://127.0.0.1:0")
+            .build()
+            .expect("build transport"),
+    )
+}
+
+/// Pinned to UCX's tcp lane, so it runs without RDMA hardware.
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+fn ucx() -> Arc<dyn velo::Transport> {
+    Arc::new(
+        velo::transports::ucx::UcxTransportBuilder::new()
+            .tls("tcp")
+            .build()
+            .expect("build transport"),
+    )
 }
 
 async fn node(runtime: TaskRuntime, credit: Option<u32>, registry: Option<&Registry>) -> Velo {
@@ -580,6 +621,188 @@ enum Inbound {
     Record,
 }
 
+/// Row 7: every worker of the application's runtime is held while a peer on
+/// another runtime contacts the node for the first time. The delay is from
+/// the peer's `wait_for_handler` call to its answer, which needs the node's
+/// `_hello` or `_list_handlers` handler to run. Measured on the peer's
+/// runtime, which is never held.
+async fn first_contact(runtime: TaskRuntime, workers: usize) -> Duration {
+    let node = node(runtime, None, None).await;
+    node.register_handler(Handler::am_handler("sink", |_ctx: Context| Ok(())).build())
+        .expect("handler");
+    let node_info = node.peer_info();
+    let target = node.instance_id();
+    let (info_tx, info_rx) = tokio::sync::oneshot::channel();
+    let (go_tx, go_rx) = tokio::sync::oneshot::channel::<()>();
+    let (delay_tx, delay_rx) = std::sync::mpsc::channel::<Duration>();
+    let peer = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("peer runtime");
+        rt.block_on(async move {
+            let peer = Velo::builder()
+                .add_transport(tcp())
+                .mux_only()
+                .build()
+                .await
+                .expect("peer");
+            peer.register_peer(node_info).expect("register node");
+            info_tx.send(peer.peer_info()).expect("peer info");
+            go_rx.await.expect("go");
+            let started = Instant::now();
+            tokio::time::timeout(PATIENCE, peer.wait_for_handler(target, "sink"))
+                .await
+                .expect("first contact timed out")
+                .expect("first contact");
+            delay_tx.send(started.elapsed()).expect("delay");
+            peer.shutdown(velo::ShutdownPolicy::Timeout(Duration::from_secs(1)))
+                .await;
+        });
+    });
+    // Known before the hold, so the node's reply needs no lookup.
+    node.register_peer(info_rx.await.expect("peer info"))
+        .expect("register peer");
+
+    // Hold every worker, as row 5 does. This thread is not a worker.
+    let started = Arc::new(AtomicUsize::new(0));
+    let holders: Vec<_> = (0..workers)
+        .map(|_| {
+            let started = Arc::clone(&started);
+            tokio::spawn(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(HOLD);
+            })
+        })
+        .collect();
+    let deadline = Instant::now() + PATIENCE;
+    while started.load(Ordering::SeqCst) < workers {
+        assert!(Instant::now() < deadline, "the holders never started");
+        std::thread::sleep(Duration::from_micros(100));
+    }
+    go_tx.send(()).expect("go");
+    let delay = delay_rx.recv_timeout(PATIENCE).expect("row 7: no answer");
+    for holder in holders {
+        holder.await.expect("holder");
+    }
+    tokio::task::spawn_blocking(move || peer.join().expect("peer thread"))
+        .await
+        .expect("join");
+    node.shutdown(velo::ShutdownPolicy::Timeout(Duration::from_secs(1)))
+        .await;
+    delay
+}
+
+/// The heartbeat of row 6: short, so that the hold spans many windows.
+const IDLE_HEARTBEAT: Duration = Duration::from_millis(50);
+/// Twelve heartbeat windows. The watchdog ends a silent stream that holds
+/// data credit after three to four.
+const IDLE_HOLD: Duration = Duration::from_millis(600);
+
+/// Row 6: a stream is open and idle, and every worker of the producer's
+/// application runtime is held for [`IDLE_HOLD`]. The producer is on a
+/// runtime of its own, as a producer in another process would be; the
+/// consumer, on the test's runtime, is never held, so its watchdog keeps
+/// counting. The producer then sends item 1 and finalizes. Returns the frames
+/// the consumer read after item 0: `[item 1, finalized]` when the stream
+/// survived, `Dropped` when the watchdog ended it.
+///
+/// Holding both nodes' runtimes at once does not show the failure: the
+/// watchdog is held too, and the first heartbeat after the hold reaches it.
+async fn idle_stream_held(runtime: TaskRuntime, workers: usize) -> Vec<String> {
+    let producer_rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(workers)
+        .enable_all()
+        .build()
+        .expect("producer runtime");
+    // Built on its runtime, so its handlers and timers belong to it.
+    let producer = producer_rt
+        .spawn(node(runtime, None, None))
+        .await
+        .expect("producer");
+    let consumer = node(runtime, None, None).await;
+    introduce(&producer, &consumer).await;
+    let mut anchor = consumer.create_anchor_with_config::<u32>(AnchorConfig {
+        heartbeat_interval: Some(IDLE_HEARTBEAT),
+        ..AnchorConfig::default()
+    });
+    let ticket = consumer.prebind_anchor(anchor.handle()).expect("ticket");
+    let handle = anchor.handle();
+    let sender = producer_rt
+        .spawn({
+            let producer = producer.clone();
+            async move {
+                let sender = producer
+                    .open_anchor_stream::<u32>(handle, ticket)
+                    .await
+                    .expect("open stream");
+                sender.send(0).await.expect("send");
+                sender
+            }
+        })
+        .await
+        .expect("sender");
+    match tokio::time::timeout(PATIENCE, anchor.next()).await {
+        Ok(Some(Ok(StreamFrame::Item(0)))) => {}
+        other => panic!("row 6: item 0 did not arrive: {other:?}"),
+    }
+    // Idle a few windows first, so the stream is past its first heartbeat.
+    tokio::time::sleep(IDLE_HEARTBEAT * 3).await;
+
+    // Hold every worker of the producer's runtime. Spawned from a thread that
+    // is not one of its workers, so each idle worker takes one.
+    let started = Arc::new(AtomicUsize::new(0));
+    let holders: Vec<_> = (0..workers)
+        .map(|_| {
+            let started = Arc::clone(&started);
+            producer_rt.spawn(async move {
+                started.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(IDLE_HOLD);
+            })
+        })
+        .collect();
+    let deadline = Instant::now() + PATIENCE;
+    while started.load(Ordering::SeqCst) < workers {
+        assert!(Instant::now() < deadline, "the holders never started");
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    for holder in holders {
+        holder.await.expect("holder");
+    }
+
+    // A stream the watchdog ended refuses these; the reader reports it.
+    producer_rt
+        .spawn(async move {
+            let _ = sender.send(1).await;
+            let _ = sender.finalize();
+        })
+        .await
+        .expect("finish");
+    let mut frames = Vec::new();
+    loop {
+        match tokio::time::timeout(PATIENCE, anchor.next()).await {
+            Ok(Some(Ok(StreamFrame::Item(v)))) => frames.push(format!("item {v}")),
+            Ok(Some(Ok(StreamFrame::Finalized))) => {
+                frames.push("finalized".to_string());
+                break;
+            }
+            Ok(Some(other)) => {
+                frames.push(format!("{other:?}"));
+                break;
+            }
+            Ok(None) => break,
+            Err(_) => panic!("row 6: the stream did not end: {frames:?}"),
+        }
+    }
+    producer.shutdown(velo::ShutdownPolicy::WaitForever).await;
+    consumer.shutdown(velo::ShutdownPolicy::WaitForever).await;
+    drop(producer);
+    // Dropping a runtime inside an async context panics.
+    producer_rt.shutdown_background();
+    frames
+}
+
 // --- On the default, a dedicated runtime: live ----------------------------
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -620,6 +843,48 @@ async fn dedicated_mux_delivers_while_every_worker_is_held() {
 async fn dedicated_quic_transport_reads_while_every_worker_is_held() {
     let delay = inbound_read(quic, TaskRuntime::default(), 2, Inbound::Message).await;
     assert_none_waited("row 5, QUIC", &[delay]);
+}
+
+#[cfg(feature = "grpc")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dedicated_grpc_transport_reads_while_every_worker_is_held() {
+    let delay = inbound_read(grpc, TaskRuntime::default(), 2, Inbound::Message).await;
+    assert_none_waited("row 5, gRPC", &[delay]);
+}
+
+#[cfg(feature = "zmq")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dedicated_zmq_transport_reads_while_every_worker_is_held() {
+    let delay = inbound_read(zmq, TaskRuntime::default(), 2, Inbound::Message).await;
+    assert_none_waited("row 5, ZMQ", &[delay]);
+}
+
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dedicated_ucx_transport_reads_while_every_worker_is_held() {
+    let delay = inbound_read(ucx, TaskRuntime::default(), 2, Inbound::Message).await;
+    assert_none_waited("row 5, UCX", &[delay]);
+}
+
+/// Row 7: velo's own handlers run on its runtime, so a peer's first contact
+/// is answered while every application worker is held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dedicated_first_contact_is_answered_while_every_worker_is_held() {
+    let delay = first_contact(TaskRuntime::default(), 2).await;
+    assert_none_waited("row 7", &[delay]);
+}
+
+/// Row 6: the producer's heartbeats run on velo's runtime, so a hold of
+/// every worker of the producer's application runtime does not end an idle
+/// stream.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn dedicated_idle_stream_survives_every_worker_held() {
+    let frames = idle_stream_held(TaskRuntime::default(), 2).await;
+    assert_eq!(
+        frames,
+        ["item 1", "finalized"],
+        "row 6: the stream did not survive the hold"
+    );
 }
 
 /// Two threads take the same path as one; a check that the count is wired
@@ -663,4 +928,21 @@ async fn application_credit_sweep_waits_for_a_held_thread() {
 async fn application_transport_waits_while_every_worker_is_held() {
     let delay = inbound_read(tcp_dyn, TaskRuntime::Application, 2, Inbound::Message).await;
     assert_all_waited("row 5", &[delay]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "demonstration: on the application's runtime the producer's heartbeats wait for the hold; run with --ignored to see the watchdog end the stream"]
+async fn application_idle_stream_is_dropped_when_every_worker_is_held() {
+    let frames = idle_stream_held(TaskRuntime::Application, 2).await;
+    assert!(
+        frames.last().is_some_and(|f| f.contains("Dropped")),
+        "row 6: the stream survived this time: {frames:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "demonstration: on the application's runtime velo's own handlers wait for any hold of every worker; run with --ignored to see it"]
+async fn application_first_contact_waits_while_every_worker_is_held() {
+    let delay = first_contact(TaskRuntime::Application, 2).await;
+    assert_all_waited("row 7", &[delay]);
 }

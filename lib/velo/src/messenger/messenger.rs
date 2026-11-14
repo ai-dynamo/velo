@@ -401,6 +401,9 @@ impl Messenger {
     ///
     /// A handler of the same name is replaced. The replacement is gated by the
     /// drain like any request, even if the handler it replaced was exempt.
+    ///
+    /// The handler runs on the runtime that built the instance, as an
+    /// application handler does. velo's own handlers run on its task runtime.
     pub fn register_streaming_handler(
         &self,
         handler: crate::messenger::handlers::Handler,
@@ -412,7 +415,17 @@ impl Messenger {
         self.handlers.register_internal_handler(handler)
     }
 
-    /// Register an internal handler that the drain gate lets through.
+    /// Register one of velo's own handlers: names may start with `_`, and it
+    /// runs on velo's task runtime. Gated by the drain like any request.
+    pub(crate) fn register_system_handler(
+        &self,
+        handler: crate::messenger::handlers::Handler,
+    ) -> anyhow::Result<()> {
+        self.register_streaming_handler(handler.on_task_runtime())
+    }
+
+    /// Register one of velo's own handlers that the drain gate lets through.
+    /// It runs on velo's task runtime.
     ///
     /// Use it only for a handler that serves work this node or its peer
     /// accepted before the drain: the messages of an open stream, or the pull
@@ -433,7 +446,8 @@ impl Messenger {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(handler.name().as_bytes().into());
-        self.handlers.register_internal_handler(handler)
+        self.handlers
+            .register_internal_handler(handler.on_task_runtime())
     }
 
     /// Run `hook` when a payload staged for `handler_name` is refused for its

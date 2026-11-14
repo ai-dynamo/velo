@@ -476,7 +476,7 @@ pub(crate) fn mpsc_anchor_attach_handler(manager: Weak<AnchorManager>) -> crate:
                         session_id: routing_session_id,
                     }
                 });
-                tokio::spawn(mpsc_reader_pump(
+                manager.task_runtime().spawn(mpsc_reader_pump(
                     sender_id,
                     transport_rx,
                     frame_tx,

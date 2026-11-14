@@ -527,8 +527,10 @@ impl VeloBuilder {
     }
 
     /// Choose where velo runs its own tasks: the transports, the inbound loop,
-    /// the messenger mux and its batch lanes. Handlers run on the runtime
-    /// that calls [`build`](Self::build) either way.
+    /// the messenger mux and its batch lanes, the streams' heartbeats,
+    /// watchdogs and deadline sweeps, and velo's own handlers. The
+    /// application's handlers run on the runtime that calls
+    /// [`build`](Self::build) either way.
     ///
     /// The default, [`TaskRuntime::Dedicated`] with one thread, runs them on a
     /// runtime this instance builds and shuts down, so an application task

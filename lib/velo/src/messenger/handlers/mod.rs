@@ -74,6 +74,14 @@ impl Handler {
         self.dispatcher.as_ref().name()
     }
 
+    /// The same handler, run on velo's task runtime. Only for velo's own
+    /// handlers; see [`ActiveMessageDispatcher::on_task_runtime`].
+    pub(crate) fn on_task_runtime(self) -> Self {
+        Self {
+            dispatcher: self.dispatcher.on_task_runtime(),
+        }
+    }
+
     /// Create a synchronous active message handler
     pub fn am_handler<F>(
         name: impl Into<String>,
@@ -202,7 +210,8 @@ pub struct OrderedConfig {
     pub(crate) overflow: OverflowPolicy,
     /// Run the lanes on velo's task runtime rather than the messenger's.
     /// Only for velo's own handlers that do no application work: the mux's
-    /// batch lanes.
+    /// batch lanes, and any ordered handler velo registers for itself
+    /// (`Handler::on_task_runtime`).
     pub(crate) on_task_runtime: bool,
 }
 

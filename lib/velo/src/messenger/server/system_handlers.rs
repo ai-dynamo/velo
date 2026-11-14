@@ -69,9 +69,12 @@ fn create_list_handlers_handler() -> Handler {
 }
 
 /// Register all system handlers with the dispatcher.
+///
+/// They run on velo's task runtime, so a held application worker cannot hold
+/// up a peer's first contact.
 pub(crate) fn register_system_handlers(manager: &HandlerManager) -> Result<()> {
-    manager.register_internal_handler(create_hello_handler())?;
-    manager.register_internal_handler(create_list_handlers_handler())?;
+    manager.register_internal_handler(create_hello_handler().on_task_runtime())?;
+    manager.register_internal_handler(create_list_handlers_handler().on_task_runtime())?;
 
     tracing::info!(
         target: "crate::messenger::system",

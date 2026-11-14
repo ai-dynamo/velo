@@ -69,6 +69,10 @@ mod tests {
         fn dispatch(&self, _call: InboundCall, _system: &Arc<crate::Messenger>) {
             // No-op for testing
         }
+
+        fn on_task_runtime(self: Arc<Self>) -> Arc<dyn ActiveMessageDispatcher> {
+            self
+        }
     }
 
     fn make_manager() -> HandlerManager {

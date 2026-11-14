@@ -593,9 +593,10 @@ pub(crate) fn anchor_attach_handler(manager: Weak<AnchorManager>) -> crate::Hand
                                             std::sync::atomic::AtomicBool::new(false),
                                         ),
                                     },
+                                    &manager.task_runtime(),
                                 );
                             } else {
-                                tokio::spawn(reader_pump(
+                                manager.task_runtime().spawn(reader_pump(
                                     receiver,      // transport receiver from bind
                                     pump_frame_tx, // cloned from entry
                                     pump_cancel,   // cloned from entry

@@ -104,6 +104,13 @@ pub(crate) trait ActiveMessageDispatcher: Send + Sync {
 
     /// Dispatch a message to the handler (non-async, kicks off handler execution)
     fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>);
+
+    /// The same handler, run on velo's task runtime rather than the
+    /// messenger's. Chosen once, when velo registers one of its own handlers,
+    /// so dispatch pays nothing for the choice. Never for application
+    /// handlers: velo's runtime has one thread by default, and application
+    /// work there would stall velo.
+    fn on_task_runtime(self: Arc<Self>) -> Arc<dyn ActiveMessageDispatcher>;
 }
 
 /// Catch both a panic in `handle()` and a panic while its future is polled.
@@ -202,7 +209,11 @@ pub(crate) async fn send_error_reply(
 }
 
 /// Run each handler on its own task. The context keeps its drain guard.
-pub(crate) struct SpawnedDispatcher<H: ActiveMessageHandler> {
+///
+/// `ON_TASK_RUNTIME` picks the runtime the task is spawned on: the
+/// messenger's (application handlers), or velo's task runtime (velo's own
+/// handlers). A const, not a field, so neither dispatch branches on it.
+pub(crate) struct SpawnedDispatcher<H: ActiveMessageHandler, const ON_TASK_RUNTIME: bool = false> {
     handler: Arc<H>,
 }
 
@@ -214,7 +225,9 @@ impl<H: ActiveMessageHandler> SpawnedDispatcher<H> {
     }
 }
 
-impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispatcher<H> {
+impl<H: ActiveMessageHandler + 'static, const ON_TASK_RUNTIME: bool> ActiveMessageDispatcher
+    for SpawnedDispatcher<H, ON_TASK_RUNTIME>
+{
     fn name(&self) -> &str {
         self.handler.name()
     }
@@ -222,6 +235,15 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispa
     fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>) {
         let handler = self.handler.clone();
         let ctx = call.into_context(Arc::clone(system));
+        // velo's own handlers run where velo's other tasks do, so a held
+        // application worker cannot stall them. From the inbound loop, which
+        // is on that runtime, this is a local push.
+        if ON_TASK_RUNTIME {
+            system.task_runtime().spawn(async move {
+                run_handler(&*handler, ctx, DispatchFailure::HandlerPanic).await;
+            });
+            return;
+        }
         // On the messenger's runtime, not the current one: this runs on the
         // inbound loop, which is on velo's own runtime by default, so the
         // spawn is a remote push to the application's runtime. Under
@@ -230,6 +252,12 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispa
         system.runtime().spawn(async move {
             run_handler(&*handler, ctx, DispatchFailure::HandlerPanic).await;
         });
+    }
+
+    fn on_task_runtime(self: Arc<Self>) -> Arc<dyn ActiveMessageDispatcher> {
+        Arc::new(SpawnedDispatcher::<H, true> {
+            handler: Arc::clone(&self.handler),
+        })
     }
 }
 
@@ -307,11 +335,15 @@ impl LaneObserver for OrderedLaneObserver {
 
 impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
     pub fn new(handler: H, config: OrderedConfig) -> Self {
+        Self::with_handler(Arc::new(handler), config)
+    }
+
+    fn with_handler(handler: Arc<H>, config: OrderedConfig) -> Self {
         let limiter = config
             .max_concurrent
             .map(|limit| Arc::new(Semaphore::new(limit)));
         Self {
-            handler: Arc::new(handler),
+            handler,
             config,
             bound: OnceLock::new(),
             limiter,
@@ -404,6 +436,16 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
 impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispatcher<H> {
     fn name(&self) -> &str {
         self.handler.name()
+    }
+
+    fn on_task_runtime(self: Arc<Self>) -> Arc<dyn ActiveMessageDispatcher> {
+        if self.config.on_task_runtime {
+            return self;
+        }
+        // Called at registration, before any dispatch has bound the lanes.
+        let mut config = self.config.clone();
+        config.on_task_runtime = true;
+        Arc::new(Self::with_handler(Arc::clone(&self.handler), config))
     }
 
     fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>) {

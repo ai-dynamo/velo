@@ -1394,6 +1394,16 @@ impl AnchorManager {
         }
     }
 
+    /// Where velo's own stream tasks run (watchdogs, reader pumps): velo's
+    /// task runtime once the messenger is set, the current runtime before.
+    pub(crate) fn task_runtime(&self) -> tokio::runtime::Handle {
+        self.messenger_lock
+            .get()
+            .map_or_else(tokio::runtime::Handle::current, |messenger| {
+                messenger.task_runtime().clone()
+            })
+    }
+
     pub(crate) async fn shutdown(&self) {
         self.deadline_queue.stop();
         self.mpsc_deadlines.stop();
@@ -1748,6 +1758,7 @@ impl AnchorManager {
                 // `WatchdogContext::prebound`.
                 prebound,
             },
+            &self.task_runtime(),
         );
 
         self.record_streaming_operation(
@@ -2194,7 +2205,7 @@ impl AnchorManager {
             anchor_detach_handler, anchor_finalize_handler, create_stream_cancel_handler,
         };
 
-        messenger.register_streaming_handler(anchor_attach_handler(manager.clone()))?;
+        messenger.register_system_handler(anchor_attach_handler(manager.clone()))?;
         // Everything but the attaches serves a stream already open, or a
         // reservation already made, so the drain gate lets it through; an
         // attach opens a new stream.
@@ -2215,7 +2226,7 @@ impl AnchorManager {
 
         // MPSC handlers — share the same SenderRegistry so `_stream_cancel`
         // covers both SPSC and MPSC senders uniformly.
-        messenger.register_streaming_handler(
+        messenger.register_system_handler(
             crate::streaming::mpsc::control::mpsc_anchor_attach_handler(manager.clone()),
         )?;
         messenger.register_drain_exempt_handler(
@@ -2225,10 +2236,12 @@ impl AnchorManager {
             crate::streaming::mpsc::control::mpsc_anchor_cancel_handler(manager),
         )?;
 
-        // The sweeps run on the messenger's runtime from here on. Remote
-        // streams need that runtime anyway, and a sweep on it does not die
-        // with a shorter-lived runtime that happened to push first.
-        let runtime = messenger.runtime().clone();
+        // The sweeps run on velo's task runtime from here on (the messenger's
+        // under `TaskRuntime::Application`), so a held application worker
+        // cannot hold back a heartbeat, and a sweep does not die with a
+        // shorter-lived runtime that happened to push first. Velo stops them
+        // in `shutdown` before it stops that runtime.
+        let runtime = messenger.task_runtime().clone();
         self.deadline_queue.pin_runtime(runtime.clone());
         self.mpsc_deadlines.pin_runtime(runtime.clone());
         self.heartbeats.pin_runtime(runtime);

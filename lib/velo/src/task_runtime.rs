@@ -16,8 +16,11 @@ use futures::future::{BoxFuture, Shared};
 use crate::transports::VeloBackend;
 
 /// Where velo runs its own tasks: the transports, the inbound loop, the
-/// messenger mux, and the mux's batch lanes. Handlers always run on the
-/// application's runtime, the one that calls [`VeloBuilder::build`].
+/// messenger mux and the mux's batch lanes, the streams' heartbeats,
+/// watchdogs and deadline sweeps, and velo's own handlers (stream attach and
+/// control, rendezvous, events, first contact). The application's handlers
+/// always run on the application's runtime, the one that calls
+/// [`VeloBuilder::build`].
 ///
 /// Set it with [`VeloBuilder::task_runtime`]. The default is
 /// [`TaskRuntime::Dedicated`] with one thread. [`TaskRuntime::Application`]
@@ -35,18 +38,25 @@ use crate::transports::VeloBackend;
 /// limitations" appendix describes the stall and the other workaround
 /// (`block_in_place` or `spawn_blocking`).
 ///
-/// Some of velo's work stays on the application's runtime: the streams'
-/// heartbeat, watchdog and deadline timers, and velo's own handlers (stream
-/// attach, rendezvous, first contact). A timer is woken by the runtime's
-/// driver, not into a held worker's LIFO slot, so one held worker does not
-/// stall it. But a hold of every worker at once for longer than a few
-/// heartbeat intervals can still end a stream as if its producer had died.
+/// The heartbeats and the watchdog matter most: on a held runtime, a
+/// producer whose every worker is held for a few heartbeat intervals sends
+/// no heartbeat, and the consumer's watchdog ends the stream as if the
+/// producer had died.
+///
+/// Some of velo's work stays on the application's runtime, because it serves
+/// the application's own call or must outlive velo's runtime: a stream `send`
+/// that finds its channel full waits in a task on the caller's runtime, and
+/// the rendezvous store's time-to-live sweep and the RDMA lease reaper keep
+/// running after [`Velo::shutdown`](crate::Velo::shutdown) has stopped velo's
+/// runtime.
 ///
 /// A transport built on a client the application connected keeps that
 /// client's I/O where the application connected it: the NATS transport takes
 /// an `async_nats::Client`, so its reads and writes still need the runtime
-/// that called `connect`. Connect it on a runtime the application does not
-/// hold to keep it clear.
+/// that called `connect`. velo does not connect the client itself, because
+/// the same client usually serves NATS discovery and queues too. To keep
+/// NATS clear of the application, connect the client on a small runtime of
+/// its own and keep that runtime for as long as the client.
 ///
 /// # What it costs
 ///
@@ -371,6 +381,84 @@ mod tests {
             TaskRuntime::default(),
             TaskRuntime::Dedicated { threads: 1 }
         );
+    }
+
+    /// The thread each of velo's own handler kinds runs on: one spawned per
+    /// message, and one on ordered lanes. Registered the two ways velo
+    /// registers its own handlers.
+    async fn system_handler_threads(runtime: TaskRuntime) -> Vec<Option<String>> {
+        use crate::Handler;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let transport = crate::transports::tcp::TcpTransportBuilder::new()
+            .from_listener(listener)
+            .unwrap()
+            .build()
+            .unwrap();
+        let velo = crate::Velo::builder()
+            .add_transport(std::sync::Arc::new(transport))
+            .task_runtime(runtime)
+            .build()
+            .await
+            .unwrap();
+        let (tx, rx) = flume::unbounded();
+        let probe = |name: &'static str, ordered: bool| {
+            let tx = tx.clone();
+            let builder = Handler::am_handler(name, move |_ctx| {
+                let _ = tx.send(std::thread::current().name().map(str::to_owned));
+                Ok(())
+            });
+            if ordered {
+                builder.ordered().build()
+            } else {
+                builder.build()
+            }
+        };
+        let messenger = velo.messenger();
+        messenger
+            .register_drain_exempt_handler(probe("_probe_spawned", false))
+            .unwrap();
+        messenger
+            .register_system_handler(probe("_probe_ordered", true))
+            .unwrap();
+        velo.register_peer(velo.peer_info()).unwrap();
+        let mut threads = Vec::new();
+        for name in ["_probe_spawned", "_probe_ordered"] {
+            // The unchecked form velo's own senders use for `_` names.
+            messenger
+                .am_send_streaming(name)
+                .unwrap()
+                .instance(velo.instance_id())
+                .send()
+                .await
+                .unwrap();
+            threads.push(
+                tokio::time::timeout(Duration::from_secs(5), rx.recv_async())
+                    .await
+                    .expect("the handler never ran")
+                    .unwrap(),
+            );
+        }
+        velo.shutdown(crate::ShutdownPolicy::WaitForever).await;
+        threads
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn velos_own_handlers_run_on_the_task_runtime() {
+        for thread in system_handler_threads(TaskRuntime::default()).await {
+            assert_eq!(thread.as_deref(), Some(THREAD_NAME));
+        }
+    }
+
+    /// The opt-out keeps them where they ran before: on the runtime that
+    /// built the instance.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn under_application_velos_own_handlers_stay_on_its_runtime() {
+        let worker = tokio::spawn(async { std::thread::current().name().map(str::to_owned) })
+            .await
+            .unwrap();
+        for thread in system_handler_threads(TaskRuntime::Application).await {
+            assert_eq!(thread, worker, "not on the test's runtime");
+        }
     }
 
     /// A slot dropped inside an async task must not panic: `Runtime`'s own

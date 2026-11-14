@@ -99,9 +99,9 @@ So the kill switch is a rollback only for a node that opted in to the per-stream
 
 ## 0.23.0: velo's tasks run on a runtime it owns
 
-Before 0.23.0, velo ran its own tasks (the transports, the inbound loop, the messenger mux and its batch lanes) on the runtime that called `build`. From 0.23.0, `VeloBuilder::task_runtime` defaults to `TaskRuntime::Dedicated { threads: 1 }`: velo builds a one-thread runtime named `velo-rt` for these tasks and stops it in `Velo::shutdown` or on the last drop. Handlers still run on the runtime that called `build`. The code does not change; the behaviour does.
+Before 0.23.0, velo ran its own tasks (the transports, the inbound loop, the messenger mux and its batch lanes, the streams' heartbeats, watchdogs and deadline sweeps, and its own handlers) on the runtime that called `build`. From 0.23.0, `VeloBuilder::task_runtime` defaults to `TaskRuntime::Dedicated { threads: 1 }`: velo builds a one-thread runtime named `velo-rt` for these tasks and stops it in `Velo::shutdown` or on the last drop. The application's handlers still run on the runtime that called `build`. The code does not change; the behaviour does.
 
-What it buys: an application task that holds its worker thread right after it calls velo (a blocking call, a long encode) no longer stalls velo's tasks. See [Known limitations](../appendix/limitations.md#a-task-that-holds-its-worker-thread-stalls-velos-tasks).
+What it buys: an application task that holds its worker thread right after it calls velo (a blocking call, a long encode) no longer stalls velo's tasks, and a hold of every application worker no longer ends a stream for want of heartbeats. See [Known limitations](../appendix/limitations.md#a-task-that-holds-its-worker-thread-stalls-velos-tasks).
 
 What it costs: each wake between the application and velo now crosses threads. In velo's own benchmark on one exclusive 72-core node, a single caller making one unary call at a time took about 3.5 to 4 times as long per call. Under concurrency the dedicated runtime did better, and in dynamo's frontend load test the frontend used 6% to 25% less CPU per output token. `TaskRuntime`'s documentation has the setup and the other numbers.
 
@@ -123,3 +123,12 @@ Also check:
 
 - Tests that pause tokio's clock (`start_paused`, `tokio::time::pause`) control only their own runtime's clock, not velo's. A test that pauses time while velo runs a timer of its own may need `TaskRuntime::Application`.
 - Code that counts the process's threads sees one more, `velo-rt`, per instance, and a short-lived `velo-rt-stop` thread when an instance stops.
+- A NATS transport keeps its I/O where the application connected its `async_nats::Client`. velo does not connect the client itself, because the same client usually serves NATS discovery and queues too. To keep NATS traffic clear of the application's runtime, connect the client on a small runtime of its own, and keep that runtime as long as the client (stop it with `shutdown_background`, because dropping a runtime inside an async task panics):
+
+  ```rust
+  let nats_rt = tokio::runtime::Builder::new_multi_thread()
+      .worker_threads(1)
+      .enable_all()
+      .build()?;
+  let client = nats_rt.spawn(async_nats::connect(url)).await??;
+  ```

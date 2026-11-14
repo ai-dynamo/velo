@@ -290,12 +290,11 @@ impl RendezvousManager {
         // owner answers such an acquire chunked, never by RDMA; see
         // `rdma_response`. `_rv_metadata` and `_rv_ref` start a new consumer,
         // which is new work, so they stay gated.
-        messenger
-            .register_streaming_handler(create_rv_metadata_handler(Arc::clone(&self.store)))?;
+        messenger.register_system_handler(create_rv_metadata_handler(Arc::clone(&self.store)))?;
         messenger
             .register_drain_exempt_handler(create_rv_acquire_handler(Arc::clone(&self.store)))?;
         messenger.register_drain_exempt_handler(create_rv_pull_handler(Arc::clone(&self.store)))?;
-        messenger.register_streaming_handler(create_rv_ref_handler(Arc::clone(&self.store)))?;
+        messenger.register_system_handler(create_rv_ref_handler(Arc::clone(&self.store)))?;
         messenger
             .register_drain_exempt_handler(create_rv_detach_handler(Arc::clone(&self.store)))?;
         messenger

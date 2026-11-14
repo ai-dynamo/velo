@@ -231,14 +231,18 @@ pub(crate) fn install_direct_feed(
 /// feed, and the frame is queued, so it cannot be lost to a race with the
 /// consumer's next poll. The consumer drops heartbeats before they reach the
 /// application.
+///
+/// The watchdog runs on `runtime`, velo's task runtime: on a runtime the
+/// application holds, it would count the held time as silence.
 pub(crate) fn launch_direct_stream(
     feed: Arc<DirectFeed>,
     frame_tx: flume::Sender<Vec<u8>>,
     ctx: crate::streaming::anchor::AnchorContext,
     watch: WatchdogContext,
+    runtime: &tokio::runtime::Handle,
 ) {
     let _ = frame_tx.try_send(crate::streaming::sender::cached_heartbeat().clone());
-    tokio::spawn(stream_watchdog(feed, frame_tx, ctx, watch));
+    runtime.spawn(stream_watchdog(feed, frame_tx, ctx, watch));
 }
 
 /// Reap a bind nobody claimed whose buffer just closed, exactly once.
