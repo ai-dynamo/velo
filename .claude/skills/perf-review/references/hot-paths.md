@@ -178,6 +178,7 @@ mux harnesses install them, so these are T1 when metrics are on.
 | `GSO_SAFE_MAX_MTU` 6550, `DEFAULT_SERVER_ENDPOINTS`, UDP buffers | `transports/quic/transport/builder.rs` | operations/quic-performance.md |
 | `UcxConfig::spin_us` 20 | `transports/ucx/transport.rs` | operations/rdma-performance.md |
 | `DEFAULT_SENDER_CAPACITY` 1024 | `transports/nats/transport.rs` | none |
+| `TaskRuntime::default()`: `Dedicated { threads: 1 }`; every T1 path crosses between the application's runtime and velo's | `task_runtime.rs` | `TaskRuntime` docs, "What it costs"; guides/migrate-services.md |
 
 ## Perf-sensitive dependencies
 
