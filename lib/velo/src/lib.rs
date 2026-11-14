@@ -2262,10 +2262,12 @@ mod tests {
                     .build()
                     .unwrap(),
             ));
+            // The other arm opts in to the per-stream path, so that final
+            // drop is checked with a builder-owned stream listener too.
             let builder = if mux_only {
                 builder.mux_only()
             } else {
-                builder
+                builder.stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
             };
             let node = builder.build().await.unwrap();
             (node, addr)
@@ -2306,6 +2308,11 @@ mod tests {
                 Some(OwnedStreamTransport::Grpc(_)) => unreachable!(),
                 None => None,
             };
+            assert_eq!(
+                frame_transport.is_some(),
+                !mux_only,
+                "only the per-stream arm owns a stream listener"
+            );
             let stream_addr = frame_transport
                 .as_ref()
                 .map(|transport| transport.bound_addr());
