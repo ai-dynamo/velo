@@ -34,7 +34,7 @@ On the default, a unary call to a handler hands off between the two runtimes fou
 3. The handler hands its response to the server's connection writer, on velo's runtime.
 4. The client's response path, on velo's runtime, wakes the caller.
 
-On `TaskRuntime::Application` the whole call runs on the application's runtime. The tests `a_unary_call_crosses_between_runtimes_four_times` and `a_unary_call_on_the_application_runtime_stays_there` in `lib/velo/tests/task_runtime.rs` count these hand-offs by thread.
+On `TaskRuntime::Application` the whole call runs on the application's runtime. The test `a_unary_call_crosses_between_runtimes_four_times` in `lib/velo/tests/task_runtime.rs` counts hand-offs 1 to 3 exactly, once each per call. It checks the fourth as at least one wake of a caller from velo's runtime and none from the application's, because a wake per call cannot be counted: a response that arrives during the caller's poll needs no wake. `a_unary_call_on_the_application_runtime_stays_there` is the control.
 
 ## The arms
 
@@ -142,7 +142,7 @@ A wake from velo's runtime into the busy application runtime goes to tokio's sha
 
 ### What the numbers show
 
-- **One crossing at low load is expensive.** A unary call at one caller takes 15.7 µs on arm A: the whole round trip runs on one worker with no thread park. C1 adds the four hand-offs above, and the call takes 55.7 µs at 4.3 times the CPU. Both nodes ran in one process, each with its own velo runtime, so in C1 each socket read also woke a parked velo thread. Between two hosts a socket read wakes a thread on the receiving host in every arm. How much of the gap remains between hosts was not measured.
+- **One crossing at low load is expensive.** A unary call at one caller takes 15.7 µs on arm A: the whole round trip runs on one worker with no thread park. C1 adds the four hand-offs above, and the call takes 55.7 µs at 4.3 times the CPU. Both nodes ran in one process, each with its own velo runtime, so in C1 each socket read also woke a parked velo thread. Whether the gap is smaller between two hosts was not measured.
 - **At one stream, C1 costs little.** It has a lower p50 than A (32.9 µs against 37.2 µs) and 9% less CPU per record. Its p99 is higher (53 µs against 44 µs), but the ranges overlap.
 - **Under concurrency, the C arms win.** At 64 streams, C1 moves 40% more records than A, at a lower p99 and 13% less CPU per record. With 4 busy peers, C2 moves 2.6 times as many. At 64 unary callers, C1 serves 1.2 times as many calls as A, and C2 serves 1.6 times as many.
 - **Flood and the serving shape favor A.** In a flood, the C arms move 13% to 14% fewer records at 9% to 11% more CPU. In the serving shape, C1 uses 29% more CPU per token than A and C2 54% more. The inter-token p50 rises 13%, and the p99 falls 5% to 7%.
@@ -180,9 +180,9 @@ A wake from velo's runtime into the busy application runtime goes to tokio's sha
 - **Latency.** For time to first token and inter-token latency, each median of C1 was within 1% of A's or had a range that overlapped A's, with one exception. At 5.8 to 8 ms spacing and concurrency 64, C1's median time to first token was 83.7 ms against A's 70.9 ms (ranges 75.4 to 96.9 against 68.3 to 79.3). No other cell showed it.
 - **Two threads.** C2 used more frontend CPU per token than C1 in every cell. It had 4% to 23% more thread parks per token than A, and in some cells the engines used up to 17% more CPU per token than in A.
 
-## Why the default
+## The decision
 
-Only a dedicated runtime removes the stall in all its forms. In dynamo's load test, the default cost less CPU and changed neither throughput nor latency. Its cost falls on unary calls made one at a time, which dynamo did not make. For those, the opt-out stays.
+C1 is the default in 0.23.0: `TaskRuntime::Dedicated { threads: 1 }`. `TaskRuntime::Application` stays as the opt-out, and the migration guide tells users whose latency depends on unary calls, such as dynamo-gdl and kvbm, how to opt out. In the tables above, only the C arms removed all four stalls. In dynamo's load test, C1 used less frontend CPU per token than A in every cell, at equal throughput. The largest cost measured is the round trip of a single unary caller.
 
 ## Who should opt out
 
