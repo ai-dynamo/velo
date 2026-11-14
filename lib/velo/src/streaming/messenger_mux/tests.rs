@@ -2700,27 +2700,50 @@ async fn watched_anchor<T: serde::de::DeserializeOwned>(
 /// that holds no credit alone, however long it stays quiet. The records are
 /// all still there when the consumer comes back.
 ///
-/// Control: once the consumer has read them, credit goes back to the sender,
-/// the same silence is the sender's, and the watchdog reaps the anchor.
+/// Control: once credit goes back to the sender, the same silence is the
+/// sender's, and the watchdog reaps the anchor.
+///
+/// No credit goes back until the test returns it. The test used to read the
+/// window with credit flowing back on a 1 ms sweep, so the first reads made
+/// the sender "silent with credit", and on a loaded host the watchdog fired
+/// three windows later, before the last read: `SenderDropped`. The sweep now
+/// runs only by hand, and the peer's drain wake is raised before any read, so
+/// no doorbell visit runs either (the same setup as
+/// `a_busy_tick_returns_credit_no_doorbell_asked_for`). The control returns
+/// the credit with one sweep.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_watchdog_does_not_fire_while_its_sender_is_parked() {
     const CREDIT: u32 = 8;
     let heartbeat = Duration::from_millis(50);
     let config = MuxConfig {
         initial_credit: CREDIT,
-        ..test_config()
+        ..manual_tick_config()
     };
-    let (pair, manager, mut anchor, local_id, tx) =
-        watched_anchor::<u32>(config, heartbeat, false).await;
+    let (pair, manager, mut anchor, local_id, session_id, drain) =
+        watched_anchor_unconnected::<u32>(config, heartbeat, false).await;
+    // The sweep task's first tick would return credit too.
+    eventually(|| {
+        pair.consumer
+            .core
+            .ticks
+            .load(std::sync::atomic::Ordering::Acquire)
+            > 0
+    })
+    .await;
+    pair.consumer
+        .core
+        .ingress
+        .pending_wake(lane0(pair.producer_worker))
+        .store(true, std::sync::atomic::Ordering::Release);
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, local_id, session_id)
+        .await
+        .expect("connect");
     for n in 0..CREDIT {
         tx.send_async(item(n)).await.expect("send item");
     }
-    eventually(|| {
-        pair.consumer
-            .live_ingress_slots(lane0(pair.producer_worker))
-            == 1
-    })
-    .await;
+    eventually(|| drain.arrivals() == u64::from(CREDIT)).await;
 
     // Twenty windows of silence, with the whole window unread.
     tokio::time::sleep(heartbeat * 20).await;
@@ -2736,8 +2759,14 @@ async fn the_watchdog_does_not_fire_while_its_sender_is_parked() {
             .expect("record decodes");
         assert!(matches!(frame, StreamFrame::Item(v) if v == n));
     }
+    tokio::time::sleep(heartbeat * 5).await;
+    assert!(
+        manager.registry.contains_key(&local_id),
+        "reading the window returned no credit, so the sender is still parked"
+    );
 
-    // The credit is back with the sender, and it is still silent.
+    // Return the credit: the sender holds it now, and it is still silent.
+    pair.consumer.core.sweep();
     eventually(|| !manager.registry.contains_key(&local_id)).await;
     drop(tx);
 }
