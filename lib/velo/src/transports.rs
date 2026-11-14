@@ -144,22 +144,11 @@ pub struct VeloBackend {
     teardown_outcome: teardown::Outcome,
     runtime: tokio::runtime::Handle,
     observability: Option<Arc<VeloMetrics>>,
-    peers: Mutex<PeerTable>,
+    /// Each registered peer's `PeerInfo`, so that an observer installed
+    /// late hears of it. Written under the peer's `primary_transport` entry.
+    peers: DashMap<InstanceId, PeerInfo>,
+    peer_observer: OnceLock<Arc<dyn PeerTableObserver>>,
     advertised: OnceLock<PeerInfo>,
-}
-
-/// The registered peers and the one observer of their changes.
-///
-/// One lock covers the routes and the observer, so a register and an
-/// unregister of one peer cannot interleave there: the observer's table ends
-/// as the routes do. It also lets an observer installed after the
-/// transports started learn the peers that a `_hello` registered first.
-/// `Transport::unregister` runs outside it, because it can run the error
-/// handlers of the peer's queued sends.
-#[derive(Default)]
-struct PeerTable {
-    peers: HashMap<InstanceId, PeerInfo>,
-    observer: Option<Arc<dyn PeerTableObserver>>,
 }
 
 /// Told when the backend's peer table changes.
@@ -170,8 +159,10 @@ struct PeerTable {
 /// installs one observer that keeps the per-stream transport's own peer
 /// table in step, so that no path can fill one table and not the other.
 ///
-/// The backend calls it under its peer-table lock: it must not block, and
-/// it must not call back into the backend.
+/// The backend calls it while it holds the peer's `primary_transport`
+/// entry, so that a register and an unregister of one peer reach it in the
+/// order they change the route. It must not block, and it must not call
+/// back into the backend.
 pub(crate) trait PeerTableObserver: Send + Sync {
     /// The peer was added: at least one messenger transport accepted it.
     /// Infallible, because the messenger's registration stands either way;
@@ -326,7 +317,8 @@ impl VeloBackend {
                 teardown_outcome: Default::default(),
                 runtime,
                 observability,
-                peers: Mutex::default(),
+                peers: DashMap::new(),
+                peer_observer: OnceLock::new(),
                 advertised: OnceLock::new(),
             },
             data_streams,
@@ -384,15 +376,16 @@ impl VeloBackend {
         &self,
         observer: Arc<dyn PeerTableObserver>,
     ) -> anyhow::Result<()> {
-        let mut table = self.peers.lock();
-        anyhow::ensure!(
-            table.observer.is_none(),
-            "a peer table observer is already installed"
-        );
-        for peer in table.peers.values() {
-            observer.registered(peer);
+        self.peer_observer
+            .set(Arc::clone(&observer))
+            .map_err(|_| anyhow::anyhow!("a peer table observer is already installed"))?;
+        // Installed first, so a register from here on tells it, and one that
+        // the walk also finds is told twice, which is one register. The walk
+        // holds each shard while it calls, so a register or an unregister of
+        // that peer comes after it.
+        for peer in self.peers.iter() {
+            observer.registered(peer.value());
         }
-        table.observer = Some(observer);
         Ok(())
     }
 
@@ -719,7 +712,6 @@ impl VeloBackend {
     /// can accept the peer's address.
     pub fn register_peer(&self, peer: PeerInfo) -> Result<(), VeloBackendError> {
         let instance_id = peer.instance_id();
-        let mut table = self.peers.lock();
         let mut compatible_transports = Vec::new();
         let mut failures = Vec::new();
         for (key, transport) in self.transports.iter() {
@@ -753,16 +745,21 @@ impl VeloBackend {
 
         let primary_transport = self.transports.get(&primary_transport_key).unwrap();
 
-        self.primary_transport
-            .insert(instance_id, primary_transport.clone());
+        // The route's entry orders this against an unregister of the same
+        // peer, so the observer's table ends as the route does. No lock of
+        // the backend's own: a send's error handler can register a peer.
+        let route = self
+            .primary_transport
+            .entry(instance_id)
+            .insert(primary_transport.clone());
+        self.peers.insert(instance_id, peer.clone());
+        if let Some(observer) = self.peer_observer.get() {
+            observer.registered(&peer);
+        }
+        drop(route);
         self.alternative_transports
             .insert(instance_id, alternative_transport_keys);
         self.workers.insert(instance_id.worker_id(), instance_id);
-
-        if let Some(observer) = &table.observer {
-            observer.registered(&peer);
-        }
-        table.peers.insert(instance_id, peer);
         Ok(())
     }
 
@@ -773,21 +770,22 @@ impl VeloBackend {
     /// A send to it then fails with [`VeloBackendError::InstanceNotRegistered`].
     /// Idempotent; other peers are not affected.
     pub fn unregister_peer(&self, instance_id: InstanceId) {
-        {
-            let mut table = self.peers.lock();
-            table.peers.remove(&instance_id);
-            // Routes first, so a new send fails here and does not reach a
-            // transport that is closing the peer's connections.
-            self.primary_transport.remove(&instance_id);
-            self.alternative_transports.remove(&instance_id);
-            self.workers
-                .remove_if(&instance_id.worker_id(), |_, id| *id == instance_id);
-            if let Some(observer) = &table.observer {
-                observer.unregistered(instance_id);
-            }
+        // Routes first, so a new send fails here and does not reach a
+        // transport that is closing the peer's connections. The observer is
+        // told under the route's entry, as `register_peer` tells it.
+        let route = self.primary_transport.entry(instance_id);
+        self.peers.remove(&instance_id);
+        if let Some(observer) = self.peer_observer.get() {
+            observer.unregistered(instance_id);
         }
-        // Outside the lock: a transport fails the peer's queued sends here
-        // and runs their error handlers, which may register a peer.
+        if let dashmap::Entry::Occupied(route) = route {
+            route.remove();
+        }
+        self.alternative_transports.remove(&instance_id);
+        self.workers
+            .remove_if(&instance_id.worker_id(), |_, id| *id == instance_id);
+        // A transport fails the peer's queued sends here and runs their
+        // error handlers, so it runs under no entry.
         // Every transport, not only the routes: a re-registration that one
         // transport refused leaves that transport out of the routes, but it
         // can still hold the peer from before.
