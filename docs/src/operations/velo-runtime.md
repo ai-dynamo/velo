@@ -57,9 +57,9 @@ Each node builds its own runtime in `VeloBuilder::build`, so a process with N no
 ### Setup
 
 - Host: one aarch64 workstation with 72 Neoverse-V2 cores, Linux 6.17, governor `performance`, exclusive for the run. Rust 1.99.1, tokio 1.54.0.
-- Pinning: each process ran under `taskset -c 8-35`. The application's runtime had 4 worker threads, pinned with the main thread to cores 8 to 11. velo's runtime threads were pinned to cores 12 to 35. The shipped runtime does not pin its threads.
+- Pinning: each timed run ran under `taskset -c 8-35`. The application's runtime had 4 worker threads, pinned with the main thread to cores 8 to 11. velo's runtime threads were pinned to cores 12 to 35. The shipped runtime does not pin its threads.
 - Order: 10 reps of each cell. Within a rep, every arm ran once, and the arm that ran first rotated from cell to cell and rep to rep.
-- Host record: before each run, the busy CPU over 3 s (median 0.02 cores, maximum 2.3). A run during which another process used 100 ms of CPU or more was run again. 24 of 840 runs were.
+- Host record: before each run, the busy CPU over 3 s (median 0.02 cores, maximum 2.3). A timed run during which another process used 100 ms of CPU or more was run again. 24 of 840 timed runs were.
 - Counters: process CPU comes from `CLOCK_PROCESS_CPUTIME_ID`. Thread parks are the voluntary context switches, summed over `/proc/self/task/*/status`. Batcher wakes and records per batch come from velo's mux metrics.
 - Tables give the median of 10 reps, with the range in parentheses where it matters. Unless the text says otherwise, each difference named below has ranges that do not overlap.
 
@@ -79,7 +79,7 @@ In a closed loop, each stream sends one record and waits until the consumer has 
 
 ### Stalls
 
-Each row ran 50 times per arm with a hold of 100 ms. A run stalled when the woken work took at least half the hold. A stalled run waited for the whole hold, about 100 to 103 ms.
+The stall probes are ignored tests in the measurement build, run with `--ignored --test-threads=1` under `taskset -c 8-35`, once per arm. Each test ran on its own 4-worker runtime, without the core split of the timed runs. Each row ran 50 times per arm with a hold of 100 ms. During each arm's probe run, other processes used 100 to 290 ms of CPU, and no probe run was repeated. A run stalled when the woken work took at least half the hold. A stalled run waited for the whole hold, about 100 to 103 ms.
 
 | Row | A | B1, B2 | C1, C2, C4 | D |
 |---|---|---|---|---|
