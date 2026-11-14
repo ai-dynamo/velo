@@ -117,7 +117,7 @@ pub struct RendezvousManager {
     messenger_lock: OnceLock<MessengerLink>,
     /// Optional Prometheus metrics.
     metrics: Option<Arc<VeloMetrics>>,
-    /// Stops the lease reaper. Cancelled by `Velo::graceful_shutdown` before
+    /// Stops the lease reaper. Cancelled by `Velo::shutdown` before
     /// the registration sweep, so the reaper is not force-releasing leases
     /// while regions are being unmapped underneath them.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -619,7 +619,7 @@ impl RendezvousManager {
             anyhow::bail!("set_rdma_context called twice");
         }
 
-        // Weak on both sides: a `Velo` dropped without `graceful_shutdown` must
+        // Weak on both sides: a `Velo` dropped without `shutdown` must
         // not be kept alive by its own reaper. The token is the orderly exit,
         // the upgrade failure is the backstop, so neither a forgotten shutdown
         // nor an abandoned runtime leaves the task holding a store.
@@ -634,7 +634,7 @@ impl RendezvousManager {
 
     /// Stop the lease reaper and release the staging the sweep is waiting for.
     ///
-    /// Called by `Velo::graceful_shutdown` immediately before the registration
+    /// Called by `Velo::shutdown` immediately before the registration
     /// sweep, and it does two things.
     ///
     /// **The reapers stop**: the RDMA one, and the store's sweep of chunked
@@ -1372,7 +1372,7 @@ impl Drop for LeaseGuard {
 ///
 /// # Why the handles are weak
 ///
-/// A `Velo` dropped without `graceful_shutdown` — a panic, a test that lets it
+/// A `Velo` dropped without `shutdown` — a panic, a test that lets it
 /// fall out of scope — must not be kept alive by its own reaper. The token is
 /// the orderly exit; the upgrade failure is the backstop for every other way a
 /// runtime ends.

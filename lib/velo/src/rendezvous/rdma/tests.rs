@@ -1553,10 +1553,10 @@ async fn ucx_pool_arena_is_one_registration() {
 }
 
 /// The ordering D8 exists for, asserted end to end through the real
-/// `Velo::graceful_shutdown`.
+/// `Velo::shutdown`.
 ///
 /// The load-bearing claim is not "the memory is eventually released" but
-/// "it is released *before* graceful_shutdown returns, and before the transport
+/// "it is released *before* shutdown returns, and before the transport
 /// is torn down". So the assertion is taken at the moment shutdown returns,
 /// against the progress thread's own region count — the one number that cannot be
 /// satisfied by bookkeeping in the layer under test. If the registry sweep ran
@@ -1564,7 +1564,7 @@ async fn ucx_pool_arena_is_one_registration() {
 /// here or the unmap would have been a forced one from teardown rather than an
 /// orderly one from the sweep.
 #[tokio::test(flavor = "multi_thread")]
-async fn velo_graceful_shutdown_deregisters_before_transport_teardown() {
+async fn velo_shutdown_deregisters_before_transport_teardown() {
     let transport = Arc::new(
         crate::transports::ucx::UcxTransportBuilder::new()
             .tls("tcp")
@@ -1592,12 +1592,12 @@ async fn velo_graceful_shutdown_deregisters_before_transport_teardown() {
 
     assert!(
         watch.is_deregistered(),
-        "graceful_shutdown returned without resolving the deregistered() latch"
+        "shutdown returned without resolving the deregistered() latch"
     );
     assert_eq!(
         transport.live_regions(),
         0,
-        "graceful_shutdown returned with memory still registered with ucx"
+        "shutdown returned with memory still registered with ucx"
     );
     assert_eq!(
         transport.live_rkeys(),
@@ -1928,7 +1928,7 @@ async fn external_registration_charges_page_enclosing_bytes() {
 /// This is what makes the future a signal a caller can actually wait on. A
 /// backend that answers `ShuttingDown` — a transport already going down, a
 /// wedged progress thread — leaves the sweep unable to latch honestly; but by
-/// the time `graceful_shutdown` returns, transport teardown has force-unmapped
+/// the time `Velo::shutdown` returns, transport teardown has force-unmapped
 /// everything, so the region really is released. Without the final latch the
 /// future would stay pending forever and a caller waiting on it before freeing
 /// would wait for the life of the process.
@@ -1951,7 +1951,7 @@ async fn shutdown_latches_regions_whose_unmap_was_never_confirmed() {
     );
 
     // Standing in for the transport teardown that force-unmaps everything, and
-    // then for the end of `Velo::graceful_shutdown`.
+    // then for the end of `Velo::shutdown`.
     backend.force_teardown();
     registry.latch_all_deregistered();
 
@@ -2297,7 +2297,7 @@ async fn unregister_owned_refuses_before_deregistering() {
     assert!(!watch.is_deregistered());
 }
 
-/// Concurrent `graceful_shutdown` calls are serialised, and the sequence runs
+/// Concurrent `Velo::shutdown` calls are serialised, and the sequence runs
 /// once.
 ///
 /// `Velo` is `Clone`, so several clones can arrive together. Only one can take
@@ -2314,8 +2314,7 @@ async fn unregister_owned_refuses_before_deregistering() {
 /// independent backstop if it ever does interleave: it refuses while the
 /// backend still reports registrations.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(deprecated)] // tests the deprecated `Velo::graceful_shutdown` itself
-async fn concurrent_graceful_shutdowns_are_serialised() {
+async fn concurrent_shutdowns_are_serialised() {
     const CALLERS: usize = 8;
 
     let transport = Arc::new(
@@ -2341,8 +2340,7 @@ async fn concurrent_graceful_shutdowns_are_serialised() {
     for _ in 0..CALLERS {
         let velo = crate::Velo::clone(&velo);
         callers.push(tokio::spawn(async move {
-            velo.graceful_shutdown(velo_ext::ShutdownPolicy::Timeout(T))
-                .await
+            velo.shutdown(velo_ext::ShutdownPolicy::Timeout(T)).await
         }));
     }
     for caller in callers {
@@ -2730,7 +2728,7 @@ async fn a_transfer_is_refused_once_the_registration_gate_is_closed() {
 
 /// The arena sweep waits for a transfer hold, and proceeds when it releases.
 ///
-/// The integration test asserts this end to end through `graceful_shutdown`;
+/// The integration test asserts this end to end through `Velo::shutdown`;
 /// this one asserts it against the sweep itself, so a change to the wait fails
 /// here without needing a UCX transport to notice.
 #[tokio::test(flavor = "multi_thread")]

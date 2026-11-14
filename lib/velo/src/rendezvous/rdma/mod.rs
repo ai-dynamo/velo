@@ -17,7 +17,7 @@
 //!
 //! # Shutdown is an ordering, not a flag (D8)
 //!
-//! [`RdmaRegistry::shutdown`] implements steps 1–3, and `Velo::graceful_shutdown`
+//! [`RdmaRegistry::shutdown`] implements steps 1–3, and `Velo::shutdown`
 //! runs it *before* messenger teardown, because an RDMA GET is issued by the
 //! peer's NIC and is therefore invisible to this instance's in-flight counters.
 //! Unmapping after transport teardown would be unmapping under a transfer
@@ -237,7 +237,7 @@ pub(crate) struct RegistryShared {
     generations: Arc<AtomicU64>,
     /// How many times the shutdown sweep has run.
     ///
-    /// It should run once. `Velo::graceful_shutdown` serialises its callers, so
+    /// It should run once. `Velo::shutdown` serialises its callers, so
     /// this is how a test observes that the serialisation is real rather than
     /// hoping to catch the narrow interleaving it prevents.
     sweeps: std::sync::atomic::AtomicUsize,
@@ -663,7 +663,7 @@ impl RdmaRegistry {
     /// latch anything unless the answer is none.
     ///
     /// The call site is nonetheless what *makes* the answer none:
-    /// `Velo::graceful_shutdown` runs this after transport teardown, and
+    /// `Velo::shutdown` runs this after transport teardown, and
     /// teardown force-unmaps every region the progress thread holds and joins
     /// that thread before returning. The check is there so a future caller
     /// cannot quietly move this earlier — under a `Timeout` policy the

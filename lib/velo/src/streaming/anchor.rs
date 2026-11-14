@@ -1307,7 +1307,7 @@ impl AnchorManager {
     /// around `Velo::shutdown`) still leaves no stream waiting on a slot or an
     /// anchor. The slots then stay open, with no reader, until the mux drops.
     ///
-    /// `Velo::graceful_shutdown` stops and joins mux sends before transport
+    /// `Velo::shutdown` stops and joins mux sends before transport
     /// teardown. A direct call to this method is safe because slots are
     /// retired only after the streams leave them, never by this method: step
     /// 1 runs only when the transports are already gone, so it is not what
@@ -4336,8 +4336,8 @@ mod tests {
             .build()
             .await
             .unwrap();
-        consumer.register_peer_inner(producer.peer_info()).unwrap();
-        producer.register_peer_inner(consumer.peer_info()).unwrap();
+        consumer.register_peer(producer.peer_info()).unwrap();
+        producer.register_peer(consumer.peer_info()).unwrap();
         let receiver = Arc::new(
             AnchorManagerBuilder::default()
                 .worker_id(consumer.instance_id().worker_id())
@@ -5224,8 +5224,8 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            consumer.register_peer_inner(producer.peer_info()).unwrap();
-            producer.register_peer_inner(consumer.peer_info()).unwrap();
+            consumer.register_peer(producer.peer_info()).unwrap();
+            producer.register_peer(consumer.peer_info()).unwrap();
             let receiver_transport =
                 crate::streaming::TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
                     .await
@@ -5288,7 +5288,7 @@ mod tests {
             );
             if upgraded {
                 let replacement = receiver.attach_stream_anchor::<u32>(handle).await.unwrap();
-                consumer.begin_drain_inner();
+                consumer.begin_drain();
                 let stale = AnchorAbortAttachRequest {
                     handle,
                     stream_cancel_handle: StreamCancelHandle::pack(
@@ -5333,10 +5333,10 @@ mod tests {
             receiver_transport.shutdown().await;
             sender_transport.shutdown().await;
             consumer
-                .graceful_shutdown_inner(crate::ShutdownPolicy::WaitForever)
+                .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
                 .await;
             producer
-                .graceful_shutdown_inner(crate::ShutdownPolicy::WaitForever)
+                .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
                 .await;
             consumer.closed().await;
             producer.closed().await;
@@ -5372,10 +5372,10 @@ mod tests {
             .await
             .expect("producer messenger");
         m_consumer
-            .register_peer_inner(m_producer.peer_info())
+            .register_peer(m_producer.peer_info())
             .expect("register producer on consumer");
         m_producer
-            .register_peer_inner(m_consumer.peer_info())
+            .register_peer(m_consumer.peer_info())
             .expect("register consumer on producer");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -5526,10 +5526,10 @@ mod tests {
             .await
             .expect("producer messenger");
         m_consumer
-            .register_peer_inner(m_producer.peer_info())
+            .register_peer(m_producer.peer_info())
             .expect("register producer on consumer");
         m_producer
-            .register_peer_inner(m_consumer.peer_info())
+            .register_peer(m_consumer.peer_info())
             .expect("register consumer on producer");
 
         let tcp_consumer = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
@@ -5621,8 +5621,8 @@ mod tests {
             .build()
             .await
             .unwrap();
-        consumer.register_peer_inner(producer.peer_info()).unwrap();
-        producer.register_peer_inner(consumer.peer_info()).unwrap();
+        consumer.register_peer(producer.peer_info()).unwrap();
+        producer.register_peer(consumer.peer_info()).unwrap();
         let lifetime = Duration::from_secs(60);
         let receiver = Arc::new(
             AnchorManagerBuilder::default()

@@ -16,6 +16,8 @@
 //! This transport is ideal for same-host communication (e.g., daemon-to-container via
 //! bind-mounted sockets), avoiding the overhead of the TCP/IP stack entirely.
 
+#[cfg(test)]
+mod host_affinity_tests;
 mod listener;
 mod transport;
 mod writer;

@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use velo::messenger::Messenger;
+use velo::Velo;
 use velo::streaming::{
     AnchorManager, AnchorManagerBuilder, FrameTransport, StreamFrame, TcpFrameTransport,
 };
@@ -50,48 +50,46 @@ use velo_ext::{PeerInfo, WorkerId};
 struct RemotePair {
     producer: Arc<AnchorManager>,
     consumer: Arc<AnchorManager>,
-    // Keep messengers alive for the lifetime of the test.
-    _msgr_producer: Arc<Messenger>,
-    _msgr_consumer: Arc<Messenger>,
+    // Keep the nodes alive for the lifetime of the test.
+    _node_producer: Velo,
+    _node_consumer: Velo,
 }
 
-#[allow(deprecated)] // an `AnchorManager` built by hand over a bare `Messenger`, which `Velo` registers itself
-async fn make_two_tcp_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
-    let bind = |_| {
+/// Two mux-only `Velo`s that know each other over TCP loopback. Each side
+/// builds its own `AnchorManager` over the `Velo`'s messenger, which replaces
+/// the anchor handlers the `Velo` registered.
+async fn make_two_tcp_nodes() -> (Velo, Velo) {
+    let node = || async {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        Arc::new(
+        let transport = Arc::new(
             TcpTransportBuilder::new()
                 .from_listener(listener)
                 .unwrap()
                 .build()
                 .unwrap(),
-        )
+        );
+        Velo::builder()
+            .add_transport(transport)
+            .mux_only()
+            .build()
+            .await
+            .expect("build velo")
     };
-    let t1 = bind(());
-    let t2 = bind(());
-
-    let m1 = Messenger::builder()
-        .add_transport(t1)
-        .build()
-        .await
-        .expect("build messenger 1");
-    let m2 = Messenger::builder()
-        .add_transport(t2)
-        .build()
-        .await
-        .expect("build messenger 2");
-
-    m2.register_peer(m1.peer_info()).expect("register m1 on m2");
-    m1.register_peer(m2.peer_info()).expect("register m2 on m1");
+    let v1 = node().await;
+    let v2 = node().await;
+    v2.register_peer(v1.peer_info()).expect("register v1 on v2");
+    v1.register_peer(v2.peer_info()).expect("register v2 on v1");
     tokio::time::sleep(Duration::from_millis(200)).await;
-    (m1, m2)
+    (v1, v2)
 }
 
 /// Consumer side owns the anchor; producer side attaches remotely.
 /// Uses raw `TcpFrameTransport` as data plane on both sides, with a
 /// `transport_registry` entry so the remote-attach handshake can resolve the scheme.
 async fn make_remote_pair_tcp() -> RemotePair {
-    let (m_consumer, m_producer) = make_two_tcp_messengers().await;
+    let (node_consumer, node_producer) = make_two_tcp_nodes().await;
+    let m_consumer = Arc::clone(node_consumer.messenger());
+    let m_producer = Arc::clone(node_producer.messenger());
     let worker_consumer = m_consumer.instance_id().worker_id();
     let worker_producer = m_producer.instance_id().worker_id();
 
@@ -128,11 +126,10 @@ async fn make_remote_pair_tcp() -> RemotePair {
     let (consumer, tcp_consumer) = make_side(worker_consumer).await;
     let (producer, tcp_producer) = make_side(worker_producer).await;
 
-    // `Messenger::register_peer` only covers the control plane. The streaming
-    // transports keep their own WorkerId -> SocketAddr cache, populated from a
-    // PeerInfo carrying the peer's `tcp-stream` entry, so register those too.
-    // (`Velo::register_peer` does this fan-out automatically; these tests build
-    // the AnchorManager directly and so must do it by hand.)
+    // The nodes are mux-only, so `Velo::register_peer` registered no
+    // `tcp-stream` endpoint. The streaming transports keep their own
+    // WorkerId -> SocketAddr cache, populated from a PeerInfo carrying the
+    // peer's `tcp-stream` entry, so register those by hand.
     let peer_consumer = PeerInfo::new(m_consumer.instance_id(), tcp_consumer.address());
     let peer_producer = PeerInfo::new(m_producer.instance_id(), tcp_producer.address());
     tcp_producer
@@ -152,8 +149,8 @@ async fn make_remote_pair_tcp() -> RemotePair {
     RemotePair {
         producer,
         consumer,
-        _msgr_producer: m_producer,
-        _msgr_consumer: m_consumer,
+        _node_producer: node_producer,
+        _node_consumer: node_consumer,
     }
 }
 

@@ -87,7 +87,7 @@ fn install_stager(messenger: &Messenger, threshold: usize) {
     let manager = std::sync::Arc::new(crate::RendezvousManager::new(velo_ext::WorkerId::from_u64(
         7,
     )));
-    messenger.set_large_payload_support_inner(
+    messenger.set_large_payload_support(
         std::sync::Arc::new(RendezvousStager::new(manager.clone()).with_threshold(threshold)),
         std::sync::Arc::new(crate::rendezvous::transparent::RendezvousResolver::new(
             manager,
@@ -114,9 +114,7 @@ async fn tcp_messenger() -> (std::sync::Arc<Messenger>, std::sync::Arc<Messenger
             .expect("messenger")
     }
     let (local, remote) = (build().await, build().await);
-    local
-        .register_peer_inner(remote.peer_info())
-        .expect("register");
+    local.register_peer(remote.peer_info()).expect("register");
     (local, remote)
 }
 
@@ -315,7 +313,7 @@ async fn capped_messenger(
         .expect("messenger");
     let target = InstanceId::new_v4();
     messenger
-        .register_peer_inner(velo_ext::PeerInfo::new(target, transport.address()))
+        .register_peer(velo_ext::PeerInfo::new(target, transport.address()))
         .expect("register peer");
     (messenger, target, transport)
 }

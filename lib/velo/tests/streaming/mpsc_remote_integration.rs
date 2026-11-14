@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
+use velo::Velo;
 use velo::messenger::Messenger;
 use velo::streaming::control::StreamCancelHandle;
 use velo::streaming::mpsc::{
@@ -39,39 +40,43 @@ fn new_tcp_transport() -> Arc<velo::transports::tcp::TcpTransport> {
     )
 }
 
-#[allow(deprecated)] // an `AnchorManager` built by hand over a bare `Messenger`, which `Velo` registers itself
-async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
-    let t1 = new_tcp_transport();
-    let t2 = new_tcp_transport();
-
-    let m1 = Messenger::builder()
-        .add_transport(t1)
-        .build()
-        .await
-        .expect("create messenger 1");
-    let m2 = Messenger::builder()
-        .add_transport(t2)
-        .build()
-        .await
-        .expect("create messenger 2");
-
-    let p1 = m1.peer_info();
-    let p2 = m2.peer_info();
-    m2.register_peer(p1).expect("register m1 on m2");
-    m1.register_peer(p2).expect("register m2 on m1");
+/// Two mux-only `Velo`s that know each other over TCP loopback, and their
+/// messengers. Each test builds its own `AnchorManager` over a messenger,
+/// which replaces the anchor handlers the `Velo` registered. The caller keeps
+/// the `Velo`s alive for the length of the test.
+async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>, [Velo; 2]) {
+    let v1 = mux_only_node().await;
+    let v2 = mux_only_node().await;
+    v2.register_peer(v1.peer_info()).expect("register v1 on v2");
+    v1.register_peer(v2.peer_info()).expect("register v2 on v1");
+    // Wait for TCP connections to establish.
     tokio::time::sleep(Duration::from_millis(200)).await;
+    (
+        Arc::clone(v1.messenger()),
+        Arc::clone(v2.messenger()),
+        [v1, v2],
+    )
+}
 
-    (m1, m2)
+/// A `Velo` with no per-stream listener of its own: the tests bring their own
+/// `TcpFrameTransport`.
+async fn mux_only_node() -> Velo {
+    Velo::builder()
+        .add_transport(new_tcp_transport())
+        .mux_only()
+        .build()
+        .await
+        .expect("build velo")
 }
 
 /// Every streaming endpoint this test binary has built, so a newly created side
 /// can be cross-registered against the ones already standing.
 ///
-/// `Messenger::register_peer` only covers the control plane;
-/// `TcpFrameTransport` keeps its own `WorkerId -> SocketAddr` cache, populated
-/// from a `PeerInfo` carrying the peer's `tcp-stream` entry. `Velo::register_peer`
-/// fans that out automatically, but these tests build the `AnchorManager`
-/// directly and so must do it by hand — and they build sides one at a time,
+/// The nodes are mux-only, so `Velo::register_peer` covers only the control
+/// plane; `TcpFrameTransport` keeps its own `WorkerId -> SocketAddr` cache,
+/// populated from a `PeerInfo` carrying the peer's `tcp-stream` entry. These
+/// tests build the `AnchorManager` directly and so must register those by
+/// hand — and they build sides one at a time,
 /// which is why the already-built ones are remembered here rather than passed
 /// in. Registering an endpoint from an unrelated test costs nothing: it is a map
 /// insert that nothing ever looks up.
@@ -117,7 +122,7 @@ fn roundtrip_handle(handle: StreamAnchorHandle) -> StreamAnchorHandle {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn remote_sender_detach_and_drop_preserve_unrelated_local_slots() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
     let am_a = make_am(messenger_a).await;
     let am_b = make_am(messenger_b).await;
     let remote_anchor = am_a.create_mpsc_anchor::<u32>();
@@ -158,7 +163,7 @@ async fn remote_sender_detach_and_drop_preserve_unrelated_local_slots() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn remote_sender_cancel_preserves_an_unrelated_local_sender() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
     let am_a = make_am(messenger_a).await;
     let am_b = make_am(messenger_b).await;
     let remote_anchor = am_a.create_mpsc_anchor::<u32>();
@@ -198,7 +203,7 @@ async fn remote_sender_cancel_preserves_an_unrelated_local_sender() {
 /// reports both.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpsc_remote_multi_attach() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
 
     let am_a = make_am(messenger_a).await;
     let am_b = make_am(messenger_b).await;
@@ -263,7 +268,7 @@ async fn test_mpsc_remote_multi_attach() {
 /// `Dropped` event for that sender while the other keeps flowing.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpsc_heartbeat_timeout_per_sender() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
     let am_a = make_am(messenger_a).await;
     let am_b = make_am(messenger_b).await;
 
@@ -339,43 +344,27 @@ async fn test_mpsc_heartbeat_timeout_per_sender() {
 /// attach. Each sender's items must reach the anchor under its own `SenderId`,
 /// with no crossover.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(deprecated)] // an `AnchorManager` built by hand over a bare `Messenger`, which `Velo` registers itself
 async fn test_mpsc_remote_two_workers_no_routing_collision() {
-    // Three messengers: A hosts the anchor; B and C are two distinct
+    // Three nodes: A hosts the anchor; B and C are two distinct
     // sender-side workers. Each gets its own streaming stack and a fresh
     // `next_sender_stream_id` starting at 0 -- the first attach on each would,
     // without the fix, reuse session_id == 1 on A's transport.
-    let t_a = new_tcp_transport();
-    let t_b = new_tcp_transport();
-    let t_c = new_tcp_transport();
-    let messenger_a = Messenger::builder()
-        .add_transport(t_a)
-        .build()
-        .await
-        .unwrap();
-    let messenger_b = Messenger::builder()
-        .add_transport(t_b)
-        .build()
-        .await
-        .unwrap();
-    let messenger_c = Messenger::builder()
-        .add_transport(t_c)
-        .build()
-        .await
-        .unwrap();
+    let node_a = mux_only_node().await;
+    let node_b = mux_only_node().await;
+    let node_c = mux_only_node().await;
 
-    let p_a = messenger_a.peer_info();
-    let p_b = messenger_b.peer_info();
-    let p_c = messenger_c.peer_info();
-    messenger_a.register_peer(p_b.clone()).unwrap();
-    messenger_a.register_peer(p_c.clone()).unwrap();
-    messenger_b.register_peer(p_a.clone()).unwrap();
-    messenger_c.register_peer(p_a.clone()).unwrap();
+    let p_a = node_a.peer_info();
+    let p_b = node_b.peer_info();
+    let p_c = node_c.peer_info();
+    node_a.register_peer(p_b.clone()).unwrap();
+    node_a.register_peer(p_c.clone()).unwrap();
+    node_b.register_peer(p_a.clone()).unwrap();
+    node_c.register_peer(p_a.clone()).unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
 
-    let am_a = make_am(messenger_a).await;
-    let am_b = make_am(messenger_b).await;
-    let am_c = make_am(messenger_c).await;
+    let am_a = make_am(Arc::clone(node_a.messenger())).await;
+    let am_b = make_am(Arc::clone(node_b.messenger())).await;
+    let am_c = make_am(Arc::clone(node_c.messenger())).await;
 
     let mut anchor = am_a.create_mpsc_anchor::<u32>();
     let handle = anchor.handle();
@@ -449,7 +438,7 @@ async fn test_mpsc_remote_two_workers_no_routing_collision() {
 /// `max_senders` capacity immediately.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpsc_remote_detach_is_exact_once() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
     let am_a = make_am(messenger_a).await;
     let am_b = make_am(messenger_b).await;
 
@@ -504,7 +493,7 @@ async fn test_mpsc_remote_detach_is_exact_once() {
 /// `max_senders` capacity immediately.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpsc_remote_drop_is_exact_once() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
     let am_a = make_am(messenger_a).await;
     let am_b = make_am(messenger_b).await;
 
@@ -564,7 +553,7 @@ async fn test_mpsc_remote_drop_is_exact_once() {
 /// client-side check. Exercises the defence-in-depth branch.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpsc_remote_handler_rejects_spsc_handle() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
     let am_a = make_am(messenger_a.clone()).await;
     let _am_b = make_am(messenger_b.clone()).await;
 
@@ -606,7 +595,7 @@ async fn test_mpsc_remote_handler_rejects_spsc_handle() {
 /// exists at the requested `local_id`.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpsc_remote_handler_anchor_not_found() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
     let _am_a = make_am(messenger_a.clone()).await;
     let _am_b = make_am(messenger_b.clone()).await;
     let worker_a = messenger_a.instance_id().worker_id();
@@ -641,7 +630,7 @@ async fn test_mpsc_remote_handler_anchor_not_found() {
 /// attach path returns `AttachError::TransportError` wrapping the reason.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpsc_remote_max_senders_enforced_by_handler() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
     let am_a = make_am(messenger_a.clone()).await;
     let am_b = make_am(messenger_b.clone()).await;
 
@@ -679,7 +668,7 @@ async fn test_mpsc_remote_max_senders_enforced_by_handler() {
 /// currently client-unused handler gets coverage.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpsc_remote_detach_handler() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
     let am_a = make_am(messenger_a.clone()).await;
     let am_b = make_am(messenger_b.clone()).await;
 
@@ -731,7 +720,7 @@ async fn test_mpsc_remote_detach_handler() {
 /// registry.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpsc_remote_cancel_handler() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
     let am_a = make_am(messenger_a.clone()).await;
     let _am_b = make_am(messenger_b.clone()).await;
 
@@ -763,7 +752,7 @@ async fn test_mpsc_remote_cancel_handler() {
 /// `ChannelClosed` shortly after the cancel.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpsc_controller_cancel_propagates_cross_worker() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
     let am_a = make_am(messenger_a.clone()).await;
     let am_b = make_am(messenger_b.clone()).await;
 
@@ -801,7 +790,7 @@ async fn test_mpsc_controller_cancel_propagates_cross_worker() {
 /// the consumer cancels, even before the remote sender is dropped.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_mpsc_pending_next_wakes_on_cross_worker_cancel() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
+    let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
     let am_a = make_am(messenger_a.clone()).await;
     let am_b = make_am(messenger_b.clone()).await;
 
@@ -871,7 +860,7 @@ impl FrameTransport for PausedConnect {
 #[tokio::test(flavor = "multi_thread")]
 async fn mpsc_identity_survives_early_cancel_and_cleans_up_failed_attach() {
     for outcome in ["cancel", "error", "abort"] {
-        let (messenger_a, messenger_b) = make_two_messengers().await;
+        let (messenger_a, messenger_b, _nodes) = make_two_messengers().await;
         let am_a = make_am(messenger_a).await;
         let (entered, connected) = flume::bounded(1);
         let (finish, result) = flume::bounded(1);

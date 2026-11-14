@@ -58,10 +58,8 @@ async fn messenger_pair() -> (Arc<Messenger>, Arc<Messenger>) {
         .build()
         .await
         .expect("messenger b");
-    a.register_peer_inner(b.peer_info())
-        .expect("register b on a");
-    b.register_peer_inner(a.peer_info())
-        .expect("register a on b");
+    a.register_peer(b.peer_info()).expect("register b on a");
+    b.register_peer(a.peer_info()).expect("register a on b");
     tokio::time::sleep(Duration::from_millis(200)).await;
     (a, b)
 }
@@ -516,7 +514,7 @@ fn aborting_a_retiring_batchers_final_flush_stops_the_mux() {
             .unwrap();
         let peer = velo_ext::InstanceId::new_v4();
         messenger
-            .register_peer_inner(velo_ext::PeerInfo::new(peer, stalling_address()))
+            .register_peer(velo_ext::PeerInfo::new(peer, stalling_address()))
             .unwrap();
         let mux = MessengerMuxTransport::new(
             messenger,
@@ -582,7 +580,7 @@ async fn a_batcher_dropped_by_stop_sending_leaves_slots_to_shutdown() {
         .unwrap();
     let peer = velo_ext::InstanceId::new_v4();
     messenger
-        .register_peer_inner(velo_ext::PeerInfo::new(peer, stalling_address()))
+        .register_peer(velo_ext::PeerInfo::new(peer, stalling_address()))
         .unwrap();
     let mux = MessengerMuxTransport::new(
         messenger,
@@ -1199,9 +1197,9 @@ async fn one_flush_reaches_every_peer_batcher() {
             .await
             .expect("consumer messenger");
         producer_messenger
-            .register_peer_inner(m.peer_info())
+            .register_peer(m.peer_info())
             .expect("register consumer");
-        m.register_peer_inner(producer_messenger.peer_info())
+        m.register_peer(producer_messenger.peer_info())
             .expect("register producer");
         consumers.push(m);
     }
@@ -1321,10 +1319,10 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
         .await
         .expect("consumer messenger");
     producer_messenger
-        .register_peer_inner(consumer_messenger.peer_info())
+        .register_peer(consumer_messenger.peer_info())
         .expect("register consumer");
     consumer_messenger
-        .register_peer_inner(producer_messenger.peer_info())
+        .register_peer(producer_messenger.peer_info())
         .expect("register producer");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
