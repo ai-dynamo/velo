@@ -3,9 +3,9 @@
 
 [package]
 name = "velo-ext"
-version = "0.5.6"
+version = "0.6.0"
 edition.workspace = true
-description = "Extension trait surface for Velo. External crates implement Transport, FrameTransport, and PeerDiscovery against this stable contract without depending on the Velo runtime."
+description = "Extension trait surface for Velo. External crates implement Transport, PeerDiscovery, and ServiceDiscovery against this stable contract without depending on the Velo runtime."
 authors.workspace = true
 license.workspace = true
 homepage.workspace = true
@@ -13,7 +13,7 @@ repository.workspace = true
 keywords.workspace = true
 
 # Stability contract: this crate is the API boundary that out-of-tree
-# implementors of Transport / FrameTransport / PeerDiscovery / ServiceDiscovery
+# implementors of Transport / PeerDiscovery / ServiceDiscovery
 # depend on. Changes here ripple to every downstream impl, so:
 #
 #   1. New trait methods MUST land with default implementations.

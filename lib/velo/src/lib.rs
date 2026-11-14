@@ -6,9 +6,9 @@
 //! Active messaging runtime for Velo distributed systems. Wraps [`Messenger`]
 //! with builder sugar for discovery wiring and re-exports the full public API.
 //!
-//! Out-of-tree implementors of [`Transport`], [`crate::streaming::FrameTransport`],
-//! [`PeerDiscovery`], or [`crate::discovery::ServiceDiscovery`] should depend
-//! on the smaller [`velo_ext`] crate instead of `velo`. Everything that lives
+//! Out-of-tree implementors of [`Transport`], [`PeerDiscovery`], or
+//! [`crate::discovery::ServiceDiscovery`] should depend on the smaller
+//! [`velo_ext`] crate instead of `velo`. Everything that lives
 //! here is the runtime and concrete impls.
 
 use std::sync::Arc;
@@ -70,8 +70,8 @@ pub use crate::messenger::VeloEvents;
 // Streaming (flat at root for convenience; full surface still under [`streaming`])
 pub use crate::streaming::control::StreamOpenTicket;
 pub use crate::streaming::{
-    AnchorManager, AttachError, SendError, StreamAnchor, StreamAnchorHandle, StreamController,
-    StreamError, StreamFrame, StreamSender,
+    AttachError, SendError, StreamAnchor, StreamAnchorHandle, StreamController, StreamError,
+    StreamFrame, StreamSender,
 };
 
 // Rendezvous
@@ -584,9 +584,8 @@ impl VeloBuilder {
 
         // A node with a stream config keeps a per-stream listener for peers
         // without the mux. Otherwise the mux itself fills the default
-        // transport field. Set metrics before type erasure: the public
-        // FrameTransport trait must not require Prometheus in external
-        // implementations.
+        // transport field. Set metrics before type erasure: the
+        // FrameTransport trait carries no metrics handle.
         let (stream_transport, owned_stream_transport): (
             Arc<dyn crate::streaming::FrameTransport>,
             Option<OwnedStreamTransport>,
@@ -1141,8 +1140,8 @@ impl Velo {
     /// The returned [`PeerInfo`] carries the messenger transport entries.
     /// A node built with [`VeloBuilder::stream_config`] or
     /// [`VeloBuilder::stream_bind_addr`] also publishes a per-stream endpoint,
-    /// such as `tcp-stream` or `grpc-stream`, for
-    /// [`crate::streaming::FrameTransport::register`]. Otherwise the primary
+    /// such as `tcp-stream` or `grpc-stream`, for the peer's per-stream
+    /// transport to connect to. Otherwise the primary
     /// stream transport is the mux, which uses the messenger endpoints and
     /// adds no streaming endpoint.
     pub fn peer_info(&self) -> PeerInfo {
@@ -1423,15 +1422,6 @@ impl Velo {
             .await
     }
 
-    /// Get the underlying anchor manager for direct registry access.
-    #[deprecated(
-        since = "0.22.1",
-        note = "use the anchor methods on `Velo`: `create_anchor_with_config`, `active_anchor_count`, `renew_reservations`, `create_anchor`, `attach_anchor`, `prebind_anchor`, `open_anchor_stream`"
-    )]
-    pub fn anchor_manager(&self) -> &crate::streaming::AnchorManager {
-        &self.inner.anchor_manager
-    }
-
     // -----------------------------------------------------------------------
     // MPSC anchor API
     // -----------------------------------------------------------------------
@@ -1670,6 +1660,52 @@ impl Velo {
             .client()
             .response_manager
             .pending_outcome_count()
+    }
+
+    /// How many senders attached through this instance are still live: one
+    /// for each `StreamSender` or `MpscStreamSender` that has not ended.
+    ///
+    /// Exposed for tests only. Every way a sender ends (finalize, detach,
+    /// drop, a cancel from the anchor, an abandoned detach future) must take
+    /// it out of the sender registry. A sender left there keeps its cancel
+    /// path and its heartbeat state alive for the life of the node.
+    #[cfg(feature = "test-helpers")]
+    pub fn stream_senders_in_use(&self) -> usize {
+        self.inner.anchor_manager.sender_registry.senders.len()
+    }
+
+    /// The keys of the stream transports this instance installed, sorted:
+    /// the mux and the per-stream transport, as the builder chose them.
+    ///
+    /// Exposed for tests only. Which transports a node installs follows from
+    /// several builder settings (`stream_config`, `messenger_mux`,
+    /// `mux_only`, and the mux kill switch); a test of those rules must see
+    /// the result, and the peer address shows only the transports that
+    /// listen.
+    #[cfg(feature = "test-helpers")]
+    pub fn stream_transport_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .inner
+            .anchor_manager
+            .transport_registry
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// The key of the stream transport this instance falls back to when an
+    /// attach does not negotiate one: the per-stream transport when the
+    /// builder set a stream config, and the mux otherwise.
+    ///
+    /// Exposed for tests only, for the same reason as
+    /// [`stream_transport_keys`](Self::stream_transport_keys).
+    #[cfg(feature = "test-helpers")]
+    pub fn default_stream_transport_key(&self) -> String {
+        crate::streaming::FrameTransport::key(self.inner.anchor_manager.transport.as_ref())
+            .as_str()
+            .to_string()
     }
 
     /// Get the underlying rendezvous manager for direct access.

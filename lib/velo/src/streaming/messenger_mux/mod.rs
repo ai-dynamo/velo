@@ -279,8 +279,8 @@ struct MuxCore {
     /// feed and watchdog (or MPSC pump) holding them.
     ///
     /// `bind` cannot hand this back directly — `FrameTransport::bind` returns a
-    /// receiver and nothing else, and widening that trait would be a breaking
-    /// change to `velo-ext` for every out-of-tree implementor. So the signal is
+    /// receiver and nothing else, and the per-stream transports that share the
+    /// trait have no drain signal to return. So the signal is
     /// parked here for the attach path to take, which it does a few lines after
     /// `bind` returns. Take-once: whoever collects it owns it, and the bind
     /// expiry that already exists drops any that was never collected.

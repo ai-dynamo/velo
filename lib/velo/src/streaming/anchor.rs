@@ -1110,7 +1110,7 @@ fn insert_at_random_id<V>(
 /// with a 120-second unattached timeout and a 5-second heartbeat interval.
 #[derive(Builder)]
 #[builder(pattern = "owned", build_fn(name = "build_inner", private))]
-pub struct AnchorManager {
+pub(crate) struct AnchorManager {
     worker_id: velo_ext::WorkerId,
 
     #[builder(default = "Arc::new(DashMap::new())")]
@@ -1212,8 +1212,7 @@ pub struct AnchorManager {
     /// window a peer advertised back, and — for zero-RTT setup — a synchronous
     /// `prebind` plus the `release_bind` and `close_claimed_slot` that give a
     /// pre-bound slot back. Keeping all of that off the trait is deliberate:
-    /// `FrameTransport` lives in `velo-ext` and out-of-tree implementors should
-    /// not grow methods about one in-tree transport's credit protocol.
+    /// the per-stream transports share the trait and have no credit protocol.
     ///
     /// Write-once, like `messenger_lock`, and skipped by the builder: it is a
     /// crate-internal type, and a public setter naming it would leak it.
@@ -1405,11 +1404,10 @@ impl AnchorManager {
         }
     }
 
-    /// Convenience constructor with the builder defaults: a 120 s unattached
-    /// timeout and a 5 s heartbeat interval.
-    ///
-    /// Equivalent to `AnchorManagerBuilder::default().worker_id(id).transport(t).build()`.
-    pub fn new(
+    /// A manager with the builder defaults (a 120 s unattached timeout and a
+    /// 5 s heartbeat interval) and no messenger, for local tests.
+    #[cfg(test)]
+    pub(crate) fn new(
         worker_id: velo_ext::WorkerId,
         transport: Arc<dyn crate::streaming::transport::FrameTransport>,
     ) -> Self {

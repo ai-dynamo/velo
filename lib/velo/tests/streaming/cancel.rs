@@ -8,56 +8,11 @@
 //! TEST-CANCEL-03: Remote cross-worker cancel via _stream_cancel AM over TCP.
 //! TEST-CANCEL-04: Drop StreamAnchor with no sender — registry cleared, attach fails.
 
-use std::sync::Arc;
+mod common;
+
 use std::time::Duration;
 
-use futures::future::BoxFuture;
-use velo::streaming::{AnchorConfig, AnchorManager, AnchorManagerBuilder, AttachError};
-use velo_ext::{TransportKey, WorkerAddress, WorkerId};
-
-// ---------------------------------------------------------------------------
-// LocalMockTransport — in-memory transport for local (non-TCP) cancel tests
-// ---------------------------------------------------------------------------
-
-struct LocalMockTransport;
-
-impl velo::streaming::FrameTransport for LocalMockTransport {
-    fn key(&self) -> TransportKey {
-        TransportKey::new("mock-stream")
-    }
-
-    fn address(&self) -> WorkerAddress {
-        WorkerAddress::empty()
-    }
-
-    fn bind(
-        &self,
-        _anchor_id: u64,
-        _session_id: u64,
-    ) -> BoxFuture<'_, anyhow::Result<flume::Receiver<Vec<u8>>>> {
-        Box::pin(async move {
-            let (_tx, rx) = flume::bounded::<Vec<u8>>(256);
-            Ok(rx)
-        })
-    }
-
-    fn connect(
-        &self,
-        _peer: WorkerId,
-        _anchor_id: u64,
-        _session_id: u64,
-    ) -> BoxFuture<'_, anyhow::Result<flume::Sender<Vec<u8>>>> {
-        Box::pin(async move {
-            let (tx, _rx) = flume::bounded::<Vec<u8>>(1);
-            Ok(tx)
-        })
-    }
-}
-
-fn make_local_manager() -> Arc<AnchorManager> {
-    let worker_id = WorkerId::from_u64(1);
-    Arc::new(AnchorManager::new(worker_id, Arc::new(LocalMockTransport)))
-}
+use velo::streaming::{AnchorConfig, AttachError};
 
 // ---------------------------------------------------------------------------
 // TEST-CANCEL-01: Drop StreamAnchor with attached sender — token fires, send() fails
@@ -68,13 +23,13 @@ fn make_local_manager() -> Arc<AnchorManager> {
 ///   - subsequent send() returns Err(SendError::ChannelClosed)
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cancel_01_drop_with_sender() {
-    let mgr = make_local_manager();
+    let mgr = common::local_node().await;
     let anchor = mgr.create_anchor::<u32>();
     let handle = anchor.handle();
 
     // Attach sender
     let sender = mgr
-        .attach_stream_anchor::<u32>(handle)
+        .attach_anchor::<u32>(handle)
         .await
         .expect("attach must succeed");
 
@@ -114,7 +69,7 @@ async fn test_cancel_01_drop_with_sender() {
 /// StreamController::cancel() triggers the same effect as dropping StreamAnchor.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cancel_02_controller_cancel() {
-    let mgr = make_local_manager();
+    let mgr = common::local_node().await;
     let anchor = mgr.create_anchor::<u32>();
     let handle = anchor.handle();
 
@@ -123,7 +78,7 @@ async fn test_cancel_02_controller_cancel() {
 
     // Attach sender
     let sender = mgr
-        .attach_stream_anchor::<u32>(handle)
+        .attach_anchor::<u32>(handle)
         .await
         .expect("attach must succeed");
 
@@ -167,7 +122,7 @@ async fn test_cancel_02_controller_cancel() {
 ///   - subsequent attach returns AnchorNotFound
 #[tokio::test]
 async fn test_cancel_04_drop_no_sender() {
-    let mgr = make_local_manager();
+    let mgr = common::local_node().await;
     let anchor = mgr.create_anchor::<u32>();
     let handle = anchor.handle();
 
@@ -178,7 +133,7 @@ async fn test_cancel_04_drop_no_sender() {
     tokio::task::yield_now().await;
 
     // Subsequent attach must return AnchorNotFound — proves registry was cleared
-    let result = mgr.attach_stream_anchor::<u32>(handle).await;
+    let result = mgr.attach_anchor::<u32>(handle).await;
     assert!(
         matches!(result, Err(AttachError::AnchorNotFound { .. })),
         "attach after no-sender drop must return AnchorNotFound, got {:?}",
@@ -190,47 +145,7 @@ async fn test_cancel_04_drop_no_sender() {
 // TCP helpers + TEST-CANCEL-03 (remote two-worker cancel)
 // ---------------------------------------------------------------------------
 
-use velo::messenger::Messenger;
-use velo::streaming::control::{StreamCancelRequest, create_stream_cancel_handler};
-use velo::transports::tcp::TcpTransportBuilder;
-
-// serde_json is needed for AM payload serialization (typed_unary_async handlers use JSON)
-
-/// Create a TcpTransport bound to an OS-assigned port.
-fn new_tcp_transport() -> Arc<velo::transports::tcp::TcpTransport> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    Arc::new(
-        TcpTransportBuilder::new()
-            .from_listener(listener)
-            .unwrap()
-            .build()
-            .unwrap(),
-    )
-}
-
-/// Set up two Messenger instances connected over TCP loopback.
-#[allow(deprecated)] // an `AnchorManager` built by hand over a bare `Messenger`, which `Velo` registers itself
-async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
-    let t1 = new_tcp_transport();
-    let t2 = new_tcp_transport();
-
-    let m1 = Messenger::builder()
-        .add_transport(t1)
-        .build()
-        .await
-        .expect("m1");
-    let m2 = Messenger::builder()
-        .add_transport(t2)
-        .build()
-        .await
-        .expect("m2");
-
-    m2.register_peer(m1.peer_info()).expect("register m1 on m2");
-    m1.register_peer(m2.peer_info()).expect("register m2 on m1");
-
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    (m1, m2)
-}
+use velo::streaming::control::StreamCancelRequest;
 
 /// TEST-CANCEL-03: Remote cross-worker cancel via _stream_cancel AM over TCP.
 ///
@@ -239,35 +154,29 @@ async fn make_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
 /// StreamSender identified by `sender_stream_id`.
 #[tokio::test(flavor = "multi_thread")]
 async fn test_cancel_03_remote_cancel() {
-    let (messenger_a, messenger_b) = make_two_messengers().await;
-    let worker_id_b = messenger_b.instance_id().worker_id();
-
-    // Worker B: create AnchorManager with sender_registry + register _stream_cancel handler
-    let mock_transport_b = Arc::new(LocalMockTransport);
-    let am_b = Arc::new(
-        AnchorManagerBuilder::default()
-            .worker_id(worker_id_b)
-            .transport(mock_transport_b)
-            .build()
-            .expect("am_b"),
-    );
-    let _ = messenger_b.register_streaming_handler(create_stream_cancel_handler(Arc::clone(
-        &am_b.sender_registry,
-    )));
+    let [node_a, node_b] = [common::local_node().await, common::local_node().await];
+    node_a
+        .register_peer(node_b.peer_info())
+        .expect("register b on a");
+    node_b
+        .register_peer(node_a.peer_info())
+        .expect("register a on b");
+    let worker_id_b = node_b.instance_id().worker_id();
 
     // Worker B: create a local anchor + attach local sender (to populate SenderRegistry)
-    let anchor_b = am_b.create_anchor::<u32>();
+    let anchor_b = node_b.create_anchor::<u32>();
     let handle_b = anchor_b.handle();
-    let sender_b = am_b
-        .attach_stream_anchor::<u32>(handle_b)
+    let sender_b = node_b
+        .attach_anchor::<u32>(handle_b)
         .await
         .expect("attach sender B");
     let cancel_token = sender_b.cancellation_token();
 
-    // sender_stream_id is 1 (first attach on am_b)
+    // sender_stream_id is 1 (first attach on node_b)
     let sender_stream_id = 1u64;
-    assert!(
-        am_b.sender_registry.senders.contains_key(&sender_stream_id),
+    assert_eq!(
+        node_b.stream_senders_in_use(),
+        1,
         "SenderEntry must be in registry before cancel"
     );
 
@@ -275,7 +184,8 @@ async fn test_cancel_03_remote_cancel() {
     // NOTE: typed_unary_async handlers deserialize with serde_json, not rmp_serde.
     let payload = serde_json::to_vec(&StreamCancelRequest { sender_stream_id })
         .expect("serialize StreamCancelRequest");
-    messenger_a
+    node_a
+        .messenger()
         .am_send_streaming("_stream_cancel")
         .expect("am_send_streaming builder")
         .raw_payload(bytes::Bytes::from(payload))
@@ -345,7 +255,7 @@ fn cancel_mux_config() -> MuxConfig {
 
 async fn velo_node() -> Velo {
     Velo::builder()
-        .add_transport(new_tcp_transport())
+        .add_transport(common::loopback_tcp())
         .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
         .messenger_mux(cancel_mux_config())
         .expect("install mux")

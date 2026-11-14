@@ -5,8 +5,8 @@
 
 //! Extension trait surface for Velo.
 //!
-//! Out-of-tree implementors of [`Transport`], [`FrameTransport`], and
-//! [`PeerDiscovery`] depend on this crate. It
+//! Out-of-tree implementors of [`Transport`], [`PeerDiscovery`],
+//! [`ServiceDiscovery`], and [`TransportObservability`] depend on this crate. It
 //! contains the trait definitions and the value/error types that appear in
 //! their signatures — nothing more. Anyone who only *uses* Velo should depend
 //! on the `velo` crate; only plugin authors should reach for `velo-ext`.
@@ -21,7 +21,6 @@ pub mod admission;
 pub mod discovery;
 pub mod id;
 pub mod observability;
-pub mod streaming;
 pub mod transport;
 
 // Convenience re-exports at the crate root for the most-used items. Plugin
@@ -32,7 +31,6 @@ pub use discovery::{
 };
 pub use id::{InstanceId, PeerInfo, TransportKey, WorkerAddress, WorkerAddressError, WorkerId};
 pub use observability::{Direction, TransportObservability, TransportRejection};
-pub use streaming::FrameTransport;
 pub use transport::{
     AdmitOutcome, DataStreams, DrainExemption, HealthCheckError, InFlightGuard, InboundMessage,
     MessageType, ShutdownPolicy, ShutdownState, Transport, TransportAdapter, TransportError,

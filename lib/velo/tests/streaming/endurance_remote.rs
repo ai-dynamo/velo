@@ -6,8 +6,8 @@
 //! Real-transport endurance tests for velo-streaming.
 //!
 //! Parallels the local endurance suite in `endurance.rs` but runs the
-//! data-flow scenarios end-to-end across two `AnchorManager`s wired through
-//! **raw TCP** (`TcpFrameTransport`).
+//! data-flow scenarios end-to-end across two `Velo` nodes whose streams ride
+//! the per-stream TCP transport (`TcpFrameTransport`).
 //!
 //! The messenger-backed variants that used to sit beside them went with the
 //! deleted `VeloFrameTransport`. Their replacement rides `messenger-mux-v2`,
@@ -23,24 +23,19 @@
 //! ```
 //!
 //! The *consumer* side creates the anchor; the *producer* side calls
-//! `attach_stream_anchor(handle)` — worker-id mismatch forces the remote path,
+//! `attach_anchor(handle)` — worker-id mismatch forces the remote path,
 //! so frames cross the wire via the transport under test.
 //!
 //! Scope: E-01, E-02, E-05, E-06 over TCP.
 //! E-03/E-04/E-07 exercise local registry / Drop / cancel-gate semantics and
 //! are covered by the local suite only.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+mod common;
+
 use std::time::Duration;
 
 use futures::StreamExt;
-use velo::messenger::Messenger;
-use velo::streaming::{
-    AnchorManager, AnchorManagerBuilder, FrameTransport, StreamFrame, TcpFrameTransport,
-};
-use velo::transports::tcp::TcpTransportBuilder;
-use velo_ext::{PeerInfo, WorkerId};
+use velo::streaming::StreamFrame;
 
 // ---------------------------------------------------------------------------
 // Two-node fixture
@@ -48,113 +43,16 @@ use velo_ext::{PeerInfo, WorkerId};
 
 /// Producer attaches; consumer owns the anchor and receives frames across the wire.
 struct RemotePair {
-    producer: Arc<AnchorManager>,
-    consumer: Arc<AnchorManager>,
-    // Keep messengers alive for the lifetime of the test.
-    _msgr_producer: Arc<Messenger>,
-    _msgr_consumer: Arc<Messenger>,
+    producer: velo::Velo,
+    consumer: velo::Velo,
 }
 
-#[allow(deprecated)] // an `AnchorManager` built by hand over a bare `Messenger`, which `Velo` registers itself
-async fn make_two_tcp_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
-    let bind = |_| {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        Arc::new(
-            TcpTransportBuilder::new()
-                .from_listener(listener)
-                .unwrap()
-                .build()
-                .unwrap(),
-        )
-    };
-    let t1 = bind(());
-    let t2 = bind(());
-
-    let m1 = Messenger::builder()
-        .add_transport(t1)
-        .build()
-        .await
-        .expect("build messenger 1");
-    let m2 = Messenger::builder()
-        .add_transport(t2)
-        .build()
-        .await
-        .expect("build messenger 2");
-
-    m2.register_peer(m1.peer_info()).expect("register m1 on m2");
-    m1.register_peer(m2.peer_info()).expect("register m2 on m1");
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    (m1, m2)
-}
-
-/// Consumer side owns the anchor; producer side attaches remotely.
-/// Uses raw `TcpFrameTransport` as data plane on both sides, with a
-/// `transport_registry` entry so the remote-attach handshake can resolve the scheme.
+/// Two nodes whose streams ride the per-stream TCP transport
+/// (`TcpFrameTransport`): the consumer side owns the anchor, the producer
+/// side attaches remotely.
 async fn make_remote_pair_tcp() -> RemotePair {
-    let (m_consumer, m_producer) = make_two_tcp_messengers().await;
-    let worker_consumer = m_consumer.instance_id().worker_id();
-    let worker_producer = m_producer.instance_id().worker_id();
-
-    // Returns the AnchorManager alongside its frame transport, because the two
-    // sides must be cross-`register`ed before `connect()` can resolve a peer.
-    async fn make_side(
-        worker_id: WorkerId,
-    ) -> (Arc<velo::streaming::AnchorManager>, Arc<TcpFrameTransport>) {
-        let tcp = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
-            .await
-            .unwrap();
-        // Key the registry by the transport's own key. `TcpFrameTransport`
-        // advertises `tcp-stream` (the `-stream` suffix keeps it distinct from
-        // the messenger TCP transport's `tcp` entry in the same WorkerAddress),
-        // and `resolve_transport` looks up exactly the key the attach response
-        // carries — a mismatch fails the attach with "unsupported streaming
-        // transport key".
-        let mut registry = HashMap::new();
-        registry.insert(
-            tcp.key().as_str().to_string(),
-            tcp.clone() as Arc<dyn FrameTransport>,
-        );
-        let manager = Arc::new(
-            AnchorManagerBuilder::default()
-                .worker_id(worker_id)
-                .transport(tcp.clone() as Arc<dyn FrameTransport>)
-                .transport_registry(Arc::new(registry))
-                .build()
-                .expect("build AM"),
-        );
-        (manager, tcp)
-    }
-
-    let (consumer, tcp_consumer) = make_side(worker_consumer).await;
-    let (producer, tcp_producer) = make_side(worker_producer).await;
-
-    // `Messenger::register_peer` only covers the control plane. The streaming
-    // transports keep their own WorkerId -> SocketAddr cache, populated from a
-    // PeerInfo carrying the peer's `tcp-stream` entry, so register those too.
-    // (`Velo::register_peer` does this fan-out automatically; these tests build
-    // the AnchorManager directly and so must do it by hand.)
-    let peer_consumer = PeerInfo::new(m_consumer.instance_id(), tcp_consumer.address());
-    let peer_producer = PeerInfo::new(m_producer.instance_id(), tcp_producer.address());
-    tcp_producer
-        .register(&peer_consumer)
-        .expect("register consumer stream endpoint on producer");
-    tcp_consumer
-        .register(&peer_producer)
-        .expect("register producer stream endpoint on consumer");
-
-    consumer
-        .register_handlers(Arc::clone(&m_consumer))
-        .expect("consumer register_handlers");
-    producer
-        .register_handlers(Arc::clone(&m_producer))
-        .expect("producer register_handlers");
-
-    RemotePair {
-        producer,
-        consumer,
-        _msgr_producer: m_producer,
-        _msgr_consumer: m_consumer,
-    }
+    let (consumer, producer) = common::tcp_stream_pair().await;
+    RemotePair { producer, consumer }
 }
 
 // ---------------------------------------------------------------------------
@@ -172,7 +70,7 @@ async fn run_e01(pair: &RemotePair, total: u64, ordered: bool) {
     let handle = anchor.handle();
     let sender = pair
         .producer
-        .attach_stream_anchor::<u64>(handle)
+        .attach_anchor::<u64>(handle)
         .await
         .expect("remote attach");
 
@@ -223,7 +121,7 @@ async fn run_e02(pair: &RemotePair, streams: usize, items: u32, ordered: bool) {
         let handle = anchor.handle();
         let sender = pair
             .producer
-            .attach_stream_anchor::<u32>(handle)
+            .attach_anchor::<u32>(handle)
             .await
             .expect("attach");
         anchors.push(anchor);
@@ -296,7 +194,7 @@ async fn run_e05(pair: &RemotePair, total: u32, ordered: bool) {
     let handle = anchor.handle();
     let sender = pair
         .producer
-        .attach_stream_anchor::<u32>(handle)
+        .attach_anchor::<u32>(handle)
         .await
         .expect("attach");
 
@@ -347,7 +245,7 @@ async fn run_e06(pair: &RemotePair, cycles: u32, batch: u32, ordered: bool) {
     for cycle in 0..cycles {
         let sender = pair
             .producer
-            .attach_stream_anchor::<u32>(current_handle)
+            .attach_anchor::<u32>(current_handle)
             .await
             .unwrap_or_else(|e| panic!("cycle {cycle} attach: {e}"));
         for j in 0..batch {
@@ -377,7 +275,7 @@ async fn run_e06(pair: &RemotePair, cycles: u32, batch: u32, ordered: bool) {
 
     let last_sender = pair
         .producer
-        .attach_stream_anchor::<u32>(current_handle)
+        .attach_anchor::<u32>(current_handle)
         .await
         .expect("final attach");
     for j in 0..batch {
