@@ -632,6 +632,14 @@ where
 /// A sender that exits right after `closed()` closes its connection on the
 /// wire; its peer sees an application close, not an idle timeout. The peer is
 /// a raw quinn server, so the test reads the close reason directly.
+///
+/// The peer's idle timeout is 20 s. A short one also fires when a loaded host
+/// stalls the sender between its frame and its close, and the peer then
+/// reports a timeout though the sender closed. The test waits for the close
+/// reason, so a passing run stays short. The sender runs with a 30 s close
+/// grace: an acknowledgement read after a stall gives quinn an RTT sample that
+/// includes the stall, and the close's draining period, three probe timeouts,
+/// can then outlast the default 2 s close wait.
 #[test]
 fn the_senders_exit_closes_its_connection() {
     let rx_rt = tokio::runtime::Builder::new_multi_thread()
@@ -644,7 +652,7 @@ fn the_senders_exit_closes_its_connection() {
     let (peer, peer_id) = rx_rt.block_on(async {
         raw_server(
             1 << 20,
-            Duration::from_millis(1500),
+            Duration::from_secs(20),
             move |connection| async move {
                 let (_send, mut recv) = connection.accept_bi().await.unwrap();
                 let _ = accepted_tx.send(());
@@ -659,7 +667,8 @@ fn the_senders_exit_closes_its_connection() {
         .build()
         .unwrap();
     tx_rt.block_on(async {
-        let (client, _client_streams, _) = started().await;
+        let (client, _client_streams, _) =
+            started_with(QuicTransportBuilder::new().close_grace(Duration::from_secs(30))).await;
         client.register(peer).unwrap();
         let _ = client.send_message(
             peer_id,
@@ -670,7 +679,7 @@ fn the_senders_exit_closes_its_connection() {
         );
         // The peer sees the stream only once the frame arrives, so the
         // connection is up before the shutdown under test.
-        tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+        tokio::time::timeout(Duration::from_secs(30), accepted_rx)
             .await
             .expect("the frame never reached the peer")
             .unwrap();
@@ -684,8 +693,9 @@ fn the_senders_exit_closes_its_connection() {
     });
     drop(tx_rt);
 
+    // Only catches a hang: a missing close ends at the idle timeout.
     let reason = reason_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(60))
         .expect("the connection ends");
     assert!(
         matches!(reason, quinn::ConnectionError::ApplicationClosed(_)),
@@ -766,8 +776,15 @@ async fn closed_fails_frames_still_waiting_in_the_gate() {
 /// close only at its idle timeout and counts that as a decode error.
 ///
 /// The receiver runs on its own runtime and is dropped right after
-/// `shutdown()` and `closed()`. The dialer has a short idle timeout, so a
-/// missing close would time out within the test.
+/// `shutdown()` and `closed()`. Then the test waits until the dialer's
+/// connection has ended, and checks how. A missing close ends it at the
+/// dialer's idle timeout, counted as a decode error.
+///
+/// The idle timeout is 20 s, not a short one. A short timeout also fires when
+/// a loaded host stalls the receiver between the frame and its close, and the
+/// test then fails though the close was sent. Waiting for the connection to
+/// end, not for a fixed time, keeps a passing run short. The receiver runs
+/// with a 30 s close grace, as in `the_senders_exit_closes_its_connection`.
 #[test]
 fn an_accept_only_node_closes_its_connections_before_it_exits() {
     accept_only_node_closes_before_it_exits(
@@ -802,7 +819,7 @@ fn accept_only_node_closes_before_it_exits(server_rt: tokio::runtime::Runtime) {
     let client = dialer_rt.block_on(async {
         let client = QuicTransportBuilder::new()
             .bind_addr("127.0.0.1:0".parse().unwrap())
-            .idle_timeout(Duration::from_millis(1500))
+            .idle_timeout(Duration::from_secs(20))
             .build()
             .unwrap();
         client.set_observability(seen.clone());
@@ -819,7 +836,8 @@ fn accept_only_node_closes_before_it_exits(server_rt: tokio::runtime::Runtime) {
     });
 
     server_rt.block_on(async {
-        let (server, server_streams, server_id) = started().await;
+        let (server, server_streams, server_id) =
+            started_with(QuicTransportBuilder::new().close_grace(Duration::from_secs(30))).await;
         client
             .register(peer_with_fingerprint(
                 &server,
@@ -835,7 +853,7 @@ fn accept_only_node_closes_before_it_exits(server_rt: tokio::runtime::Runtime) {
             Arc::new(Errors::default()),
         );
         tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(30),
             server_streams.event_stream.recv_async(),
         )
         .await
@@ -854,7 +872,18 @@ fn accept_only_node_closes_before_it_exits(server_rt: tokio::runtime::Runtime) {
     // The receiver's process exits.
     drop(server_rt);
 
-    dialer_rt.block_on(async { tokio::time::sleep(Duration::from_secs(3)).await });
+    // The dialed reader records a decode error before it stops the writer,
+    // and the writer then leaves `connections`. The timeout only catches a
+    // hang: a missing close ends the connection at the idle timeout.
+    dialer_rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !client.connections.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dialer's connection never ended")
+    });
     assert_eq!(
         seen.decode_errors(),
         0,
