@@ -348,8 +348,21 @@ impl DataStore {
     }
 
     /// The metrics handle, if this instance was built with one.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub(crate) fn metrics(&self) -> Option<&Arc<VeloMetrics>> {
         self.metrics.as_ref()
+    }
+
+    /// Set `velo_rendezvous_active_slots` to the slots staged now.
+    ///
+    /// Called by each call here that removes a slot, so every path that frees
+    /// one refreshes the gauge: the owner's call, local and remote detach and
+    /// release, a `LeaseGuard` drop, and the reapers. A caller that refreshed
+    /// it after its own free missed the frees it did not know it caused.
+    fn refresh_active_slots(&self) {
+        if let Some(m) = &self.metrics {
+            m.set_rendezvous_active_slots(self.slots.len());
+        }
     }
 
     /// Bind the RDMA registry and policy. Called once, from
@@ -728,6 +741,7 @@ impl DataStore {
         if slot.ttl.is_some() {
             self.expiring.remove(&local_id);
         }
+        self.refresh_active_slots();
         slot.body.to_bytes()
     }
 
@@ -738,11 +752,13 @@ impl DataStore {
             slot.refcount.load(Ordering::Relaxed) == 0
                 && slot.read_lock_count.load(Ordering::Relaxed) == 0
         });
-        if let Some((_, slot)) = freed
-            && slot.ttl.is_some()
-        {
+        let Some((_, slot)) = freed else {
+            return;
+        };
+        if slot.ttl.is_some() {
             self.expiring.remove(&local_id);
         }
+        self.refresh_active_slots();
     }
 
     /// Get the data bytes for a slot (for inline responses or local fast-path).
@@ -890,6 +906,7 @@ impl DataStore {
                 // to preserve and nothing an in-flight pull could have read.
                 Some(None) => {
                     if self.slots.remove(&local_id).is_some() {
+                        self.refresh_active_slots();
                         dropped += 1;
                     }
                 }
@@ -944,6 +961,7 @@ impl DataStore {
         if self.slots.remove(&local_id).is_none() {
             return false;
         }
+        self.refresh_active_slots();
         let mut ended = Vec::new();
         self.active_leases.retain(|lease_id, held| {
             if *held == local_id {
@@ -1040,9 +1058,6 @@ async fn sweep_while_pending(store: Weak<DataStore>, stop: tokio_util::sync::Can
                 slots,
                 "rendezvous: ended staged payloads past their deadline"
             );
-            if let Some(m) = store.metrics() {
-                m.set_rendezvous_active_slots(store.slots.len());
-            }
         }
         if store.has_pending_expiry() {
             continue;
