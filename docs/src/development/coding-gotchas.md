@@ -37,7 +37,7 @@ Test: on `TaskRuntime::Application`, `block_in_place_keeps_the_stream` is the li
 
 A future whose value arrives during its poll needs no wake. A value published before its wake can be read by another poll, so the future finishes before its wake runs. And `AtomicWaker::register` delivers a wake that races the registration on the registering thread, inside its poll.
 
-**Failure.** A test counted one response wake from velo's runtime for each unary call. Three review passes in a row each found a valid interleaving that broke it: a response during the first poll, a spurious poll before the wake, and a wake that the registration handed to the caller's own thread. Each fix moved the failure to the next interleaving.
+**Failure.** A test that counted one response wake from velo's runtime for each unary call fails on three valid interleavings: a response during the first poll, a spurious poll before the wake, and a wake that the registration hands to the caller's own thread.
 
 **Test.** Hold the sender between the registration and the check, or between the publish and the wake, and see whether the assertion still holds. Run the test 200 times, with 8 copies in parallel.
 
