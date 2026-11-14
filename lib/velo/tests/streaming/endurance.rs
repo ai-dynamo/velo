@@ -29,16 +29,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use velo::streaming::{AnchorManager, StreamController, StreamFrame};
-use velo_ext::WorkerId;
+use velo::streaming::{StreamController, StreamFrame};
 
-use common::MockFrameTransport;
-
-fn make_manager() -> Arc<AnchorManager> {
-    Arc::new(AnchorManager::new(
-        WorkerId::from_u64(1),
-        Arc::new(MockFrameTransport::new()),
-    ))
+async fn make_manager() -> Arc<velo::Velo> {
+    Arc::new(common::local_node().await)
 }
 
 // ============================================================================
@@ -50,13 +44,10 @@ fn make_manager() -> Arc<AnchorManager> {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e01_sustained_10k_frames() {
     const TOTAL: u64 = 10_000;
-    let mgr = make_manager();
+    let mgr = make_manager().await;
     let mut anchor = mgr.create_anchor::<u64>();
     let handle = anchor.handle();
-    let sender = mgr
-        .attach_stream_anchor::<u64>(handle)
-        .await
-        .expect("attach");
+    let sender = mgr.attach_anchor::<u64>(handle).await.expect("attach");
 
     let send_task = tokio::spawn(async move {
         for i in 0..TOTAL {
@@ -95,7 +86,7 @@ async fn test_e02_concurrent_100_streams() {
     const STREAMS: usize = 100;
     const ITEMS: u32 = 100;
 
-    let mgr = make_manager();
+    let mgr = make_manager().await;
 
     // Create all anchors + attach all senders
     let mut anchors: Vec<_> = Vec::new();
@@ -103,10 +94,7 @@ async fn test_e02_concurrent_100_streams() {
     for _ in 0..STREAMS {
         let anchor = mgr.create_anchor::<u32>();
         let handle = anchor.handle();
-        let sender = mgr
-            .attach_stream_anchor::<u32>(handle)
-            .await
-            .expect("attach");
+        let sender = mgr.attach_anchor::<u32>(handle).await.expect("attach");
         anchors.push(anchor);
         senders.push(sender);
     }
@@ -175,13 +163,13 @@ async fn test_e02_concurrent_100_streams() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e03_rapid_create_destroy_anchors() {
     const ROUNDS: usize = 1_000;
-    let mgr = make_manager();
+    let mgr = make_manager().await;
 
     for round in 0..ROUNDS {
         let mut anchor = mgr.create_anchor::<u32>();
         let handle = anchor.handle();
         let sender = mgr
-            .attach_stream_anchor::<u32>(handle)
+            .attach_anchor::<u32>(handle)
             .await
             .unwrap_or_else(|e| panic!("round {round} attach: {e}"));
         sender
@@ -214,13 +202,10 @@ async fn test_e03_rapid_create_destroy_anchors() {
 async fn test_e04_sender_panic_drop() {
     use velo::streaming::StreamError;
 
-    let mgr = make_manager();
+    let mgr = make_manager().await;
     let mut anchor = mgr.create_anchor::<u32>();
     let handle = anchor.handle();
-    let sender = mgr
-        .attach_stream_anchor::<u32>(handle)
-        .await
-        .expect("attach");
+    let sender = mgr.attach_anchor::<u32>(handle).await.expect("attach");
 
     // Spawn a task that sends 500 items then panics.
     // `catch_unwind` keeps the test runtime alive; the sender's Drop fires on panic.
@@ -265,13 +250,10 @@ async fn test_e04_sender_panic_drop() {
 async fn test_e05_consumer_slow_sustained() {
     const TOTAL: u32 = 1_000;
 
-    let mgr = make_manager();
+    let mgr = make_manager().await;
     let mut anchor = mgr.create_anchor::<u32>();
     let handle = anchor.handle();
-    let sender = mgr
-        .attach_stream_anchor::<u32>(handle)
-        .await
-        .expect("attach");
+    let sender = mgr.attach_anchor::<u32>(handle).await.expect("attach");
 
     let send_task = tokio::spawn(async move {
         for i in 0..TOTAL {
@@ -314,7 +296,7 @@ async fn test_e06_five_cycle_reattach_endurance() {
     const CYCLES: u32 = 5;
     const BATCH: u32 = 100;
 
-    let mgr = make_manager();
+    let mgr = make_manager().await;
     let mut anchor = mgr.create_anchor::<u32>();
     let mut current_handle = anchor.handle();
     let mut all_items: Vec<u32> = Vec::new();
@@ -323,7 +305,7 @@ async fn test_e06_five_cycle_reattach_endurance() {
 
     for cycle in 0..CYCLES {
         let sender = mgr
-            .attach_stream_anchor::<u32>(current_handle)
+            .attach_anchor::<u32>(current_handle)
             .await
             .unwrap_or_else(|e| panic!("cycle {cycle} attach: {e}"));
         for j in 0..BATCH {
@@ -350,7 +332,7 @@ async fn test_e06_five_cycle_reattach_endurance() {
 
     // Final attach + finalize
     let last_sender = mgr
-        .attach_stream_anchor::<u32>(current_handle)
+        .attach_anchor::<u32>(current_handle)
         .await
         .expect("final attach");
     for j in 0..BATCH {
@@ -399,7 +381,7 @@ async fn test_e06_five_cycle_reattach_endurance() {
 async fn test_e07_cancel_storm() {
     const STORMERS: usize = 50;
 
-    let mgr = make_manager();
+    let mgr = make_manager().await;
     let anchor = mgr.create_anchor::<u32>();
     let ctrl: StreamController = anchor.controller();
 

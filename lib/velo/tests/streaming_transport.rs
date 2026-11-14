@@ -42,14 +42,16 @@ async fn test_velo_builder_tcp_transport() {
 
     // The StreamConfig branch and the mux, which the builder installs by
     // default beside it.
-    // The transport registry has no `Velo` form.
-    #[allow(deprecated)]
-    let registry = &velo.anchor_manager().transport_registry;
+    let registry = velo.stream_transport_keys();
     assert!(
-        registry.contains_key("tcp-stream"),
+        registry.iter().any(|key| key == "tcp-stream"),
         "transport_registry should contain 'tcp-stream' key"
     );
-    assert!(registry.contains_key(velo::streaming::MESSENGER_MUX_KEY));
+    assert!(
+        registry
+            .iter()
+            .any(|key| key == velo::streaming::MESSENGER_MUX_KEY)
+    );
     assert_eq!(
         registry.len(),
         2,
@@ -92,14 +94,16 @@ async fn test_velo_builder_grpc_transport() {
         .expect("VeloBuilder with Grpc config should build successfully");
 
     // The chosen streaming transport, and the mux beside it (the default).
-    // The transport registry has no `Velo` form.
-    #[allow(deprecated)]
-    let registry = &velo.anchor_manager().transport_registry;
+    let registry = velo.stream_transport_keys();
     assert!(
-        registry.contains_key("grpc-stream"),
+        registry.iter().any(|key| key == "grpc-stream"),
         "transport_registry should contain 'grpc-stream' key"
     );
-    assert!(registry.contains_key(velo::streaming::MESSENGER_MUX_KEY));
+    assert!(
+        registry
+            .iter()
+            .any(|key| key == velo::streaming::MESSENGER_MUX_KEY)
+    );
     assert_eq!(
         registry.len(),
         2,
@@ -254,16 +258,13 @@ async fn test_velo_facade_mpsc_with_config() {
 async fn the_default_builder_installs_only_the_mux() {
     let velo = tcp_node(velo::Velo::builder()).await;
 
-    // The transport registry has no `Velo` form.
-    #[allow(deprecated)]
-    let manager = velo.anchor_manager();
     assert_eq!(
-        manager.transport_registry.keys().collect::<Vec<_>>(),
+        velo.stream_transport_keys(),
         [velo::streaming::MESSENGER_MUX_KEY],
         "a default node installs the mux and nothing else"
     );
     assert_eq!(
-        manager.transport.key().as_str(),
+        velo.default_stream_transport_key(),
         velo::streaming::MESSENGER_MUX_KEY,
         "the mux is the default node's stream transport"
     );
@@ -309,15 +310,7 @@ async fn an_explicit_stream_config_installs_the_per_stream_transport() {
     ];
     for (builder, key) in opted_in {
         let velo = tcp_node(builder).await;
-        // The transport registry has no `Velo` form.
-        #[allow(deprecated)]
-        let manager = velo.anchor_manager();
-        let mut keys = manager
-            .transport_registry
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        keys.sort();
+        let keys = velo.stream_transport_keys();
         let mut expected = vec![
             key.to_string(),
             velo::streaming::MESSENGER_MUX_KEY.to_string(),
@@ -327,7 +320,7 @@ async fn an_explicit_stream_config_installs_the_per_stream_transport() {
             keys, expected,
             "{key}: the per-stream transport and the mux"
         );
-        assert_eq!(manager.transport.key().as_str(), key);
+        assert_eq!(velo.default_stream_transport_key(), key);
         let advertised = velo
             .peer_info()
             .worker_address()
@@ -581,11 +574,7 @@ async fn mux_only_carries_streams_and_large_messages() {
         producer.register_peer(consumer.peer_info()).unwrap();
         consumer.register_peer(producer.peer_info()).unwrap();
         for node in [&producer, &consumer] {
-            // The transport registry has no `Velo` form.
-            #[allow(deprecated)]
-            let registry = &node.anchor_manager().transport_registry;
-            assert_eq!(registry.len(), 1);
-            assert!(registry.contains_key(MESSENGER_MUX_KEY));
+            assert_eq!(node.stream_transport_keys(), [MESSENGER_MUX_KEY]);
             assert!(
                 node.peer_info()
                     .worker_address
