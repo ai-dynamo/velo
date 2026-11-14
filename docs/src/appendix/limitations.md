@@ -20,7 +20,7 @@ envelope.
 **Why.** Such an item leaves the producer as a handle. Its bytes stay staged
 in the producer's rendezvous store until the consumer pulls them. `Sent` is
 reported when the batch that carries the handle is admitted by the transport,
-and the drain of `graceful_shutdown` counts requests in flight, not staged
+and the drain of `Velo::shutdown` counts requests in flight, not staged
 payloads, so neither waits for the pull.
 
 **Workaround.** Keep stream items under the eager budget, or wait for the
@@ -37,7 +37,7 @@ that test asserts.
 when the transport tears down is reported as failed. A stream whose `Sent`
 came just before the shutdown can lose its tail over QUIC.
 
-**When.** At the teardown step of `graceful_shutdown`, over the `quic`
+**When.** At the teardown step of `Velo::shutdown`, over the `quic`
 transport.
 
 **Why.** TCP and UDS keep writing admitted frames for the teardown grace.
@@ -133,7 +133,7 @@ transport's teardown grace (`teardown_flush_grace` on the builders, 1 s by
 default), but only the frames already in its channel: at most
 `channel_capacity` per connection. A frame that waits in the connection's admission gate when teardown starts is refused, and a send after teardown fails at once. A send that races the start of teardown can still be admitted and then fail; closing that needs a terminal state on the admission gate in `velo-ext`. Over the messenger mux, a refused batch retires its streams as `Discarded`.
 
-**When.** The close step of `graceful_shutdown`.
+**When.** The close step of `Velo::shutdown`.
 
 **Why.** The grace starts after the drain. The time the work behind the
 frames takes belongs to the drain, which `ShutdownPolicy::Timeout` bounds;

@@ -283,7 +283,7 @@ Pages outlive their registration. Arena memory is freed only after the backend c
 
 The guard does not borrow. Its lifecycle:
 
-- `deregistered().await` is the single release signal. It resolves on a confirmed unmap, or at the end of `graceful_shutdown`, whichever comes first. Only then can the caller free the memory.
+- `deregistered().await` is the single release signal. It resolves on a confirmed unmap, or at the end of `Velo::shutdown`, whichever comes first. Only then can the caller free the memory.
 - `unregister(timeout)` gates new use, drains in-flight work, and unmaps. It returns `Deregistered::Drained` or `Deregistered::DrainTimedOut`. **Both mean the memory is released.** `DrainTimedOut` means velo did not wait for in-flight work. An earlier `Err(Timeout)` shape mixed up "still mapped" with "unmapped early", and only the first means "do not free".
 - `Drop` without `unregister` starts a background deregistration, logs at `warn`, and returns at once. It never blocks, because blocking in `Drop` inside a tokio runtime deadlocks the worker. The memory stays pinned until the background task finishes. An early drop is a liveness bug for the caller, not a soundness bug for anyone else.
 - `watch()` returns a `RegionWatch`. It carries the same observers but does not own the release, because `unregister` consumes the guard.
@@ -338,7 +338,7 @@ With both knobs on, a peer that is registered but never used is wired up once an
 
 ## Shutdown ordering
 
-An RDMA GET is invisible to the owner's in-flight counters. An unmap after transport teardown can remove memory under a transfer that nobody on the owner can see. `graceful_shutdown` therefore runs the RDMA sweep **before** messenger teardown, under one shared deadline.
+An RDMA GET is invisible to the owner's in-flight counters. An unmap after transport teardown can remove memory under a transfer that nobody on the owner can see. `Velo::shutdown` therefore runs the RDMA sweep **before** messenger teardown, under one shared deadline.
 
 ```mermaid
 sequenceDiagram
@@ -347,14 +347,14 @@ sequenceDiagram
     participant RV as RendezvousManager
     participant Reg as RdmaRegistry
     participant UCX as UCX progress thread
-    App->>Velo: graceful_shutdown(policy)
+    App->>Velo: shutdown(policy)
     Velo->>Velo: begin_drain (messenger gate)
     Velo->>RV: stop lease reaper, demote pinned slots to heap
     Velo->>Reg: 1. Gate: refuse new registrations and allocations
     Velo->>Reg: 2. Drain: wait for in-progress registrations and region in-flight counts
     Velo->>Reg: 3. Deregister: unmap every region and arena
     Reg->>UCX: unmap (regions before endpoints)
-    Velo->>Velo: messenger graceful_shutdown (remaining budget)
+    Velo->>Velo: messenger drain, teardown and close (remaining budget)
     UCX->>UCX: teardown force-unmaps anything left
     Velo->>Reg: latch deregistered() for every region
 ```
