@@ -246,6 +246,15 @@ impl VeloBackend {
         backend_transports: Vec<Arc<dyn Transport>>,
         observability: Option<Arc<VeloMetrics>>,
     ) -> anyhow::Result<(Self, DataStreams)> {
+        Self::new_on(backend_transports, observability, None).await
+    }
+
+    /// Scratch (arm C): start the transports on `io_runtime` when given.
+    pub(crate) async fn new_on(
+        backend_transports: Vec<Arc<dyn Transport>>,
+        observability: Option<Arc<VeloMetrics>>,
+        io_runtime: Option<tokio::runtime::Handle>,
+    ) -> anyhow::Result<(Self, DataStreams)> {
         let instance_id = InstanceId::new_v4();
 
         // build worker address
@@ -277,7 +286,11 @@ impl VeloBackend {
                     transport_metrics.insert(key.clone(), handle);
                 }
                 transport
-                    .start(instance_id, adapter.clone(), runtime.clone())
+                    .start(
+                        instance_id,
+                        adapter.clone(),
+                        io_runtime.clone().unwrap_or_else(|| runtime.clone()),
+                    )
                     .await?;
                 started
                     .transports

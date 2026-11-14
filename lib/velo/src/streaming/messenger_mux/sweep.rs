@@ -234,6 +234,7 @@ pub(super) fn spawn_sweep(core: &Arc<MuxCore>) {
             match wake {
                 Wake::Tick => periodic_tick(&core, &mut visits, now),
                 Wake::Peer(peer) => {
+                    crate::scratch_arm::note_visit();
                     if let Some(peer) = visits.admit(peer, now) {
                         core.visit_drained_peer(peer);
                     }

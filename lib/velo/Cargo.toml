@@ -232,6 +232,11 @@ name = "streaming_blocked_producer"
 path = "tests/streaming/blocked_producer.rs"
 
 [[test]]
+name = "streaming_stall_rows"
+path = "tests/streaming/stall_rows.rs"
+required-features = ["test-helpers"]
+
+[[test]]
 name = "streaming_retired"
 path = "tests/streaming/retired.rs"
 required-features = ["test-helpers"]

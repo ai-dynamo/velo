@@ -35,6 +35,8 @@ pub struct Messenger {
     events: Arc<VeloEvents>,
     observability: Option<Arc<VeloMetrics>>,
     runtime: tokio::runtime::Handle,
+    /// Scratch (arm C): velo's own runtime, when it has one.
+    io_runtime: Option<tokio::runtime::Handle>,
     tracker: tokio_util::task::TaskTracker,
     /// Late-bound large payload resolver for transparent rendezvous (receiver side).
     large_payload_resolver:
@@ -64,6 +66,8 @@ pub(crate) struct MessengerParts {
     transports: Vec<Arc<dyn Transport>>,
     discovery: Option<Arc<dyn PeerDiscovery>>,
     metrics: Option<Arc<VeloMetrics>>,
+    /// Scratch (arm C): where transports and the inbound loop run.
+    io_runtime: Option<tokio::runtime::Handle>,
 }
 
 impl MessengerParts {
@@ -72,7 +76,13 @@ impl MessengerParts {
             transports: Vec::new(),
             discovery: None,
             metrics: None,
+            io_runtime: None,
         }
+    }
+
+    pub(crate) fn io_runtime(mut self, runtime: tokio::runtime::Handle) -> Self {
+        self.io_runtime = Some(runtime);
+        self
     }
 
     pub(crate) fn add_transport(mut self, transport: Arc<dyn Transport>) -> Self {
@@ -91,7 +101,13 @@ impl MessengerParts {
     }
 
     pub(crate) async fn build(self) -> Result<Arc<Messenger>> {
-        Messenger::new(self.transports, self.discovery, self.metrics).await
+        Messenger::new(
+            self.transports,
+            self.discovery,
+            self.metrics,
+            self.io_runtime,
+        )
+        .await
     }
 }
 
@@ -170,9 +186,11 @@ impl Messenger {
         transports: Vec<Arc<dyn Transport>>,
         discovery: Option<Arc<dyn PeerDiscovery>>,
         metrics: Option<Arc<VeloMetrics>>,
+        io_runtime: Option<tokio::runtime::Handle>,
     ) -> Result<Arc<Self>> {
         // 1. Setup infrastructure
-        let (backend, data_streams) = VeloBackend::new(transports, metrics.clone()).await?;
+        let (backend, data_streams) =
+            VeloBackend::new_on(transports, metrics.clone(), io_runtime.clone()).await?;
         let backend = Arc::new(backend);
         // Work accepted before a drain keeps flowing through it. See
         // `register_drain_exempt_handler`. Installed before this messenger
@@ -232,6 +250,7 @@ impl Messenger {
             tracker.clone(),
             metrics.clone(),
             large_payload_resolver.clone(),
+            io_runtime.clone(),
         )
         .await;
         let server = Arc::new(server);
@@ -289,6 +308,7 @@ impl Messenger {
             events: events.clone(),
             observability: metrics,
             runtime,
+            io_runtime,
             tracker,
             large_payload_resolver,
             drain_exempt,
@@ -725,6 +745,11 @@ impl Messenger {
 
     pub fn runtime(&self) -> &tokio::runtime::Handle {
         &self.runtime
+    }
+
+    /// Scratch (arm C): velo's own runtime, when it has one.
+    pub(crate) fn io_runtime(&self) -> Option<&tokio::runtime::Handle> {
+        self.io_runtime.as_ref()
     }
 
     /// Track receive loops, ordering lanes, and application tasks.

@@ -25,6 +25,7 @@ pub mod observability;
 #[cfg(feature = "services")]
 pub mod queue;
 pub mod rendezvous;
+pub mod scratch_arm;
 pub mod streaming;
 pub mod transports;
 
@@ -254,6 +255,9 @@ struct VeloInner {
     /// running. It would free arena pages the NIC may still have. Every clone
     /// reaches the same `VeloInner`, so every clone contends on the same lock.
     shutdown: ShutdownOnce,
+    /// Scratch: the runtime arm B or C built. Last, so it drops after the
+    /// rest of the instance.
+    _owned_runtime: Option<crate::scratch_arm::OwnedRuntime>,
 }
 
 /// Makes [`Velo::graceful_shutdown`] run exactly once, and makes concurrent
@@ -318,6 +322,8 @@ pub struct VeloBuilder {
     mux_only: bool,
     /// See [`mux_runtime`](Self::mux_runtime).
     mux_runtime: Option<tokio::runtime::Handle>,
+    /// Scratch: see [`scratch_arm`].
+    arm: crate::scratch_arm::RuntimeArm,
     metrics: Option<Arc<VeloMetrics>>,
     /// See [`staged_payload_max`](Self::staged_payload_max).
     staged_payload_max: Option<usize>,
@@ -349,6 +355,7 @@ impl VeloBuilder {
             reservation_config: Default::default(),
             mux_only: false,
             mux_runtime: None,
+            arm: crate::scratch_arm::RuntimeArm::from_env(),
             metrics: None,
             staged_payload_max: None,
             staged_fetch_timeout: None,
@@ -481,6 +488,12 @@ impl VeloBuilder {
         self
     }
 
+    /// Scratch: where velo's own tasks run. Defaults to `VELO_ARM`.
+    pub fn runtime_arm(mut self, arm: crate::scratch_arm::RuntimeArm) -> Self {
+        self.arm = arm;
+        self
+    }
+
     /// Set the peer discovery backend.
     pub fn discovery(mut self, discovery: Arc<dyn PeerDiscovery>) -> Self {
         self.inner = self.inner.discovery(discovery);
@@ -557,7 +570,32 @@ impl VeloBuilder {
             messenger_mux_disabled_by_env(),
             self.mux_only,
         )?;
-        let messenger = self.inner.build().await?;
+        use crate::scratch_arm::{OwnedRuntime, RuntimeArm};
+        let mut mux_runtime = self.mux_runtime;
+        let mut io_runtime = None;
+        let owned_runtime = match self.arm {
+            RuntimeArm::Default => None,
+            RuntimeArm::Yield => {
+                crate::scratch_arm::enable_yield();
+                None
+            }
+            RuntimeArm::Mux(n) => {
+                let rt = OwnedRuntime::build("velo-mux", n)?;
+                mux_runtime = Some(rt.handle());
+                Some(rt)
+            }
+            RuntimeArm::Velo(n) => {
+                let rt = OwnedRuntime::build("velo-rt", n)?;
+                mux_runtime = Some(rt.handle());
+                io_runtime = Some(rt.handle());
+                Some(rt)
+            }
+        };
+        let mut inner = self.inner;
+        if let Some(rt) = io_runtime {
+            inner = inner.io_runtime(rt);
+        }
+        let messenger = inner.build().await?;
         let worker_id = messenger.instance_id().worker_id();
         let mux = if config.enabled {
             let mux = crate::streaming::messenger_mux::MessengerMuxTransport::new(
@@ -565,7 +603,7 @@ impl VeloBuilder {
                 config,
                 self.metrics.clone(),
                 self.reservation_config.prebind_timeout,
-                self.mux_runtime,
+                mux_runtime,
             )?;
             Some(mux)
         } else {
@@ -750,6 +788,7 @@ impl VeloBuilder {
                     lock: tokio::sync::Mutex::new(()),
                     done: std::sync::atomic::AtomicBool::new(false),
                 },
+                _owned_runtime: owned_runtime,
             }),
         })
     }

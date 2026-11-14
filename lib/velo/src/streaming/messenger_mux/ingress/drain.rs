@@ -211,6 +211,8 @@ impl DrainSignal {
         if self.wake.try_send(claim.key).is_err() {
             // The sweep task is gone; nobody will take the flag down.
             claim.pending.store(false, Ordering::Release);
+        } else {
+            crate::scratch_arm::DRAIN_WAKES.fetch_add(1, Ordering::Relaxed);
         }
     }
 

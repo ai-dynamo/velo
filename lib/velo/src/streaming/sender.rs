@@ -617,8 +617,14 @@ impl<T> StreamSender<T> {
         // Try non-blocking first so we can record producer-side backpressure
         // before falling through to the awaited send. The connect-side channel
         // is 4096 deep on the per-stream path and C+1 deep under the mux.
+        crate::scratch_arm::clear_woken();
         match self.tx.try_send(bytes) {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // Scratch (arm D): let the woken batcher out of this
+                // worker's LIFO slot before the caller goes on.
+                crate::scratch_arm::maybe_yield().await;
+                Ok(())
+            }
             Err(flume::TrySendError::Full(b)) => {
                 if let Some(m) = self.metrics.as_ref() {
                     m.record_producer_send_backpressure();

@@ -222,7 +222,10 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispa
     fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>) {
         let handler = self.handler.clone();
         let ctx = call.into_context(Arc::clone(system));
-        tokio::spawn(async move {
+        // Scratch (arm C): handlers run on the application's runtime. From a
+        // worker of that runtime this is the same local spawn as
+        // `tokio::spawn`.
+        system.runtime().spawn(async move {
             run_handler(&*handler, ctx, DispatchFailure::HandlerPanic).await;
         });
     }
@@ -382,7 +385,12 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
             consumer,
             LaneRouterConfig {
                 idle_ttl: self.config.idle_lane_ttl,
-                runtime: system.runtime().clone(),
+                // Scratch (arm C): the mux's batch lanes are velo's ingress
+                // and run on velo's runtime; other lanes are handlers.
+                runtime: match system.io_runtime() {
+                    Some(rt) if self.handler.name().starts_with("_stream_batch") => rt.clone(),
+                    _ => system.runtime().clone(),
+                },
                 tracker: system.tracker().clone(),
                 observer,
             },

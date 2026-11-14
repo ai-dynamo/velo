@@ -347,7 +347,7 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
     // stream ended). The loop exits on its own cancel arm instead; the grace
     // only bounds a send to a stalled peer, so the join in shutdown stays
     // bounded.
-    tasks.spawn_until_done(async move {
+    let task = async move {
         let run = batcher.run(open_rx);
         tokio::pin!(run);
         tokio::select! {
@@ -357,7 +357,13 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
                 tokio::time::sleep(STOP_GRACE).await;
             } => {}
         }
-    });
+    };
+    // Scratch (arm D): flag the thread that wakes the batcher.
+    if crate::scratch_arm::yield_enabled() {
+        tasks.spawn_until_done(crate::scratch_arm::FlagWake::new(task));
+    } else {
+        tasks.spawn_until_done(task);
+    }
     handle
 }
 
