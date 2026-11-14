@@ -1518,3 +1518,97 @@ async fn a_hello_queued_at_startup_reaches_the_stream_table() {
     }
     remote.shutdown().await;
 }
+
+/// A failed send's error handler can register another peer without entering the failed gate.
+#[tokio::test]
+#[ignore = "F3: unregister holds the peer-table lock while invoking a send error handler that registers another peer"]
+async fn unregister_allows_send_error_handlers_to_register_another_peer() {
+    struct RegisterOnError {
+        backend: Arc<VeloBackend>,
+        peer: PeerInfo,
+        completed: AtomicUsize,
+        workers: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    }
+
+    impl TransportErrorHandler for RegisterOnError {
+        fn on_error(&self, _: Bytes, _: Bytes, _: String) {
+            let backend = Arc::clone(&self.backend);
+            let peer = self.peer.clone();
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (done_tx, done_rx) = flume::bounded(1);
+            self.workers.lock().push(std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                backend.register_peer(peer).unwrap();
+                let _ = done_tx.send(());
+            }));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Bound a re-entrant registration so the test can release unregister and join the worker.
+            if done_rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+                self.completed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp = Arc::new(
+        crate::transports::tcp::TcpTransportBuilder::new()
+            .from_listener(listener)
+            .unwrap()
+            .channel_capacity(1)
+            .build()
+            .unwrap(),
+    );
+    let (backend, _streams) = VeloBackend::new(vec![tcp.clone()], None).await.unwrap();
+    let backend = Arc::new(backend);
+    let peer = PeerInfo::new(InstanceId::new_v4(), tcp.address());
+    let id = peer.instance_id();
+    backend.register_peer(peer).unwrap();
+    let alternate = PeerInfo::new(InstanceId::new_v4(), tcp.address());
+    let alternate_id = alternate.instance_id();
+    let errors = Arc::new(RegisterOnError {
+        backend: Arc::clone(&backend),
+        peer: alternate,
+        completed: AtomicUsize::new(0),
+        workers: Default::default(),
+    });
+    errors.on_error(Bytes::new(), Bytes::new(), "control".into());
+    assert_eq!(errors.completed.load(Ordering::Relaxed), 1);
+
+    // No yield on this runtime: the writer and gate driver cannot drain the one-slot channel yet.
+    assert!(
+        backend
+            .send_message(
+                id,
+                Bytes::new(),
+                Bytes::new(),
+                MessageType::Message,
+                Arc::new(NoopErrorHandler)
+            )
+            .unwrap()
+            .is_admitted()
+    );
+    let pending = backend
+        .send_message(
+            id,
+            Bytes::new(),
+            Bytes::new(),
+            MessageType::Message,
+            errors.clone(),
+        )
+        .unwrap()
+        .into_pending()
+        .expect("the second send must wait in the gate");
+    assert_eq!(pending.state(), AdmissionState::Pending);
+    backend.unregister_peer(id);
+    for worker in std::mem::take(&mut *errors.workers.lock()) {
+        worker.join().unwrap();
+    }
+    assert_eq!(pending.state(), AdmissionState::Failed);
+    assert!(backend.is_registered(alternate_id));
+    backend.graceful_shutdown(ShutdownPolicy::WaitForever).await;
+    assert_eq!(
+        errors.completed.load(Ordering::Relaxed),
+        2,
+        "the send error handler's registration blocks until unregister releases the peer-table lock"
+    );
+}
