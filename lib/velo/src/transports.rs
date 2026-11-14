@@ -203,6 +203,16 @@ impl StartupTransports {
         stop_transports(&shutdown, &self.transports)
     }
 
+    /// Each started transport's close, on a task of the runtime they started
+    /// on, so a caller that stops waiting (a cancelled build) does not cut it
+    /// short. A dedicated runtime that stops once it is idle waits for it.
+    fn spawn_close(&self) -> tokio::task::JoinHandle<()> {
+        let transports: Vec<_> = self.transports.values().cloned().collect();
+        self.runtime.spawn(async move {
+            futures::future::join_all(transports.iter().map(|t| t.closed())).await;
+        })
+    }
+
     fn finish(mut self) -> HashMap<TransportKey, Arc<dyn Transport>> {
         self.shutdown = None;
         std::mem::take(&mut self.transports)
@@ -246,15 +256,11 @@ fn stop_transports(
 
 /// Reached with transports still to stop only when the start was abandoned
 /// (its future dropped). A drop cannot wait for them to close, so their close
-/// runs on the runtime they started on, as it would after a finished
-/// teardown. A dedicated runtime that stops once it is idle then waits for it.
+/// runs on a task of its own (see `spawn_close`).
 impl Drop for StartupTransports {
     fn drop(&mut self) {
         if self.shutdown.is_some() && self.stop().is_ok() && !self.transports.is_empty() {
-            let transports: Vec<_> = self.transports.values().cloned().collect();
-            self.runtime.spawn(async move {
-                futures::future::join_all(transports.iter().map(|t| t.closed())).await;
-            });
+            drop(self.spawn_close());
         }
     }
 }
@@ -328,8 +334,7 @@ impl VeloBackend {
                 // waits on, so wait only after a clean teardown, as
                 // `finish_shutdown` does.
                 if started.stop().is_ok() {
-                    futures::future::join_all(started.transports.values().map(|t| t.closed()))
-                        .await;
+                    let _ = started.spawn_close().await;
                 }
                 return Err(error);
             }

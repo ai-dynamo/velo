@@ -755,6 +755,126 @@ async fn a_cancelled_build_keeps_the_runtime_until_started_transports_close() {
     assert!(ready.finished.load(Ordering::SeqCst));
 }
 
+/// A build cancelled while the rollback of a failed start waits for a started
+/// transport's close still lets that close finish before velo's runtime
+/// stops. A duplicate transport key fails the start after the first
+/// transport has started.
+#[tokio::test]
+async fn cancelling_a_failed_start_during_close_preserves_the_close() {
+    struct CloseOnRelease {
+        inner: NeedsRuntime,
+        runtime: std::sync::OnceLock<tokio::runtime::Handle>,
+        closing: std::sync::atomic::AtomicBool,
+        release: flume::Receiver<()>,
+        finished: std::sync::atomic::AtomicBool,
+    }
+
+    impl velo::Transport for CloseOnRelease {
+        fn key(&self) -> velo::ext::TransportKey {
+            self.inner.key()
+        }
+
+        fn address(&self) -> velo::WorkerAddress {
+            self.inner.address()
+        }
+
+        fn register(&self, peer: velo::PeerInfo) -> Result<(), velo::ext::TransportError> {
+            self.inner.register(peer)
+        }
+
+        fn send_message(
+            &self,
+            id: velo::InstanceId,
+            header: Bytes,
+            payload: Bytes,
+            kind: velo::ext::MessageType,
+            on_error: Arc<dyn velo::ext::TransportErrorHandler>,
+        ) -> velo::ext::SendOutcome {
+            self.inner.send_message(id, header, payload, kind, on_error)
+        }
+
+        fn start(
+            &self,
+            id: velo::InstanceId,
+            channels: velo::ext::TransportAdapter,
+            runtime: tokio::runtime::Handle,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+            self.runtime.set(runtime.clone()).unwrap();
+            self.inner.start(id, channels, runtime)
+        }
+
+        fn shutdown(&self) {}
+
+        fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
+            Box::pin(async move {
+                self.closing.store(true, Ordering::SeqCst);
+                tokio::time::timeout(Duration::from_secs(2), self.release.recv_async())
+                    .await
+                    .expect("the test did not release close")
+                    .unwrap();
+                let probe = self.runtime.get().unwrap().spawn(async {}).await;
+                self.finished.store(probe.is_ok(), Ordering::SeqCst);
+            })
+        }
+
+        fn check_health(
+            &self,
+            id: velo::InstanceId,
+            timeout: Duration,
+        ) -> futures::future::BoxFuture<'_, Result<(), velo::ext::HealthCheckError>> {
+            self.inner.check_health(id, timeout)
+        }
+    }
+
+    let _serial = serial().await;
+    for cancel in [false, true] {
+        let (release, held) = flume::bounded(1);
+        let transport = Arc::new(CloseOnRelease {
+            inner: NeedsRuntime {
+                spawned_ran: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+            runtime: std::sync::OnceLock::new(),
+            closing: std::sync::atomic::AtomicBool::new(false),
+            release: held,
+            finished: std::sync::atomic::AtomicBool::new(false),
+        });
+        // The duplicate key fails only after the first transport starts.
+        let mut build = Box::pin(
+            Velo::builder()
+                .task_runtime(TaskRuntime::dedicated())
+                .add_transport(transport.clone())
+                .add_transport(transport.clone())
+                .build(),
+        );
+        assert!(futures::poll!(build.as_mut()).is_pending());
+        // The close runs on a task of velo's runtime, not inside this poll.
+        let deadline = Instant::now() + PATIENCE;
+        while !transport.closing.load(Ordering::SeqCst) {
+            assert!(
+                Instant::now() < deadline,
+                "the rollback never began to close"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        if cancel {
+            drop(build);
+        } else {
+            release.send(()).unwrap();
+            let error = build.await.err().expect("duplicate key must fail");
+            assert!(error.to_string().contains("Duplicate transport key"));
+        }
+        if cancel {
+            release.send(()).unwrap();
+        }
+        wait_for_threads(0);
+        assert!(
+            transport.finished.load(Ordering::SeqCst),
+            "cancelling the failed build abandoned closed() and stopped its runtime (cancel={cancel})"
+        );
+    }
+}
+
 /// Demonstration of a limit: a NATS client the application connected keeps
 /// its I/O on the runtime that connected it, so under
 /// `TaskRuntime::Dedicated` a NATS write still waits for the application's
