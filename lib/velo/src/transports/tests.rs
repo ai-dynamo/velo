@@ -1728,3 +1728,211 @@ async fn unregister_does_not_block_registration_from_an_active_send_error_handle
         "unregister holds the peer lock while waiting for the send's route guard, so the send error handler cannot register another peer"
     );
 }
+
+/// Two unregister calls can overlap while TCP still holds queued sends.
+#[tokio::test]
+#[ignore = "F5: a vacant route guard blocks peer registration from TCP's queued send error handler"]
+async fn an_absent_route_does_not_block_a_queued_send_error_handler() {
+    struct PausedUnregister {
+        inner: Arc<crate::transports::tcp::TcpTransport>,
+        first: AtomicBool,
+        entered: flume::Sender<()>,
+        release: flume::Receiver<()>,
+    }
+
+    impl Transport for PausedUnregister {
+        fn key(&self) -> TransportKey {
+            self.inner.key()
+        }
+
+        fn address(&self) -> WorkerAddress {
+            self.inner.address()
+        }
+
+        fn register(&self, peer: PeerInfo) -> Result<(), TransportError> {
+            self.inner.register(peer)
+        }
+
+        fn unregister(&self, peer: InstanceId) {
+            if self.first.swap(false, Ordering::Relaxed) {
+                self.entered.send(()).unwrap();
+                self.release.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            self.inner.unregister(peer);
+        }
+
+        fn send_message(
+            &self,
+            target: InstanceId,
+            header: Bytes,
+            payload: Bytes,
+            kind: MessageType,
+            on_error: Arc<dyn TransportErrorHandler>,
+        ) -> SendOutcome {
+            self.inner
+                .send_message(target, header, payload, kind, on_error)
+        }
+
+        fn start(
+            &self,
+            id: InstanceId,
+            adapter: TransportAdapter,
+            runtime: tokio::runtime::Handle,
+        ) -> BoxFuture<'_, anyhow::Result<()>> {
+            self.inner.start(id, adapter, runtime)
+        }
+
+        fn shutdown(&self) {
+            self.inner.shutdown();
+        }
+
+        fn begin_drain(&self) {
+            self.inner.begin_drain();
+        }
+
+        fn closed(&self) -> BoxFuture<'_, ()> {
+            self.inner.closed()
+        }
+
+        fn check_health(
+            &self,
+            id: InstanceId,
+            timeout: Duration,
+        ) -> BoxFuture<'_, Result<(), HealthCheckError>> {
+            self.inner.check_health(id, timeout)
+        }
+    }
+
+    struct RegisterOnError {
+        backend: Arc<VeloBackend>,
+        peer: PeerInfo,
+        removed: InstanceId,
+        completed: AtomicUsize,
+        route_locked: AtomicBool,
+        workers: parking_lot::Mutex<Vec<std::thread::JoinHandle<()>>>,
+    }
+
+    impl TransportErrorHandler for RegisterOnError {
+        fn on_error(&self, _: Bytes, _: Bytes, _: String) {
+            self.route_locked.store(
+                matches!(
+                    self.backend.primary_transport.try_get_mut(&self.removed),
+                    dashmap::try_result::TryResult::Locked
+                ),
+                Ordering::Relaxed,
+            );
+            let backend = Arc::clone(&self.backend);
+            let peer = self.peer.clone();
+            let (entered_tx, entered_rx) = flume::bounded(1);
+            let (done_tx, done_rx) = flume::bounded(1);
+            self.workers.lock().push(std::thread::spawn(move || {
+                entered_tx.send(()).unwrap();
+                backend.register_peer(peer).unwrap();
+                let _ = done_tx.send(());
+            }));
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            // Bound the callback so unregister returns and every worker can be joined.
+            if done_rx.recv_timeout(Duration::from_secs(1)).is_ok() {
+                self.completed.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let tcp = Arc::new(
+        crate::transports::tcp::TcpTransportBuilder::new()
+            .from_listener(listener)
+            .unwrap()
+            .channel_capacity(1)
+            .build()
+            .unwrap(),
+    );
+    let (entered_tx, entered_rx) = flume::bounded(1);
+    let (release_tx, release_rx) = flume::bounded(1);
+    let transport = Arc::new(PausedUnregister {
+        inner: tcp,
+        first: AtomicBool::new(true),
+        entered: entered_tx,
+        release: release_rx,
+    });
+    let (backend, _streams) = VeloBackend::new(vec![transport.clone()], None)
+        .await
+        .unwrap();
+    let backend = Arc::new(backend);
+    let peer = PeerInfo::new(InstanceId::new_v4(), transport.address());
+    let id = peer.instance_id();
+    backend.register_peer(peer).unwrap();
+
+    // No send holds a route during the callbacks below. Pick a peer on the removed route's shard.
+    let alternate = {
+        let _held = backend.primary_transport.get(&id).unwrap();
+        loop {
+            let candidate = InstanceId::new_v4();
+            if matches!(
+                backend.primary_transport.try_get_mut(&candidate),
+                dashmap::try_result::TryResult::Locked
+            ) {
+                break PeerInfo::new(candidate, transport.address());
+            }
+        }
+    };
+    let alternate_id = alternate.instance_id();
+    let errors = Arc::new(RegisterOnError {
+        backend: Arc::clone(&backend),
+        peer: alternate,
+        removed: id,
+        completed: AtomicUsize::new(0),
+        route_locked: AtomicBool::new(false),
+        workers: Default::default(),
+    });
+    errors.on_error(Bytes::new(), Bytes::new(), "control".into());
+    assert_eq!(errors.completed.load(Ordering::Relaxed), 1);
+    assert!(!errors.route_locked.load(Ordering::Relaxed));
+
+    // No runtime yield: the writer cannot drain the one-slot channel before unregister.
+    assert!(
+        backend
+            .send_message(
+                id,
+                Bytes::new(),
+                Bytes::new(),
+                MessageType::Message,
+                Arc::new(NoopErrorHandler),
+            )
+            .unwrap()
+            .is_admitted()
+    );
+    let pending = backend
+        .send_message(
+            id,
+            Bytes::new(),
+            Bytes::new(),
+            MessageType::Message,
+            errors.clone(),
+        )
+        .unwrap()
+        .into_pending()
+        .expect("the second send waits in the gate");
+    assert_eq!(pending.state(), AdmissionState::Pending);
+
+    let unregistering_backend = Arc::clone(&backend);
+    let unregistering = std::thread::spawn(move || unregistering_backend.unregister_peer(id));
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(!backend.is_registered(id));
+    // The first call removed the route but has not failed the TCP queue yet.
+    backend.unregister_peer(id);
+    release_tx.send(()).unwrap();
+    unregistering.join().unwrap();
+    for worker in std::mem::take(&mut *errors.workers.lock()) {
+        worker.join().unwrap();
+    }
+    assert_eq!(pending.state(), AdmissionState::Failed);
+    assert!(backend.is_registered(alternate_id));
+    backend.graceful_shutdown(ShutdownPolicy::WaitForever).await;
+    assert_eq!(
+        errors.completed.load(Ordering::Relaxed),
+        2,
+        "the second unregister keeps its vacant route guard across TCP's error callback; route locked in callback: {}",
+        errors.route_locked.load(Ordering::Relaxed),
+    );
+}
