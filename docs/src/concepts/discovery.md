@@ -37,6 +37,8 @@ Without a discovery backend, register each peer by hand:
 node_a.register_peer(node_b.peer_info())?;
 ```
 
+A node can learn a peer by `register_peer`, by discovery when a send names the peer's worker, or by the `_hello` the peer sends with its first message, and each way registers the peer with the stream transport too, so the node can attach a stream to it.
+
 ## Forget a peer
 
 `Velo::unregister_peer(instance_id)` undoes `register_peer`. It drops the peer from every transport, closes the connections to it, and forgets its handler list. A send to the peer then fails as a send to a peer never registered does. A later `register_peer`, with the same id or a new one, starts fresh. Other peers are not affected. The call is synchronous, cheap, and idempotent.

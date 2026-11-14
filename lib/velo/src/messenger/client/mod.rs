@@ -336,7 +336,7 @@ impl ActiveMessageClient {
 
         // Send _hello with our peer info
         let request = HelloRequest {
-            peer_info: self.backend.peer_info(),
+            peer_info: self.backend.advertised_peer_info(),
         };
 
         // Serialize request
