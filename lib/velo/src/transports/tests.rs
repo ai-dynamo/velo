@@ -287,6 +287,91 @@ async fn start_runs_with_the_given_runtime_entered() {
     other.shutdown_background();
 }
 
+/// A start that fails after another transport started runs that transport's
+/// shutdown hook with the runtime it started on entered, as a teardown after
+/// a successful start does.
+#[tokio::test]
+async fn failed_startup_runs_shutdown_in_the_transports_runtime() {
+    struct HookContext {
+        inner: Arc<MockTransport>,
+        shutdown_context: OnceLock<tokio::runtime::Id>,
+    }
+
+    impl Transport for HookContext {
+        fn key(&self) -> TransportKey {
+            self.inner.key()
+        }
+
+        fn address(&self) -> WorkerAddress {
+            self.inner.address()
+        }
+
+        fn register(&self, peer: PeerInfo) -> Result<(), TransportError> {
+            self.inner.register(peer)
+        }
+
+        fn send_message(
+            &self,
+            id: InstanceId,
+            header: Bytes,
+            payload: Bytes,
+            kind: MessageType,
+            on_error: Arc<dyn TransportErrorHandler>,
+        ) -> SendOutcome {
+            self.inner.send_message(id, header, payload, kind, on_error)
+        }
+
+        fn start(
+            &self,
+            id: InstanceId,
+            channels: TransportAdapter,
+            runtime: tokio::runtime::Handle,
+        ) -> BoxFuture<'_, anyhow::Result<()>> {
+            self.inner.start(id, channels, runtime)
+        }
+
+        fn begin_drain(&self) {
+            self.inner.begin_drain();
+        }
+
+        fn shutdown(&self) {
+            self.shutdown_context
+                .set(tokio::runtime::Handle::current().id())
+                .unwrap();
+            self.inner.shutdown();
+        }
+
+        fn closed(&self) -> BoxFuture<'_, ()> {
+            self.inner.closed()
+        }
+
+        fn check_health(
+            &self,
+            id: InstanceId,
+            timeout: Duration,
+        ) -> BoxFuture<'_, Result<(), HealthCheckError>> {
+            self.inner.check_health(id, timeout)
+        }
+    }
+
+    let (runtime, handle) = crate::task_runtime::VeloRuntime::build(1).unwrap();
+    let started = Arc::new(HookContext {
+        inner: MockTransport::new("started", true),
+        shutdown_context: OnceLock::new(),
+    });
+    let mut failing = MockTransport::new("failing", true);
+    Arc::get_mut(&mut failing).unwrap().fail_start = true;
+    let result = VeloBackend::new(vec![started.clone(), failing], None, handle.clone()).await;
+    assert!(result.is_err());
+    runtime.stop().await;
+    assert_eq!(started.inner.start_context.get(), Some(&handle.id()));
+    assert_eq!(
+        started.shutdown_context.get(),
+        started.inner.start_context.get(),
+        "failed startup ran the transport's hook in the application's runtime"
+    );
+}
+
 #[tokio::test]
 async fn test_new_single_transport() {
     let t = MockTransport::new("tcp", true);

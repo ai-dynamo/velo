@@ -183,12 +183,21 @@ pub(crate) trait PeerTableObserver: Send + Sync {
 struct StartupTransports {
     transports: HashMap<TransportKey, Arc<dyn Transport>>,
     shutdown: Option<ShutdownState>,
+    /// The runtime the transports started on. Their hooks run with it
+    /// entered, as they do in a teardown after a successful start.
+    runtime: tokio::runtime::Handle,
 }
 
 impl StartupTransports {
     fn stop(&mut self) -> Result<(), Arc<str>> {
         let Some(shutdown) = self.shutdown.take() else {
             return Ok(());
+        };
+        // Not during thread-local teardown: `Handle::enter` panics there, and
+        // this may run in a drop.
+        let _runtime = match tokio::runtime::Handle::try_current() {
+            Err(error) if error.is_thread_local_destroyed() => None,
+            _ => Some(self.runtime.enter()),
         };
         // Construction has no caller to drain work for. Use a zero budget.
         stop_transports(&shutdown, &self.transports)
@@ -269,6 +278,7 @@ impl VeloBackend {
         let mut started = StartupTransports {
             transports: HashMap::new(),
             shutdown: Some(shutdown_state.clone()),
+            runtime: runtime.clone(),
         };
 
         let startup = async {
