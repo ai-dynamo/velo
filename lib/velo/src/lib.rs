@@ -675,7 +675,13 @@ impl VeloBuilder {
             }
             Some(StreamConfig::Tcp(tcp_cfg)) => {
                 let bind_addr = tcp_cfg.unwrap_or_default().bind_addr;
-                let tcp = crate::streaming::TcpFrameTransport::new(bind_addr).await?;
+                // Built with velo's task runtime entered: its listener and its
+                // tasks take the runtime current here.
+                let tcp = crate::task_runtime::entered(
+                    messenger.task_runtime(),
+                    crate::streaming::TcpFrameTransport::new(bind_addr),
+                )
+                .await?;
                 if let Some(metrics) = &self.metrics {
                     tcp.set_metrics(Arc::clone(metrics));
                 }
@@ -684,11 +690,12 @@ impl VeloBuilder {
             #[cfg(feature = "grpc")]
             Some(StreamConfig::Grpc(grpc_cfg)) => {
                 let bind_addr = grpc_cfg.unwrap_or_default().bind_addr;
-                let grpc = crate::streaming::GrpcFrameTransport::new(bind_addr)
-                    .await
-                    .map_err(|e| {
-                        anyhow::anyhow!("Failed to start gRPC streaming transport: {e}")
-                    })?;
+                let grpc = crate::task_runtime::entered(
+                    messenger.task_runtime(),
+                    crate::streaming::GrpcFrameTransport::new(bind_addr),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to start gRPC streaming transport: {e}"))?;
                 if let Some(metrics) = &self.metrics {
                     grpc.set_metrics(Arc::clone(metrics));
                 }
@@ -2167,6 +2174,75 @@ impl Velo {
 mod tests {
     use super::*;
     use crate::rendezvous::RendezvousManager;
+
+    /// Under `TaskRuntime::Dedicated` the builder's per-stream transport runs
+    /// on velo's runtime too: built with it entered and dialing with it
+    /// entered, so its sockets and pumps do not need the application's
+    /// runtime to move a frame.
+    #[test]
+    fn a_dedicated_per_stream_writer_runs_without_the_application() {
+        use crate::streaming::transport::FrameTransport;
+        use std::time::Duration;
+
+        let application = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let peer_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let peer = peer_runtime
+            .block_on(crate::streaming::TcpFrameTransport::new(
+                std::net::Ipv4Addr::LOCALHOST.into(),
+            ))
+            .unwrap();
+        let received = peer_runtime.block_on(peer.bind(17, 23)).unwrap();
+        let peer_info = PeerInfo::new(InstanceId::new_v4(), peer.address());
+        let (velo, sender) = application.block_on(async {
+            let velo = Velo::builder()
+                .task_runtime(TaskRuntime::dedicated())
+                .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
+                .messenger_mux(crate::streaming::MuxConfig {
+                    enabled: false,
+                    ..Default::default()
+                })
+                .unwrap()
+                .build()
+                .await
+                .unwrap();
+            let Some(OwnedStreamTransport::Tcp(transport)) = &velo.inner.stream_owner.transport
+            else {
+                panic!("the builder did not install its TCP streaming transport");
+            };
+            transport.register(&peer_info).unwrap();
+            let sender = transport
+                .connect(peer_info.worker_id(), 17, 23)
+                .await
+                .unwrap();
+            sender.send(b"warm".to_vec()).unwrap();
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(5), received.recv_async())
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                b"warm"
+            );
+            (velo, sender)
+        });
+
+        // A current-thread runtime runs nothing outside block_on.
+        sender.send(b"held".to_vec()).unwrap();
+        let during_hold = received.recv_timeout(Duration::from_secs(1));
+        application.block_on(velo.shutdown(ShutdownPolicy::WaitForever));
+        peer_runtime.block_on(peer.shutdown());
+        assert_eq!(
+            during_hold,
+            Ok(b"held".to_vec()),
+            "the builder-owned per-stream writer still needs the application's runtime"
+        );
+    }
 
     /// Every mode against both kill-switch forms, the config field and the
     /// environment variable. Only a node that opted in to the per-stream path

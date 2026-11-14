@@ -544,58 +544,64 @@ impl TcpFrameTransport {
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
         let peers = self.peers.clone();
         let metrics = self.metrics.clone();
-        Box::pin(async move {
-            if self.tasks.is_stopped() {
-                return Err(anyhow!("TCP streaming transport shut down"));
-            }
-            let addr = *peers.get(&peer).ok_or_else(|| {
-                anyhow!(
-                    "TCP streaming: peer {} not registered (call register_peer first)",
-                    peer
-                )
-            })?;
-
-            // Bound the dial and handshake write so an unreachable / stalled
-            // peer surfaces as a fast `connect timed out` instead of hanging
-            // an attach for the full kernel SYN backoff or longer.
-            let mut stream = tokio::time::timeout(TOKEN_READ_TIMEOUT, TcpStream::connect(addr))
-                .await
-                .map_err(|_| {
+        // Dialed with the transport's runtime entered, so the socket and the
+        // tasks a client library spawns belong to it: under
+        // `TaskRuntime::Dedicated` that is velo's runtime, not the caller's.
+        Box::pin(crate::task_runtime::entered(
+            self.tasks.runtime(),
+            async move {
+                if self.tasks.is_stopped() {
+                    return Err(anyhow!("TCP streaming transport shut down"));
+                }
+                let addr = *peers.get(&peer).ok_or_else(|| {
                     anyhow!(
-                        "TCP streaming: connect to peer {} ({}) timed out after {:?}",
-                        peer,
-                        addr,
-                        TOKEN_READ_TIMEOUT
+                        "TCP streaming: peer {} not registered (call register_peer first)",
+                        peer
                     )
-                })??;
-            configure_socket(&stream);
-            configure_socket_buffers(&stream);
-            let mut handshake = [0u8; 16];
-            handshake[..8].copy_from_slice(&anchor_id.to_be_bytes());
-            handshake[8..].copy_from_slice(&session_id.to_be_bytes());
-            tokio::time::timeout(TOKEN_READ_TIMEOUT, stream.write_all(&handshake))
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "TCP streaming: handshake write to peer {} ({}) timed out after {:?}",
-                        peer,
-                        addr,
-                        TOKEN_READ_TIMEOUT
-                    )
-                })??;
+                })?;
 
-            let (tx, rx) = flume::bounded::<Vec<u8>>(4096);
-            let pump_metrics = metrics.get().cloned();
+                // Bound the dial and handshake write so an unreachable / stalled
+                // peer surfaces as a fast `connect timed out` instead of hanging
+                // an attach for the full kernel SYN backoff or longer.
+                let mut stream = tokio::time::timeout(TOKEN_READ_TIMEOUT, TcpStream::connect(addr))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "TCP streaming: connect to peer {} ({}) timed out after {:?}",
+                            peer,
+                            addr,
+                            TOKEN_READ_TIMEOUT
+                        )
+                    })??;
+                configure_socket(&stream);
+                configure_socket_buffers(&stream);
+                let mut handshake = [0u8; 16];
+                handshake[..8].copy_from_slice(&anchor_id.to_be_bytes());
+                handshake[8..].copy_from_slice(&session_id.to_be_bytes());
+                tokio::time::timeout(TOKEN_READ_TIMEOUT, stream.write_all(&handshake))
+                    .await
+                    .map_err(|_| {
+                        anyhow!(
+                            "TCP streaming: handshake write to peer {} ({}) timed out after {:?}",
+                            peer,
+                            addr,
+                            TOKEN_READ_TIMEOUT
+                        )
+                    })??;
 
-            if !self
-                .tasks
-                .spawn(egress_pump(stream, rx, pump_metrics, retire))
-            {
-                return Err(anyhow!("TCP streaming transport shut down"));
-            }
+                let (tx, rx) = flume::bounded::<Vec<u8>>(4096);
+                let pump_metrics = metrics.get().cloned();
 
-            Ok(tx)
-        })
+                if !self
+                    .tasks
+                    .spawn(egress_pump(stream, rx, pump_metrics, retire))
+                {
+                    return Err(anyhow!("TCP streaming transport shut down"));
+                }
+
+                Ok(tx)
+            },
+        ))
     }
 }
 

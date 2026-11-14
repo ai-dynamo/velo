@@ -63,6 +63,11 @@ impl StreamTasks {
         true
     }
 
+    /// The runtime these tasks are spawned on.
+    pub(crate) fn runtime(&self) -> &tokio::runtime::Handle {
+        &self.runtime
+    }
+
     pub(crate) fn cancellation_token(&self) -> CancellationToken {
         self.cancel.clone()
     }

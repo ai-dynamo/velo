@@ -411,51 +411,56 @@ impl GrpcFrameTransport {
         retire: Option<RetireGuard>,
     ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
         let peers = self.peers.clone();
-        Box::pin(async move {
-            if self.tasks.is_stopped() {
-                return Err(anyhow!("gRPC streaming transport shut down"));
-            }
-            let addr = *peers.get(&peer).ok_or_else(|| {
-                anyhow!(
-                    "gRPC streaming: peer {} not registered (call register_peer first)",
-                    peer
-                )
-            })?;
+        // Dialed with the transport's runtime entered, so the socket and the
+        // tasks a client library spawns belong to it: under
+        // `TaskRuntime::Dedicated` that is velo's runtime, not the caller's.
+        Box::pin(crate::task_runtime::entered(
+            self.tasks.runtime(),
+            async move {
+                if self.tasks.is_stopped() {
+                    return Err(anyhow!("gRPC streaming transport shut down"));
+                }
+                let addr = *peers.get(&peer).ok_or_else(|| {
+                    anyhow!(
+                        "gRPC streaming: peer {} not registered (call register_peer first)",
+                        peer
+                    )
+                })?;
 
-            let channel = tonic::transport::Channel::from_shared(format!("http://{}", addr))?
-                .connect()
-                .await?;
+                let channel = tonic::transport::Channel::from_shared(format!("http://{}", addr))?
+                    .connect()
+                    .await?;
 
-            let mut client = VeloStreamingClient::new(channel)
-                .max_encoding_message_size(MAX_ITEM_BYTES + MESSAGE_ENVELOPE);
+                let mut client = VeloStreamingClient::new(channel)
+                    .max_encoding_message_size(MAX_ITEM_BYTES + MESSAGE_ENVELOPE);
 
-            let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel::<FramedData>(256);
-            let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(4096);
+                let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::channel::<FramedData>(256);
+                let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(4096);
 
-            let request_stream = tokio_stream::wrappers::ReceiverStream::new(mpsc_rx);
+                let request_stream = tokio_stream::wrappers::ReceiverStream::new(mpsc_rx);
 
-            let mut request = Request::new(request_stream);
-            request.metadata_mut().insert(
-                ANCHOR_ID_META,
-                anchor_id
-                    .to_string()
-                    .parse()
-                    .map_err(|_| anyhow!("failed to encode anchor_id as metadata"))?,
-            );
-            request.metadata_mut().insert(
-                SESSION_ID_META,
-                session_id
-                    .to_string()
-                    .parse()
-                    .map_err(|_| anyhow!("failed to encode session_id as metadata"))?,
-            );
+                let mut request = Request::new(request_stream);
+                request.metadata_mut().insert(
+                    ANCHOR_ID_META,
+                    anchor_id
+                        .to_string()
+                        .parse()
+                        .map_err(|_| anyhow!("failed to encode anchor_id as metadata"))?,
+                );
+                request.metadata_mut().insert(
+                    SESSION_ID_META,
+                    session_id
+                        .to_string()
+                        .parse()
+                        .map_err(|_| anyhow!("failed to encode session_id as metadata"))?,
+                );
 
-            let response = client
-                .stream(request)
-                .await
-                .map_err(|status| anyhow!("gRPC stream rejected: {}", status))?;
+                let response = client
+                    .stream(request)
+                    .await
+                    .map_err(|status| anyhow!("gRPC stream rejected: {}", status))?;
 
-            if !self.tasks.spawn(async move {
+                if !self.tasks.spawn(async move {
                 // Hold the inbound half (and thus the underlying H2 bidi call)
                 // for as long as we are pumping frames; dropping it sends
                 // RST_STREAM and cancels the call.
@@ -543,8 +548,9 @@ impl GrpcFrameTransport {
                 return Err(anyhow!("gRPC streaming transport shut down"));
             }
 
-            Ok(frame_tx)
-        })
+                Ok(frame_tx)
+            },
+        ))
     }
 }
 
