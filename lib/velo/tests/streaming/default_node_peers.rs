@@ -107,8 +107,6 @@ async fn ping(from: &Velo, to: &Velo, by_worker: bool) {
 enum Learned {
     /// `Velo::register_peer`.
     Velo,
-    /// `Messenger::register_peer`.
-    Messenger,
     /// The `_hello` the consumer sends on its first message to the producer.
     Hello,
     /// Discovery of the consumer when the producer first sends to its worker id.
@@ -126,7 +124,6 @@ enum Learned {
 ///
 /// The debug line is the control that proves the capture sees registration.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(deprecated)] // Messenger::register_peer is deprecated in 0.22.1; one path calls it.
 async fn a_default_node_learns_peers_without_a_per_stream_transport() {
     let logs = CapturedLogs::default();
     tracing::subscriber::set_global_default(
@@ -139,12 +136,7 @@ async fn a_default_node_learns_peers_without_a_per_stream_transport() {
     .expect("this binary installs one subscriber");
 
     for consumer_opted_in in [false, true] {
-        for path in [
-            Learned::Velo,
-            Learned::Messenger,
-            Learned::Hello,
-            Learned::Discovery,
-        ] {
+        for path in [Learned::Velo, Learned::Hello, Learned::Discovery] {
             let case = format!("{path:?}, consumer opted in {consumer_opted_in}");
             let consumer = if consumer_opted_in {
                 builder(None).stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
@@ -160,14 +152,10 @@ async fn a_default_node_learns_peers_without_a_per_stream_transport() {
             logs.take();
             match path {
                 Learned::Velo => producer.register_peer(consumer.peer_info()).unwrap(),
-                Learned::Messenger => producer
-                    .messenger()
-                    .register_peer(consumer.peer_info())
-                    .unwrap(),
                 Learned::Hello | Learned::Discovery => {}
             }
             match path {
-                Learned::Velo | Learned::Messenger => ping(&producer, &consumer, false).await,
+                Learned::Velo => ping(&producer, &consumer, false).await,
                 Learned::Hello => {
                     consumer.register_peer(producer.peer_info()).unwrap();
                     ping(&consumer, &producer, false).await;
