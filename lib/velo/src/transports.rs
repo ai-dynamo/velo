@@ -244,9 +244,18 @@ fn stop_transports(
     failure.map_or(Ok(()), Err)
 }
 
+/// Reached with transports still to stop only when the start was abandoned
+/// (its future dropped). A drop cannot wait for them to close, so their close
+/// runs on the runtime they started on, as it would after a finished
+/// teardown. A dedicated runtime that stops once it is idle then waits for it.
 impl Drop for StartupTransports {
     fn drop(&mut self) {
-        let _ = self.stop();
+        if self.shutdown.is_some() && self.stop().is_ok() && !self.transports.is_empty() {
+            let transports: Vec<_> = self.transports.values().cloned().collect();
+            self.runtime.spawn(async move {
+                futures::future::join_all(transports.iter().map(|t| t.closed())).await;
+            });
+        }
     }
 }
 

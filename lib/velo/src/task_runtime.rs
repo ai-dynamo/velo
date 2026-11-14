@@ -141,7 +141,6 @@ const DROP_CLOSE_WAIT: Duration = Duration::from_secs(5);
 /// clone of one `Velo`.
 pub(crate) struct VeloRuntime {
     state: parking_lot::Mutex<State>,
-    #[cfg(test)]
     handle: Handle,
 }
 
@@ -180,7 +179,6 @@ impl VeloRuntime {
         Ok((
             Self {
                 state: parking_lot::Mutex::new(State::Running(RuntimeSlot(Some(runtime)))),
-                #[cfg(test)]
                 handle: handle.clone(),
             },
             handle,
@@ -265,9 +263,26 @@ impl BuildingRuntime {
 
 impl Drop for BuildingRuntime {
     fn drop(&mut self) {
-        if let (Some(runtime), Some(backend)) = (self.runtime.as_mut(), self.backend.take()) {
-            runtime.stop_detached(Box::pin(async move { backend.teardown_and_close().await }));
-        }
+        let Some(runtime) = self.runtime.as_mut() else {
+            return;
+        };
+        let teardown: BoxFuture<'static, ()> = match self.backend.take() {
+            Some(backend) => Box::pin(async move { backend.teardown_and_close().await }),
+            // The start failed or was abandoned. The transports that started
+            // have run their shutdown hooks, and may still be closing on tasks
+            // of their own (an abandoned start spawns its close there). Stop
+            // once the runtime is idle.
+            None => Box::pin(idle(runtime.handle.clone())),
+        };
+        runtime.stop_detached(teardown);
+    }
+}
+
+/// Resolves once `handle`'s runtime has no task alive. Polled by the thread
+/// that stops it, from `block_on`, which is not a task.
+async fn idle(handle: Handle) {
+    while handle.metrics().num_alive_tasks() > 0 {
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 

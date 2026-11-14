@@ -636,3 +636,121 @@ async fn a_failed_build_keeps_the_runtime_until_teardown_finishes() {
         "the failed build stopped its runtime before the transport's shutdown hook finished: {probe:?}"
     );
 }
+
+/// A build cancelled while a later transport starts lets an earlier one
+/// finish closing: velo's runtime stays up until it is idle.
+#[tokio::test]
+async fn a_cancelled_build_keeps_the_runtime_until_started_transports_close() {
+    struct StartingTransport {
+        key: &'static str,
+        pending: bool,
+        runtime: std::sync::OnceLock<tokio::runtime::Handle>,
+        release: flume::Receiver<()>,
+        finished: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl velo::Transport for StartingTransport {
+        fn key(&self) -> velo::ext::TransportKey {
+            velo::ext::TransportKey::new(self.key)
+        }
+
+        fn address(&self) -> velo::WorkerAddress {
+            let entries = std::collections::BTreeMap::from([(self.key, b"x".to_vec())]);
+            velo::WorkerAddress::from_encoded(rmp_serde::to_vec(&entries).unwrap())
+        }
+
+        fn register(&self, _: velo::PeerInfo) -> Result<(), velo::ext::TransportError> {
+            Ok(())
+        }
+
+        fn send_message(
+            &self,
+            _: velo::InstanceId,
+            _: Bytes,
+            _: Bytes,
+            _: velo::ext::MessageType,
+            _: Arc<dyn velo::ext::TransportErrorHandler>,
+        ) -> velo::ext::SendOutcome {
+            velo::ext::SendOutcome::Admitted
+        }
+
+        fn start(
+            &self,
+            _: velo::InstanceId,
+            _: velo::ext::TransportAdapter,
+            runtime: tokio::runtime::Handle,
+        ) -> futures::future::BoxFuture<'_, anyhow::Result<()>> {
+            self.runtime.set(runtime).unwrap();
+            Box::pin(async move {
+                if self.pending {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            })
+        }
+
+        fn shutdown(&self) {
+            let release = self.release.clone();
+            let finished = Arc::clone(&self.finished);
+            self.runtime.get().unwrap().spawn(async move {
+                release.recv_async().await.unwrap();
+                finished.store(true, Ordering::SeqCst);
+            });
+        }
+
+        fn closed(&self) -> futures::future::BoxFuture<'_, ()> {
+            Box::pin(async move {
+                while !self.finished.load(Ordering::SeqCst) {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+        }
+
+        fn check_health(
+            &self,
+            _: velo::InstanceId,
+            _: Duration,
+        ) -> futures::future::BoxFuture<'_, Result<(), velo::ext::HealthCheckError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    let _serial = serial().await;
+    let (release, held) = flume::bounded(1);
+    let transport = |key, pending| {
+        Arc::new(StartingTransport {
+            key,
+            pending,
+            runtime: std::sync::OnceLock::new(),
+            release: held.clone(),
+            finished: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        })
+    };
+    let ready = transport("ready", false);
+    let pending = transport("pending", true);
+    let mut build = Box::pin(
+        Velo::builder()
+            .task_runtime(TaskRuntime::dedicated())
+            .add_transport(ready.clone())
+            .add_transport(pending.clone())
+            .build(),
+    );
+    assert!(futures::poll!(build.as_mut()).is_pending());
+    assert!(
+        pending.runtime.get().is_some(),
+        "the second start was not reached"
+    );
+    drop(build);
+
+    // The close is held on a channel, so a live runtime must still run this probe.
+    let probe = tokio::time::timeout(PATIENCE, ready.runtime.get().unwrap().spawn(async {}))
+        .await
+        .expect("runtime probe hung");
+    release.send(()).unwrap();
+    wait_for_threads(0);
+    assert!(
+        probe.is_ok(),
+        "cancelling startup stopped the runtime before the completed transport closed: {probe:?}"
+    );
+    assert!(ready.finished.load(Ordering::SeqCst));
+}
