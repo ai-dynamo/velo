@@ -51,9 +51,11 @@ async fn make_pair() -> (Velo, Registry, Velo, Registry) {
 
     // The mux is off on both nodes: this file covers the per-stream cascade
     // (connect and bind channels, the server pump), and with the mux on (the
-    // default) the streams would ride it instead.
+    // default) the streams would ride it instead. A node with the mux off
+    // needs the per-stream path opted in.
     let producer = Velo::builder()
         .add_transport(new_messenger_transport())
+        .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
         .messenger_mux(MuxConfig {
             enabled: false,
             ..MuxConfig::default()
@@ -65,6 +67,7 @@ async fn make_pair() -> (Velo, Registry, Velo, Registry) {
         .unwrap();
     let consumer = Velo::builder()
         .add_transport(new_messenger_transport())
+        .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
         .messenger_mux(MuxConfig {
             enabled: false,
             ..MuxConfig::default()
