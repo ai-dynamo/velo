@@ -150,10 +150,12 @@ pub struct VeloBackend {
 
 /// The registered peers and the one observer of their changes.
 ///
-/// One lock covers the routes, the transports, and the observer, so a
-/// register and an unregister of one peer cannot interleave: the observer's
-/// table ends as the routes do. It also lets an observer installed after
-/// the transports started learn the peers that a `_hello` registered first.
+/// One lock covers the routes and the observer, so a register and an
+/// unregister of one peer cannot interleave there: the observer's table ends
+/// as the routes do. It also lets an observer installed after the
+/// transports started learn the peers that a `_hello` registered first.
+/// `Transport::unregister` runs outside it, because it can run the error
+/// handlers of the peer's queued sends.
 #[derive(Default)]
 struct PeerTable {
     peers: HashMap<InstanceId, PeerInfo>,
@@ -771,22 +773,26 @@ impl VeloBackend {
     /// A send to it then fails with [`VeloBackendError::InstanceNotRegistered`].
     /// Idempotent; other peers are not affected.
     pub fn unregister_peer(&self, instance_id: InstanceId) {
-        let mut table = self.peers.lock();
-        table.peers.remove(&instance_id);
-        // Routes first, so a new send fails here and does not reach a
-        // transport that is closing the peer's connections.
-        self.primary_transport.remove(&instance_id);
-        self.alternative_transports.remove(&instance_id);
-        self.workers
-            .remove_if(&instance_id.worker_id(), |_, id| *id == instance_id);
+        {
+            let mut table = self.peers.lock();
+            table.peers.remove(&instance_id);
+            // Routes first, so a new send fails here and does not reach a
+            // transport that is closing the peer's connections.
+            self.primary_transport.remove(&instance_id);
+            self.alternative_transports.remove(&instance_id);
+            self.workers
+                .remove_if(&instance_id.worker_id(), |_, id| *id == instance_id);
+            if let Some(observer) = &table.observer {
+                observer.unregistered(instance_id);
+            }
+        }
+        // Outside the lock: a transport fails the peer's queued sends here
+        // and runs their error handlers, which may register a peer.
         // Every transport, not only the routes: a re-registration that one
         // transport refused leaves that transport out of the routes, but it
         // can still hold the peer from before.
         for transport in self.transports.values() {
             transport.unregister(instance_id);
-        }
-        if let Some(observer) = &table.observer {
-            observer.unregistered(instance_id);
         }
         tracing::debug!(peer = %instance_id, "Unregistered peer");
     }

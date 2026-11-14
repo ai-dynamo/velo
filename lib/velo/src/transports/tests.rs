@@ -1521,7 +1521,6 @@ async fn a_hello_queued_at_startup_reaches_the_stream_table() {
 
 /// A failed send's error handler can register another peer without entering the failed gate.
 #[tokio::test]
-#[ignore = "F3: unregister holds the peer-table lock while invoking a send error handler that registers another peer"]
 async fn unregister_allows_send_error_handlers_to_register_another_peer() {
     struct RegisterOnError {
         backend: Arc<VeloBackend>,
