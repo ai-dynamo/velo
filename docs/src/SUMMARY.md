@@ -41,6 +41,7 @@
 - [Versioning](development/versioning.md)
 - [Testing](development/testing.md)
 - [Review for performance](development/performance-review.md)
+- [Coding gotchas](development/coding-gotchas.md)
 - [Documentation](development/documentation.md)
 - [Batched streaming design](development/batched-streaming-design.md)
 - [RDMA design](development/rdma-design.md)
