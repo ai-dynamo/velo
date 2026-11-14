@@ -40,3 +40,28 @@ order is only likely. A loop of the plain test on two workers fails only about
 
 Test: `transports::quic::listener::tests::teardown_stops_no_stream_before_the_connection_task_closes`
 (`lib/velo/src/transports/quic/listener.rs`).
+
+## A peer's close does not mean its frames were read
+
+**Rule.** When a peer closes a connection, let each reader read to its own
+end. Stop readers only when this side ends the connection itself.
+
+A QUIC peer can close as soon as it has an acknowledgement for its last
+frames. The acknowledgement says the frames reached this side's buffer. It
+does not say that a reader has decoded and routed them. On a closed
+connection, a read returns the buffered bytes and then the end, so a reader
+left alone delivers them and stops.
+
+**Failure.** The QUIC listener's connection task stopped its stream readers
+when `accept_bi` failed, which is what a peer's close looks like. A reader
+that was behind lost the frames still in its buffer, and the dialer counted
+them as delivered. Two delivery-count tests failed 5 runs in 50 under
+parallel load: one or two frames of 256 were neither delivered nor failed.
+
+**Test.** Pause the reader inside the routing of its first frame. Send the
+rest, finish the stream, and wait for the acknowledgement. Close the
+connection from the peer, and let the connection task see the close. Then
+release the reader, and count the frames that arrive.
+
+Test: `transports::quic::listener::tests::a_peer_close_preserves_acknowledged_frames`
+(`lib/velo/src/transports/quic/listener.rs`).
