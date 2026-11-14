@@ -268,6 +268,116 @@ mod tests {
         );
     }
 
+    /// A blocked drain reply keeps the connection open when another reader stops.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "F1: task drop cancels readers before closing a connection held by a blocked reply"]
+    async fn dropping_a_connection_task_closes_before_stopping_its_readers() {
+        async fn check(drop_task: bool) {
+            struct RejectingMessage(Arc<tokio::sync::Notify>);
+            impl velo_ext::TransportObservability for RejectingMessage {
+                fn record_frame(&self, _: velo_ext::Direction, _: &str, _: usize) {}
+                fn record_rejection(&self, reason: velo_ext::TransportRejection) {
+                    if matches!(reason, velo_ext::TransportRejection::DrainRejected) {
+                        self.0.notify_one();
+                    }
+                }
+                fn set_registered_peers(&self, _: usize) {}
+                fn set_active_connections(&self, _: usize) {}
+                fn record_send_backpressure(&self) {}
+            }
+
+            let identity = tls::Identity::generate().unwrap();
+            let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(
+                tls::server_crypto(&identity).unwrap(),
+            )
+            .unwrap();
+            let server = quinn::Endpoint::server(
+                quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+                "127.0.0.1:0".parse().unwrap(),
+            )
+            .unwrap();
+            let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+            let mut client_config = tls::pinned_client_config(identity.fingerprint).unwrap();
+            let mut transport_config = quinn::TransportConfig::default();
+            transport_config.stream_receive_window(1u32.into());
+            client_config.transport_config(Arc::new(transport_config));
+            client.set_default_client_config(client_config);
+            let accept = tokio::spawn({
+                let server = server.clone();
+                async move { server.accept().await.unwrap().await.unwrap() }
+            });
+            let connection = client
+                .connect(server.local_addr().unwrap(), "velo")
+                .unwrap()
+                .await
+                .unwrap();
+            let server_connection = accept.await.unwrap();
+            let (mut send, _recv) = connection.open_bi().await.unwrap();
+            let (adapter, streams) = velo_ext::make_channels();
+            adapter.shutdown_state.begin_drain();
+            let rejecting_message = Arc::new(tokio::sync::Notify::new());
+            let teardown = CancellationToken::new();
+            let ctx = AcceptContext {
+                adapter,
+                error_handler: Arc::new(FailErrors),
+                transport_key: "quic".into(),
+                metrics: Some(Arc::new(RejectingMessage(rejecting_message.clone()))),
+                teardown: teardown.clone(),
+                shrink_threshold: usize::MAX,
+            };
+            let mut connection_task = Box::pin(serve_connection(server_connection, ctx));
+            TcpFrameCodec::encode_frame(&mut send, MessageType::Event, b"h", b"p")
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = &mut connection_task => panic!("the connection must stay open"),
+                    frame = streams.event_stream.recv_async() => { frame.unwrap(); }
+                }
+            })
+            .await
+            .expect("the idle reader has routed a frame");
+
+            // The peer's one-byte window cannot fit a ShuttingDown reply.
+            let (mut blocked_send, _blocked_recv) = connection.open_bi().await.unwrap();
+            TcpFrameCodec::encode_frame(&mut blocked_send, MessageType::Message, b"h", b"p")
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::select! {
+                    _ = &mut connection_task => panic!("the connection must stay open"),
+                    _ = rejecting_message.notified() => {}
+                }
+            })
+            .await
+            .expect("the second reader is replying to a drain rejection");
+            assert!(connection.close_reason().is_none());
+
+            teardown.cancel();
+            if !drop_task {
+                tokio::time::timeout(Duration::from_secs(5), &mut connection_task)
+                    .await
+                    .expect("the connection task handles teardown");
+            }
+            drop(connection_task);
+            let outcome = tokio::time::timeout(Duration::from_secs(5), send.stopped()).await;
+            server.close(0u32.into(), b"done");
+            client.close(0u32.into(), b"done");
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(Err(quinn::StoppedError::ConnectionLost(
+                        quinn::ConnectionError::ApplicationClosed(_)
+                    )))
+                ),
+                "connection task dropped={drop_task} stopped a stream before closing: {outcome:?}"
+            );
+        }
+
+        check(false).await;
+        check(true).await;
+    }
+
     /// A stream builds its teardown future once, not once per frame: the QUIC
     /// twin of `tcp::listener::a_connection_arms_its_teardown_once`, which
     /// says why. QUIC used to rebuild it per frame on the node-wide token (65
