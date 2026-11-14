@@ -1105,9 +1105,9 @@ fn insert_at_random_id<V>(
 /// consumer-side tasks can hold a cheap clone of the registry reference without
 /// holding a reference to the whole `AnchorManager`.
 ///
-/// Use [`AnchorManagerBuilder`] for optional configuration (e.g. `default_unattached_timeout`,
-/// `default_heartbeat_interval`), or [`AnchorManager::new`] as a convenience constructor
-/// with a 120-second unattached timeout and a 5-second heartbeat interval.
+/// The `Velo` builder builds one with [`AnchorManagerBuilder`]. Unit tests
+/// use `AnchorManager::new`, which takes the builder defaults: a 120-second
+/// unattached timeout and a 5-second heartbeat interval.
 #[derive(Builder)]
 #[builder(pattern = "owned", build_fn(name = "build_inner", private))]
 pub(crate) struct AnchorManager {
@@ -5423,7 +5423,7 @@ mod tests {
     /// An `AnchorManager` built by hand over `TcpFrameTransport` has no one
     /// to name the transport as one that reports retirement from its pump:
     /// only the `Velo` builder does that. Its senders report `Sent` as the
-    /// terminal enters the egress channel, which the docs say.
+    /// terminal enters the egress channel. Only unit tests build one.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_hand_built_manager_retires_as_the_terminal_is_queued() {
         use crate::streaming::sender::RetiresOn;

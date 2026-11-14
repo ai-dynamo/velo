@@ -4,7 +4,8 @@
 
 ```rust,ignore
 use prometheus::Registry;
-use velo::{Velo, VeloMetrics};
+use velo::Velo;
+use velo::observability::VeloMetrics;
 
 let registry = Registry::new();
 let metrics = Arc::new(VeloMetrics::register(&registry)?);

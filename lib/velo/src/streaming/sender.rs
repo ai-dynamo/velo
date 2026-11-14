@@ -178,11 +178,8 @@ pub enum Retirement {
     /// this node still holds it; the "Known limitations" appendix of the book says
     /// what that means for a shutdown. On the same worker, the terminal is in
     /// the anchor's channel. On a per-stream
-    /// transport of this crate that the `Velo` builder installed, the
-    /// stream's own pump wrote the terminal to the socket (TCP), or the
-    /// server took the whole stream (gRPC); on a frame transport from outside
-    /// velo, or under an `AnchorManager` built by hand, the terminal is in
-    /// the stream's egress channel.
+    /// transport, the stream's own pump wrote the terminal to the socket
+    /// (TCP), or the server took the whole stream (gRPC).
     ///
     /// It says nothing about the consumer: not that it received anything.
     /// Over gRPC, a server from before velo 0.21 ends the call cleanly even

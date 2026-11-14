@@ -127,7 +127,7 @@ For the tuning settings and the measured cost against TCP, see [QUIC performance
 
 ## Frame transports for streams
 
-Streams without the mux use a `FrameTransport`. TCP is the default. gRPC is available with the `grpc` feature. See [Streaming](streaming.md).
+Streams without the mux use a per-stream transport, which a node opts in to. TCP is the default. gRPC is available with the `grpc` feature. See [Streaming](streaming.md).
 
 ## Add a transport
 

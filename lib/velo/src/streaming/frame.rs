@@ -80,9 +80,7 @@ pub enum SendError {
     SerializationError(String),
     /// The encoded item is larger than the stream's transport carries in one
     /// frame (per-stream TCP and gRPC: 16 MiB, `MAX_ITEM_BYTES`). Nothing
-    /// was sent; the stream stays open. Only when the `Velo` builder
-    /// installed the transport: over an `AnchorManager` built by hand, the
-    /// item reaches the codec, which fails the stream.
+    /// was sent; the stream stays open.
     #[error("item of {len} bytes is over the transport's limit of {limit} bytes")]
     ItemTooLarge { len: usize, limit: usize },
 }

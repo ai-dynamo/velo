@@ -23,6 +23,7 @@
 - [Move off the manager accessors in 0.22.1](guides/migrate-manager-accessors.md)
 - [Services and stream transports](guides/migrate-services.md)
 - [Move off the Messenger front door in 0.22.1](guides/migrate-messenger-front-door.md)
+- [Move to the public paths of 0.23.0](guides/migrate-public-paths.md)
 - [Write an out-of-tree transport](guides/out-of-tree-transport.md)
 - [Tune batched streaming](guides/tune-batched-streaming.md)
 - [Run rendezvous over RDMA](guides/ucx-rdma.md)

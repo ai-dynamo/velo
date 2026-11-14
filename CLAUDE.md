@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Two crates only, plus the documented exceptions below:
 
 - **`lib/velo`** — the runtime. All concrete transport / discovery / streaming / messenger / queue / rendezvous / observability code lives here as modules (`velo::transports::tcp`, `velo::discovery::etcd`, `velo::streaming`, etc.). This is what application authors depend on.
-- **`lib/velo-ext`** — the extension trait surface. Out-of-tree implementors of `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, or `TransportObservability` depend only on this crate. It must remain small, free of heavy deps (especially `prometheus`), and stable.
+- **`lib/velo-ext`** — the extension trait surface. Out-of-tree implementors of `Transport`, `PeerDiscovery`, `ServiceDiscovery`, or `TransportObservability` depend only on this crate. It must remain small, free of heavy deps (especially `prometheus`), and stable.
 
 One documented exception: **`crates/ucx-rs`** — Rust bindings + a vendored static
 build of UCX, backing the `ucx` transport feature. It is a leaf FFI crate that
@@ -79,7 +79,7 @@ The bug class that motivated the workspace collapse: a 0.1.1 "patch" of an inter
 1. **Only `velo` and `velo-ext` are publishable** (plus `ucx-rs` and, once its publish gate clears, `velo-hub` and `velo-hub-ext` — the documented exceptions above). Any new crate added to the workspace must have `publish = false` in its `Cargo.toml` unless there is a deliberate, documented reason to publish it. Adding a third publishable crate reopens the bug class.
 2. **`velo-ext` is `=`-pinned in `[workspace.dependencies]`.** The line is:
    ```toml
-   velo-ext = { path = "lib/velo-ext", version = "=0.5.6" }
+   velo-ext = { path = "lib/velo-ext", version = "=0.6.0" }
    ```
    The `=` is load-bearing. Caret (the cargo default) lets a future "compatible" patch silently re-resolve downstream lockfiles. Do not relax this to a caret requirement.
 3. **When `velo-ext` moves past its latest published version, `velo` must carry a bump over its own latest published version too.** The `=` pin in `[workspace.dependencies]` must track `velo-ext`'s version; cargo fails to resolve the workspace otherwise.
@@ -90,12 +90,13 @@ The bug class that motivated the workspace collapse: a 0.1.1 "patch" of an inter
 
 ### What lives in `velo-ext` (and why it must stay small)
 
-- Trait definitions: `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`
+- Trait definitions: `Transport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`
 - Value/error types referenced by those traits: `WorkerId`, `InstanceId`, `PeerInfo`, `WorkerAddress`, `TransportKey`, `MessageType`, `TransportError`, `HealthCheckError`, `SendOutcome`, `SendAdmission`, `AdmissionError`, `AdmissionState`, `ShutdownState`, `Direction`, `TransportRejection`, `DrainExemption`, etc.
 - Channel plumbing types used in trait signatures: `TransportAdapter`, `DataStreams`, `make_channels`, `AdmissionGate`
 
 What does **not** live in `velo-ext`:
 
+- The frame transport trait of the per-stream transports. It is crate-private in `velo` (`streaming::transport`): stream transports are in-tree only, and a new transport implements `Transport`, whose streams ride the mux
 - Concrete impls (TCP/NATS/gRPC/etc. transports, etcd/filesystem/NATS discovery)
 - `prometheus`, `tonic`, `axum`, or any heavyweight dep
 - The `Messenger`, `Velo`, `AnchorManager`, `RendezvousManager` runtime types
@@ -155,7 +156,7 @@ External authors depend only on `velo-ext` and implement `Transport` against it.
 
 ```toml
 [dependencies]
-velo-ext = "0.5"  # exact pin tracked by velo's workspace
+velo-ext = "0.6"  # exact pin tracked by velo's workspace
 ```
 
 ## Code Style

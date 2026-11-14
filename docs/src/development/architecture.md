@@ -23,7 +23,7 @@ The fix was structural. All runtime code moved into `lib/velo/src/`. Do not add 
 
 ## What goes in `velo-ext`
 
-- The traits: `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`.
+- The traits: `Transport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`.
 - The types in their signatures: `WorkerId`, `InstanceId`, `PeerInfo`, `WorkerAddress`, `TransportKey`, `MessageType`, `TransportError`, `SendOutcome`, `ShutdownState`, `Direction`, and similar.
 - The channel types in their signatures: `TransportAdapter`, `DataStreams`, `make_channels`, `AdmissionGate`.
 
@@ -31,7 +31,8 @@ These stay out of `velo-ext`:
 
 - Concrete transports and discovery backends.
 - `prometheus`, `tonic`, `axum`, and other heavy dependencies.
-- The runtime types: `Messenger`, `Velo`, `AnchorManager`, `RendezvousManager`.
+- The runtime types: `Messenger`, `Velo`, and the crate-private anchor and rendezvous managers.
+- The frame transport trait of the per-stream transports. It is crate-private in `velo`. Stream transports are in-tree only: a new transport implements `Transport`, and its streams ride the mux.
 
 The test for the boundary: `cargo tree -p velo-ext | grep -c prometheus` must print `0`.
 
