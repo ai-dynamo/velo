@@ -41,6 +41,9 @@ report() {
         sed 's/^/       /' <<<"$detail"
         fail_count=$((fail_count + 1))
     fi
+    # One report per case: a later case that does not set it must not print
+    # this case's exit code.
+    last_case=""
 }
 
 # ── Stubs on PATH ──────────────────────────────────────────────────────────
@@ -266,34 +269,35 @@ fi
 report "(pipe) a here-string check survives output a pipe check fails on" "$ok" \
     "pipe form failed $piped_failures of 5, here-string form failed $herestring_failures of 5"
 
-pipe_sites=$(grep -nE '(echo|printf)[^|#]*\|[[:space:]]*grep[[:space:]]+-(q|m)' \
+pipe_sites=$(grep -nE '(echo|printf)[^|#]*\|[[:space:]]*grep([[:space:]]|$)' \
     "$CHECK_SEMVER" "${BASH_SOURCE[0]}" | grep -vE ':[[:space:]]*#' | grep -vF '(echo "$big" |' || true)
 ok=1
 if [[ -z "$pipe_sites" ]]; then
     ok=0
 fi
-report "(pipe) no script pipes echo or printf into grep -q or grep -m" "$ok" "$pipe_sites"
+report "(pipe) no script pipes echo or printf into grep" "$ok" "$pipe_sites"
 
-if [[ "${SEMVER_REVIEW_F2:-0}" == "1" ]]; then
-    review_gate_source=$(cat "$CHECK_SEMVER")
-    review_here_string='grep -qE "^${crate_dir}/" <<<"$changed_files"'
-    review_pipe='echo "$changed_files" | grep -Eq "^${crate_dir}/"'
-    if [[ "$review_gate_source" != *"$review_here_string"* ]]; then
-        printf 'FAIL - review F2: could not find the crate selection check\n'
-        exit 1
+# The lint must also catch other spellings: put the pipe form back into a copy
+# of the gate with the options in another order, and run this script on it.
+if [[ -z "${SEMVER_LINT_NESTED:-}" ]]; then
+    gate_source=$(cat "$CHECK_SEMVER")
+    here_string='grep -qE "^${crate_dir}/" <<<"$changed_files"'
+    # Built from parts, so the lint does not flag this line.
+    bar='|'
+    piped='echo "$changed_files" '"$bar"' grep -Eq "^${crate_dir}/"'
+    nested_exit=0
+    if [[ "$gate_source" == *"$here_string"* ]]; then
+        printf '%s\n' "${gate_source/"$here_string"/"$piped"}" > "$TMP_ROOT/piped-gate.sh"
+        SEMVER_LINT_NESTED=1 CHECK_SEMVER="$TMP_ROOT/piped-gate.sh" \
+            timeout 300 bash "${BASH_SOURCE[0]}" > "$TMP_ROOT/piped-gate.out" 2>&1 || nested_exit=$?
     fi
-    review_gate_source=${review_gate_source/"$review_here_string"/"$review_pipe"}
-    review_gate="$TMP_ROOT/review-piped-gate.sh"
-    printf '%s\n' "$review_gate_source" > "$review_gate"
-    review_nested_exit=0
-    SEMVER_REVIEW_F1=0 SEMVER_REVIEW_F2=0 CHECK_SEMVER="$review_gate" \
-        timeout 300 bash "${BASH_SOURCE[0]}" > "$TMP_ROOT/review-lint.out" 2>&1 || review_nested_exit=$?
-    if [[ "$review_nested_exit" == "0" ]] \
-        || ! grep -qF 'FAIL - (pipe) no script pipes echo or printf into grep -q or grep -m' "$TMP_ROOT/review-lint.out"; then
-        printf 'FAIL - review F2: lint must reject pipe into grep -Eq (nested exit %s)\n' "$review_nested_exit"
-        sed -n '/(pipe) no script/p; /passed:/p' "$TMP_ROOT/review-lint.out"
-        exit 1
+    ok=1
+    if [[ "$nested_exit" != "0" ]] \
+        && grep -qF 'FAIL - (pipe) no script pipes echo or printf into grep' "$TMP_ROOT/piped-gate.out"; then
+        ok=0
     fi
+    report "(pipe) the lint finds a pipe into grep -Eq" "$ok" \
+        "nested exit $nested_exit; $(grep -F '(pipe) no script' "$TMP_ROOT/piped-gate.out" 2>/dev/null)"
 fi
 
 # ── (a) a breaking change at the published version fails ───────────────────
@@ -380,6 +384,7 @@ publish ucx-rs "0.1.0+ucx.1.22.0"
 {
     repo="$TMP_ROOT/repo-e"
     mkdir -p "$repo"
+    last_case=e
     (
         cd "$repo"
         git init -q -b main
@@ -409,17 +414,14 @@ if [[ "$(cat "$TMP_ROOT/e.exit")" == "0" ]] \
     && ! grep -qi 'invalid arithmetic operator' <<<"$out"; then
     ok=0
 fi
+# What a failure of (e) would print, read in a subshell so (e) still reports.
+e_failure=$(report "(e)" 1 "")
 report "(e) ucx-rs's +build metadata compares on the semver core, and the baseline keeps it; a correct bump passes" "$ok" "$out"
-
-if [[ "${SEMVER_REVIEW_F1:-0}" == "1" ]]; then
-    review_report=$(report "(e) assertion failure" 1 "$out")
-    review_expected_exit=$(cat "$TMP_ROOT/e.exit")
-    if ! grep -qFx "       exit code: $review_expected_exit" <<<"$review_report"; then
-        printf 'FAIL - review F1: case (e) exited %s, but report used another case\n' "$review_expected_exit"
-        printf '%s\n' "$review_report"
-        exit 1
-    fi
+ok=1
+if grep -qFx "       exit code: $(cat "$TMP_ROOT/e.exit")" <<<"$e_failure"; then
+    ok=0
 fi
+report "(report) a case run outside run_case prints its own exit code" "$ok" "$e_failure"
 
 # ── (f) a crate that was never published is skipped ─────────────────────────
 # The index answers 404 for it, so there is no baseline to break.

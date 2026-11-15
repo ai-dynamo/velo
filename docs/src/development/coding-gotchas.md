@@ -54,6 +54,6 @@ the crates a change touches, so it could skip a changed crate's check
 
 **Test.** Run the pipe form on output larger than the pipe buffer: it fails
 nearly every time, and the here-string form never does. Then search the
-scripts for the pipe form.
+scripts for the pipe form, with any options.
 
 Test: the two `(pipe)` cases in `scripts/check-semver.test.sh`.
