@@ -343,6 +343,7 @@ use ucx_rs::{decode_status_ptr, status_string, sys};
 use velo_ext::{AdmitOutcome, InstanceId, MessageType, TransportAdapter, TransportErrorHandler};
 
 use super::address::{AM_ID_BASE, AM_KIND_COUNT, AM_KIND_PING, AM_KIND_PONG, UcxEndpoint};
+use super::clock::ReaperClock;
 use super::ring::{CommandReceiver, CommandSender};
 use super::rma::{
     MAX_PACKED_RKEY, MappedRegion, RKEY_UNPACK_PAD, RmaError, RmaGetRequest, validate_packed_rkey,
@@ -603,6 +604,21 @@ pub(crate) struct WorkerShared {
     /// the runtime otherwise synchronizes with, so the callback reads the
     /// slot per frame rather than capture the handle once at `start()`.
     pub metrics: OnceLock<Arc<dyn velo_ext::TransportObservability>>,
+    /// The idle reaper's clock. No fields in a normal build; see
+    /// [`ReaperClock`].
+    pub reaper_clock: ReaperClock,
+    /// Test seam: while set, the receive callback records when each sender's
+    /// last frame arrived, in `last_inbound`, on the reaper's clock.
+    #[cfg(test)]
+    pub track_inbound: AtomicBool,
+    /// Test seam: when each sender's last frame arrived, by incarnation.
+    #[cfg(test)]
+    pub last_inbound: parking_lot::Mutex<HashMap<u64, Instant>>,
+    /// Test seam: idle reaps of an endpoint whose peer sent a frame within
+    /// the timeout. The reaper must never do this, at any load; see
+    /// [`WorkerState::reap_idle_eps`].
+    #[cfg(test)]
+    pub eps_reaped_while_active: AtomicU64,
     /// Test seam: sleep this long after each `ucp_ep_create`, so a test can
     /// make endpoint creation slower than the idle timeout on demand.
     #[cfg(test)]
@@ -614,13 +630,24 @@ pub(crate) struct WorkerShared {
     /// the peer's half of the wireup.
     #[cfg(test)]
     pub progress_stall_ms: AtomicU64,
-    /// Test seam: after the pass clock is read and before
-    /// `ucp_worker_progress`, the progress loop clears this cell and then
-    /// sleeps once for the value it held (see [`take_test_delay`]). It stands
-    /// in for a long progress loop: a frame that waits in the socket meanwhile
-    /// is received late in the pass, well after the pass clock was read.
+    /// Test seam: while set, the progress loop waits after it reads the pass
+    /// clock and before `ucp_worker_progress`. A frame that waits in the
+    /// socket meanwhile is received in that pass, after the test has moved the
+    /// reaper's clock: the stand-in for a long progress loop.
     #[cfg(test)]
-    pub pre_progress_delay_ms: AtomicU64,
+    pub pre_progress_hold: AtomicBool,
+    /// Test seam: `true` while the progress loop waits on `pre_progress_hold`.
+    #[cfg(test)]
+    pub pre_progress_held: AtomicBool,
+    /// Test seam: passes of the progress loop that reached the reaper. A test
+    /// that moves the reaper's clock waits for two more, so one pass has read
+    /// the new time and scanned with it.
+    #[cfg(test)]
+    pub passes: AtomicU64,
+    /// Test seam: commands the progress loop has handled. Once it moves past
+    /// a send's command, that send has been posted.
+    #[cfg(test)]
+    pub cmds_handled: AtomicU64,
     /// Test seam: while set, the progress loop waits at the top of its pass
     /// and takes no command. Unlike `progress_stall_ms`, the wait lasts until
     /// the test clears the flag, so a test that must act while the thread
@@ -708,14 +735,16 @@ struct EpSends {
     /// nanoseconds after `born`. Zero means never.
     drained_at_ns: AtomicU64,
     born: Instant,
+    clock: ReaperClock,
 }
 
 impl EpSends {
-    fn new(born: Instant) -> Self {
+    fn new(born: Instant, clock: ReaperClock) -> Self {
         Self {
             inflight: AtomicUsize::new(0),
             drained_at_ns: AtomicU64::new(0),
             born,
+            clock,
         }
     }
 
@@ -754,7 +783,12 @@ impl OpState {
     fn stamp_ep_drained(&self) {
         if let Some(sends) = &self.ep_sends {
             // `max(1)`: zero means "never".
-            let ns = (sends.born.elapsed().as_nanos() as u64).max(1);
+            let ns = (sends
+                .clock
+                .now()
+                .saturating_duration_since(sends.born)
+                .as_nanos() as u64)
+                .max(1);
             sends.drained_at_ns.store(ns, Ordering::Relaxed);
         }
     }
@@ -1190,6 +1224,14 @@ unsafe extern "C" fn recv_trampoline(
         if ra.shared.stamp_inbound {
             let sender = u64::from_le_bytes(tag.try_into().unwrap());
             ra.shared.worker.senders.record(sender as usize);
+        }
+        // Kept apart from the sighting above on purpose: the check it feeds
+        // must still see a frame that the sighting path misses.
+        #[cfg(test)]
+        if ra.shared.worker.track_inbound.load(Ordering::Relaxed) {
+            let sender = u64::from_le_bytes(tag.try_into().unwrap());
+            let now = ra.shared.worker.reaper_clock.now();
+            ra.shared.worker.last_inbound.lock().insert(sender, now);
         }
 
         let header = if header.is_empty() {
@@ -1861,8 +1903,8 @@ unsafe fn init_ucx(
                 _recv_args: std::mem::take(&mut native.recv_args),
                 parked_for_close: Vec::new(),
                 pending_closes: Vec::new(),
-                now: Instant::now(),
-                next_ep_scan: Instant::now(),
+                now: shared.reaper_clock.now(),
+                next_ep_scan: shared.reaper_clock.now(),
                 seen_senders: 0,
                 sender_scratch: Vec::with_capacity(SENDER_SLOTS),
                 am_header: Vec::new(),
@@ -1897,6 +1939,8 @@ fn drain_ring(
                     warn!("ucx: panic while handling a command (continuing)");
                     true
                 });
+                #[cfg(test)]
+                state.shared.cmds_handled.fetch_add(1, Ordering::Release);
                 if !cont {
                     return (false, false);
                 }
@@ -1913,8 +1957,8 @@ fn drain_ring(
 /// The order is load-bearing. A test that sees the cell read zero knows the
 /// progress thread has taken the value and is in, or entering, the sleep, with
 /// no progress call left before it.
-/// `a_frame_received_late_in_a_long_pass_is_not_stamped_early` relies on that
-/// to send while the thread is stalled.
+/// `an_rma_get_slower_than_the_timeout_restarts_the_idle_clock` relies on that
+/// to post its GET while the owner is stalled.
 ///
 /// A load first, so the benchmarks in the test build pay no read-modify-write
 /// per pass.
@@ -1926,15 +1970,16 @@ fn take_test_delay(cell: &AtomicU64) {
     }
 }
 
-/// Test seam: wait while `progress_hold` is set; see its doc.
+/// Test seam: wait while `hold` is set, with `held` raised meanwhile; see
+/// `progress_hold` and `pre_progress_hold`.
 #[cfg(test)]
-fn wait_while_held(shared: &WorkerShared) {
-    if shared.progress_hold.load(Ordering::Acquire) {
-        shared.progress_held.store(true, Ordering::Release);
-        while shared.progress_hold.load(Ordering::Acquire) {
+fn wait_while_held(hold: &AtomicBool, held: &AtomicBool) {
+    if hold.load(Ordering::Acquire) {
+        held.store(true, Ordering::Release);
+        while hold.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_micros(100));
         }
-        shared.progress_held.store(false, Ordering::Release);
+        held.store(false, Ordering::Release);
     }
 }
 
@@ -1957,7 +2002,7 @@ fn run_loop(mut state: WorkerState, mut ring_rx: CommandReceiver) {
         #[cfg(test)]
         take_test_delay(&state.shared.progress_stall_ms);
         #[cfg(test)]
-        wait_while_held(&state.shared);
+        wait_while_held(&state.shared.progress_hold, &state.shared.progress_held);
         #[cfg(test)]
         state.shared.progress_passes.fetch_add(1, Ordering::Relaxed);
         // The reaper's clock. It is read here, again after the progress loop,
@@ -1969,7 +2014,7 @@ fn run_loop(mut state: WorkerState, mut ring_rx: CommandReceiver) {
         // value. The scan's `saturating_duration_since` reads that as zero idle
         // time, which is correct.
         if reaper_on {
-            state.now = Instant::now();
+            state.now = state.shared.reaper_clock.now();
         }
 
         // -- drain the ring --------------------------------------------------
@@ -1980,7 +2025,10 @@ fn run_loop(mut state: WorkerState, mut ring_rx: CommandReceiver) {
         }
 
         #[cfg(test)]
-        take_test_delay(&state.shared.pre_progress_delay_ms);
+        wait_while_held(
+            &state.shared.pre_progress_hold,
+            &state.shared.pre_progress_held,
+        );
 
         // -- progress to quiescence -----------------------------------------
         // SAFETY: worker owned by this thread.
@@ -1994,7 +2042,7 @@ fn run_loop(mut state: WorkerState, mut ring_rx: CommandReceiver) {
         // just used. The clock only moves forward, and a later stamp errs
         // toward keeping an endpoint open.
         if reaper_on {
-            state.now = Instant::now();
+            state.now = state.shared.reaper_clock.now();
         }
 
         // -- flush, then reap -------------------------------------------------
@@ -2035,6 +2083,8 @@ fn run_loop(mut state: WorkerState, mut ring_rx: CommandReceiver) {
             // after `drain_rma_completions` so the in-flight registry it
             // consults is as fresh as this thread can make it.
             state.reap_idle_eps();
+            #[cfg(test)]
+            state.shared.passes.fetch_add(1, Ordering::Release);
         }
         state.poll_pending_closes();
 
@@ -2375,14 +2425,14 @@ impl WorkerState {
         // the scan that ends it on one clock. It also makes endpoints stamped
         // earlier in this pass read as older by the time the create took,
         // which is their true age in wall-clock time.
-        self.now = Instant::now();
+        self.now = self.shared.reaper_clock.now();
 
         self.shared.failed_peers.remove(&peer);
         self.shared.eps_open.fetch_add(1, Ordering::Relaxed);
         let sends = self
             .config
             .ep_idle_timeout
-            .map(|_| Arc::new(EpSends::new(self.now)));
+            .map(|_| Arc::new(EpSends::new(self.now, self.shared.reaper_clock.clone())));
         self.eps.insert(
             peer,
             EpEntry {
@@ -2561,6 +2611,30 @@ impl WorkerState {
 
         for peer in idle {
             if let Some(entry) = self.eps.remove(&peer) {
+                // Test check: a reap of an endpoint whose peer sent a frame
+                // within the timeout. It can never fire for a correct
+                // reaper, at any load. A frame is received inside
+                // `ucp_worker_progress`, and its time is read there. The pass
+                // clock is read after the progress loop, so it is no earlier,
+                // and `stamp_inbound_use` writes that clock to the endpoint
+                // before this scan. Nothing between the clock read and this
+                // scan runs an AM callback: the flush drain, the RMA drain and
+                // the three close passes never call `ucp_worker_progress`. So
+                // `last_used` is no earlier than the frame, and a reap needs
+                // `now - last_used > timeout`.
+                #[cfg(test)]
+                if let Some(seen) = self
+                    .shared
+                    .last_inbound
+                    .lock()
+                    .get(&entry.incarnation)
+                    .copied()
+                    && self.now.saturating_duration_since(seen) <= timeout
+                {
+                    self.shared
+                        .eps_reaped_while_active
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 debug!("ucx: closing endpoint to {peer} after {timeout:?} idle");
                 // NOTED RISK, for whoever changes close timing next. Every close
                 // that existed before this one was reactive — a peer failed, or

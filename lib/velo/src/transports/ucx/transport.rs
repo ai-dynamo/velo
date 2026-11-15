@@ -186,12 +186,25 @@ impl UcxTransport {
             senders: Arc::new(super::worker::SenderSightings::new()),
             incarnation,
             metrics: OnceLock::new(),
+            reaper_clock: Default::default(),
+            #[cfg(test)]
+            track_inbound: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            last_inbound: Default::default(),
+            #[cfg(test)]
+            eps_reaped_while_active: AtomicU64::new(0),
             #[cfg(test)]
             ep_create_delay_ms: AtomicU64::new(0),
             #[cfg(test)]
             progress_stall_ms: AtomicU64::new(0),
             #[cfg(test)]
-            pre_progress_delay_ms: AtomicU64::new(0),
+            pre_progress_hold: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            pre_progress_held: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            passes: AtomicU64::new(0),
+            #[cfg(test)]
+            cmds_handled: AtomicU64::new(0),
             #[cfg(test)]
             progress_hold: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
