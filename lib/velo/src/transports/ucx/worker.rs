@@ -72,11 +72,22 @@
 //!   `UCS_ERR_CANCELED`.
 //!
 //! The worker-lifetime requirement holds even on the one path where a callback
-//! fires from *inside* `ucp_worker_destroy`: that function drives purges
-//! (`ucp_worker_discard_uct_ep_cleanup`, `ucp_worker_destroy_eps`, lines
-//! 3053-3055) well before `ucp_worker_destroy_mpools` tears down `rkey_mp`
-//! (`ucp_worker.c:2129`). So the rkey outlives no endpoint and precedes no
-//! mpool, whichever path completes it.
+//! fires from *inside* `ucp_worker_destroy`: a FORCE close whose lane discard
+//! has not finished is completed by `ucp_worker_discard_uct_ep_cleanup`, and
+//! its completion purges the endpoint's requests, well before
+//! `ucp_worker_destroy_mpools` tears down `rkey_mp` (`ucp_worker.c:2129`). So
+//! the rkey outlives no endpoint and precedes no mpool, whichever path
+//! completes it.
+//!
+//! What `ucp_worker_destroy` does **not** do is complete a GET on an endpoint
+//! that was only flush-closed. Once a GET has a request id (over tcp, once its
+//! request has gone to the owner), it waits in the endpoint's `proto_reqs`
+//! list. Only `ucp_ep_reqs_purge` empties that list, and only a FORCE close or
+//! an endpoint failure calls it. `ucp_worker_destroy_eps` purges the lanes'
+//! pending queues and then deletes the endpoint, so such a GET's callback never
+//! runs: its rkey, its request and its `RmaOpState` leak. That is why teardown
+//! FORCE-closes every endpoint whose peer still has an RMA operation in flight
+//! (see "What teardown does with an RMA operation in flight" below).
 //!
 //! **A parked unmap gates its region.** `Cmd::UnmapRegion` for a region with
 //! operations in flight parks its reply in the region entry; from that moment
@@ -267,21 +278,35 @@
 //! behind a gate belong to a connection that is still perfectly good. They reach
 //! the ring later and wire an endpoint up again on the way.
 //!
-//! ## What teardown cannot promise
+//! ## What teardown does with an RMA operation in flight
 //!
-//! D8 asks for regions to be unmapped before endpoints are closed. That holds
-//! for every region that is idle when teardown starts, and for every region
-//! whose operations complete during the flush-close. It cannot hold for a
-//! region whose GET is posted to a peer that has stopped progressing: Phase A's
-//! flush-close never completes, and Phase B's FORCE close on that same endpoint
-//! is a **no-op** — `ucp_ep_close_nbx` returns `UCS_ERR_NOT_CONNECTED` at its
-//! `UCP_EP_FLAG_CLOSED` guard (`ucp_ep.c:2221`) because Phase A already set the
-//! flag, so no second discard and no `CANCELED` purge happen. Such an operation
-//! is completed only by the purges inside `ucp_worker_destroy`, i.e. *after*
-//! `force_unmap_regions` has already deregistered its destination. Over tcp that
-//! is silent; on IB the straggler completes with an access error. Accepted, and
-//! a hardware-checkpoint item — the caller is still answered, which is the part
-//! that had to be fixed.
+//! D8 asks for regions to be unmapped before endpoints are closed. Teardown
+//! first gives RMA operations a bounded time ([`RMA_DRAIN`]) to finish while
+//! every endpoint is still open, so a GET that is only slow still answers
+//! `Ok`. An endpoint whose peer still has an operation after that is
+//! FORCE-closed, not flush-closed. A flush close would wait for the operation,
+//! and nothing could cancel it afterwards: a FORCE close of an endpoint
+//! already closed is refused at the `UCP_EP_FLAG_CLOSED` guard
+//! (`ucp_ep.c:2221`) and returns `UCS_ERR_NOT_CONNECTED`, with no second
+//! discard and no purge. The FORCE close discards the lanes and then purges
+//! `proto_reqs` with `UCS_ERR_CANCELED`, so the callback runs: the caller is
+//! answered `RmaError::Ucx`, and the rkey is destroyed while the worker exists.
+//!
+//! The purge runs when the lane discard completes, which takes progress. The
+//! in-flight drain below gives it that. Over tcp the discard completes at once
+//! (`shutdown_cancels_a_get_its_peer_stopped_answering`). A discard that does
+//! not complete within that drain is completed inside `ucp_worker_destroy`,
+//! *after* `force_unmap_regions` has deregistered the destination; on IB such
+//! a straggler could complete with an access error. That is a hardware
+//! checkpoint item. The caller is answered either way, by `abandon_rma_ops`.
+//!
+//! The owner of the memory is the other half, and velo cannot protect it. Over
+//! tcp a GET is emulated in software: the owner serves the request by sending
+//! the data back. If the puller is gone before the owner reads the request, UCX
+//! 1.22 sends the reply on a failed endpoint and `ucp_request_try_send` calls
+//! `ucs_fatal`, aborting the owner's process
+//! (`an_owner_survives_a_puller_that_vanishes_mid_get`, ignored for that
+//! reason). A puller that crashes reaches it too.
 
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
@@ -580,6 +605,12 @@ pub(crate) struct WorkerShared {
     /// this: the region exists a moment before its reply goes out.
     #[cfg(test)]
     pub map_replies_delivered: AtomicU64,
+    /// Test seam: passes the progress loop has begun, counted after the
+    /// `progress_hold` wait. A test that releases the hold and needs one whole
+    /// pass to have run, its progress loop included, waits for this to move
+    /// by two.
+    #[cfg(test)]
+    pub progress_passes: AtomicU64,
 }
 
 /// What the progress thread reports back once UCX is initialised.
@@ -1433,6 +1464,10 @@ pub(super) fn ep_scan_period(timeout: Duration) -> Duration {
 /// reaper tests use to size their margins.
 pub(super) const PARK_MS: c_int = 100;
 
+/// How long teardown waits for RMA operations to finish on open endpoints
+/// before it FORCE-closes the endpoints they still use. See `teardown`.
+const RMA_DRAIN: Duration = Duration::from_secs(1);
+
 /// Entry point of the dedicated progress thread.
 pub(crate) fn worker_main(args: WorkerArgs) {
     let WorkerArgs {
@@ -1753,6 +1788,8 @@ fn run_loop(mut state: WorkerState, mut ring_rx: CommandReceiver) {
         take_test_delay(&state.shared.progress_stall_ms);
         #[cfg(test)]
         wait_while_held(&state.shared);
+        #[cfg(test)]
+        state.shared.progress_passes.fetch_add(1, Ordering::Relaxed);
         // The reaper's clock. It is read here, again after the progress loop,
         // and after each `ucp_ep_create`, and only moves forward. The two
         // per-pass reads run only with the reaper on. Every
@@ -2941,13 +2978,12 @@ impl WorkerState {
     /// run, then let the registry go.
     ///
     /// Called once, after teardown's bounded in-flight drain has expired. An
-    /// operation still here has been abandoned inside UCX's request bookkeeping;
-    /// `ucp_worker_destroy` may or may not purge it, and the caller cannot be
-    /// left awaiting a `oneshot` that outcome decides. Taking the reply out is
-    /// safe against a late callback by construction: it finds `None` and stays
-    /// silent. The `Arc`s themselves are dropped here; the one UCX still holds
-    /// keeps the state alive, and its rkey is leaked with it — the same leak the
-    /// `inflight_ops` warning already reports.
+    /// operation still here was FORCE-closed in Phase A, but its lane discard
+    /// has not completed yet; `ucp_worker_destroy` completes it, and the caller
+    /// cannot be left awaiting a `oneshot` until then. Taking the reply out is
+    /// safe against the late callback by construction: it finds `None` and
+    /// stays silent. The `Arc`s themselves are dropped here; the one UCX still
+    /// holds keeps the state alive until that callback destroys the rkey.
     fn abandon_rma_ops(&mut self) {
         for (op_id, op) in std::mem::take(&mut self.rma_ops) {
             debug!("ucx: abandoning rma op {op_id} at teardown");
@@ -2974,6 +3010,19 @@ impl WorkerState {
         self.drain_rma_completions();
         self.unmap_idle_regions();
 
+        // Give RMA operations a bounded chance to finish while every endpoint
+        // is still open, so a GET that is only slow still answers `Ok`. One
+        // second is the budget the flush-close below used to give it, and the
+        // same as each other bound here: `shutdown()`'s caller blocks on all
+        // of them.
+        let deadline = Instant::now() + RMA_DRAIN;
+        while !self.rma_ops.is_empty() && Instant::now() < deadline {
+            // SAFETY: worker owned by this thread.
+            unsafe { sys::ucp_worker_progress(self.worker) };
+            self.drain_rma_completions();
+        }
+        self.unmap_idle_regions();
+
         // Close every endpoint CONCURRENTLY under one global deadline, so
         // teardown latency is bounded by the slowest peer, not the sum. This
         // runs on `shutdown()`'s caller-blocking path.
@@ -2983,9 +3032,30 @@ impl WorkerState {
             all.append(&mut self.parked_for_close);
             all
         };
+        // An RMA operation still outstanding gets a FORCE close, not a flush
+        // close. A flush close waits for the operation, and once it has begun
+        // nothing can cancel it: the FORCE close of Phase B is refused for an
+        // endpoint already closed. A GET left like that is never completed, not
+        // even by `ucp_worker_destroy`, which deletes the endpoint without
+        // purging its `proto_reqs`, so its callback never runs and its rkey
+        // and request leak. FORCE discards the lanes and then purges
+        // `proto_reqs` with `UCS_ERR_CANCELED`, which runs the callback: the
+        // caller is answered `RmaError::Ucx`, and the rkey is destroyed while
+        // the worker still exists. Chosen by peer, as the idle reaper does,
+        // because an operation names its peer and not its endpoint.
+        let rma_peers: std::collections::HashSet<InstanceId> =
+            self.rma_ops.values().map(|op| op.peer).collect();
         // Phase A: flush-mode close, all at once.
         let mut pending: Vec<(EpEntry, sys::ucs_status_ptr_t)> = Vec::new();
         for entry in entries {
+            // SAFETY: `err_arg` was leaked at creation and is freed only when
+            // the entry is closed, which has not happened yet.
+            let peer = unsafe { (*entry.err_arg).peer };
+            if rma_peers.contains(&peer) {
+                debug!("ucx: force-closing endpoint to {peer} with rma op(s) in flight");
+                self.close_ep_raw(entry, true);
+                continue;
+            }
             // SAFETY: worker/ep owned by this thread.
             let ptr = unsafe {
                 let param: sys::ucp_request_param_t = MaybeUninit::zeroed().assume_init();
@@ -3036,10 +3106,9 @@ impl WorkerState {
         // `UCP_EP_FLAG_CLOSED` guard (`ucp_ep.c:2221`) for an endpoint Phase A
         // already close-initiated, so the FORCE flag buys nothing here: no
         // second discard, no `CANCELED` purge, no completion callbacks. What it
-        // does is free the request and the leaked `ErrArg`. Operations posted to
-        // a peer that stopped progressing are completed — if at all — by the
-        // purges inside `ucp_worker_destroy`, long after this point; that is why
-        // `abandon_rma_ops` below has to answer their callers directly.
+        // does is free the request and the leaked `ErrArg`. That is why an
+        // endpoint with an RMA operation in flight was FORCE-closed in Phase A
+        // instead of flush-closed.
         for (entry, req) in pending {
             // SAFETY: the flush-close request is abandoned; freeing it and
             // issuing the (guarded, hence no-op) force close is the documented
