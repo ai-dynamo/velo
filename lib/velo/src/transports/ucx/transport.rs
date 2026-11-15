@@ -157,6 +157,9 @@ pub struct UcxTransport {
     /// Submit-side RMA bookkeeping, shared with every [`RdmaEndpoint`] handed
     /// out by [`UcxTransport::rdma_endpoint`].
     rma: Arc<RmaState>,
+    /// Leave UCX's software RMA emulation on. Off unless a test asked for it
+    /// with [`UcxTransportBuilder::allow_software_rma`]; see that method.
+    software_rma: bool,
 }
 
 impl UcxTransport {
@@ -170,6 +173,7 @@ impl UcxTransport {
             peers: Arc::new(DashMap::new()),
             pending_pings: Arc::new(DashMap::new()),
             failed_peers: Arc::new(DashMap::new()),
+            no_native_get: Arc::new(DashMap::new()),
             inflight_ops: Arc::new(Default::default()),
             shutdown_requested: Arc::new(Default::default()),
             reg_epoch: Arc::new(Default::default()),
@@ -212,6 +216,7 @@ impl UcxTransport {
             join: Mutex::new(None),
             ping_token: AtomicU64::new(1),
             rma: Arc::new(RmaState::new()),
+            software_rma: false,
         }
     }
 
@@ -617,6 +622,7 @@ impl Transport for UcxTransport {
             let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
             let args = WorkerArgs {
                 config: self.config.clone(),
+                software_rma: self.software_rma,
                 ring_rx,
                 shared: Arc::clone(&self.shared),
                 adapter: channels,
@@ -737,6 +743,7 @@ impl Transport for UcxTransport {
 pub struct UcxTransportBuilder {
     key: Option<TransportKey>,
     config: UcxConfig,
+    software_rma: bool,
 }
 
 impl UcxTransportBuilder {
@@ -745,6 +752,7 @@ impl UcxTransportBuilder {
         Self {
             key: None,
             config: UcxConfig::default(),
+            software_rma: false,
         }
     }
 
@@ -982,11 +990,35 @@ impl UcxTransportBuilder {
         self
     }
 
+    /// Let UCX emulate RMA in software where no lane can do it in hardware,
+    /// as over a tcp-only lane. For tests only: CI has no RDMA hardware, and
+    /// the RMA tests need a GET to run.
+    ///
+    /// **The emulation can abort the owner's process.** In UCX 1.22, an owner
+    /// serving a software GET aborts when the puller goes away during the
+    /// reply: `ucs_fatal` in `ucp_request_try_send`, or an assertion in
+    /// `uct_tcp_ep_pending_purge`. A crashed puller is enough. So velo leaves
+    /// it off by default, and a GET with no lane that can do it in hardware is
+    /// refused; the rendezvous layer then moves the bytes over its chunked
+    /// path. The protection is on the puller's side: an owner is safe when
+    /// every puller that reads from it has the emulation off.
+    ///
+    /// A deployment that accepts the risk can set
+    /// `UCX_PROTO_EMULATION_ENABLE=y` instead. The environment always wins, as
+    /// for every other `UCX_*` setting velo has a default for.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn allow_software_rma(mut self, allow: bool) -> Self {
+        self.software_rma = allow;
+        self
+    }
+
     /// Build the [`UcxTransport`]. UCX initialisation is deferred to
     /// [`Transport::start`]; building never touches UCX.
     pub fn build(self) -> Result<UcxTransport> {
         let key = self.key.unwrap_or_else(|| TransportKey::from("ucx"));
-        Ok(UcxTransport::new(key, self.config))
+        let mut transport = UcxTransport::new(key, self.config);
+        transport.software_rma = self.software_rma;
+        Ok(transport)
     }
 }
 

@@ -91,6 +91,8 @@ The GET uses this consumer's own UCX endpoint to the owner. So "UCX is registere
 
 The rule has a cold-start effect. A peer that is not registered yet translates to nothing. The first `get` to an unknown owner therefore offers nothing and pulls chunks. Later gets take the RDMA path.
 
+One more fact can stop the offer: a GET to the owner was refused because UCX has no native GET to it, as over a TCP-only lane (`no_native_get`). See [No RDMA rendezvous over a TCP-only lane](../appendix/limitations.md#no-rdma-rendezvous-over-a-tcp-only-lane).
+
 ## Fallback is a routing decision
 
 After the owner sends a descriptor, four failures can occur on the consumer. They map to three reason labels:
@@ -99,7 +101,7 @@ After the owner sends a descriptor, four failures can occur on the consumer. The
 |---|---|
 | The descriptor does not decode, or it names a backend this consumer does not have. | `decode_error` |
 | The consumer cannot get a registered destination buffer. | `pool_exhausted` |
-| The GET fails. | `get_failed` |
+| The GET fails, or UCX refuses it because no native GET reaches the owner. | `get_failed` |
 
 For each failure, the consumer detaches the lease, acquires again with no offer, and pulls chunks. This always works, because a pinned slot also serves the chunked path.
 
@@ -404,7 +406,7 @@ The switch acts on both roles. An owner with it on never answers `Rdma` and stag
 Both sides record into `path_total`, at different points:
 
 - The owner records at staging time, when `register_data_pinned` falls back (`kill_switch`, `budget`, `pool_exhausted`). It also records at each acquire (`no_offer`, `not_configured`, `kill_switch`, `not_pinned`, `below_min`, `draining`, `ok`).
-- The consumer records when it builds its offer (`not_configured`, `kill_switch`, `no_offer`), after a failure (`decode_error`, `pool_exhausted`, `get_failed`), and when a GET completes (`ok`).
+- The consumer records when it builds its offer (`not_configured`, `kill_switch`, `no_offer`, `no_native_get`), after a failure (`decode_error`, `pool_exhausted`, `get_failed`), and when a GET completes (`ok`).
 
 The series counts decisions, not transfers. With the owner's kill switch on, one slot adds `kill_switch` once at staging and again at each acquire. A fallback acquire carries no offer, so the owner also counts `no_offer` for a consumer whose GET failed. The owner counts `ok` when it sends a descriptor, before the GET runs. The consumer's `ok` is the proof that a GET completed.
 

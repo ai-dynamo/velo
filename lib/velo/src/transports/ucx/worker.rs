@@ -111,6 +111,24 @@
 //! `ShuttingDown`. The reply lives behind a `take`-able slot, which is what
 //! makes double-resolution impossible if the callback later fires anyway.
 //!
+//! ## Software RMA is off
+//!
+//! Over a lane with no RMA in hardware, such as tcp, UCX emulates a GET: the
+//! owner's progress thread serves the read. In UCX 1.22 the owner's process
+//! aborts if the puller goes away during the reply (`ucs_fatal` in
+//! `ucp_request_try_send`, or an assertion in `uct_tcp_ep_pending_purge`), and
+//! a crashed puller reaches both. So [`init_ucx`] sets
+//! `PROTO_EMULATION_ENABLE=n` unless the environment sets it, or a test asked
+//! for software RMA.
+//!
+//! UCX selects the GET protocol per endpoint, so a GET still runs in hardware
+//! where a lane can do it. Where none can, `ucp_proto_reconfig_progress`
+//! aborts the request with `UCS_ERR_CANCELED` and leaves the endpoint up.
+//! [`RmaOpState::refused`] tells that from a FORCE close, answers
+//! [`RmaError::NoNativeGet`], and records the peer's incarnation in
+//! [`WorkerShared::no_native_get`]. The rendezvous consumer reads that record
+//! and stops offering RDMA to the peer.
+//!
 //! ## The idle-endpoint reaper (D9)
 //!
 //! [`UcxConfig::ep_idle_timeout`](super::transport::UcxConfig::ep_idle_timeout)
@@ -500,6 +518,15 @@ pub(crate) struct WorkerShared {
     /// Peers whose endpoint hit a transport-level error; consulted by
     /// `check_health` and cleared when a fresh endpoint is established.
     pub failed_peers: Arc<DashMap<InstanceId, ()>>,
+    /// Peers this worker cannot GET from without software emulation, with the
+    /// incarnation whose endpoint refused the GET.
+    ///
+    /// Written by [`RmaOpState::complete`] when UCX refuses a GET for want of
+    /// a native protocol (see "Software RMA is off" in the module docs). Read
+    /// by the rendezvous consumer, which then does not offer RDMA to that
+    /// peer. The incarnation makes the entry lapse when the peer re-registers:
+    /// a new process may be reachable over a lane that has GET in hardware.
+    pub no_native_get: Arc<DashMap<InstanceId, u64>>,
     /// Operations posted with a request outstanding (exit 2). Drained before
     /// worker destruction.
     pub inflight_ops: Arc<AtomicUsize>,
@@ -626,6 +653,9 @@ pub(crate) struct StartupOut {
 /// Everything [`worker_main`] needs, assembled by `UcxTransport::start`.
 pub(crate) struct WorkerArgs {
     pub config: UcxConfig,
+    /// Leave UCX's software RMA emulation on. See "Software RMA is off" in the
+    /// module docs.
+    pub software_rma: bool,
     pub ring_rx: CommandReceiver,
     pub shared: Arc<WorkerShared>,
     pub adapter: TransportAdapter,
@@ -820,6 +850,16 @@ struct RmaOpState {
     /// handle to compare against, whereas the peer is stable and errs toward
     /// keeping an endpoint that might be in use.
     peer: InstanceId,
+    /// The incarnation of the peer the endpoint was created for. Recorded in
+    /// [`WorkerShared::no_native_get`] if UCX refuses the GET.
+    incarnation: u64,
+    /// Set when velo retires the endpoint this operation was posted on. A GET
+    /// that velo's own FORCE close cancelled is not a refusal.
+    ep_retired: Arc<AtomicBool>,
+    /// Set by `shutdown()`. Teardown cancels operations too.
+    shutdown_requested: Arc<AtomicBool>,
+    /// Where a refusal is recorded.
+    no_native_get: Arc<DashMap<InstanceId, u64>>,
     /// Region whose in-flight count this operation holds.
     region_id: u64,
     /// Identifies this operation in [`WorkerState::rma_ops`].
@@ -869,6 +909,11 @@ impl RmaOpState {
         }
         self.resolve(if status == sys::ucs_status_t_UCS_OK {
             Ok(())
+        } else if self.refused(status) {
+            // Recorded before the caller hears of it, so a caller that falls
+            // back and tries again already finds the peer marked.
+            self.no_native_get.insert(self.peer, self.incarnation);
+            Err(RmaError::NoNativeGet)
         } else {
             Err(RmaError::Ucx {
                 status_name: status_string(status),
@@ -878,6 +923,21 @@ impl RmaOpState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((self.region_id, self.op_id));
+    }
+
+    /// Whether `status` is UCX refusing the GET because no native protocol
+    /// reaches the peer.
+    ///
+    /// With software RMA off, `ucp_proto_reconfig_progress` (`proto_reconfig.c`)
+    /// aborts such a GET with `UCS_ERR_CANCELED` and leaves the endpoint up.
+    /// The only other source of `CANCELED` for a GET is a FORCE close, and
+    /// velo issues every FORCE close itself: it marks the endpoint retired, or
+    /// it is shutting down, before the close. A failed endpoint purges its
+    /// requests with the failure status, not `CANCELED` (`ucp_ep_reqs_purge`).
+    fn refused(&self, status: sys::ucs_status_t) -> bool {
+        status == sys::ucs_status_t_UCS_ERR_CANCELED
+            && !self.ep_retired.load(Ordering::Acquire)
+            && !self.shutdown_requested.load(Ordering::Acquire)
     }
 
     /// Answer the caller, at most once. Also used by teardown for operations
@@ -1326,6 +1386,9 @@ struct EpEntry {
     /// which is the only reader, so with the reaper off (the default) a send
     /// pays only two `None` checks, plus one clock read per `ucp_ep_create`.
     sends: Option<Arc<EpSends>>,
+    /// Set just before velo closes this endpoint, so a GET the close cancels
+    /// is not taken for UCX refusing it (see [`RmaOpState::refused`]).
+    retired: Arc<AtomicBool>,
 }
 
 impl EpEntry {
@@ -1384,6 +1447,9 @@ struct PreparedGet {
     /// Carried through so the posted operation can name its peer for the idle
     /// reaper's in-flight check.
     peer: InstanceId,
+    /// The endpoint's incarnation and retired flag; see [`RmaOpState`].
+    incarnation: u64,
+    ep_retired: Arc<AtomicBool>,
 }
 
 struct WorkerState {
@@ -1474,13 +1540,14 @@ const RMA_DRAIN: Duration = Duration::from_secs(1);
 pub(crate) fn worker_main(args: WorkerArgs) {
     let WorkerArgs {
         config,
+        software_rma,
         ring_rx,
         shared,
         adapter,
         startup,
     } = args;
 
-    let state = match unsafe { init_ucx(&config, &shared, &adapter) } {
+    let state = match unsafe { init_ucx(&config, software_rma, &shared, &adapter) } {
         Ok((state, out)) => {
             let _ = startup.send(Ok(out));
             state
@@ -1528,6 +1595,7 @@ fn config_value(name: &str, value: &str) -> anyhow::Result<std::ffi::CString> {
 /// All UCX object creation, in one place. Runs once, on the progress thread.
 unsafe fn init_ucx(
     config: &UcxConfig,
+    software_rma: bool,
     shared: &Arc<WorkerShared>,
     adapter: &TransportAdapter,
 ) -> anyhow::Result<(WorkerState, StartupOut)> {
@@ -1556,6 +1624,19 @@ unsafe fn init_ucx(
                 let v = std::ffi::CString::new(value).unwrap();
                 let _ = sys::ucp_config_modify(ucp_cfg, k.as_ptr(), v.as_ptr());
             }
+        }
+        // Software RMA is off: see the module docs. The environment wins here
+        // too, so `UCX_PROTO_EMULATION_ENABLE=y` turns it back on for a
+        // deployment that accepts the risk.
+        if !software_rma && std::env::var_os("UCX_PROTO_EMULATION_ENABLE").is_none() {
+            let k = std::ffi::CString::new("PROTO_EMULATION_ENABLE").unwrap();
+            let v = std::ffi::CString::new("n").unwrap();
+            let st = sys::ucp_config_modify(ucp_cfg, k.as_ptr(), v.as_ptr());
+            anyhow::ensure!(
+                st == sys::ucs_status_t_UCS_OK,
+                "ucp_config_modify(PROTO_EMULATION_ENABLE=n): {}",
+                status_string(st)
+            );
         }
         if let Some(tls) = &config.tls
             && std::env::var_os("UCX_TLS").is_none()
@@ -2223,6 +2304,7 @@ impl WorkerState {
                 incarnation: blob.incarnation,
                 last_used: self.now,
                 sends: sends.clone(),
+                retired: Arc::new(AtomicBool::new(false)),
             },
         );
         debug!("ucx: created endpoint to {peer}");
@@ -2432,6 +2514,7 @@ impl WorkerState {
         // than coming through here. Every `EpEntry` passes through exactly one
         // of them, which is what keeps `eps_open` from drifting.
         self.shared.eps_open.fetch_sub(1, Ordering::Relaxed);
+        entry.retired.store(true, Ordering::Release);
         // SAFETY: worker/ep owned by this thread; err_arg was leaked at
         // creation and UCX will not call the handler after close is issued.
         unsafe {
@@ -2740,6 +2823,13 @@ impl WorkerState {
         let (ep, _) = self
             .ensure_ep(req.peer)
             .map_err(|e| RmaError::EndpointUnavailable(e.to_string()))?;
+        let (incarnation, ep_retired) = {
+            let entry = self
+                .eps
+                .get(&req.peer)
+                .ok_or_else(|| RmaError::EndpointUnavailable("no endpoint".into()))?;
+            (entry.incarnation, Arc::clone(&entry.retired))
+        };
 
         // Two distinct over-reads, contained two different ways.
         //
@@ -2793,6 +2883,8 @@ impl WorkerState {
             len: req.len as usize,
             region_id: req.local_region,
             peer: req.peer,
+            incarnation,
+            ep_retired,
         }))
     }
 
@@ -2814,6 +2906,10 @@ impl WorkerState {
         let op = Arc::new(RmaOpState {
             rkey: Mutex::new(Some(prepared.rkey as usize)),
             peer: prepared.peer,
+            incarnation: prepared.incarnation,
+            ep_retired: prepared.ep_retired,
+            shutdown_requested: Arc::clone(&self.shared.shutdown_requested),
+            no_native_get: Arc::clone(&self.shared.no_native_get),
             region_id: prepared.region_id,
             op_id,
             reply: Mutex::new(Some(reply)),
@@ -3058,6 +3154,7 @@ impl WorkerState {
                 self.close_ep_raw(entry, true);
                 continue;
             }
+            entry.retired.store(true, Ordering::Release);
             // SAFETY: worker/ep owned by this thread.
             let ptr = unsafe {
                 let param: sys::ucp_request_param_t = MaybeUninit::zeroed().assume_init();

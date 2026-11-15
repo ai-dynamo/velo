@@ -71,3 +71,24 @@ test, not the whole test binary.
 Tests: `transports::ucx::transport::tests::shutdown_cancels_a_get_its_peer_stopped_answering`
 and `transports::ucx::transport::tests::an_owner_survives_a_puller_that_vanishes_mid_get`
 (`lib/velo/src/transports/ucx/tests.rs`).
+
+## A refused UCX GET fails like a cancelled one
+
+**Rule.** Over TCP, velo leaves UCX's software RMA off, so a GET there is
+refused. A test whose GET must run over TCP opts in with
+`UcxTransportBuilder::allow_software_rma(true)`. A test that expects a GET
+to fail must also show which failure it got, not only that it failed.
+
+**Failure.** With software RMA off and no opt-in, the UCX module had 10
+tests that failed and many that still passed. `shutdown_with_inflight_get`
+and `get_cancelled_by_endpoint_replacement` passed because the GET was
+refused at once. They no longer tested a GET in flight at all.
+
+**Test.** Build the nodes for an RMA test with the opt-in, and match the
+error variant: `RmaError::NoNativeGet` for a refusal, `RmaError::Ucx` or
+`RmaError::ShuttingDown` for a cancelled GET. The opt-in brings back the
+UCX 1.22 owner abort, so a test that shuts a puller down mid-GET runs the
+scenario in a child process, as the entry above says.
+
+Test: `transports::ucx::transport::tests::a_get_over_a_tcp_only_lane_is_refused_not_emulated`
+(`lib/velo/src/transports/ucx/tests.rs`).

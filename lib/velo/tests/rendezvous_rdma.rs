@@ -72,11 +72,24 @@ struct Node {
     registry: Registry,
 }
 
+/// A UCX transport over the tcp lane that can GET.
+///
+/// Velo leaves UCX's software RMA off, so over tcp a GET is refused (see
+/// `a_tcp_only_lane_moves_the_payload_chunked`). These tests are about the RDMA
+/// path, and CI has no RDMA hardware, so they turn it back on. The known risk:
+/// in UCX 1.22 an owner serving a software GET aborts when its puller goes away
+/// during the reply, so a test here that shuts a puller down mid-GET can abort
+/// the binary under load.
+fn ucx_with_software_get() -> UcxTransportBuilder {
+    UcxTransportBuilder::new()
+        .tls("tcp")
+        .allow_software_rma(true)
+}
+
 impl Node {
     async fn start(config: Option<RdmaConfig>) -> Self {
         let transport = Arc::new(
-            UcxTransportBuilder::new()
-                .tls("tcp")
+            ucx_with_software_get()
                 .build()
                 .expect("build ucx transport"),
         );
@@ -89,6 +102,26 @@ impl Node {
             builder = builder.rdma_config(config);
         }
         let velo = builder.build().await.expect("build velo");
+        Self { velo, registry }
+    }
+
+    /// A node on UCX's defaults for RMA: over a tcp-only lane a GET is
+    /// refused, never emulated in software.
+    async fn start_tcp_only() -> Self {
+        let transport = Arc::new(
+            UcxTransportBuilder::new()
+                .tls("tcp")
+                .build()
+                .expect("build ucx transport"),
+        );
+        let registry = Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).expect("register metrics"));
+        let velo = Velo::builder()
+            .metrics(metrics)
+            .add_ucx_transport(transport)
+            .build()
+            .await
+            .expect("build velo");
         Self { velo, registry }
     }
 
@@ -131,8 +164,7 @@ impl Node {
                 .expect("build tcp transport"),
         );
         let ucx = Arc::new(
-            UcxTransportBuilder::new()
-                .tls("tcp")
+            ucx_with_software_get()
                 .build()
                 .expect("build ucx transport"),
         );
@@ -222,6 +254,15 @@ impl Pair {
     async fn with_configs(owner: Option<RdmaConfig>, consumer: Option<RdmaConfig>) -> Self {
         let owner = Node::start(owner).await;
         let consumer = Node::start(consumer).await;
+        connect(&owner, &consumer).await;
+        Self { owner, consumer }
+    }
+
+    /// Both nodes on UCX's defaults for RMA, so no GET can run over the tcp
+    /// lane.
+    async fn tcp_only() -> Self {
+        let owner = Node::start_tcp_only().await;
+        let consumer = Node::start_tcp_only().await;
         connect(&owner, &consumer).await;
         Self { owner, consumer }
     }
@@ -403,6 +444,160 @@ async fn pinned_owner_and_offering_consumer_take_the_rdma_path() {
         "the GET duration histogram was not observed"
     );
     shutdown(pair).await;
+}
+
+/// A transfer over a tcp-only lane completes over the chunked path, with no
+/// help from the caller.
+///
+/// Over tcp UCX has no GET in hardware. It can only emulate one in software,
+/// and UCX 1.22 can abort the owner's process in that code when the puller
+/// goes away, so velo does not use it. The first GET to the owner is refused,
+/// and the consumer falls back to the chunked path by itself. The consumer
+/// then remembers the refusal for that owner and stops offering RDMA to it, so
+/// a later transfer costs only the chunked path: no descriptor, no refused
+/// GET, no fallback.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tcp_only_lane_moves_the_payload_chunked() {
+    let pair = Pair::tcp_only().await;
+    let len = 1024 * 1024 + 7;
+
+    let first = pair.owner.velo.register_data_pinned(&pattern(len)).await;
+    let (data, lease) = pair.consumer.velo.get(first).await.expect("first get");
+    assert_pattern(&data, len);
+    pair.consumer
+        .velo
+        .release(first, lease)
+        .await
+        .expect("release");
+    assert_eq!(
+        pair.consumer.path_count("ok"),
+        0,
+        "a GET ran over the tcp lane"
+    );
+    assert_eq!(
+        pair.consumer.path_count("get_failed"),
+        1,
+        "the refused GET did not fall back to the chunked path by itself"
+    );
+
+    let second = pair.owner.velo.register_data_pinned(&pattern(len)).await;
+    let (data, lease) = pair.consumer.velo.get(second).await.expect("second get");
+    assert_pattern(&data, len);
+    pair.consumer
+        .velo
+        .release(second, lease)
+        .await
+        .expect("release");
+    assert_eq!(
+        pair.consumer.path_count("no_native_get"),
+        1,
+        "the consumer offered RDMA again to an owner it cannot GET from"
+    );
+    assert_eq!(pair.consumer.path_count("get_failed"), 1);
+    assert_eq!(pair.consumer.path_count("ok"), 0);
+    assert_eq!(
+        pair.owner.path_count("ok"),
+        1,
+        "the owner answered the second acquire with a descriptor"
+    );
+    shutdown(pair).await;
+}
+
+/// Outbound frames this node's transports sent, and their bytes.
+fn outbound_frames(node: &Node) -> (u64, u64) {
+    let sum = |name: &str| -> u64 {
+        node.registry
+            .gather()
+            .iter()
+            .filter(|family| family.name() == name)
+            .flat_map(|family| family.get_metric())
+            .filter(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|pair| pair.name() == "direction" && pair.value() == "outbound")
+            })
+            .map(|metric| metric.get_counter().value() as u64)
+            .sum()
+    };
+    (
+        sum("velo_transport_frames_total"),
+        sum("velo_transport_frame_bytes_total"),
+    )
+}
+
+/// What one transfer costs in velo frames, on the RDMA path over tcp (software
+/// GET on) and on the chunked path a tcp-only lane takes now.
+///
+/// Counts, not timing. Each pair first moves one payload so the endpoints and
+/// the consumer's refusal record are in place; the second transfer is the one
+/// counted. The UCX messages of a software GET are not velo frames, so they
+/// are not in these counts; the book's limitations derive them.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cost_of_a_transfer_over_a_tcp_only_lane() {
+    let len = 1024 * 1024 + 7;
+
+    async fn counted(pair: &Pair, len: usize) -> ((u64, u64), (u64, u64)) {
+        let warm = pair.owner.velo.register_data_pinned(&pattern(len)).await;
+        let (_, lease) = pair.consumer.velo.get(warm).await.expect("warm-up get");
+        pair.consumer
+            .velo
+            .release(warm, lease)
+            .await
+            .expect("release");
+
+        let handle = pair.owner.velo.register_data_pinned(&pattern(len)).await;
+        let (c0, o0) = (
+            outbound_frames(&pair.consumer),
+            outbound_frames(&pair.owner),
+        );
+        let (data, lease) = pair.consumer.velo.get(handle).await.expect("get");
+        assert_pattern(&data, len);
+        let (c1, o1) = (
+            outbound_frames(&pair.consumer),
+            outbound_frames(&pair.owner),
+        );
+        pair.consumer
+            .velo
+            .release(handle, lease)
+            .await
+            .expect("release");
+        ((c1.0 - c0.0, c1.1 - c0.1), (o1.0 - o0.0, o1.1 - o0.1))
+    }
+
+    let rdma = Pair::new().await;
+    let (rdma_consumer, rdma_owner) = counted(&rdma, len).await;
+    assert_eq!(rdma.consumer.path_count("ok"), 2, "the GET did not run");
+    shutdown(rdma).await;
+
+    let chunked = Pair::tcp_only().await;
+    let (chunked_consumer, chunked_owner) = counted(&chunked, len).await;
+    assert_eq!(chunked.consumer.path_count("no_native_get"), 1);
+    shutdown(chunked).await;
+
+    println!(
+        "software GET: consumer sent {} frames ({} B), owner sent {} frames ({} B)",
+        rdma_consumer.0, rdma_consumer.1, rdma_owner.0, rdma_owner.1
+    );
+    println!(
+        "chunked:      consumer sent {} frames ({} B), owner sent {} frames ({} B)",
+        chunked_consumer.0, chunked_consumer.1, chunked_owner.0, chunked_owner.1
+    );
+    // The acquire and its answer; the payload rides the GET.
+    assert_eq!((rdma_consumer.0, rdma_owner.0), (1, 1));
+    // The acquire and its answer, then one pull and its 512 KiB answer per
+    // chunk: three chunks for 1 MiB + 7 B.
+    let chunks = len.div_ceil(512 * 1024) as u64;
+    assert_eq!(chunks, 3);
+    assert_eq!(
+        (chunked_consumer.0, chunked_owner.0),
+        (1 + chunks, 1 + chunks)
+    );
+    assert!(
+        chunked_owner.1 >= len as u64,
+        "the payload rides the owner's frames"
+    );
+    assert!(rdma_owner.1 < 1024, "the payload rode a velo frame");
 }
 
 // ---------------------------------------------------------------------------
