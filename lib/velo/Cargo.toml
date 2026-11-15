@@ -28,8 +28,9 @@ zmq = ["dep:zmq"]
 # default feature is on — CI without RDMA packages exercises it over UCX_TLS=tcp,
 # but building still needs libibverbs-dev/librdmacm-dev headers).
 ucx = ["dep:ucx-rs", "dep:serde_bytes", "dep:offset-allocator"]
-# QUIC messenger transport (quinn, TLS 1.3 with a pinned self-signed certificate).
-quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:ring"]
+# QUIC messenger transport (quinn, TLS 1.3 with a pinned self-signed certificate,
+# or certificates from a private CA).
+quic = ["dep:quinn", "dep:rustls", "dep:rcgen", "dep:ring", "dep:webpki"]
 
 # Discovery backends
 nats-discovery = ["services", "dep:async-nats"]
@@ -102,9 +103,12 @@ loom-rs = { version = "0.5.0", features = ["sim"], optional = true }
 # quinn-proto 0.11.18, whose stream assembler no longer fails ordered,
 # lossless streams with "too many gaps in stream buffer" (quinn-rs/quinn#2826).
 quinn = { version = "0.11.12", optional = true, default-features = false, features = ["runtime-tokio", "rustls-ring", "log"] }
-rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
+rustls = { version = "0.23.23", optional = true, default-features = false, features = ["ring", "std"] }
 rcgen = { version = "0.14", optional = true, default-features = false, features = ["crypto", "ring"] }
 ring = { version = "0.17", optional = true }
+# Reads the URI SANs of a verified QUIC peer certificate (feature `quic`).
+# 0.103.8 is the first release with `valid_uri_names`.
+webpki = { package = "rustls-webpki", version = "0.103.8", optional = true, default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.31.2", features = ["sched", "net"] }

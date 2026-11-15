@@ -37,10 +37,13 @@ struct Node {
 
 impl Node {
     async fn new(lanes: u16) -> Self {
+        Self::with_builder(QuicTransportBuilder::new().lanes(lanes)).await
+    }
+
+    async fn with_builder(builder: QuicTransportBuilder) -> Self {
         let quic = Arc::new(
-            QuicTransportBuilder::new()
+            builder
                 .bind_addr("127.0.0.1:0".parse().expect("loopback"))
-                .lanes(lanes)
                 .build()
                 .expect("quic transport"),
         );
@@ -202,6 +205,71 @@ async fn a_stream_on_lane_three_rides_lane_three_both_ways() {
             .quic
             .has_lane_connection(producer.velo.instance_id(), LANE),
         "the consumer's credit must travel on its QUIC lane 3"
+    );
+}
+
+/// Positive control for authenticated QUIC: a connection that begins with
+/// mux traffic. The stream rides lane 3, so the producer's lane 3
+/// connection carries `_stream_batch` frames first, and the consumer's lane 3
+/// connection carries credit first; neither goes through the messenger's
+/// `_hello`. Each node's authorizer sees and accepts the lane 3 connection it
+/// dialed, before the stream's first frame.
+#[tokio::test(flavor = "multi_thread")]
+async fn authenticated_lane_three_connections_begin_with_mux_traffic() {
+    use crate::transports::quic::auth::test_ca::Ca;
+    use crate::transports::quic::{ConnectionOrigin, PeerIdentity};
+
+    let ca = Ca::new();
+    let dialed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let node = |uri: &'static str| {
+        let dialed = Arc::clone(&dialed);
+        let tls = ca
+            .tls(uri)
+            .authorizer(move |peer: &PeerIdentity, origin: &ConnectionOrigin| {
+                if let ConnectionOrigin::Dialed { lane, .. } = origin {
+                    dialed.lock().push((uri, *lane, peer.uris().to_vec()));
+                }
+                peer.uris().iter().any(|uri| uri.starts_with("spiffe://d/"))
+            });
+        Node::with_builder(QuicTransportBuilder::new().lanes(4).tls(tls))
+    };
+    let consumer = node("spiffe://d/consumer/c1").await;
+    let producer = node("spiffe://d/producer/c2").await;
+    connect(&consumer, &producer).await;
+    let before = dialed
+        .lock()
+        .iter()
+        .filter(|(_, lane, _)| *lane == LANE)
+        .count();
+    assert_eq!(before, 0, "nothing dialed lane 3 before the stream");
+
+    let anchor = consumer.velo.create_anchor::<u32>();
+    let sender = producer
+        .velo
+        .attach_anchor_keyed::<u32>(transfer(anchor.handle()), key_for(LANE, 4))
+        .await
+        .expect("remote attach");
+    stream_through(sender, anchor).await;
+
+    let on_lane: Vec<_> = dialed
+        .lock()
+        .iter()
+        .filter(|(_, lane, _)| *lane == LANE)
+        .cloned()
+        .collect();
+    assert!(
+        on_lane
+            .iter()
+            .any(|(by, _, peer)| *by == "spiffe://d/producer/c2"
+                && peer == &vec!["spiffe://d/consumer/c1".to_string()]),
+        "the producer authorized its lane 3 dial: {on_lane:?}"
+    );
+    assert!(
+        on_lane
+            .iter()
+            .any(|(by, _, peer)| *by == "spiffe://d/consumer/c1"
+                && peer == &vec!["spiffe://d/producer/c2".to_string()]),
+        "the consumer authorized its lane 3 dial: {on_lane:?}"
     );
 }
 
