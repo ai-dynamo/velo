@@ -597,16 +597,16 @@ impl ResponseManagerInner {
         // else: permit drops at end of scope, returning one permit to the
         // semaphore alongside the arena's free-list push.
 
-        let pending = self.pending.fetch_sub(1, Ordering::Release) - 1;
+        self.pending.fetch_sub(1, Ordering::Release);
         if let Some(metrics) = self.observability.as_ref() {
-            metrics.set_pending_responses(pending);
+            metrics.dec_pending_responses();
         }
     }
 
     fn mark_pending(&self) {
-        let pending = self.pending.fetch_add(1, Ordering::AcqRel) + 1;
+        self.pending.fetch_add(1, Ordering::AcqRel);
         if let Some(metrics) = self.observability.as_ref() {
-            metrics.set_pending_responses(pending);
+            metrics.inc_pending_responses();
         }
     }
 

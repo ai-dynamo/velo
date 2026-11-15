@@ -3050,34 +3050,66 @@ async fn reaping_disrupts_the_peers_path_back() {
     assert_rma_balanced(&b);
 }
 
+/// Holds a node's progress thread at the top of its pass until dropped.
+///
+/// Released on drop, so a failed assertion does not leave the thread held and
+/// its node's shutdown hung.
+struct ProgressHold<'a>(&'a Node);
+
+impl<'a> ProgressHold<'a> {
+    async fn new(node: &'a Node) -> Self {
+        let shared = &node.transport.shared;
+        shared.progress_hold.store(true, Ordering::Release);
+        let hold = Self(node);
+        assert!(
+            wait_until(T, || shared.progress_held.load(Ordering::Acquire)).await,
+            "the progress thread never stopped at the hold"
+        );
+        hold
+    }
+}
+
+impl Drop for ProgressHold<'_> {
+    fn drop(&mut self) {
+        self.0
+            .transport
+            .shared
+            .progress_hold
+            .store(false, Ordering::Release);
+    }
+}
+
 /// The in-flight exclusion, isolated: an endpoint old enough to reap is spared
 /// purely because [`WorkerState::rma_ops`] still names its peer.
 ///
-/// Three deliberate choices make this neither vacuous nor flaky.
+/// Four deliberate choices make this neither vacuous nor flaky.
 ///
 /// *Two peers.* The idle one **is** reaped, which is what proves a scan ran past
 /// the timeout while the GETs were still outstanding; the busy one is not, and
 /// exactly one close between the two is the whole claim. A single-peer version
 /// would pass trivially whenever the transfer happened to finish first.
 ///
-/// *A sub-floor timeout, set on the config directly.* The reaper has to act
-/// faster than a 64 MiB transfer over the tcp lane, while the builder's floor
-/// is sized for the opposite concern — dominating endpoint wireup, so that
-/// endpoints do not close between ordinary uses and re-pay wireup each time,
-/// while the peer loses its Messages and pings to us until keepalive fails its
-/// endpoint. Going under it isolates the exclusion from transfer timing, which
-/// is what is under test. Nothing here sends an Active Message, and the idle
-/// peer's close is the point of the test, so those costs do not apply.
+/// *The owner's progress thread is held.* Over the tcp lane a GET needs the
+/// owner's progress thread, so while `progress_hold` is set no GET can finish.
+/// The test holds it from before the GETs are posted until the idle peer is
+/// reaped, so the GETs are outstanding at that scan by construction. Timing
+/// cannot make this certain: a transfer sized to outlast the idle window
+/// finished inside it about 1 run in 125 with 16 copies of the test running at
+/// once. The regions are mapped first, because a map is a command the owner's
+/// progress thread answers.
+///
+/// *A sub-floor timeout, set on the config directly.* The builder's floor is
+/// sized to dominate endpoint wireup, so that endpoints do not close between
+/// ordinary uses and re-pay wireup each time, while the peer loses its Messages
+/// and pings to us until keepalive fails its endpoint. Nothing here sends an
+/// Active Message, and the idle peer's close is the point of the test, so those
+/// costs do not apply, and a short timeout keeps the test short.
 ///
 /// *Eager wireup, no frames.* Both endpoints are established by registration
 /// alone, so neither depends on an AM completing.
-///
-/// The two loads are ordered closed-then-inflight on purpose: nothing posts more
-/// operations after the spawn, so `inflight > 0` now implies it was `> 0` when
-/// the close count was read.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_endpoint_with_an_inflight_get_is_not_reaped() {
-    const CHUNK: usize = 8 * 1024 * 1024;
+    const CHUNK: usize = 64 * 1024;
     const CHUNKS: usize = 8;
     const LEN: usize = CHUNK * CHUNKS;
     let mut src = PageBuf::new(LEN);
@@ -3107,6 +3139,8 @@ async fn an_endpoint_with_an_inflight_get_is_not_reaped() {
         .await
         .expect("map dst");
 
+    let hold = ProgressHold::new(&owner).await;
+
     let mut gets = Vec::with_capacity(CHUNKS);
     for i in 0..CHUNKS {
         let endpoint = puller_rma.clone();
@@ -3120,11 +3154,9 @@ async fn an_endpoint_with_an_inflight_get_is_not_reaped() {
         };
         gets.push(tokio::spawn(async move { endpoint.get(req).await }));
     }
+    let inflight = || puller.transport.shared.inflight_ops.load(Ordering::SeqCst);
     assert!(
-        wait_until(T, || {
-            puller.transport.shared.inflight_ops.load(Ordering::SeqCst) >= CHUNKS
-        })
-        .await,
+        wait_until(T, || inflight() >= CHUNKS).await,
         "all {CHUNKS} GETs must be posted before the idle peer is introduced"
     );
 
@@ -3132,34 +3164,25 @@ async fn an_endpoint_with_an_inflight_get_is_not_reaped() {
     // may already have been reaped (and recreated by the GETs) while the regions
     // above were being mapped.
     let baseline = eps_closed_idle(&puller);
-    // Introduced only now, so its idle window runs entirely inside the transfer.
+    // Introduced only now, so its idle window runs entirely inside the hold.
     cross_register(&puller, &idle_peer);
 
-    let observed = Arc::new(AtomicUsize::new(usize::MAX));
-    let seen = {
-        let observed = Arc::clone(&observed);
-        wait_until(T, || {
-            let closed = eps_closed_idle(&puller);
-            let inflight = puller.transport.shared.inflight_ops.load(Ordering::SeqCst);
-            if closed > baseline && inflight > 0 {
-                observed.store((closed - baseline) as usize, Ordering::SeqCst);
-                true
-            } else {
-                false
-            }
-        })
-        .await
-    };
     assert!(
-        seen,
-        "no scan closed the idle endpoint while the GETs were still outstanding; \
-         64 MiB over the tcp lane finished faster than a 10 ms idle window"
+        wait_until(T, || eps_closed_idle(&puller) > baseline).await,
+        "no scan closed the idle endpoint"
+    );
+    let closed = eps_closed_idle(&puller) - baseline;
+    assert_eq!(
+        inflight(),
+        CHUNKS,
+        "a GET finished while the owner's progress thread was held, so the hold \
+         does not keep a GET in flight and this test proves nothing"
     );
     assert_eq!(
-        observed.load(Ordering::SeqCst),
-        1,
+        closed, 1,
         "the endpoint carrying the in-flight GETs was reaped too"
     );
+    drop(hold);
 
     // The backstop for the same property, and the one that would fail loudly if
     // the exclusion were removed: a reaped endpoint cancels its operations.

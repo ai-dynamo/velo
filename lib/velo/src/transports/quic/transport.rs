@@ -50,6 +50,40 @@ const CLOSE_WAIT: Duration = FINISH_GRACE.saturating_mul(2);
 /// writers that were still blocked to report their frames as failed.
 const FAIL_REPORT_GRACE: Duration = Duration::from_millis(500);
 
+/// The two shutdown waits, FINISH_GRACE and CLOSE_WAIT, as one transport uses
+/// them. Only a test changes them (`QuicTransportBuilder::close_grace`), so
+/// that a test of what shutdown waits for does not fail on a slow host.
+#[derive(Clone, Copy, Debug)]
+struct CloseGrace {
+    /// FINISH_GRACE unless a test set it.
+    finish: Duration,
+    /// CLOSE_WAIT unless a test set it.
+    close: Duration,
+}
+
+impl CloseGrace {
+    const DEFAULT: Self = Self {
+        finish: FINISH_GRACE,
+        close: CLOSE_WAIT,
+    };
+
+    /// `finish`, and twice that for the close wait, as the defaults are.
+    #[cfg(test)]
+    fn with_finish(finish: Duration) -> Self {
+        Self {
+            finish,
+            close: finish.saturating_mul(2),
+        }
+    }
+}
+
+/// Test seam: every connection a transport dials, when a test asked for them
+/// with `QuicTransportBuilder::record_dialed`. The test reads their quinn
+/// statistics. Off by default, because a held `quinn::Connection` keeps its
+/// connection alive.
+#[cfg(test)]
+pub(crate) type DialedConnections = Arc<parking_lot::Mutex<Vec<quinn::Connection>>>;
+
 mod builder;
 pub use builder::QuicTransportBuilder;
 
@@ -112,6 +146,9 @@ pub struct QuicTransport {
 
     metrics: OnceLock<Arc<dyn velo_ext::TransportObservability>>,
     dialed_ctx: OnceLock<DialedReaderContext>,
+    close_grace: CloseGrace,
+    #[cfg(test)]
+    dialed: Option<DialedConnections>,
 }
 
 /// A registered peer: where to dial, and the TLS config that pins its
@@ -281,6 +318,9 @@ impl QuicTransport {
                     connect_timeout: self.connect_timeout,
                     reader_ctx: self.dialed_ctx.get().cloned(),
                     metrics: self.metrics.get().cloned(),
+                    close_grace: self.close_grace,
+                    #[cfg(test)]
+                    dialed: self.dialed.clone(),
                 },
             ),
             rt,
@@ -565,8 +605,9 @@ impl Transport for QuicTransport {
             match self.runtime.get() {
                 Some(rt) => {
                     let endpoint = endpoint.clone();
+                    let close_wait = self.close_grace.close;
                     rt.spawn(async move {
-                        let _ = tokio::time::timeout(CLOSE_WAIT, endpoint.wait_idle()).await;
+                        let _ = tokio::time::timeout(close_wait, endpoint.wait_idle()).await;
                         endpoint.close(quinn::VarInt::from_u32(0), b"shutdown");
                     });
                 }
@@ -587,7 +628,7 @@ impl Transport for QuicTransport {
             if !self.cancel_token.is_cancelled() {
                 return;
             }
-            let _ = tokio::time::timeout(CLOSE_WAIT, async {
+            let _ = tokio::time::timeout(self.close_grace.close, async {
                 self.writers.wait().await;
                 for endpoint in self.client_endpoints.get().into_iter().flatten() {
                     endpoint.wait_idle().await;
@@ -691,6 +732,9 @@ struct WriterTaskContext {
     connect_timeout: Duration,
     reader_ctx: Option<DialedReaderContext>,
     metrics: Option<Arc<dyn velo_ext::TransportObservability>>,
+    close_grace: CloseGrace,
+    #[cfg(test)]
+    dialed: Option<DialedConnections>,
 }
 
 /// Dial, then write frames until the channel closes, a write fails, or the
@@ -747,6 +791,9 @@ async fn connection_writer_inner(
         connect_timeout,
         reader_ctx,
         metrics,
+        close_grace,
+        #[cfg(test)]
+        dialed,
         ..
     } = ctx;
 
@@ -759,6 +806,10 @@ async fn connection_writer_inner(
             res.context("connect timeout")?.context("QUIC handshake failed")?
         },
     };
+    #[cfg(test)]
+    if let Some(dialed) = &dialed {
+        dialed.lock().push(connection.clone());
+    }
     let (mut send, recv) = connection
         .open_bi()
         .await
@@ -814,19 +865,23 @@ async fn connection_writer_inner(
         Some(quinn::ConnectionError::ApplicationClosed(reason)) => {
             debug!("QUIC connection to {peer_name} closed by peer: {reason}");
         }
-        Some(quinn::ConnectionError::LocallyClosed) => {
-            loss(format!("closed by force at shutdown, after {CLOSE_WAIT:?}"))
-        }
+        Some(quinn::ConnectionError::LocallyClosed) => loss(format!(
+            "closed by force at shutdown, after {:?}",
+            close_grace.close
+        )),
         Some(reason) => loss(format!("connection ended: {reason}")),
         None if send.finish().is_ok() => {
-            match tokio::time::timeout(FINISH_GRACE, send.stopped()).await {
+            match tokio::time::timeout(close_grace.finish, send.stopped()).await {
                 Ok(Ok(None)) => {}
                 Ok(Err(quinn::StoppedError::ConnectionLost(
                     quinn::ConnectionError::ApplicationClosed(reason),
                 ))) => {
                     debug!("QUIC connection to {peer_name} closed by peer: {reason}");
                 }
-                Err(_) => loss(format!("no acknowledgement within {FINISH_GRACE:?}")),
+                Err(_) => loss(format!(
+                    "no acknowledgement within {:?}",
+                    close_grace.finish
+                )),
                 Ok(outcome) => loss(format!("{outcome:?}")),
             }
         }
