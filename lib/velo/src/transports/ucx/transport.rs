@@ -998,9 +998,11 @@ impl UcxTransportBuilder {
     /// be usable together: eager wireup amortises the connection cost away from
     /// the first transfer, and the reaper reclaims it again if the peer turns
     /// out never to be used. An eagerly established endpoint's idle clock starts
-    /// when `ucp_ep_create` returns, so with both on, a registered-but-never-used
-    /// peer is wired up once and closed about one timeout (see the close window
-    /// in [`ep_idle_timeout`](Self::ep_idle_timeout)) after that call returned.
+    /// when `ucp_ep_create` returns, but a peer that is never used never sends
+    /// to us, so its endpoint stays in setup for the 5 s setup bound. With both
+    /// on, such a peer is wired up once and closed about one setup bound, or
+    /// one timeout if that is longer (see the close window in
+    /// [`ep_idle_timeout`](Self::ep_idle_timeout)), after that call returned.
     /// The UCX wireup itself finishes later, in the background. That is the
     /// intended behaviour, not a conflict.
     pub fn eager_endpoints(mut self, eager: bool) -> Self {
