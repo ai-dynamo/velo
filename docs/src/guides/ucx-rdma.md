@@ -158,10 +158,10 @@ The current version is 2, from velo 0.15.0. Version 2 starts every frame header 
 
 The example stages 8 MiB on an owner and pulls it on a consumer, with a TCP control plane and UCX beside it. The consumer exits non-zero if the transfer did not take the RDMA path.
 
-On one host, over TCP:
+On one host, over TCP, with UCX's software GET turned back on (velo leaves it off, see [No RDMA rendezvous over a TCP-only lane](../appendix/limitations.md#no-rdma-rendezvous-over-a-tcp-only-lane)):
 
 ```bash
-UCX_TLS=tcp cargo run --manifest-path examples/Cargo.toml --release --features ucx --example rendezvous_rdma_two_proc
+UCX_TLS=tcp UCX_PROTO_EMULATION_ENABLE=y cargo run --manifest-path examples/Cargo.toml --release --features ucx --example rendezvous_rdma_two_proc
 ```
 
 With no `--role`, the example starts both roles as child processes.
@@ -187,7 +187,7 @@ On two nodes:
 
 Use `--size <bytes>` to change the payload. The two processes find each other through JSON files in `--dir`. On NFS, negative-dentry caching can delay that exchange by about 30 s. That delay is not a velo latency.
 
-CI runs the single-host form with `UCX_TLS=tcp` on every pull request.
+CI runs the single-host form with `UCX_TLS=tcp` and `UCX_PROTO_EMULATION_ENABLE=y` on every pull request.
 
 ## Run the tests
 
@@ -240,6 +240,8 @@ timeout 300 cargo test -p velo --features ucx,test-helpers --lib transports::ucx
 | `budget` | The registered-bytes budget is spent. | Raise `RdmaPoolConfig::registered_bytes_budget`, or set `arena_reclaim_after`. |
 | `ibv_reg_mr` fails at 32 MiB | The memlock limit is 8 MiB. | Set `ulimit -l unlimited`, or grant `IPC_LOCK` in a container. |
 | Process abort: `rc_verbs_impl.h:104 Fatal: receive completion ... with error` | A GET used an unusable or stale rkey on InfiniBand. | Report it. The single-use rkey rule was broken, or the TCP-only test above ran on InfiniBand. |
+| Process abort on the owner, over TCP: `ucp_request.inl:356 Fatal: unexpected error: Endpoint timeout`, or `stubs.c:107 Assertion '0' failed` | A puller with software RMA on went away (shut down or crashed) in the middle of a GET. UCX 1.22 aborts while it sends the reply, or while it discards the endpoint that still holds replies. | Find the puller that sets `UCX_PROTO_EMULATION_ENABLE=y`, or that runs an older velo, and turn the emulation off. See [A puller that goes away can abort the owner over TCP](../development/rdma-design.md#a-puller-that-goes-away-can-abort-the-owner-over-tcp). |
+| `UCX ERROR No zero-copy protocol found for get into host from host`, and the consumer reports `get_failed`, then `no_native_get` | UCX has no native GET to that owner, as over a TCP-only lane. Velo does not use UCX's software GET. | None, if the lane is TCP. Otherwise check the lane, as in [Verify the lane](#verify-the-lane). See [No RDMA rendezvous over a TCP-only lane](../appendix/limitations.md#no-rdma-rendezvous-over-a-tcp-only-lane). |
 | `ucp_ep.c:2222 UCX ERROR ep ... has already been closed` at teardown on InfiniBand | A double close during teardown. Assertions still pass. | None. This is known log noise. |
 | `register()` returns `InvalidEndpoint`, with the warning `ucx: rejecting peer blob: unsupported ucx blob version` | The peer runs a velo with a different UCX wire version. | Upgrade all UCX peers together. See [Version compatibility](#version-compatibility). |
 | `tcp_ep ... recv(-1) failed: Input/output error` on a peer | The endpoint idle reaper closed an endpoint. | None, if `ep_idle_timeout` is on. The node that logged this loses its Messages to the node that closed the endpoint, and, inferred, its pings, until keepalive fails its endpoint (about 20 s). See [Endpoint idle reaper](../concepts/rendezvous.md#endpoint-idle-reaper). |

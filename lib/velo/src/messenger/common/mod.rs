@@ -6,6 +6,8 @@
 pub(crate) mod events;
 pub(crate) mod message_id;
 pub(crate) mod messages;
+#[cfg(test)]
+mod pending_gauge_tests;
 pub(crate) mod responses;
 
 pub(crate) use messages::{ActiveMessage, MessageMetadata};

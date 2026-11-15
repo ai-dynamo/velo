@@ -220,6 +220,16 @@ pub(crate) trait RdmaBackend: Send + Sync {
     fn live_registrations(&self) -> Option<usize> {
         None
     }
+
+    /// Whether a GET to `peer` is known to be refused, so the consumer should
+    /// not offer this backend for a transfer from it.
+    ///
+    /// A hint, not a guarantee in either direction: `false` means "not known
+    /// to be refused", and a GET that is refused anyway falls back to the
+    /// chunked path. The default knows of no refusal.
+    fn refuses_get(&self, _peer: InstanceId) -> bool {
+        false
+    }
 }
 
 /// [`RdmaBackend`] over the UCX transport's Phase-1 RMA plumbing.
@@ -277,6 +287,12 @@ impl RdmaBackend for UcxBackend {
     /// for a handle UCX itself issued; a UCX bump has to re-check that.
     fn live_registrations(&self) -> Option<usize> {
         Some(self.endpoint.live_regions())
+    }
+
+    /// True once UCX refused a GET to the peer's current incarnation for want
+    /// of a native protocol: a tcp-only lane, with software RMA off.
+    fn refuses_get(&self, peer: InstanceId) -> bool {
+        self.endpoint.refuses_get(peer)
     }
 
     fn get(&self, req: BackendGet) -> BoxFuture<'_, Result<(), RdmaError>> {
