@@ -341,15 +341,31 @@ impl DataStore {
 
     /// A store that emits into `metrics`.
     pub(crate) fn with_metrics(metrics: Option<Arc<VeloMetrics>>) -> Self {
-        Self {
-            metrics,
-            ..Self::new()
-        }
+        let mut store = Self::new();
+        store.metrics = metrics;
+        store
     }
 
     /// The metrics handle, if this instance was built with one.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub(crate) fn metrics(&self) -> Option<&Arc<VeloMetrics>> {
         self.metrics.as_ref()
+    }
+
+    /// Take one from `velo_rendezvous_active_slots`.
+    ///
+    /// Called by each call here that removes a slot, so every path that frees
+    /// one moves the gauge: the owner's call, local and remote detach and
+    /// release, a `LeaseGuard` drop, and the reapers. A caller that refreshed
+    /// it after its own free missed the frees it did not know it caused.
+    ///
+    /// A step of one, not the slot count: a count read after a free can be
+    /// older than another thread's, and set last. Only the call whose remove
+    /// returned the slot gets here, so each slot is counted out once.
+    fn note_slot_removed(&self) {
+        if let Some(m) = &self.metrics {
+            m.dec_rendezvous_active_slots();
+        }
     }
 
     /// Bind the RDMA registry and policy. Called once, from
@@ -386,6 +402,11 @@ impl DataStore {
         let local_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let total_len = body.total_len();
         let ttl = opts.as_ref().and_then(|o| o.ttl);
+        // Counted in before the insert, so that a free on another thread
+        // cannot count the slot out first and leave the gauge below 0.
+        if let Some(m) = &self.metrics {
+            m.inc_rendezvous_active_slots();
+        }
         self.slots.insert(
             local_id,
             DataSlot {
@@ -728,6 +749,7 @@ impl DataStore {
         if slot.ttl.is_some() {
             self.expiring.remove(&local_id);
         }
+        self.note_slot_removed();
         slot.body.to_bytes()
     }
 
@@ -738,11 +760,13 @@ impl DataStore {
             slot.refcount.load(Ordering::Relaxed) == 0
                 && slot.read_lock_count.load(Ordering::Relaxed) == 0
         });
-        if let Some((_, slot)) = freed
-            && slot.ttl.is_some()
-        {
+        let Some((_, slot)) = freed else {
+            return;
+        };
+        if slot.ttl.is_some() {
             self.expiring.remove(&local_id);
         }
+        self.note_slot_removed();
     }
 
     /// Get the data bytes for a slot (for inline responses or local fast-path).
@@ -890,6 +914,7 @@ impl DataStore {
                 // to preserve and nothing an in-flight pull could have read.
                 Some(None) => {
                     if self.slots.remove(&local_id).is_some() {
+                        self.note_slot_removed();
                         dropped += 1;
                     }
                 }
@@ -944,6 +969,7 @@ impl DataStore {
         if self.slots.remove(&local_id).is_none() {
             return false;
         }
+        self.note_slot_removed();
         let mut ended = Vec::new();
         self.active_leases.retain(|lease_id, held| {
             if *held == local_id {
@@ -1040,9 +1066,6 @@ async fn sweep_while_pending(store: Weak<DataStore>, stop: tokio_util::sync::Can
                 slots,
                 "rendezvous: ended staged payloads past their deadline"
             );
-            if let Some(m) = store.metrics() {
-                m.set_rendezvous_active_slots(store.slots.len());
-            }
         }
         if store.has_pending_expiry() {
             continue;
@@ -1064,6 +1087,17 @@ async fn sweep_while_pending(store: Weak<DataStore>, stop: tokio_util::sync::Can
 impl Default for DataStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for DataStore {
+    /// Count the slots still staged out of the gauge, which counts by steps
+    /// of one: a node rebuilt on the same metrics would start from them.
+    /// `&mut self` means no other call can change the slots now.
+    fn drop(&mut self) {
+        if let Some(m) = &self.metrics {
+            m.sub_rendezvous_active_slots(self.slots.len());
+        }
     }
 }
 
