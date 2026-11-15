@@ -163,6 +163,61 @@ fn software_rma(builder: UcxTransportBuilder) -> UcxTransportBuilder {
     builder.allow_software_rma(true)
 }
 
+/// An explicit disable still needs the warning when UCX ignores the switch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "F6: UCX_PROTO_EMULATION_ENABLE=n suppresses the warning on UCX older than 1.22"]
+async fn an_explicit_software_rma_disable_keeps_the_ucx_version_warning() {
+    const CHILD: &str = "VELO_UCX_VERSION_WARNING_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(std::io::stderr)
+            .init();
+        for _ in 0..2 {
+            let node = start_node().await;
+            node.transport.shutdown();
+        }
+        return;
+    }
+
+    let (mut major, mut minor, mut release) = (0, 0, 0);
+    // SAFETY: UCX writes its version into these three valid output pointers.
+    unsafe { ucx_rs::sys::ucp_get_version(&mut major, &mut minor, &mut release) };
+    let expected = usize::from((major, minor) < (1, 22));
+    let warning = format!("UCX {major}.{minor}.{release} ignores PROTO_EMULATION_ENABLE=n");
+    for explicit in [false, true] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "transports::ucx::transport::tests::an_explicit_software_rma_disable_keeps_the_ucx_version_warning",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("UCX_TLS", "tcp")
+            .env_remove("UCX_PROTO_EMULATION_ENABLE");
+        if explicit {
+            child.env("UCX_PROTO_EMULATION_ENABLE", "n");
+        }
+        let output = child.output().expect("run the warning check in isolation");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "warning check child failed: {}\n{stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            stderr.matches(&warning).count(),
+            expected,
+            "UCX {major}.{minor}.{release}: expected one warning across two starts on UCX older than 1.22, whether the disable is explicit or default; explicit={explicit}\n{stderr}"
+        );
+    }
+}
+
 /// A node built from a [`UcxConfig`] directly, bypassing the builder.
 ///
 /// The one thing this can do that [`start_node_with`] cannot is set an idle
