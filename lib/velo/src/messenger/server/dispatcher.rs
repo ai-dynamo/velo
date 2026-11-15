@@ -722,13 +722,15 @@ mod tests {
         );
         let registry = prometheus::Registry::new();
         let metrics = Arc::new(crate::observability::VeloMetrics::register(&registry).unwrap());
-        let messenger = Messenger::builder()
+        let messenger = crate::messenger::MessengerParts::new()
             .add_transport(transport)
             .metrics(metrics)
             .build()
             .await
             .unwrap();
-        messenger.register_peer(messenger.peer_info()).unwrap();
+        messenger
+            .register_peer_inner(messenger.peer_info())
+            .unwrap();
         // The panic arm reads the metrics from the backend, not the Messenger;
         // a backend built without them would drop these counts silently.
         let panics = |reason| {
@@ -767,7 +769,7 @@ mod tests {
         assert_eq!(panics("handler_panic"), 2.0);
         assert_eq!(panics("ordered_handler_panic"), 2.0);
         messenger
-            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+            .graceful_shutdown_inner(crate::ShutdownPolicy::WaitForever)
             .await;
         messenger.closed().await;
     }
@@ -791,7 +793,10 @@ mod tests {
     /// drops its context and then waits forever, as such a reply does.
     #[tokio::test]
     async fn a_handler_task_does_not_hold_the_messenger() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = crate::messenger::MessengerParts::new()
+            .build()
+            .await
+            .unwrap();
         let weak = Arc::downgrade(&messenger);
         let ctx = HandlerContext {
             message_id: ResponseId::from_u128(1),
@@ -823,7 +828,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn shedding_fire_and_forget_spawns_no_reply_task() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let messenger = Messenger::builder()
+        let messenger = crate::messenger::MessengerParts::new()
             .add_transport(Arc::new(
                 TcpTransportBuilder::new()
                     .from_listener(listener)

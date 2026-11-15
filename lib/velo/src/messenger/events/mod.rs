@@ -273,7 +273,7 @@ impl VeloEvents {
         let instance_id = peer_info.instance_id();
 
         // Auto-register discovered peer for future fast-path lookups
-        self.messenger()?.register_peer(peer_info)?;
+        self.messenger()?.register_peer_inner(peer_info)?;
 
         Ok(instance_id)
     }
@@ -1193,12 +1193,12 @@ mod tests {
     }
 
     async fn make_pair() -> (Arc<Messenger>, Arc<Messenger>) {
-        let a = Messenger::builder()
+        let a = crate::messenger::MessengerParts::new()
             .add_transport(new_transport())
             .build()
             .await
             .unwrap();
-        let b = Messenger::builder()
+        let b = crate::messenger::MessengerParts::new()
             .add_transport(new_transport())
             .build()
             .await
@@ -1206,8 +1206,8 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        a.register_peer(b.peer_info()).unwrap();
-        b.register_peer(a.peer_info()).unwrap();
+        a.register_peer_inner(b.peer_info()).unwrap();
+        b.register_peer_inner(a.peer_info()).unwrap();
 
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -1236,24 +1236,27 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_fails_remote_waiters_and_preserves_local_events() {
-        let owner = Messenger::builder()
+        let owner = crate::messenger::MessengerParts::new()
             .add_transport(new_transport())
             .build()
             .await
             .unwrap();
-        let subscriber = Messenger::builder()
+        let subscriber = crate::messenger::MessengerParts::new()
             .add_transport(new_transport())
             .discovery(Arc::new(PendingDiscovery(tokio::sync::Notify::new())))
             .build()
             .await
             .unwrap();
-        owner.register_peer(subscriber.peer_info()).unwrap();
-        subscriber.register_peer(owner.peer_info()).unwrap();
+        owner.register_peer_inner(subscriber.peer_info()).unwrap();
+        subscriber.register_peer_inner(owner.peer_info()).unwrap();
         let events = subscriber.events();
         let waiting = owner.events().new_event().unwrap().into_handle();
         // Keep these requests in discovery so neither can finish while the
         // cleanup worker starts. A live peer may reply before cancellation.
-        let undiscovered = Messenger::builder().build().await.unwrap();
+        let undiscovered = crate::messenger::MessengerParts::new()
+            .build()
+            .await
+            .unwrap();
         let triggering = undiscovered.events().new_event().unwrap().into_handle();
         let poisoning = undiscovered.events().new_event().unwrap().into_handle();
         let local = events.new_event().unwrap();
@@ -1273,7 +1276,7 @@ mod tests {
         assert!(futures::poll!(&mut poison).is_pending());
 
         subscriber
-            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+            .graceful_shutdown_inner(crate::ShutdownPolicy::WaitForever)
             .await;
         subscriber.closed().await;
         for result in [
@@ -1301,16 +1304,19 @@ mod tests {
         local.trigger().unwrap();
         local_waiter.await.unwrap();
         owner
-            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+            .graceful_shutdown_inner(crate::ShutdownPolicy::WaitForever)
             .await;
         owner.closed().await;
     }
 
     #[tokio::test]
     async fn messenger_drop_finishes_event_tasks_and_remote_waits() {
-        let owner = Messenger::builder().build().await.unwrap();
+        let owner = crate::messenger::MessengerParts::new()
+            .build()
+            .await
+            .unwrap();
         let discovery = Arc::new(PendingDiscovery(tokio::sync::Notify::new()));
-        let subscriber = Messenger::builder()
+        let subscriber = crate::messenger::MessengerParts::new()
             .discovery(discovery.clone())
             .build()
             .await
@@ -1343,7 +1349,7 @@ mod tests {
         local.trigger().unwrap();
         local_waiter.await.unwrap();
         owner
-            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+            .graceful_shutdown_inner(crate::ShutdownPolicy::WaitForever)
             .await;
         owner.closed().await;
     }
@@ -1370,7 +1376,10 @@ mod tests {
             Arc::clone(&backend),
             ResponseManager::new(worker_id.as_u64()),
         );
-        let other = Messenger::builder().build().await.unwrap();
+        let other = crate::messenger::MessengerParts::new()
+            .build()
+            .await
+            .unwrap();
         let handle = other.events().new_event().unwrap().into_handle();
         let remote = events
             .remote_event(RemoteEventKey::from_handle(handle))

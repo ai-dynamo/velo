@@ -56,16 +56,18 @@ impl Drop for Messenger {
 /// `velo_ext::DrainExemption`), and it is read only while draining.
 type DrainExemptNames = Arc<std::sync::RwLock<std::collections::HashSet<Box<[u8]>>>>;
 
-/// Builder for Messenger allowing incremental configuration.
-pub struct MessengerBuilder {
+/// What a [`Messenger`] is built from, gathered one piece at a time.
+///
+/// The crate's own builders (`VeloBuilder`) and unit tests use this, so they do
+/// not depend on the deprecated, public [`MessengerBuilder`].
+pub(crate) struct MessengerParts {
     transports: Vec<Arc<dyn Transport>>,
     discovery: Option<Arc<dyn PeerDiscovery>>,
     metrics: Option<Arc<VeloMetrics>>,
 }
 
-impl MessengerBuilder {
-    /// Create a new empty MessengerBuilder.
-    pub fn new() -> Self {
+impl MessengerParts {
+    pub(crate) fn new() -> Self {
         Self {
             transports: Vec::new(),
             discovery: None,
@@ -73,30 +75,70 @@ impl MessengerBuilder {
         }
     }
 
+    pub(crate) fn add_transport(mut self, transport: Arc<dyn Transport>) -> Self {
+        self.transports.push(transport);
+        self
+    }
+
+    pub(crate) fn discovery(mut self, discovery: Arc<dyn PeerDiscovery>) -> Self {
+        self.discovery = Some(discovery);
+        self
+    }
+
+    pub(crate) fn metrics(mut self, metrics: Arc<VeloMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    pub(crate) async fn build(self) -> Result<Arc<Messenger>> {
+        Messenger::new(self.transports, self.discovery, self.metrics).await
+    }
+}
+
+/// Builder for Messenger allowing incremental configuration.
+#[deprecated(
+    since = "0.22.1",
+    note = "Use `Velo::builder` (`VeloBuilder`). `MessengerBuilder` goes away in 0.23.0"
+)]
+pub struct MessengerBuilder {
+    parts: MessengerParts,
+}
+
+// The deprecated type's own impls name it; only callers outside it should warn.
+#[allow(deprecated)]
+impl MessengerBuilder {
+    /// Create a new empty MessengerBuilder.
+    pub fn new() -> Self {
+        Self {
+            parts: MessengerParts::new(),
+        }
+    }
+
     /// Add a transport to the Messenger system.
     pub fn add_transport(mut self, transport: Arc<dyn Transport>) -> Self {
-        self.transports.push(transport);
+        self.parts = self.parts.add_transport(transport);
         self
     }
 
     /// Set the peer discovery backend.
     pub fn discovery(mut self, discovery: Arc<dyn PeerDiscovery>) -> Self {
-        self.discovery = Some(discovery);
+        self.parts = self.parts.discovery(discovery);
         self
     }
 
     /// Install Prometheus collectors for this messenger instance.
     pub fn metrics(mut self, metrics: Arc<VeloMetrics>) -> Self {
-        self.metrics = Some(metrics);
+        self.parts = self.parts.metrics(metrics);
         self
     }
 
     /// Build the Messenger system with the configured transports and discovery.
     pub async fn build(self) -> Result<Arc<Messenger>> {
-        Messenger::new(self.transports, self.discovery, self.metrics).await
+        self.parts.build().await
     }
 }
 
+#[allow(deprecated)] // an impl of the deprecated type itself
 impl Default for MessengerBuilder {
     fn default() -> Self {
         Self::new()
@@ -114,6 +156,11 @@ impl Messenger {
     ///     .build()
     ///     .await?;
     /// ```
+    #[deprecated(
+        since = "0.22.1",
+        note = "Use `Velo::builder`. `Messenger::builder` goes away in 0.23.0"
+    )]
+    #[allow(deprecated)] // returns the deprecated builder; the caller sees the warning
     pub fn builder() -> MessengerBuilder {
         MessengerBuilder::new()
     }
@@ -453,7 +500,22 @@ impl Messenger {
     ///
     /// Must be called after construction (the stager/resolver are typically provided
     /// by `velo-rendezvous` which depends on this crate).
+    #[deprecated(
+        since = "0.22.1",
+        note = "`Velo::builder` sets up large payload support. It has no `Velo` method. This method goes away in 0.23.0"
+    )]
     pub fn set_large_payload_support(
+        &self,
+        stager: Arc<dyn crate::messenger::large_payload::LargePayloadStager>,
+        resolver: Arc<dyn crate::messenger::large_payload::LargePayloadResolver>,
+    ) {
+        self.set_large_payload_support_inner(stager, resolver);
+    }
+
+    /// What [`set_large_payload_support`](Self::set_large_payload_support)
+    /// does, for the callers inside this crate that must keep working after
+    /// that method is removed.
+    pub(crate) fn set_large_payload_support_inner(
         &self,
         stager: Arc<dyn crate::messenger::large_payload::LargePayloadStager>,
         resolver: Arc<dyn crate::messenger::large_payload::LargePayloadResolver>,
@@ -521,7 +583,17 @@ impl Messenger {
     }
 
     /// Connect to a peer by registering their peer information.
+    #[deprecated(
+        since = "0.22.1",
+        note = "Use `Velo::register_peer`, which also registers the peer with the streaming transport. `Messenger::register_peer` goes away in 0.23.0"
+    )]
     pub fn register_peer(&self, peer_info: PeerInfo) -> Result<()> {
+        self.register_peer_inner(peer_info)
+    }
+
+    /// What [`register_peer`](Self::register_peer) does, for the callers
+    /// inside this crate (`Velo::register_peer`, the `_hello` handler).
+    pub(crate) fn register_peer_inner(&self, peer_info: PeerInfo) -> Result<()> {
         let instance_id = peer_info.instance_id();
 
         // Register with backend (registers with transports)
@@ -538,7 +610,17 @@ impl Messenger {
     /// Drops it from every transport, closes its connections, and forgets
     /// its handler list. See [`crate::Velo::unregister_peer`] for when to
     /// call it.
+    #[deprecated(
+        since = "0.22.1",
+        note = "Use `Velo::unregister_peer`. `Messenger::unregister_peer` goes away in 0.23.0"
+    )]
     pub fn unregister_peer(&self, instance_id: InstanceId) {
+        self.unregister_peer_inner(instance_id);
+    }
+
+    /// What [`unregister_peer`](Self::unregister_peer) does, for the callers
+    /// inside this crate.
+    pub(crate) fn unregister_peer_inner(&self, instance_id: InstanceId) {
         // Backend first, so a new send fails at once instead of starting a
         // handshake to a peer that is going away.
         self.backend.unregister_peer(instance_id);
@@ -546,6 +628,10 @@ impl Messenger {
     }
 
     /// Discover a peer by instance_id and register it for communication.
+    #[deprecated(
+        since = "0.22.1",
+        note = "Use `Velo::discover_and_register_peer`, which also registers the peer with the streaming transport. `Messenger::discover_and_register_peer` goes away in 0.23.0"
+    )]
     pub async fn discover_and_register_peer(&self, instance_id: InstanceId) -> Result<()> {
         tracing::debug!(
             target: "crate::messenger::discovery",
@@ -568,7 +654,7 @@ impl Messenger {
             "Discovered peer, registering"
         );
 
-        self.register_peer(peer_info)
+        self.register_peer_inner(peer_info)
     }
 
     /// Check whether a specific instance has subscribed to a locally-owned event.
@@ -661,7 +747,17 @@ impl Messenger {
     /// handler invocations continue to completion; use
     /// [`graceful_shutdown`](Self::graceful_shutdown) to also wait for them
     /// and tear down. Idempotent.
+    #[deprecated(
+        since = "0.22.1",
+        note = "Use `Velo::begin_drain`. `Messenger::begin_drain` goes away in 0.23.0"
+    )]
     pub fn begin_drain(&self) {
+        self.begin_drain_inner();
+    }
+
+    /// What [`begin_drain`](Self::begin_drain) does, for the callers inside
+    /// this crate.
+    pub(crate) fn begin_drain_inner(&self) {
         self.backend.begin_drain();
     }
 
@@ -710,7 +806,17 @@ impl Messenger {
     /// Panics if a transport's shutdown hook panicked. The other hooks still
     /// ran, but shutdown cannot report the instance as stopped. A later call
     /// panics at once, without draining again.
+    #[deprecated(
+        since = "0.22.1",
+        note = "Use `Velo::shutdown`. `Messenger::graceful_shutdown` goes away in 0.23.0"
+    )]
     pub async fn graceful_shutdown(&self, policy: crate::transports::ShutdownPolicy) {
+        self.graceful_shutdown_inner(policy).await;
+    }
+
+    /// What [`graceful_shutdown`](Self::graceful_shutdown) does, for the
+    /// callers inside this crate.
+    pub(crate) async fn graceful_shutdown_inner(&self, policy: crate::transports::ShutdownPolicy) {
         self.backend.graceful_shutdown(policy).await;
     }
 
@@ -753,7 +859,7 @@ mod tests {
     async fn public_tracker_covers_receive_loops_without_extending_internal_shutdown() {
         use futures::FutureExt;
 
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         messenger.tracker().close();
         assert!(
             messenger.tracker().wait().now_or_never().is_none(),
@@ -765,7 +871,7 @@ mod tests {
             let _ = pending.await;
         });
         messenger
-            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+            .graceful_shutdown_inner(crate::ShutdownPolicy::WaitForever)
             .await;
         tokio::time::timeout(Duration::from_secs(2), messenger.closed())
             .await
@@ -969,7 +1075,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replacing_an_exempt_handler_puts_its_name_back_behind_the_drain_gate() {
         let transport = InMemoryTransport::new(format!("in-memory://{}", InstanceId::new_v4()));
-        let messenger = Messenger::builder()
+        let messenger = MessengerParts::new()
             .add_transport(Arc::clone(&transport) as Arc<dyn Transport>)
             .build()
             .await
@@ -985,7 +1091,7 @@ mod tests {
         messenger
             .register_drain_exempt_handler(Handler::am_handler("_x", |_ctx| Ok(())).build())
             .unwrap();
-        messenger.begin_drain();
+        messenger.begin_drain_inner();
         assert!(admit("_x"), "the exempt handler was refused by the drain");
         // Control: the gate is closed for a name that was never exempt.
         assert!(!admit("_y"), "the drain let a gated handler through");
@@ -1001,7 +1107,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_register_streaming_handler_allows_underscore() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         let handler = Handler::am_handler("_anchor_test", |_ctx| Ok(())).build();
         let result = messenger.register_streaming_handler(handler);
         assert!(
@@ -1012,7 +1118,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_register_streaming_handler_allows_normal() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         let handler = Handler::am_handler("normal_test", |_ctx| Ok(())).build();
         let result = messenger.register_streaming_handler(handler);
         assert!(
@@ -1023,7 +1129,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_am_send_streaming_allows_underscore_prefix() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         let result = messenger.am_send_streaming("_stream_data");
         assert!(
             result.is_ok(),
@@ -1033,7 +1139,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_am_send_still_rejects_underscore_prefix() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         let result = messenger.am_send("_stream_data");
         assert!(
             result.is_err(),
@@ -1043,7 +1149,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_am_send_streaming_builder_has_setters() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         // Verify builder methods compile and chain correctly
         let builder = messenger.am_send_streaming("_stream_data").unwrap();
         let _builder = builder
@@ -1054,7 +1160,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_typed_unary_streaming_allows_underscore_prefix() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         // Should not panic or return validation error:
         let _builder = messenger.typed_unary_streaming::<String>("_anchor_attach");
         // (builder construction succeeds; no network call made)
@@ -1062,7 +1168,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_typed_unary_still_rejects_underscore_prefix() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
         let result = messenger.typed_unary::<String>("_anchor_attach");
         assert!(
             result.is_err(),
@@ -1073,19 +1179,19 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_enabled_system_handlers_are_available_immediately_after_startup() {
         let (transport_a, transport_b) = make_transport_pair();
-        let a = Messenger::builder()
+        let a = MessengerParts::new()
             .add_transport(transport_a)
             .build()
             .await
             .unwrap();
-        let b = Messenger::builder()
+        let b = MessengerParts::new()
             .add_transport(transport_b)
             .build()
             .await
             .unwrap();
 
-        a.register_peer(b.peer_info()).unwrap();
-        b.register_peer(a.peer_info()).unwrap();
+        a.register_peer_inner(b.peer_info()).unwrap();
+        b.register_peer_inner(a.peer_info()).unwrap();
 
         let handlers = a.available_handlers(b.instance_id()).await.unwrap();
 
@@ -1118,26 +1224,26 @@ mod tests {
                 )
             };
             let (transport_a, transport_b) = make_transport_pair();
-            let a = Messenger::builder()
+            let a = MessengerParts::new()
                 .add_transport(transport_a)
                 .metrics(metrics)
                 .build()
                 .await
                 .unwrap();
-            let b = Messenger::builder()
+            let b = MessengerParts::new()
                 .add_transport(transport_b.clone())
                 .build()
                 .await
                 .unwrap();
 
-            a.register_peer(b.peer_info()).unwrap();
+            a.register_peer_inner(b.peer_info()).unwrap();
             a.wait_for_handler(b.instance_id(), "_hello").await.unwrap();
             assert_eq!(handshakes(), 1.0, "unknown peers need the initial hello");
             assert!(b.client.is_peer_registered(a.instance_id()));
 
             // Dynamo registers the response peer again for each request.
             for _ in 0..3 {
-                a.register_peer(b.peer_info()).unwrap();
+                a.register_peer_inner(b.peer_info()).unwrap();
                 a.wait_for_handler(b.instance_id(), "_hello").await.unwrap();
             }
             assert_eq!(handshakes(), 1.0, "cached handlers need no round trip");
@@ -1148,15 +1254,15 @@ mod tests {
             assert_eq!(handshakes(), 2.0, "a missing cached handler must refresh");
 
             // Reuse the address with a new instance, as after a peer restart.
-            b.graceful_shutdown(crate::ShutdownPolicy::Timeout(Duration::from_secs(1)))
+            b.graceful_shutdown_inner(crate::ShutdownPolicy::Timeout(Duration::from_secs(1)))
                 .await;
-            let restarted = Messenger::builder()
+            let restarted = MessengerParts::new()
                 .add_transport(transport_b)
                 .build()
                 .await
                 .unwrap();
             assert_ne!(b.instance_id(), restarted.instance_id());
-            a.register_peer(restarted.peer_info()).unwrap();
+            a.register_peer_inner(restarted.peer_info()).unwrap();
             a.wait_for_handler(restarted.instance_id(), "_hello")
                 .await
                 .unwrap();
@@ -1174,7 +1280,7 @@ mod tests {
     /// exercised in the `common::responses` unit tests.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_await_capacity_chains_through_all_public_builders() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
 
         let _ = messenger
             .am_send("fan_out")
@@ -1207,7 +1313,7 @@ mod tests {
     /// recycle with an error.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_await_capacity_misuse_fails_without_waiting_for_slot() {
-        let messenger = Messenger::builder().build().await.unwrap();
+        let messenger = MessengerParts::new().build().await.unwrap();
 
         // Case 1: no target set.
         let res = tokio::time::timeout(

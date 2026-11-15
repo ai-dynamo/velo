@@ -813,10 +813,11 @@ async fn test_graceful_shutdown_calls_all_transports() {
 }
 
 #[tokio::test]
+#[allow(deprecated)] // tests the deprecated `Messenger::graceful_shutdown` itself
 async fn final_messenger_drop_stops_transports_once_after_any_teardown_path() {
     for prior_shutdown in ["none", "graceful", "token"] {
         let transport = MockTransport::new("mock", true);
-        let messenger = crate::Messenger::builder()
+        let messenger = crate::messenger::MessengerParts::new()
             .add_transport(transport.clone())
             .build()
             .await
@@ -853,12 +854,13 @@ async fn final_messenger_drop_stops_transports_once_after_any_teardown_path() {
 
 /// A cancelled waiter must not interrupt hooks or let another caller skip them.
 #[tokio::test]
+#[allow(deprecated)] // tests the deprecated `Messenger::graceful_shutdown` itself
 async fn concurrent_shutdown_waits_for_hooks_after_first_waiter_is_cancelled() {
     let mut transport = MockTransport::new("mock", true);
     let (entered_tx, entered) = flume::bounded(1);
     let (release, release_rx) = flume::bounded(1);
     Arc::get_mut(&mut transport).unwrap().shutdown_block = Some((entered_tx, release_rx));
-    let messenger = crate::Messenger::builder()
+    let messenger = crate::messenger::MessengerParts::new()
         .add_transport(transport.clone())
         .build()
         .await
@@ -893,7 +895,7 @@ async fn final_drop_does_not_join_a_blocked_shutdown_hook() {
     let (entered_tx, entered) = flume::bounded(1);
     let (release, release_rx) = flume::bounded(1);
     Arc::get_mut(&mut transport).unwrap().shutdown_block = Some((entered_tx, release_rx));
-    let messenger = crate::Messenger::builder()
+    let messenger = crate::messenger::MessengerParts::new()
         .add_transport(transport.clone())
         .build()
         .await
@@ -922,7 +924,7 @@ fn final_drop_runs_hooks_outside_tokio_and_after_runtime_shutdown() {
             .unwrap();
         let messenger = runtime
             .block_on(
-                crate::Messenger::builder()
+                crate::messenger::MessengerParts::new()
                     .add_transport(transport.clone())
                     .build(),
             )
@@ -960,7 +962,7 @@ async fn a_teardown_failure_is_seen_with_the_coop_budget_spent() {
     }
     let mut transport = MockTransport::new("mock", true);
     Arc::get_mut(&mut transport).unwrap().shutdown_panics = true;
-    let messenger = crate::Messenger::builder()
+    let messenger = crate::messenger::MessengerParts::new()
         .add_transport(transport.clone())
         .build()
         .await
@@ -985,11 +987,12 @@ async fn a_teardown_failure_is_seen_with_the_coop_budget_spent() {
 }
 
 #[tokio::test]
+#[allow(deprecated)] // tests the deprecated `Messenger::graceful_shutdown` itself
 async fn failed_teardown_never_reports_successful_shutdown() {
     use futures::FutureExt;
     let mut transport = MockTransport::new("mock", true);
     Arc::get_mut(&mut transport).unwrap().shutdown_panics = true;
-    let messenger = crate::Messenger::builder()
+    let messenger = crate::messenger::MessengerParts::new()
         .add_transport(transport.clone())
         .build()
         .await
@@ -1019,7 +1022,7 @@ async fn a_failed_hook_does_not_skip_the_other_hooks() {
     Arc::get_mut(&mut first).unwrap().shutdown_panics = true;
     let mut second = MockTransport::new("mock_b", true);
     Arc::get_mut(&mut second).unwrap().shutdown_panics = true;
-    let messenger = crate::Messenger::builder()
+    let messenger = crate::messenger::MessengerParts::new()
         .add_transport(first.clone())
         .add_transport(second.clone())
         .build()
@@ -1055,6 +1058,7 @@ async fn failed_build_with_a_panicking_hook_returns_without_closing() {
 /// failed for good, so running the drain and the RDMA sweep again only spends
 /// their budget (30 s by default for the sweep) before the same panic.
 #[tokio::test]
+#[allow(deprecated)] // tests the deprecated `Velo::graceful_shutdown` itself
 async fn velo_shutdown_retry_after_a_failed_hook_skips_the_drain() {
     use futures::FutureExt;
     let mut transport = MockTransport::new("mock", true);
@@ -1084,6 +1088,7 @@ async fn velo_shutdown_retry_after_a_failed_hook_skips_the_drain() {
 /// waiter saw the failure, so the retry must look at the finished teardown
 /// itself, not at what an earlier waiter observed.
 #[tokio::test]
+#[allow(deprecated)] // tests the deprecated `Velo::graceful_shutdown` itself
 async fn velo_shutdown_retry_sees_a_failure_no_waiter_observed() {
     use futures::FutureExt;
     let mut transport = MockTransport::new("mock", true);
