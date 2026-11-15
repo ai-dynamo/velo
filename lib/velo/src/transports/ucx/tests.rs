@@ -24,7 +24,9 @@ use crate::transports::ucx::rma::{
     MAX_PACKED_RKEY, MappedRegion, RdmaEndpoint, RmaError, RmaGetRequest, SYS_DEV_UNKNOWN,
     preparse_packed_rkey,
 };
-use crate::transports::ucx::worker::{Cmd, PARK_MS, SENDER_SLOTS, SenderSightings, ep_scan_period};
+use crate::transports::ucx::worker::{
+    Cmd, EP_SETUP_BOUND, PARK_MS, SENDER_SLOTS, SenderSightings, ep_scan_period,
+};
 use velo_ext::{InstanceId, MessageType, PeerInfo};
 
 #[tokio::test]
@@ -2645,6 +2647,19 @@ async fn wire_peer_path_first(a: &Node, b: &Node, errs: &Arc<CountingErrors>) {
     assert_eq!(eps_open(a), 1);
 }
 
+/// Count `node`'s endpoints as set up as soon as they are created.
+///
+/// For reaper tests whose subject is not setup: their peers never send to the
+/// node, and without this each endpoint would wait `EP_SETUP_BOUND` before
+/// idle time counts. That would hide what they test. Setup has its own tests
+/// (`an_endpoint_is_not_reaped_while_its_peer_sets_up`).
+fn skip_setup(node: &Node) {
+    node.transport
+        .shared
+        .ep_setup_bound_ms
+        .store(0, Ordering::Relaxed);
+}
+
 fn eps_stamped_inbound(node: &Node) -> u64 {
     node.transport
         .shared
@@ -3050,6 +3065,121 @@ async fn a_peer_that_keeps_sending_events_keeps_its_endpoint() {
     a_peer_that_keeps_answering_keeps_its_endpoint(MessageType::Event).await;
 }
 
+/// An endpoint is not idle while its peer is still setting up.
+///
+/// A creates its endpoint to B by sending to B. B's first frame back waits for
+/// B's own `ucp_ep_create`, which took 630-1250 ms under load, past the 500 ms
+/// floor. A reaper that counted that wait as idle time closed A's endpoint
+/// before B's first frame arrived, and B's next Messages to A were lost
+/// (`reaping_disrupts_the_peers_path_back`). Setup ends with B's first frame;
+/// only then does idle time count.
+///
+/// A's clock is held, so the wait for B is two timeouts of A's clock, at any
+/// load. B's creation is also made slower than the timeout, as under load.
+/// Today's reaper closes A's endpoint at the first scan after the move.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_endpoint_is_not_reaped_while_its_peer_sets_up() {
+    let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    let errs = CountingErrors::new();
+    hold_reaper_clock(&a);
+
+    // A's send creates A's endpoint to B. B has sent nothing to A.
+    ping_message(&a, &b, &errs).await;
+    assert_eq!(eps_open(&a), 1);
+    advance(&a, IDLE * 2).await;
+    assert_eq!(
+        eps_closed_idle(&a),
+        0,
+        "A reaped its endpoint to B before B's first frame, while B was setting up"
+    );
+    assert_eq!(eps_open(&a), 1);
+
+    // B answers. Its first frame waits for its slow `ucp_ep_create`.
+    b.transport
+        .shared
+        .ep_create_delay_ms
+        .store((IDLE * 2).as_millis() as u64, Ordering::Relaxed);
+    let out = b.transport.send_message(
+        a.instance_id,
+        Bytes::from_static(b"h"),
+        Bytes::from_static(b"p"),
+        MessageType::Response,
+        errs.clone(),
+    );
+    assert!(matches!(out, SendOutcome::Admitted));
+    assert!(
+        recv(&a.streams.response_stream, ARRIVAL).await.is_some(),
+        "B's first frame never arrived"
+    );
+    settle(&a).await;
+
+    // Setup is over, and idle time counts from B's frame.
+    advance(&a, IDLE / 2).await;
+    assert_eq!(
+        eps_closed_idle(&a),
+        0,
+        "reaped within a timeout of B's frame"
+    );
+    advance(&a, IDLE * 2).await;
+    assert_eq!(
+        eps_closed_idle(&a),
+        1,
+        "the endpoint was never reaped once it was set up and idle"
+    );
+    assert_eq!(reaped_while_active(&a), 0);
+    assert_eq!(errs.count(), 0);
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
+/// Setup has a bound: an endpoint whose peer never sends to us is still
+/// reaped.
+///
+/// A peer may never send to us at all (we only send to it, or only read its
+/// memory), or may die during setup. Without a bound, its endpoint would stay
+/// open forever. After `EP_SETUP_BOUND` the endpoint is judged on its last use
+/// like any other, so an endpoint already idle for the timeout is closed at
+/// the next scan.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_endpoint_whose_peer_never_sends_is_reaped_after_the_setup_bound() {
+    let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    let b = start_node().await;
+    cross_register(&a, &b);
+    let errs = CountingErrors::new();
+    hold_reaper_clock(&a);
+
+    ping_message(&a, &b, &errs).await;
+    assert_eq!(eps_open(&a), 1);
+
+    // Up to the bound, the endpoint is still being set up.
+    advance(&a, EP_SETUP_BOUND).await;
+    assert_eq!(
+        eps_closed_idle(&a),
+        0,
+        "reaped before its setup bound, with no frame from its peer"
+    );
+    // Past it, the endpoint has been idle for far more than the timeout. One
+    // timeout is also more than a scan period, so a scan runs.
+    advance(&a, IDLE).await;
+    assert_eq!(
+        eps_closed_idle(&a),
+        1,
+        "an endpoint whose peer never sent was not reaped after the setup bound"
+    );
+    assert_eq!(eps_open(&a), 0);
+    assert_eq!(reaped_while_active(&a), 0);
+
+    a.transport.shutdown();
+    b.transport.shutdown();
+    assert_rma_balanced(&a);
+    assert_rma_balanced(&b);
+}
+
 /// The default is off, and "off" has to mean *never*, not *rarely*.
 ///
 /// D9's sign-off left the reaper disabled because a reconnect costs ~14 ms of
@@ -3096,6 +3226,7 @@ async fn idle_reaper_is_off_by_default() {
 #[tokio::test(flavor = "multi_thread")]
 async fn idle_endpoint_closes_and_the_next_send_wires_up_again() {
     let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    skip_setup(&a);
     let b = start_node().await;
     cross_register(&a, &b);
     let errs = CountingErrors::new();
@@ -3207,6 +3338,7 @@ async fn unregister_closes_the_endpoint_and_leaves_others_alone() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slow_endpoint_create_does_not_age_the_new_endpoint() {
     let a = start_node_with(|b| b.eager_endpoints(true).ep_idle_timeout(Some(IDLE))).await;
+    skip_setup(&a);
     let b = start_node().await;
     // Longer than IDLE, the way the measured 630 ms create was. Set before the
     // registration, which is what creates the eager endpoint.
@@ -3351,6 +3483,7 @@ async fn a_frame_received_late_in_a_long_pass_is_not_stamped_early() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_send_in_flight_keeps_its_endpoint_open() {
     let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    skip_setup(&a);
     let b = start_node().await;
     cross_register(&a, &b);
     let errs = CountingErrors::new();
@@ -3470,6 +3603,7 @@ async fn a_send_in_flight_keeps_its_endpoint_open() {
 #[tokio::test(flavor = "multi_thread")]
 async fn reaping_disrupts_the_peers_path_back() {
     let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    skip_setup(&a);
     let b = start_node().await;
     cross_register(&a, &b);
     let errs = CountingErrors::new();
@@ -3584,6 +3718,7 @@ async fn an_endpoint_with_an_inflight_get_is_not_reaped() {
         ..UcxConfig::default()
     })
     .await;
+    skip_setup(&puller);
     let owner = start_node().await;
     let idle_peer = start_node().await;
     cross_register(&puller, &owner);
@@ -3701,6 +3836,7 @@ async fn an_rma_get_slower_than_the_timeout_restarts_the_idle_clock() {
     src.fill_pattern();
 
     let puller = start_node_with(|b| software_rma(b).ep_idle_timeout(Some(TIMEOUT))).await;
+    skip_setup(&puller);
     let owner = start_node().await;
     cross_register(&puller, &owner);
     let owner_rma = owner.transport.rdma_endpoint();
@@ -3802,6 +3938,7 @@ async fn an_rma_get_slower_than_the_timeout_restarts_the_idle_clock() {
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_during_an_idle_close_is_clean() {
     let a = start_node_with(|b| b.ep_idle_timeout(Some(IDLE))).await;
+    skip_setup(&a);
     let b = start_node().await;
     cross_register(&a, &b);
     let errs = CountingErrors::new();
@@ -3914,6 +4051,7 @@ async fn eager_wireup_follows_a_re_registration() {
 #[tokio::test(flavor = "multi_thread")]
 async fn eager_wireup_and_the_reaper_compose() {
     let a = start_node_with(|b| b.eager_endpoints(true).ep_idle_timeout(Some(IDLE))).await;
+    skip_setup(&a);
     let b = start_node().await;
     cross_register(&a, &b);
 
