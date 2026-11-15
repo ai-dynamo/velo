@@ -1626,6 +1626,18 @@ impl Drop for NativeInit {
 /// setting but still emulates a GET over tcp.
 const SOFTWARE_RMA_SWITCH_FLOOR: (u32, u32) = (1, 22);
 
+/// Whether software RMA was asked to be off: by velo's default, or by the
+/// environment, which wins. UCX reads a boolean `n`, `no`, `off` or `0` as
+/// off, in any case.
+fn software_rma_requested_off(software_rma: bool, env_switch: Option<&str>) -> bool {
+    match env_switch {
+        Some(value) => ["n", "no", "off", "0"]
+            .iter()
+            .any(|off| value.trim().eq_ignore_ascii_case(off)),
+        None => !software_rma,
+    }
+}
+
 /// Whether UCX `major.minor` turns software RMA off when asked.
 fn software_rma_switch_applies(major: u32, minor: u32) -> bool {
     (major, minor) >= SOFTWARE_RMA_SWITCH_FLOOR
@@ -1686,7 +1698,8 @@ unsafe fn init_ucx(
         // Software RMA is off: see the module docs. The environment wins here
         // too, so `UCX_PROTO_EMULATION_ENABLE=y` turns it back on for a
         // deployment that accepts the risk.
-        if !software_rma && std::env::var_os("UCX_PROTO_EMULATION_ENABLE").is_none() {
+        let env_switch = std::env::var("UCX_PROTO_EMULATION_ENABLE").ok();
+        if !software_rma && env_switch.is_none() {
             let k = std::ffi::CString::new("PROTO_EMULATION_ENABLE").unwrap();
             let v = std::ffi::CString::new("n").unwrap();
             let st = sys::ucp_config_modify(ucp_cfg, k.as_ptr(), v.as_ptr());
@@ -1695,6 +1708,8 @@ unsafe fn init_ucx(
                 "ucp_config_modify(PROTO_EMULATION_ENABLE=n): {}",
                 status_string(st)
             );
+        }
+        if software_rma_requested_off(software_rma, env_switch.as_deref()) {
             let (mut major, mut minor, mut release) = (0, 0, 0);
             sys::ucp_get_version(&mut major, &mut minor, &mut release);
             if !software_rma_switch_applies(major, minor) {
@@ -3339,7 +3354,22 @@ pub(crate) type StartupSlot = OnceLock<StartupOut>;
 
 #[cfg(test)]
 mod initialization_tests {
-    use super::{config_value, software_rma_switch_applies};
+    use super::{config_value, software_rma_requested_off, software_rma_switch_applies};
+
+    /// The environment wins over velo's default, as for every `UCX_*`
+    /// setting, so an operator's `n` must also lead to the version check.
+    #[test]
+    fn software_rma_is_requested_off_by_default_or_by_the_environment() {
+        assert!(software_rma_requested_off(false, None));
+        assert!(!software_rma_requested_off(true, None));
+        for off in ["n", "no", "OFF", "0"] {
+            assert!(software_rma_requested_off(true, Some(off)), "{off}");
+            assert!(software_rma_requested_off(false, Some(off)), "{off}");
+        }
+        for on in ["y", "yes", "1"] {
+            assert!(!software_rma_requested_off(false, Some(on)), "{on}");
+        }
+    }
 
     /// The floor under which velo warns that software GET is still on. UCX
     /// 1.20 accepts `PROTO_EMULATION_ENABLE=n` and still emulates a GET over

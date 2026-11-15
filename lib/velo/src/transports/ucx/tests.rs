@@ -164,8 +164,11 @@ fn software_rma(builder: UcxTransportBuilder) -> UcxTransportBuilder {
 }
 
 /// An explicit disable still needs the warning when UCX ignores the switch.
+///
+/// On the vendored UCX 1.22 it checks that no warning is logged; on a system
+/// UCX older than 1.22 (`UCX_DIR`), that exactly one is, whether velo or the
+/// environment turned software RMA off.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "F6: UCX_PROTO_EMULATION_ENABLE=n suppresses the warning on UCX older than 1.22"]
 async fn an_explicit_software_rma_disable_keeps_the_ucx_version_warning() {
     const CHILD: &str = "VELO_UCX_VERSION_WARNING_CHILD";
     if std::env::var_os(CHILD).is_some() {
@@ -193,7 +196,6 @@ async fn an_explicit_software_rma_disable_keeps_the_ucx_version_warning() {
             .args([
                 "--exact",
                 "transports::ucx::transport::tests::an_explicit_software_rma_disable_keeps_the_ucx_version_warning",
-                "--ignored",
                 "--nocapture",
                 "--test-threads=1",
             ])
