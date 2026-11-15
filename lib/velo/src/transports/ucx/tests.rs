@@ -972,6 +972,56 @@ async fn unregister_reclaims_a_peers_get_refusal() {
     );
 }
 
+/// A GET already preparing during unregister must not recreate its memo.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "F4: a GET preparing during unregister recreates the peer's refusal memo after cleanup"]
+async fn an_unregister_outlives_a_get_already_preparing_its_endpoint() {
+    const LEN: usize = 64 * 1024;
+    let src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    let pair = start_rma_pair_with(|b| b).await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+    let shared = &pair.puller.transport.shared;
+    let hold = hold_at(&shared.progress_hold, &shared.progress_held, "the puller").await;
+    shared.ep_create_delay_ms.store(1000, Ordering::Relaxed);
+    let passes = shared.progress_passes.load(Ordering::Relaxed);
+    let mut get = Box::pin(
+        pair.puller_rma
+            .get(get_request(&pair, &src, &remote, &local)),
+    );
+    assert!(futures::poll!(get.as_mut()).is_pending());
+    drop(hold);
+    assert!(
+        wait_until(T, || shared.progress_passes.load(Ordering::Relaxed)
+            > passes)
+        .await
+    );
+    // Let the cold endpoint enter the injected one-second creation delay.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(futures::poll!(get.as_mut()).is_pending());
+    assert_eq!(eps_open(&pair.puller), 0);
+    pair.puller.transport.unregister(pair.owner.instance_id);
+    let outcome = tokio::time::timeout(T, get)
+        .await
+        .expect("the GET must resolve");
+    assert!(wait_until(T, || eps_open(&pair.puller) == 0).await);
+    let retained = shared.no_native_get.len();
+    let registered = shared.peers.len();
+
+    pair.puller_rma.unmap_region(local.region_id).await.unwrap();
+    pair.owner_rma.unmap_region(remote.region_id).await.unwrap();
+    pair.owner.transport.shutdown();
+    pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
+    assert!(outcome.is_err(), "the GET must fail: {outcome:?}");
+    assert_eq!(registered, 0);
+    assert_eq!(
+        retained, 0,
+        "a late GET refusal recreated an unregistered peer's memo after {outcome:?}"
+    );
+}
+
 /// A refusal record lapses when the peer's endpoint fails.
 ///
 /// The record must hold only a real refusal. On an RC lane, a queue pair that
