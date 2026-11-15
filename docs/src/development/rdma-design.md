@@ -28,7 +28,7 @@ UCX can drop RMA lanes under `UCP_ERR_HANDLING_MODE_PEER`, the mode that gives v
 
 On a live ConnectX-7 InfiniBand host, with UCX 1.22.0 and 1.19.0, RC kept `rma_bw` in PEER mode. The mechanism is in UCX's lane selection. Under PEER mode with rendezvous, it adds `UCT_MD_FLAG_INVALIDATE_RMA` as a requirement. It then removes that requirement again for connect-to-endpoint lanes, because both sides close the connection on error. Every RC transport connects to an endpoint. The lane survived on `rc_mlx5` with DEVX on, with `UCX_IB_MLX5_DEVX=n`, and on `rc_verbs`. A 1 MiB GET completed in 826 µs while the owner never ran its progress loop.
 
-The invalidation requirement still applies to connect-to-interface transports. Shared-memory RMA inside one host under PEER mode therefore falls back to software emulation. For the same reason, the in-process UCX tests run over `tcp`: in PEER mode, the shared-memory lanes are not eligible.
+The invalidation requirement still applies to connect-to-interface transports. Shared-memory RMA inside one host under PEER mode therefore has no native GET, and velo refuses the software emulation (see [Software RMA is off](#software-rma-is-off)). For the same reason, the in-process UCX tests run over `tcp`: in PEER mode, the shared-memory lanes are not eligible.
 
 Two more probe facts shaped the wrapper:
 
@@ -129,7 +129,7 @@ GETs post with `UCP_OP_ATTR_FLAG_NO_IMM_CMPL`, which removes the inline exit and
 
 ### One-sidedness depends on the lane
 
-With a native RMA lane, a GET completes with the owner idle (100 MiB in 19.9 ms over CMA, owner never progressed). Without one, UCX silently substitutes `rma_am` software emulation over the Active Message lane. The GET, the flush, and PUT visibility then **hang forever** on an owner that does not progress (measured: 1 s, 5.9 million polls, no completion). CI does not see this, because the owner that answered `_rv_acquire` is progressing. The owner's progress loop therefore stays live for the whole lease, and no separate unprogressed RMA worker exists.
+With a native RMA lane, a GET completes with the owner idle (100 MiB in 19.9 ms over CMA, owner never progressed). Without one, UCX silently substitutes `rma_am` software emulation over the Active Message lane, unless the emulation is off, as velo sets it by default. The GET, the flush, and PUT visibility then **hang forever** on an owner that does not progress (measured: 1 s, 5.9 million polls, no completion). CI does not see this, because the owner that answered `_rv_acquire` is progressing. The owner's progress loop therefore stays live for the whole lease, and no separate unprogressed RMA worker exists.
 
 ### Single-use rkeys
 
@@ -163,12 +163,37 @@ The rejected alternative was to keep the flush close and only lengthen its deadl
 
 ### A puller that goes away can abort the owner over TCP
 
-Over TCP, UCX emulates a GET in software. The puller sends a request, and the owner's progress thread sends the data back. If the puller goes away in the middle, UCX 1.22 can abort the owner's process at two sites:
+Over TCP, UCX can only emulate a GET in software. The puller sends a request, and the owner's progress thread sends the data back. If the puller goes away in the middle, UCX 1.22 can abort the owner's process at two sites:
 
 - The owner reads the request only after the puller is gone. It sends the reply on an endpoint that has already failed, and `ucp_request_try_send` calls `ucs_fatal` ("unexpected error: Endpoint timeout").
 - The owner still has replies queued when the puller goes. While UCX discards the failed endpoint, `uct_tcp_ep_pending_purge` finds those replies and fails an assertion (`stubs.c:107`). This happened 2 times in 96 test copies under load.
 
-A puller that crashes reaches both as well as one that shuts down, so no teardown order on the puller side prevents them. velo has a test for the first that runs the scenario in a child process; it is ignored until UCX handles the error. A GET offloaded to the NIC does not involve the owner's CPU, so this is TCP only.
+A puller that crashes reaches both as well as one that shuts down, so no teardown order on the puller side prevents them. velo cannot catch either: both happen inside `ucp_worker_progress`.
+
+### Software RMA is off
+
+So velo turns UCX's software RMA off. It sets `PROTO_EMULATION_ENABLE=n` on its UCX context, beside its other UCX defaults, unless the environment sets `UCX_PROTO_EMULATION_ENABLE`. A GET with no native protocol to the peer is then refused before any request reaches the owner, and the owner has nothing to serve.
+
+UCX makes the choice for each endpoint, not for the process. It selects a protocol per endpoint configuration (`ucp_proto_select_lookup` with the endpoint's `cfg_index`). In UCX 1.22 only three places read the flag: the software GET (`get_am.c`), the software PUT (`put_am.c`), and the error report for a refused request (`proto_reconfig.c`). The zero-copy GET protocols that RC lanes use do not read it. So one context can GET in hardware from a peer over InfiniBand or RoCE, and refuse to GET from another peer over TCP.
+
+What a refusal looks like:
+
+- UCX aborts the request with `UCS_ERR_CANCELED` and leaves the endpoint up. Frames still flow on it. UCX logs `No zero-copy protocol found for get into host from host` at ERROR level.
+- The progress thread answers the caller with `RmaError::NoNativeGet`. Two other events also complete a GET with `CANCELED`. Velo's own FORCE close is one: velo marks the endpoint retired before it closes it. A failed RC queue pair is the other: it flushes its outstanding GETs with `IBV_WC_WR_FLUSH_ERR`, which UCX reports as `CANCELED`.
+- It records the peer's incarnation in `no_native_get`. The rendezvous consumer then does not offer RDMA to that peer, and records `no_native_get` on `velo_rendezvous_rdma_path_total`.
+- The record lapses when the peer's endpoint fails, when the peer is unregistered, or when it registers a new incarnation. So a flushed GET on a failed RC lane, which looks like a refusal, keeps the peer on the chunked path only until velo reaps the failed endpoint.
+
+The first transfer to such a peer falls back by itself: the GET fails, and the consumer detaches and pulls chunks (`get_failed`). Every later transfer is chunked from the start. The cost is in [No RDMA rendezvous over a TCP-only lane](../appendix/limitations.md#no-rdma-rendezvous-over-a-tcp-only-lane).
+
+The protection is on the puller's side. The owner's handler for a GET request is registered under `UCP_FEATURE_RMA` whatever the flag says. An owner can still abort if a puller turned software RMA back on, runs a velo that predates this rule, or links a system UCX older than 1.22 through `UCX_DIR`. UCX 1.20 accepts the setting and still emulates the GET. Velo then logs one WARN at transport start, naming the UCX version (`SOFTWARE_RMA_SWITCH_FLOOR` in `transports/ucx/worker.rs`).
+
+Rejected alternatives:
+
+- **Velo checks the endpoint's transport names** and refuses RMA when they are all `tcp`. This copies UCX's lane selection into velo, and it would be wrong for every lane that velo does not list. UCX's own protocol selection already knows whether a GET is emulated.
+- **Patch the vendored UCX** so that a failed reply drops the request. That needs a `ucx-rs` release before a velo release. The open upstream fix (openucx/ucx#12258) covers only the first site, and nobody has a patch for the second.
+- **Keep the emulation and document the abort.** A crashed puller is enough to kill the owner.
+
+Tests that need a GET over TCP turn the emulation back on with `UcxTransportBuilder::allow_software_rma` (only with `test-helpers`). They can hit the abort under load. The CI step that runs `rendezvous_rdma_two_proc` sets `UCX_PROTO_EMULATION_ENABLE=y` for the same reason. `an_owner_survives_a_puller_that_vanishes_mid_get` checks that the owner survives with the emulation off. `software_get_aborts_an_owner_whose_puller_vanishes` checks that it still aborts with the emulation on, so it fails once a UCX release fixes both sites.
 
 ## A stale rkey aborts the process on InfiniBand
 

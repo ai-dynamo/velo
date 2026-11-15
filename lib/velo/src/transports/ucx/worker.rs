@@ -111,6 +111,25 @@
 //! `ShuttingDown`. The reply lives behind a `take`-able slot, which is what
 //! makes double-resolution impossible if the callback later fires anyway.
 //!
+//! ## Software RMA is off
+//!
+//! Over a lane with no RMA in hardware, such as tcp, UCX emulates a GET: the
+//! owner's progress thread serves the read. In UCX 1.22 the owner's process
+//! aborts if the puller goes away during the reply (`ucs_fatal` in
+//! `ucp_request_try_send`, or an assertion in `uct_tcp_ep_pending_purge`), and
+//! a crashed puller reaches both. So [`init_ucx`] sets
+//! `PROTO_EMULATION_ENABLE=n` unless the environment sets it, or a test asked
+//! for software RMA.
+//!
+//! UCX selects the GET protocol per endpoint, so a GET still runs in hardware
+//! where a lane can do it. Where none can, `ucp_proto_reconfig_progress`
+//! aborts the request with `UCS_ERR_CANCELED` and leaves the endpoint up.
+//! [`RmaOpState::refused`] tells that from a FORCE close and from a failed RC
+//! queue pair, answers [`RmaError::NoNativeGet`], and records the peer's
+//! incarnation in [`WorkerShared::no_native_get`]. The rendezvous consumer
+//! reads that record and stops offering RDMA to the peer. The record lapses
+//! when the peer's endpoint fails or the peer is unregistered.
+//!
 //! ## The idle-endpoint reaper (D9)
 //!
 //! [`UcxConfig::ep_idle_timeout`](super::transport::UcxConfig::ep_idle_timeout)
@@ -216,6 +235,25 @@
 //! `ucp_ep_create`. The call was measured at 630 ms (median of 31 creates in
 //! one process), past the floor. An endpoint with no send on it, such as an
 //! eager one, has only this stamp to keep it open.
+//!
+//! **Setup is not idle time.** An endpoint is set up once a frame from its
+//! peer has arrived, not when our own `ucp_ep_create` returns. The peer's
+//! first frame to us waits for the peer's own `ucp_ep_create`, and under load
+//! that took 630-1250 ms, past the 500 ms floor: a reaper that counted that
+//! wait as idle time closed the endpoint before the peer could answer, and the
+//! peer's next Messages were lost. So the scan skips an endpoint whose peer
+//! has not sent since it was created ([`EpEntry::set_up`]).
+//!
+//! Setup has a bound, [`EP_SETUP_BOUND`], so a peer that never sends to us,
+//! or that died during setup, does not hold an endpoint open forever. After
+//! the bound the endpoint is judged on its last use like any other, so an
+//! endpoint already idle for the timeout is closed at the next scan. velo has
+//! no connect or wireup deadline of its own to reuse, and UCX keepalive is not
+//! one: it fails an endpoint whose peer has gone, which the failed-endpoint
+//! reaper then closes, but it does nothing for a live peer that does not
+//! send. The bound costs only that: an endpoint to a peer that never sends to
+//! us, such as one used only for GETs, is closed up to one bound later than
+//! its idle timeout alone would close it.
 //!
 //! **When a use is stamped.** With the reaper on, [`WorkerState::now`] is read
 //! at the top of each loop pass, again after the progress loop, and after each
@@ -324,6 +362,7 @@ use ucx_rs::{decode_status_ptr, status_string, sys};
 use velo_ext::{AdmitOutcome, InstanceId, MessageType, TransportAdapter, TransportErrorHandler};
 
 use super::address::{AM_ID_BASE, AM_KIND_COUNT, AM_KIND_PING, AM_KIND_PONG, UcxEndpoint};
+use super::clock::ReaperClock;
 use super::ring::{CommandReceiver, CommandSender};
 use super::rma::{
     MAX_PACKED_RKEY, MappedRegion, RKEY_UNPACK_PAD, RmaError, RmaGetRequest, validate_packed_rkey,
@@ -500,6 +539,15 @@ pub(crate) struct WorkerShared {
     /// Peers whose endpoint hit a transport-level error; consulted by
     /// `check_health` and cleared when a fresh endpoint is established.
     pub failed_peers: Arc<DashMap<InstanceId, ()>>,
+    /// Peers this worker cannot GET from without software emulation, with the
+    /// incarnation whose endpoint refused the GET.
+    ///
+    /// Written by [`RmaOpState::complete`] when UCX refuses a GET for want of
+    /// a native protocol (see "Software RMA is off" in the module docs). Read
+    /// by the rendezvous consumer, which then does not offer RDMA to that
+    /// peer. The incarnation makes the entry lapse when the peer re-registers:
+    /// a new process may be reachable over a lane that has GET in hardware.
+    pub no_native_get: Arc<DashMap<InstanceId, u64>>,
     /// Operations posted with a request outstanding (exit 2). Drained before
     /// worker destruction.
     pub inflight_ops: Arc<AtomicUsize>,
@@ -575,6 +623,21 @@ pub(crate) struct WorkerShared {
     /// the runtime otherwise synchronizes with, so the callback reads the
     /// slot per frame rather than capture the handle once at `start()`.
     pub metrics: OnceLock<Arc<dyn velo_ext::TransportObservability>>,
+    /// The idle reaper's clock. No fields in a normal build; see
+    /// [`ReaperClock`].
+    pub reaper_clock: ReaperClock,
+    /// Test seam: while set, the receive callback records when each sender's
+    /// last frame arrived, in `last_inbound`, on the reaper's clock.
+    #[cfg(test)]
+    pub track_inbound: AtomicBool,
+    /// Test seam: when each sender's last frame arrived, by incarnation.
+    #[cfg(test)]
+    pub last_inbound: parking_lot::Mutex<HashMap<u64, Instant>>,
+    /// Test seam: idle reaps of an endpoint whose peer sent a frame within
+    /// the timeout. The reaper must never do this, at any load; see
+    /// [`WorkerState::reap_idle_eps`].
+    #[cfg(test)]
+    pub eps_reaped_while_active: AtomicU64,
     /// Test seam: sleep this long after each `ucp_ep_create`, so a test can
     /// make endpoint creation slower than the idle timeout on demand.
     #[cfg(test)]
@@ -586,13 +649,29 @@ pub(crate) struct WorkerShared {
     /// the peer's half of the wireup.
     #[cfg(test)]
     pub progress_stall_ms: AtomicU64,
-    /// Test seam: after the pass clock is read and before
-    /// `ucp_worker_progress`, the progress loop clears this cell and then
-    /// sleeps once for the value it held (see [`take_test_delay`]). It stands
-    /// in for a long progress loop: a frame that waits in the socket meanwhile
-    /// is received late in the pass, well after the pass clock was read.
+    /// Test seam: while set, the progress loop waits after it reads the pass
+    /// clock and before `ucp_worker_progress`. A frame that waits in the
+    /// socket meanwhile is received in that pass, after the test has moved the
+    /// reaper's clock: the stand-in for a long progress loop.
     #[cfg(test)]
-    pub pre_progress_delay_ms: AtomicU64,
+    pub pre_progress_hold: AtomicBool,
+    /// Test seam: `true` while the progress loop waits on `pre_progress_hold`.
+    #[cfg(test)]
+    pub pre_progress_held: AtomicBool,
+    /// Test seam: the setup bound the reaper uses, in milliseconds; starts at
+    /// [`EP_SETUP_BOUND`]. A reaper test whose subject is not setup sets it to
+    /// zero, so an endpoint counts as set up as soon as it is created.
+    #[cfg(test)]
+    pub ep_setup_bound_ms: AtomicU64,
+    /// Test seam: passes of the progress loop that reached the reaper. A test
+    /// that moves the reaper's clock waits for two more, so one pass has read
+    /// the new time and scanned with it.
+    #[cfg(test)]
+    pub passes: AtomicU64,
+    /// Test seam: commands the progress loop has handled. Once it moves past
+    /// a send's command, that send has been posted.
+    #[cfg(test)]
+    pub cmds_handled: AtomicU64,
     /// Test seam: while set, the progress loop waits at the top of its pass
     /// and takes no command. Unlike `progress_stall_ms`, the wait lasts until
     /// the test clears the flag, so a test that must act while the thread
@@ -626,6 +705,9 @@ pub(crate) struct StartupOut {
 /// Everything [`worker_main`] needs, assembled by `UcxTransport::start`.
 pub(crate) struct WorkerArgs {
     pub config: UcxConfig,
+    /// Leave UCX's software RMA emulation on. See "Software RMA is off" in the
+    /// module docs.
+    pub software_rma: bool,
     pub ring_rx: CommandReceiver,
     pub shared: Arc<WorkerShared>,
     pub adapter: TransportAdapter,
@@ -677,14 +759,16 @@ struct EpSends {
     /// nanoseconds after `born`. Zero means never.
     drained_at_ns: AtomicU64,
     born: Instant,
+    clock: ReaperClock,
 }
 
 impl EpSends {
-    fn new(born: Instant) -> Self {
+    fn new(born: Instant, clock: ReaperClock) -> Self {
         Self {
             inflight: AtomicUsize::new(0),
             drained_at_ns: AtomicU64::new(0),
             born,
+            clock,
         }
     }
 
@@ -723,7 +807,12 @@ impl OpState {
     fn stamp_ep_drained(&self) {
         if let Some(sends) = &self.ep_sends {
             // `max(1)`: zero means "never".
-            let ns = (sends.born.elapsed().as_nanos() as u64).max(1);
+            let ns = (sends
+                .clock
+                .now()
+                .saturating_duration_since(sends.born)
+                .as_nanos() as u64)
+                .max(1);
             sends.drained_at_ns.store(ns, Ordering::Relaxed);
         }
     }
@@ -820,6 +909,21 @@ struct RmaOpState {
     /// handle to compare against, whereas the peer is stable and errs toward
     /// keeping an endpoint that might be in use.
     peer: InstanceId,
+    /// The incarnation of the peer the endpoint was created for. Recorded in
+    /// [`WorkerShared::no_native_get`] if UCX refuses the GET.
+    incarnation: u64,
+    /// Set when velo retires the endpoint this operation was posted on. A GET
+    /// that velo's own FORCE close cancelled is not a refusal.
+    ep_retired: Arc<AtomicBool>,
+    /// Set by `shutdown()`. Teardown cancels operations too.
+    shutdown_requested: Arc<AtomicBool>,
+    /// Peers whose endpoint failed. A failed RC queue pair flushes its GETs
+    /// with `CANCELED` too.
+    failed_peers: Arc<DashMap<InstanceId, ()>>,
+    /// Where a refusal is recorded.
+    no_native_get: Arc<DashMap<InstanceId, u64>>,
+    /// Registered peers, read to drop a record that an unregister raced.
+    peers: Arc<DashMap<InstanceId, UcxEndpoint>>,
     /// Region whose in-flight count this operation holds.
     region_id: u64,
     /// Identifies this operation in [`WorkerState::rma_ops`].
@@ -869,6 +973,11 @@ impl RmaOpState {
         }
         self.resolve(if status == sys::ucs_status_t_UCS_OK {
             Ok(())
+        } else if self.refused(status) {
+            // Recorded before the caller hears of it, so a caller that falls
+            // back and tries again already finds the peer marked.
+            self.record_refusal();
+            Err(RmaError::NoNativeGet)
         } else {
             Err(RmaError::Ucx {
                 status_name: status_string(status),
@@ -878,6 +987,47 @@ impl RmaOpState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((self.region_id, self.op_id));
+    }
+
+    /// Whether `status` is UCX refusing the GET because no native protocol
+    /// reaches the peer.
+    ///
+    /// With software RMA off, `ucp_proto_reconfig_progress` (`proto_reconfig.c`)
+    /// aborts such a GET with `UCS_ERR_CANCELED` and leaves the endpoint up.
+    /// Two other sources of `CANCELED` exist:
+    ///
+    /// * A FORCE close. Velo issues every FORCE close itself, and it marks the
+    ///   endpoint retired, or it is shutting down, before the close.
+    /// * A failed RC queue pair, which flushes its outstanding GETs with
+    ///   `IBV_WC_WR_FLUSH_ERR` (`uct_ib_wc_to_ucs_status`). UCX purges them
+    ///   before or after the endpoint's error handler runs. Before: the peer
+    ///   is in `failed_peers` here. After: [`WorkerState::reap_failed_eps`]
+    ///   drops the record this took.
+    fn refused(&self, status: sys::ucs_status_t) -> bool {
+        status == sys::ucs_status_t_UCS_ERR_CANCELED
+            && !self.ep_retired.load(Ordering::Acquire)
+            && !self.shutdown_requested.load(Ordering::Acquire)
+            && !self.failed_peers.contains_key(&self.peer)
+    }
+
+    /// Record that the peer refused a GET, unless it is no longer registered
+    /// as the incarnation the GET went to.
+    ///
+    /// Insert first, then check: `unregister` removes the peer and then the
+    /// record. If the insert lands after that removal, this check sees the
+    /// peer gone and takes the record out again. Either way no record outlives
+    /// its peer.
+    fn record_refusal(&self) {
+        self.no_native_get.insert(self.peer, self.incarnation);
+        let registered = self
+            .peers
+            .get(&self.peer)
+            .is_some_and(|blob| blob.incarnation == self.incarnation);
+        if !registered {
+            self.no_native_get.remove_if(&self.peer, |_, incarnation| {
+                *incarnation == self.incarnation
+            });
+        }
     }
 
     /// Answer the caller, at most once. Also used by teardown for operations
@@ -1098,6 +1248,14 @@ unsafe extern "C" fn recv_trampoline(
         if ra.shared.stamp_inbound {
             let sender = u64::from_le_bytes(tag.try_into().unwrap());
             ra.shared.worker.senders.record(sender as usize);
+        }
+        // Kept apart from the sighting above on purpose: the check it feeds
+        // must still see a frame that the sighting path misses.
+        #[cfg(test)]
+        if ra.shared.worker.track_inbound.load(Ordering::Relaxed) {
+            let sender = u64::from_le_bytes(tag.try_into().unwrap());
+            let now = ra.shared.worker.reaper_clock.now();
+            ra.shared.worker.last_inbound.lock().insert(sender, now);
         }
 
         let header = if header.is_empty() {
@@ -1326,6 +1484,15 @@ struct EpEntry {
     /// which is the only reader, so with the reaper off (the default) a send
     /// pays only two `None` checks, plus one clock read per `ucp_ep_create`.
     sends: Option<Arc<EpSends>>,
+    /// When `ensure_ep` created this endpoint.
+    born: Instant,
+    /// Whether a frame from the peer has arrived since this endpoint was
+    /// created. Until one has, the endpoint is still being set up (see
+    /// [`EpEntry::set_up`]).
+    peer_sent: bool,
+    /// Set just before velo closes this endpoint, so a GET the close cancels
+    /// is not taken for UCX refusing it (see [`RmaOpState::refused`]).
+    retired: Arc<AtomicBool>,
 }
 
 impl EpEntry {
@@ -1343,6 +1510,15 @@ impl EpEntry {
         self.sends
             .as_ref()
             .is_some_and(|s| s.inflight.load(Ordering::Relaxed) != 0)
+    }
+
+    /// Whether setup has ended, so idle time may count against the endpoint.
+    ///
+    /// Setup ends with the first frame from the peer, or `bound`
+    /// ([`EP_SETUP_BOUND`]) after creation, whichever comes first. The module
+    /// docs ("Setup is not idle time") say why.
+    fn set_up(&self, now: Instant, bound: Duration) -> bool {
+        self.peer_sent || now.saturating_duration_since(self.born) > bound
     }
 }
 
@@ -1384,6 +1560,9 @@ struct PreparedGet {
     /// Carried through so the posted operation can name its peer for the idle
     /// reaper's in-flight check.
     peer: InstanceId,
+    /// The endpoint's incarnation and retired flag; see [`RmaOpState`].
+    incarnation: u64,
+    ep_retired: Arc<AtomicBool>,
 }
 
 struct WorkerState {
@@ -1460,6 +1639,16 @@ pub(super) fn ep_scan_period(timeout: Duration) -> Duration {
     (timeout / 2).clamp(Duration::from_millis(10), Duration::from_secs(1))
 }
 
+/// How long an endpoint may wait for its peer's first frame before idle time
+/// counts against it. See the module docs ("Setup is not idle time").
+///
+/// Sized from the slowest setup measured: under load (48 copies of the UCX
+/// tests at once on 8 CPUs, host load about 300) a peer's `ucp_ep_create` took
+/// 630-1250 ms, and one frame took up to 2250 ms to arrive. Five seconds is
+/// twice the slowest frame. A longer bound only keeps an endpoint to a silent
+/// peer open longer; a shorter one brings back the reap during setup.
+pub(super) const EP_SETUP_BOUND: Duration = Duration::from_secs(5);
+
 /// Backstop park timeout: a lost doorbell costs at most this much latency.
 ///
 /// It also bounds how late a due scan can run on an idle worker, which the
@@ -1474,13 +1663,14 @@ const RMA_DRAIN: Duration = Duration::from_secs(1);
 pub(crate) fn worker_main(args: WorkerArgs) {
     let WorkerArgs {
         config,
+        software_rma,
         ring_rx,
         shared,
         adapter,
         startup,
     } = args;
 
-    let state = match unsafe { init_ucx(&config, &shared, &adapter) } {
+    let state = match unsafe { init_ucx(&config, software_rma, &shared, &adapter) } {
         Ok((state, out)) => {
             let _ = startup.send(Ok(out));
             state
@@ -1520,6 +1710,53 @@ impl Drop for NativeInit {
     }
 }
 
+/// The oldest UCX release whose software GET obeys `PROTO_EMULATION_ENABLE=n`.
+///
+/// The vendored 1.22.0 does (`get_am.c` reads the flag). A system UCX linked
+/// with ucx-rs's `UCX_DIR` can be as old as 1.17, and 1.20 accepts the
+/// setting but still emulates a GET over tcp.
+const SOFTWARE_RMA_SWITCH_FLOOR: (u32, u32) = (1, 22);
+
+/// Whether software RMA was asked to be off: by velo's default, or by the
+/// environment, which wins.
+///
+/// The spellings are the ones UCX 1.22 itself reads as off: `n` and `no` in
+/// any case, `off` in lower case only, and `0`. UCX rejects any other value
+/// (`OFF`, `false`, a leading space) and the transport fails to start, so
+/// treating such a value as off would only misreport the warning.
+/// `documented_off_spellings_are_accepted_by_ucx` checks this list against
+/// UCX's own parser.
+fn software_rma_requested_off(software_rma: bool, env_switch: Option<&str>) -> bool {
+    match env_switch {
+        Some(value) => {
+            value.eq_ignore_ascii_case("n")
+                || value.eq_ignore_ascii_case("no")
+                || value == "off"
+                || value == "0"
+        }
+        None => !software_rma,
+    }
+}
+
+/// Whether UCX `major.minor` turns software RMA off when asked.
+fn software_rma_switch_applies(major: u32, minor: u32) -> bool {
+    (major, minor) >= SOFTWARE_RMA_SWITCH_FLOOR
+}
+
+/// Warn, once per process, that this UCX ignores the switch.
+fn warn_software_rma_still_on(major: u32, minor: u32, release: u32) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        let (floor_major, floor_minor) = SOFTWARE_RMA_SWITCH_FLOOR;
+        warn!(
+            "ucx: UCX {major}.{minor}.{release} ignores PROTO_EMULATION_ENABLE=n \
+             (it needs {floor_major}.{floor_minor} or later), so a GET over a tcp-only \
+             lane is still emulated in software, and a puller that goes away during \
+             one can abort the owner's process"
+        );
+    });
+}
+
 fn config_value(name: &str, value: &str) -> anyhow::Result<std::ffi::CString> {
     std::ffi::CString::new(value)
         .map_err(|_| anyhow::anyhow!("UCX {name} value contains a NUL byte"))
@@ -1528,6 +1765,7 @@ fn config_value(name: &str, value: &str) -> anyhow::Result<std::ffi::CString> {
 /// All UCX object creation, in one place. Runs once, on the progress thread.
 unsafe fn init_ucx(
     config: &UcxConfig,
+    software_rma: bool,
     shared: &Arc<WorkerShared>,
     adapter: &TransportAdapter,
 ) -> anyhow::Result<(WorkerState, StartupOut)> {
@@ -1555,6 +1793,27 @@ unsafe fn init_ucx(
                 let k = std::ffi::CString::new(key).unwrap();
                 let v = std::ffi::CString::new(value).unwrap();
                 let _ = sys::ucp_config_modify(ucp_cfg, k.as_ptr(), v.as_ptr());
+            }
+        }
+        // Software RMA is off: see the module docs. The environment wins here
+        // too, so `UCX_PROTO_EMULATION_ENABLE=y` turns it back on for a
+        // deployment that accepts the risk.
+        let env_switch = std::env::var("UCX_PROTO_EMULATION_ENABLE").ok();
+        if !software_rma && env_switch.is_none() {
+            let k = std::ffi::CString::new("PROTO_EMULATION_ENABLE").unwrap();
+            let v = std::ffi::CString::new("n").unwrap();
+            let st = sys::ucp_config_modify(ucp_cfg, k.as_ptr(), v.as_ptr());
+            anyhow::ensure!(
+                st == sys::ucs_status_t_UCS_OK,
+                "ucp_config_modify(PROTO_EMULATION_ENABLE=n): {}",
+                status_string(st)
+            );
+        }
+        if software_rma_requested_off(software_rma, env_switch.as_deref()) {
+            let (mut major, mut minor, mut release) = (0, 0, 0);
+            sys::ucp_get_version(&mut major, &mut minor, &mut release);
+            if !software_rma_switch_applies(major, minor) {
+                warn_software_rma_still_on(major, minor, release);
             }
         }
         if let Some(tls) = &config.tls
@@ -1693,8 +1952,8 @@ unsafe fn init_ucx(
                 _recv_args: std::mem::take(&mut native.recv_args),
                 parked_for_close: Vec::new(),
                 pending_closes: Vec::new(),
-                now: Instant::now(),
-                next_ep_scan: Instant::now(),
+                now: shared.reaper_clock.now(),
+                next_ep_scan: shared.reaper_clock.now(),
                 seen_senders: 0,
                 sender_scratch: Vec::with_capacity(SENDER_SLOTS),
                 am_header: Vec::new(),
@@ -1729,6 +1988,8 @@ fn drain_ring(
                     warn!("ucx: panic while handling a command (continuing)");
                     true
                 });
+                #[cfg(test)]
+                state.shared.cmds_handled.fetch_add(1, Ordering::Release);
                 if !cont {
                     return (false, false);
                 }
@@ -1745,8 +2006,8 @@ fn drain_ring(
 /// The order is load-bearing. A test that sees the cell read zero knows the
 /// progress thread has taken the value and is in, or entering, the sleep, with
 /// no progress call left before it.
-/// `a_frame_received_late_in_a_long_pass_is_not_stamped_early` relies on that
-/// to send while the thread is stalled.
+/// `an_rma_get_slower_than_the_timeout_restarts_the_idle_clock` relies on that
+/// to post its GET while the owner is stalled.
 ///
 /// A load first, so the benchmarks in the test build pay no read-modify-write
 /// per pass.
@@ -1758,15 +2019,16 @@ fn take_test_delay(cell: &AtomicU64) {
     }
 }
 
-/// Test seam: wait while `progress_hold` is set; see its doc.
+/// Test seam: wait while `hold` is set, with `held` raised meanwhile; see
+/// `progress_hold` and `pre_progress_hold`.
 #[cfg(test)]
-fn wait_while_held(shared: &WorkerShared) {
-    if shared.progress_hold.load(Ordering::Acquire) {
-        shared.progress_held.store(true, Ordering::Release);
-        while shared.progress_hold.load(Ordering::Acquire) {
+fn wait_while_held(hold: &AtomicBool, held: &AtomicBool) {
+    if hold.load(Ordering::Acquire) {
+        held.store(true, Ordering::Release);
+        while hold.load(Ordering::Acquire) {
             std::thread::sleep(Duration::from_micros(100));
         }
-        shared.progress_held.store(false, Ordering::Release);
+        held.store(false, Ordering::Release);
     }
 }
 
@@ -1789,7 +2051,7 @@ fn run_loop(mut state: WorkerState, mut ring_rx: CommandReceiver) {
         #[cfg(test)]
         take_test_delay(&state.shared.progress_stall_ms);
         #[cfg(test)]
-        wait_while_held(&state.shared);
+        wait_while_held(&state.shared.progress_hold, &state.shared.progress_held);
         #[cfg(test)]
         state.shared.progress_passes.fetch_add(1, Ordering::Relaxed);
         // The reaper's clock. It is read here, again after the progress loop,
@@ -1801,7 +2063,7 @@ fn run_loop(mut state: WorkerState, mut ring_rx: CommandReceiver) {
         // value. The scan's `saturating_duration_since` reads that as zero idle
         // time, which is correct.
         if reaper_on {
-            state.now = Instant::now();
+            state.now = state.shared.reaper_clock.now();
         }
 
         // -- drain the ring --------------------------------------------------
@@ -1812,7 +2074,10 @@ fn run_loop(mut state: WorkerState, mut ring_rx: CommandReceiver) {
         }
 
         #[cfg(test)]
-        take_test_delay(&state.shared.pre_progress_delay_ms);
+        wait_while_held(
+            &state.shared.pre_progress_hold,
+            &state.shared.pre_progress_held,
+        );
 
         // -- progress to quiescence -----------------------------------------
         // SAFETY: worker owned by this thread.
@@ -1826,7 +2091,7 @@ fn run_loop(mut state: WorkerState, mut ring_rx: CommandReceiver) {
         // just used. The clock only moves forward, and a later stamp errs
         // toward keeping an endpoint open.
         if reaper_on {
-            state.now = Instant::now();
+            state.now = state.shared.reaper_clock.now();
         }
 
         // -- flush, then reap -------------------------------------------------
@@ -1867,6 +2132,8 @@ fn run_loop(mut state: WorkerState, mut ring_rx: CommandReceiver) {
             // after `drain_rma_completions` so the in-flight registry it
             // consults is as fresh as this thread can make it.
             state.reap_idle_eps();
+            #[cfg(test)]
+            state.shared.passes.fetch_add(1, Ordering::Release);
         }
         state.poll_pending_closes();
 
@@ -2207,14 +2474,14 @@ impl WorkerState {
         // the scan that ends it on one clock. It also makes endpoints stamped
         // earlier in this pass read as older by the time the create took,
         // which is their true age in wall-clock time.
-        self.now = Instant::now();
+        self.now = self.shared.reaper_clock.now();
 
         self.shared.failed_peers.remove(&peer);
         self.shared.eps_open.fetch_add(1, Ordering::Relaxed);
         let sends = self
             .config
             .ep_idle_timeout
-            .map(|_| Arc::new(EpSends::new(self.now)));
+            .map(|_| Arc::new(EpSends::new(self.now, self.shared.reaper_clock.clone())));
         self.eps.insert(
             peer,
             EpEntry {
@@ -2223,6 +2490,9 @@ impl WorkerState {
                 incarnation: blob.incarnation,
                 last_used: self.now,
                 sends: sends.clone(),
+                born: self.now,
+                peer_sent: false,
+                retired: Arc::new(AtomicBool::new(false)),
             },
         );
         debug!("ucx: created endpoint to {peer}");
@@ -2277,6 +2547,11 @@ impl WorkerState {
             std::mem::take(&mut *guard)
         };
         for peer in peers {
+            // A GET the failure flushed can look like a refusal (see
+            // `RmaOpState::refused`), so the record is not trusted past a
+            // failure. A peer that really has no native GET is refused again
+            // on its next GET, at the cost of one more fallback.
+            self.shared.no_native_get.remove(&peer);
             if let Some(entry) = self.eps.remove(&peer) {
                 // The ep already failed: FORCE-close is the only close that
                 // cannot block on the dead peer.
@@ -2326,6 +2601,10 @@ impl WorkerState {
             for entry in self.eps.values_mut() {
                 if entry.incarnation as usize == seen {
                     entry.last_used = now;
+                    // Only an exact sighting ends setup. The overflow path
+                    // above stamps every endpoint without knowing which peers
+                    // sent, so it leaves setup alone.
+                    entry.peer_sent = true;
                     hit = true;
                 }
             }
@@ -2366,6 +2645,11 @@ impl WorkerState {
             return;
         }
 
+        #[cfg(not(test))]
+        let setup_bound = EP_SETUP_BOUND;
+        #[cfg(test)]
+        let setup_bound =
+            Duration::from_millis(self.shared.ep_setup_bound_ms.load(Ordering::Relaxed));
         // Collected before anything is removed: `close_ep` takes `&mut self`,
         // and the map cannot be iterated across that.
         let idle: Vec<InstanceId> = self
@@ -2373,6 +2657,10 @@ impl WorkerState {
             .iter()
             .filter(|(peer, entry)| {
                 self.now.saturating_duration_since(entry.last_activity()) > timeout
+                    // An endpoint still being set up is not idle: its peer's
+                    // first frame may be waiting on the peer's own endpoint
+                    // creation.
+                    && entry.set_up(self.now, setup_bound)
                     // A send in flight is a use: closing now would cancel it.
                     && !entry.has_send_in_flight()
                     // The in-flight exclusion for RMA. `rma_ops` holds every
@@ -2387,6 +2675,30 @@ impl WorkerState {
 
         for peer in idle {
             if let Some(entry) = self.eps.remove(&peer) {
+                // Test check: a reap of an endpoint whose peer sent a frame
+                // within the timeout. It can never fire for a correct
+                // reaper, at any load. A frame is received inside
+                // `ucp_worker_progress`, and its time is read there. The pass
+                // clock is read after the progress loop, so it is no earlier,
+                // and `stamp_inbound_use` writes that clock to the endpoint
+                // before this scan. Nothing between the clock read and this
+                // scan runs an AM callback: the flush drain, the RMA drain and
+                // the three close passes never call `ucp_worker_progress`. So
+                // `last_used` is no earlier than the frame, and a reap needs
+                // `now - last_used > timeout`.
+                #[cfg(test)]
+                if let Some(seen) = self
+                    .shared
+                    .last_inbound
+                    .lock()
+                    .get(&entry.incarnation)
+                    .copied()
+                    && self.now.saturating_duration_since(seen) <= timeout
+                {
+                    self.shared
+                        .eps_reaped_while_active
+                        .fetch_add(1, Ordering::Relaxed);
+                }
                 debug!("ucx: closing endpoint to {peer} after {timeout:?} idle");
                 // NOTED RISK, for whoever changes close timing next. Every close
                 // that existed before this one was reactive — a peer failed, or
@@ -2432,6 +2744,7 @@ impl WorkerState {
         // than coming through here. Every `EpEntry` passes through exactly one
         // of them, which is what keeps `eps_open` from drifting.
         self.shared.eps_open.fetch_sub(1, Ordering::Relaxed);
+        entry.retired.store(true, Ordering::Release);
         // SAFETY: worker/ep owned by this thread; err_arg was leaked at
         // creation and UCX will not call the handler after close is issued.
         unsafe {
@@ -2740,6 +3053,13 @@ impl WorkerState {
         let (ep, _) = self
             .ensure_ep(req.peer)
             .map_err(|e| RmaError::EndpointUnavailable(e.to_string()))?;
+        let (incarnation, ep_retired) = {
+            let entry = self
+                .eps
+                .get(&req.peer)
+                .ok_or_else(|| RmaError::EndpointUnavailable("no endpoint".into()))?;
+            (entry.incarnation, Arc::clone(&entry.retired))
+        };
 
         // Two distinct over-reads, contained two different ways.
         //
@@ -2793,6 +3113,8 @@ impl WorkerState {
             len: req.len as usize,
             region_id: req.local_region,
             peer: req.peer,
+            incarnation,
+            ep_retired,
         }))
     }
 
@@ -2814,6 +3136,12 @@ impl WorkerState {
         let op = Arc::new(RmaOpState {
             rkey: Mutex::new(Some(prepared.rkey as usize)),
             peer: prepared.peer,
+            incarnation: prepared.incarnation,
+            ep_retired: prepared.ep_retired,
+            shutdown_requested: Arc::clone(&self.shared.shutdown_requested),
+            failed_peers: Arc::clone(&self.shared.failed_peers),
+            no_native_get: Arc::clone(&self.shared.no_native_get),
+            peers: Arc::clone(&self.shared.peers),
             region_id: prepared.region_id,
             op_id,
             reply: Mutex::new(Some(reply)),
@@ -3058,6 +3386,7 @@ impl WorkerState {
                 self.close_ep_raw(entry, true);
                 continue;
             }
+            entry.retired.store(true, Ordering::Release);
             // SAFETY: worker/ep owned by this thread.
             let ptr = unsafe {
                 let param: sys::ucp_request_param_t = MaybeUninit::zeroed().assume_init();
@@ -3172,7 +3501,80 @@ pub(crate) type StartupSlot = OnceLock<StartupOut>;
 
 #[cfg(test)]
 mod initialization_tests {
-    use super::config_value;
+    use super::{config_value, software_rma_requested_off, software_rma_switch_applies};
+
+    /// velo reads an environment value as "software RMA off" exactly when UCX
+    /// accepts it for `PROTO_EMULATION_ENABLE`. Every candidate here is a
+    /// spelling of "off", so UCX accepting it means UCX turns emulation off.
+    /// If the two disagree, velo warns (or stays silent) for a setting UCX
+    /// does not apply the way velo thinks.
+    #[test]
+    fn documented_off_spellings_are_accepted_by_ucx() {
+        use ucx_rs::sys;
+
+        let mut config = std::ptr::null_mut();
+        // SAFETY: UCX initializes this valid output pointer with an owned config.
+        let status =
+            unsafe { sys::ucp_config_read(std::ptr::null(), std::ptr::null(), &mut config) };
+        assert_eq!(status, sys::ucs_status_t_UCS_OK);
+        let candidates = [
+            c"n", c"N", c"no", c"No", c"NO", c"off", c"Off", c"OFF", c"0", c"false", c" n",
+        ];
+        let results = candidates.map(|value| {
+            // SAFETY: the config is live and both strings are NUL-terminated.
+            let status = unsafe {
+                sys::ucp_config_modify(config, c"PROTO_EMULATION_ENABLE".as_ptr(), value.as_ptr())
+            };
+            (value, status == sys::ucs_status_t_UCS_OK)
+        });
+        // SAFETY: this test owns the config and no context uses it.
+        unsafe { sys::ucp_config_release(config) };
+        for (value, ucx_accepts) in results {
+            let text = value.to_str().expect("ASCII candidate");
+            assert_eq!(
+                software_rma_requested_off(true, Some(text)),
+                ucx_accepts,
+                "velo and UCX disagree on {text:?} (UCX accepts it: {ucx_accepts})"
+            );
+        }
+    }
+
+    /// The environment wins over velo's default, as for every `UCX_*`
+    /// setting, so an operator's `n` must also lead to the version check.
+    #[test]
+    fn software_rma_is_requested_off_by_default_or_by_the_environment() {
+        assert!(software_rma_requested_off(false, None));
+        assert!(!software_rma_requested_off(true, None));
+        for off in ["n", "N", "no", "NO", "off", "0"] {
+            assert!(software_rma_requested_off(true, Some(off)), "{off}");
+            assert!(software_rma_requested_off(false, Some(off)), "{off}");
+        }
+        for on in ["y", "yes", "1"] {
+            assert!(!software_rma_requested_off(false, Some(on)), "{on}");
+        }
+        // UCX rejects these, and then the transport fails to start; velo must
+        // not read them as off.
+        for rejected in ["OFF", "Off", "false", " n"] {
+            assert!(
+                !software_rma_requested_off(true, Some(rejected)),
+                "{rejected}"
+            );
+        }
+    }
+
+    /// The floor under which velo warns that software GET is still on. UCX
+    /// 1.20 accepts `PROTO_EMULATION_ENABLE=n` and still emulates a GET over
+    /// tcp; the vendored 1.22.0 refuses it. The release number plays no part.
+    #[test]
+    fn the_software_rma_switch_needs_ucx_1_22() {
+        assert!(!software_rma_switch_applies(1, 17));
+        assert!(!software_rma_switch_applies(1, 20));
+        assert!(!software_rma_switch_applies(1, 21));
+        assert!(software_rma_switch_applies(1, 22));
+        assert!(software_rma_switch_applies(1, 23));
+        assert!(software_rma_switch_applies(2, 0));
+        assert!(!software_rma_switch_applies(0, 99));
+    }
 
     #[test]
     fn configuration_strings_reject_nul_with_context() {

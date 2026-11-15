@@ -140,6 +140,13 @@ pub(crate) enum RmaError {
         status_name: &'static str,
     },
 
+    /// UCX has no native GET to the peer, and software RMA is off: over a
+    /// tcp-only lane UCX could only emulate the GET, and the emulation can
+    /// abort the owner's process (see `transports::ucx::worker`, "Software
+    /// RMA is off"). The endpoint stays up; only RMA to this peer is refused.
+    #[error("ucx: no native GET to this peer (software RMA is off)")]
+    NoNativeGet,
+
     /// The transport is shutting down; the operation was refused or abandoned.
     #[error("ucx transport shutting down")]
     ShuttingDown,
@@ -244,6 +251,23 @@ impl Clone for RdmaEndpoint {
 impl RdmaEndpoint {
     pub(crate) fn new(shared: Arc<WorkerShared>, state: Arc<RmaState>) -> Self {
         Self { shared, state }
+    }
+
+    /// Whether a GET to `peer` was refused for want of a native protocol, by
+    /// the endpoint to the incarnation still registered for it.
+    ///
+    /// Asked once per rendezvous transfer, before the consumer offers RDMA, so
+    /// a tcp-only peer costs one refused GET and not one per transfer. The
+    /// map is empty unless a GET was refused, so the common case is one
+    /// lookup in an empty map.
+    pub(crate) fn refuses_get(&self, peer: InstanceId) -> bool {
+        let Some(refused) = self.shared.no_native_get.get(&peer).map(|e| *e) else {
+            return false;
+        };
+        self.shared
+            .peers
+            .get(&peer)
+            .is_some_and(|blob| blob.incarnation == refused)
     }
 
     /// Register `[ptr, ptr + len)` for RMA and pack a remote key for it.

@@ -89,7 +89,13 @@ pub struct UcxConfig {
 
 /// Floor on [`UcxConfig::ep_idle_timeout`].
 ///
-/// Sized to **dominate endpoint wireup**. A send posted on an endpoint we own
+/// Sized to **dominate our own endpoint wireup**. It does not have to cover
+/// the peer's: until the peer's first frame arrives, the endpoint is still
+/// being set up and the reaper does not count idle time against it (up to a
+/// bound; see `worker::EP_SETUP_BOUND`). Under load the peer's `ucp_ep_create`
+/// took 630-1250 ms, more than this floor, and before that rule a reaper at the
+/// floor closed endpoints whose peer had not yet answered. A send posted on an
+/// endpoint we own
 /// holds that endpoint open at any timeout, so a short timeout cancels none of
 /// those sends. (Replies posted on the endpoint UCX hands the receive callback
 /// are not counted.) What a short timeout does is close endpoints between
@@ -157,6 +163,9 @@ pub struct UcxTransport {
     /// Submit-side RMA bookkeeping, shared with every [`RdmaEndpoint`] handed
     /// out by [`UcxTransport::rdma_endpoint`].
     rma: Arc<RmaState>,
+    /// Leave UCX's software RMA emulation on. Off unless a test asked for it
+    /// with [`UcxTransportBuilder::allow_software_rma`]; see that method.
+    software_rma: bool,
 }
 
 impl UcxTransport {
@@ -170,6 +179,7 @@ impl UcxTransport {
             peers: Arc::new(DashMap::new()),
             pending_pings: Arc::new(DashMap::new()),
             failed_peers: Arc::new(DashMap::new()),
+            no_native_get: Arc::new(DashMap::new()),
             inflight_ops: Arc::new(Default::default()),
             shutdown_requested: Arc::new(Default::default()),
             reg_epoch: Arc::new(Default::default()),
@@ -182,12 +192,27 @@ impl UcxTransport {
             senders: Arc::new(super::worker::SenderSightings::new()),
             incarnation,
             metrics: OnceLock::new(),
+            reaper_clock: Default::default(),
+            #[cfg(test)]
+            track_inbound: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            last_inbound: Default::default(),
+            #[cfg(test)]
+            eps_reaped_while_active: AtomicU64::new(0),
             #[cfg(test)]
             ep_create_delay_ms: AtomicU64::new(0),
             #[cfg(test)]
             progress_stall_ms: AtomicU64::new(0),
             #[cfg(test)]
-            pre_progress_delay_ms: AtomicU64::new(0),
+            pre_progress_hold: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            pre_progress_held: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            passes: AtomicU64::new(0),
+            #[cfg(test)]
+            ep_setup_bound_ms: AtomicU64::new(super::worker::EP_SETUP_BOUND.as_millis() as u64),
+            #[cfg(test)]
+            cmds_handled: AtomicU64::new(0),
             #[cfg(test)]
             progress_hold: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -212,6 +237,7 @@ impl UcxTransport {
             join: Mutex::new(None),
             ping_token: AtomicU64::new(1),
             rma: Arc::new(RmaState::new()),
+            software_rma: false,
         }
     }
 
@@ -506,6 +532,7 @@ impl Transport for UcxTransport {
     fn unregister(&self, instance_id: InstanceId) {
         let known = self.shared.peers.remove(&instance_id).is_some();
         self.shared.failed_peers.remove(&instance_id);
+        self.shared.no_native_get.remove(&instance_id);
         if let Some((_, handle)) = self.connections.remove(&instance_id) {
             // The forwarder task ends once the last clone of the handle is
             // dropped.
@@ -617,6 +644,7 @@ impl Transport for UcxTransport {
             let (startup_tx, startup_rx) = tokio::sync::oneshot::channel();
             let args = WorkerArgs {
                 config: self.config.clone(),
+                software_rma: self.software_rma,
                 ring_rx,
                 shared: Arc::clone(&self.shared),
                 adapter: channels,
@@ -737,6 +765,7 @@ impl Transport for UcxTransport {
 pub struct UcxTransportBuilder {
     key: Option<TransportKey>,
     config: UcxConfig,
+    software_rma: bool,
 }
 
 impl UcxTransportBuilder {
@@ -745,6 +774,7 @@ impl UcxTransportBuilder {
         Self {
             key: None,
             config: UcxConfig::default(),
+            software_rma: false,
         }
     }
 
@@ -859,6 +889,13 @@ impl UcxTransportBuilder {
     /// reaper scans. The time `ucp_ep_create` takes does not count as idle
     /// either.
     ///
+    /// Setup does not count as idle time. An endpoint is set up once a frame
+    /// from its peer has arrived; until then the peer may still be creating
+    /// its own endpoint back to us, which took up to 1.25 s under load. Setup
+    /// has a bound of 5 s, so an endpoint to a peer that never sends to us (for
+    /// example one used only for RDMA reads) closes up to 5 s later than the
+    /// timeout alone would close it.
+    ///
     /// Values below half a second are raised to it; see the transport's
     /// `MIN_EP_IDLE_TIMEOUT` for why that is the number.
     ///
@@ -972,9 +1009,11 @@ impl UcxTransportBuilder {
     /// be usable together: eager wireup amortises the connection cost away from
     /// the first transfer, and the reaper reclaims it again if the peer turns
     /// out never to be used. An eagerly established endpoint's idle clock starts
-    /// when `ucp_ep_create` returns, so with both on, a registered-but-never-used
-    /// peer is wired up once and closed about one timeout (see the close window
-    /// in [`ep_idle_timeout`](Self::ep_idle_timeout)) after that call returned.
+    /// when `ucp_ep_create` returns, but a peer that is never used never sends
+    /// to us, so its endpoint stays in setup for the 5 s setup bound. With both
+    /// on, such a peer is wired up once and closed about one setup bound, or
+    /// one timeout if that is longer (see the close window in
+    /// [`ep_idle_timeout`](Self::ep_idle_timeout)), after that call returned.
     /// The UCX wireup itself finishes later, in the background. That is the
     /// intended behaviour, not a conflict.
     pub fn eager_endpoints(mut self, eager: bool) -> Self {
@@ -982,11 +1021,35 @@ impl UcxTransportBuilder {
         self
     }
 
+    /// Let UCX emulate RMA in software where no lane can do it in hardware,
+    /// as over a tcp-only lane. For tests only: CI has no RDMA hardware, and
+    /// the RMA tests need a GET to run.
+    ///
+    /// **The emulation can abort the owner's process.** In UCX 1.22, an owner
+    /// serving a software GET aborts when the puller goes away during the
+    /// reply: `ucs_fatal` in `ucp_request_try_send`, or an assertion in
+    /// `uct_tcp_ep_pending_purge`. A crashed puller is enough. So velo leaves
+    /// it off by default, and a GET with no lane that can do it in hardware is
+    /// refused; the rendezvous layer then moves the bytes over its chunked
+    /// path. The protection is on the puller's side: an owner is safe when
+    /// every puller that reads from it has the emulation off.
+    ///
+    /// A deployment that accepts the risk can set
+    /// `UCX_PROTO_EMULATION_ENABLE=y` instead. The environment always wins, as
+    /// for every other `UCX_*` setting velo has a default for.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn allow_software_rma(mut self, allow: bool) -> Self {
+        self.software_rma = allow;
+        self
+    }
+
     /// Build the [`UcxTransport`]. UCX initialisation is deferred to
     /// [`Transport::start`]; building never touches UCX.
     pub fn build(self) -> Result<UcxTransport> {
         let key = self.key.unwrap_or_else(|| TransportKey::from("ucx"));
-        Ok(UcxTransport::new(key, self.config))
+        let mut transport = UcxTransport::new(key, self.config);
+        transport.software_rma = self.software_rma;
+        Ok(transport)
     }
 }
 

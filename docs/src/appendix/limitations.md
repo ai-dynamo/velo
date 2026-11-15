@@ -164,3 +164,52 @@ time-to-live.
 **Lifted by.** Not scheduled. A default time-to-live for transparently staged
 payloads would lift it, but it would also fail a fetch that is slower than
 that time.
+
+## No RDMA rendezvous over a TCP-only lane
+
+**What happens.** A rendezvous transfer to a peer that UCX reaches only over
+TCP moves over the chunked path, not by RDMA GET. The first transfer to the
+peer tries a GET. UCX refuses it and logs `No zero-copy protocol found for
+get into host from host` at ERROR level, and the consumer falls back
+(`get_failed`). Later transfers to the same peer do not offer RDMA
+(`no_native_get`).
+
+**When.** UCX has no native GET to the peer: `UCX_TLS=tcp`, or two processes
+on one host with no RC lane, because shared-memory lanes are not eligible
+under velo's peer error handling.
+
+**Why.** Over TCP, UCX can only emulate a GET in software, and in UCX 1.22
+the emulation can abort the owner's process when the puller goes away
+during the reply. A crashed puller is enough. Velo therefore turns the
+emulation off. See
+[Software RMA is off](../development/rdma-design.md#software-rma-is-off).
+
+**What it costs.** Counted for one transfer of 1 MiB + 7 B by
+`the_cost_of_a_transfer_over_a_tcp_only_lane` in
+`lib/velo/tests/rendezvous_rdma.rs`, and from the UCX 1.22 source:
+
+| | Software GET (before) | Chunked (now) |
+|---|---|---|
+| velo frames | 2: acquire and its answer | 8: acquire and its answer, then 3 pulls of 512 KiB and their answers |
+| UCX messages for the payload | 1 GET request and about 129 replies of 8 KiB (`UCX_TCP_TX_SEG_SIZE`) | the 3 chunk answers, each sent as an Active Message |
+| User-space copies of each payload byte, `get` | 3: the owner packs each reply, UCX unpacks it into the consumer's pooled buffer, and velo copies it out | 4 or 5: the owner copies the chunk out of its pinned slot, UCX packs it if it uses bcopy, UCX joins the fragments of the 512 KiB message (`ucp_am_copy_data_fragment`), the receiving transport copies it into a `Bytes`, and the consumer copies it into the result |
+
+The first transfer to a peer also pays one acquire with a descriptor that is
+not used, and one detach.
+
+**Workaround.** Use a lane with GET in hardware, such as InfiniBand or RoCE.
+A TCP-only deployment that accepts the abort risk can set
+`UCX_PROTO_EMULATION_ENABLE=y` on the pullers. Every puller must have the
+emulation off for an owner to be safe.
+
+**Not protected: a system UCX older than 1.22.** The vendored UCX 1.22.0,
+which the `ucx` feature builds by default, refuses the software GET. A build
+that links a system UCX through ucx-rs's `UCX_DIR` can use UCX 1.17 or later,
+and UCX 1.20 accepts `PROTO_EMULATION_ENABLE=n` but still emulates a GET over
+tcp. There the owner abort is still possible. Velo logs one WARN at transport
+start that names the UCX version it found.
+
+**Lifted by.** A UCX release that handles both abort sites. Then the
+emulation can be turned back on. The test
+`software_get_aborts_an_owner_whose_puller_vanishes` in
+`lib/velo/src/transports/ucx/tests.rs` fails when that happens.

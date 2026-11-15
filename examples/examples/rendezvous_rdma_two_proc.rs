@@ -30,6 +30,12 @@
 //!   that cannot reach the peer, or with `VELO_RDMA_RENDEZVOUS_DISABLE=1`, and
 //!   it still transfers correctly — the reason label changes and the exit code
 //!   says the fast path was not used.
+//! * **A tcp-only lane takes the chunked path.** Over tcp, UCX can only emulate
+//!   a GET in software, and in UCX 1.22 that emulation can abort the owner's
+//!   process when the consumer goes away. So velo does not use it: the first
+//!   GET is refused, and the transfer moves over the chunked path. To run the
+//!   GET over tcp anyway, as CI does, set `UCX_PROTO_EMULATION_ENABLE=y` and
+//!   accept that risk.
 //!
 //! # The rendezvous between the processes
 //!

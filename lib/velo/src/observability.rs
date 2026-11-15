@@ -167,7 +167,8 @@ impl RdmaRegistrationKind {
 ///   descriptor, before the GET runs).
 /// - The consumer records when it decides whether to offer
 ///   ([`NotConfigured`](Self::NotConfigured), [`KillSwitch`](Self::KillSwitch),
-///   [`NoOffer`](Self::NoOffer)) and when it pulls
+///   [`NoOffer`](Self::NoOffer), [`NoNativeGet`](Self::NoNativeGet)) and when
+///   it pulls
 ///   ([`DecodeError`](Self::DecodeError), [`Budget`](Self::Budget),
 ///   [`PoolExhausted`](Self::PoolExhausted), [`GetFailed`](Self::GetFailed),
 ///   and [`Ok`](Self::Ok) after the GET completes).
@@ -201,6 +202,10 @@ pub(crate) enum RdmaPathReason {
     PoolExhausted,
     /// The GET itself failed and the consumer re-acquired chunked.
     GetFailed,
+    /// A GET to this owner was refused before, because no native GET reaches
+    /// it: a tcp-only lane, where velo does not use UCX's software GET. The
+    /// consumer offered nothing.
+    NoNativeGet,
     /// The owner's pinned staging was refused by the registered-bytes budget
     /// and the slot was staged in plain memory instead.
     Budget,
@@ -241,6 +246,7 @@ impl RdmaPathReason {
             Self::DecodeError => "decode_error",
             Self::PoolExhausted => "pool_exhausted",
             Self::GetFailed => "get_failed",
+            Self::NoNativeGet => "no_native_get",
             Self::Budget => "budget",
             Self::NotConfigured => "not_configured",
             Self::Draining => "draining",

@@ -513,6 +513,12 @@ impl RdmaRegistry {
         self.shared.backend.get(req).await
     }
 
+    /// Whether the backend knows a GET to `peer` is refused. See
+    /// [`RdmaBackend::refuses_get`].
+    pub(crate) fn refuses_get(&self, peer: velo_ext::InstanceId) -> bool {
+        self.shared.backend.refuses_get(peer)
+    }
+
     /// Unmap arenas nothing is using any more (the pool reclamation sweep).
     ///
     /// Driven by the rendezvous lease reaper's tick, which is the one periodic

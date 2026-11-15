@@ -108,6 +108,8 @@ The GET uses this consumer's own UCX endpoint to the owner. So "UCX is registere
 
 The rule has a cold-start effect. A peer that is not registered yet translates to nothing. The first `get` to an unknown owner therefore offers nothing and pulls chunks. Later gets take the RDMA path.
 
+One more fact can stop the offer: a GET to the owner was refused because UCX has no native GET to it, as over a TCP-only lane (`no_native_get`). See [No RDMA rendezvous over a TCP-only lane](../appendix/limitations.md#no-rdma-rendezvous-over-a-tcp-only-lane).
+
 ## Fallback is a routing decision
 
 After the owner sends a descriptor, four failures can occur on the consumer. They map to three reason labels:
@@ -116,7 +118,7 @@ After the owner sends a descriptor, four failures can occur on the consumer. The
 |---|---|
 | The descriptor does not decode, or it names a backend this consumer does not have. | `decode_error` |
 | The consumer cannot get a registered destination buffer. | `pool_exhausted` |
-| The GET fails. | `get_failed` |
+| The GET fails, or UCX refuses it because no native GET reaches the owner. | `get_failed` |
 
 For each failure, the consumer detaches the lease, acquires again with no offer, and pulls chunks. This always works, because a pinned slot also serves the chunked path.
 
@@ -330,6 +332,7 @@ The sweep period is the smaller of `lease_timeout / 2` and `arena_reclaim_after 
 - The progress thread reads the reaper's clock a few times per pass, not once per use: at the start of the pass, after `ucp_worker_progress` returns, and after each `ucp_ep_create`. An inbound frame is stamped after it arrives, which keeps the endpoint open a little longer. A send can be stamped up to one command drain before it is posted, which can shorten the timeout by that much. A send whose asynchronous completion empties its endpoint's count also reads the clock once, in `stamp_ep_drained`, to record when it completed. With the reaper off, the progress thread does not read the reaper's clock per pass, and a send pays only two `None` checks, plus one clock read per `ucp_ep_create`.
 - Idle time starts when `ucp_ep_create` returns, not before the call. In the in-process test harness over TCP on a GB200 node, with several UCX workers per process, one `ucp_ep_create` call took 110 to 150 ms. Across 31 creates in one process during the parallel UCX tests, the median was 630 ms, which is longer than the floor. The cause is not isolated. An endpoint with no send on it, such as an eager one, has only this stamp to keep it open.
 - A first send between fresh workers also waits while the peer sets up its own endpoint back to us. With the CPUs oversubscribed, a fresh pair's first frame took 360 to 420 ms. With many UCX workers in one process, the peer's progress loop that contained that step took 526 to 573 ms. The count of sends in flight keeps the endpoint open for that time. The count costs no measurable time per send: on a GB200 node, in a release build with 6 alternating runs, the reaper-on send cost moved +1% to +3%, inside a noise floor of at least ±6%.
+- Setup is not idle time. An endpoint is set up once a frame from its peer has arrived. Until then the peer may still be creating its own endpoint back to us: under load (48 copies of the UCX tests at once on 8 CPUs) the peer's `ucp_ep_create` took 630 to 1250 ms, longer than the 500 ms floor, and a reaper that counted that wait closed our endpoint before the peer's first frame arrived. Setup has a bound of 5 s, twice the slowest frame measured (2.25 s), so a peer that never sends to us, or that died during setup, does not hold an endpoint open forever. After the bound, the endpoint closes at the next scan if it has been idle for the timeout. Velo has no connect deadline to reuse, and UCX keepalive only fails an endpoint whose peer is gone. The cost: an endpoint to a peer that never sends to us, such as one used only for RDMA reads, closes up to 5 s later. The rejected alternative was a higher floor: it would hold every idle endpoint open longer, to cover a wait that only a new endpoint has.
 - The next use wires up a new endpoint with no error. The peer stays registered.
 
 **Closing an endpoint costs the peer.** UCX pairs endpoints by remote worker. The peer's own endpoint back to us rides the same connection. After a reap, the peer's next Message to us is admitted and silently lost, with no error at either end (measured). By the mechanism inferred below, its next ping gets no Pong (not measured), so its `check_health` returns `Timeout` (or `ConnectionFailed` if keepalive fails the endpoint while the probe is waiting). Every Message the peer sends after that is lost too, until keepalive fails its endpoint: retrying does not help, and neither does a fresh endpoint on our side (measured by hand; the in-tree test asserts only the first loss). Pings are expected to be lost the same way (inferred, not measured). Its Responses and Events still arrive (measured: 8 of 8 arrived in every recorded run). Acks carry no REPLY flag either, so the same is expected, but it was not measured. The likely reason, inferred from the UCX source and a measurement but not proven: a REPLY-flagged frame carries an endpoint id for the reply path, and UCX drops a frame whose endpoint id no longer resolves. UCX keepalive (about 20 s) then declares the peer's endpoint failed, and the frame after that arrives. The cost per reaped endpoint is that the peer's Messages and pings to us are lost, silently, until keepalive (about 20 s) fails its endpoint. The first loss is a Message with no error, or a ping that times out. The disruption self-heals.
@@ -342,7 +345,7 @@ The reaper is meant for peers idle in both directions. That case still carries t
 
 `UcxTransportBuilder::eager_endpoints(true)` creates the endpoint at `register()` instead of at first use. It is off by default. The first GET on a fresh peer pair costs about 14 ms of UCX wireup, against about 108 µs for a warm GET (measured on 2026-08-29, see [RDMA performance](../operations/rdma-performance.md)). Eager wireup moves that cost off the first transfer. The hint is fire-and-forget: `register()` does not wait, and a dropped hint falls back to lazy wireup.
 
-With both knobs on, a peer that is registered but never used is wired up once and closed about one timeout (see the close window above) after `ucp_ep_create` returns. The UCX wireup itself finishes later, in the background.
+With both knobs on, a peer that is registered but never used is wired up once and closed about one setup bound (5 s, see above), or one timeout if that is longer, after `ucp_ep_create` returns, because such a peer never sends to us. The UCX wireup itself finishes later, in the background.
 
 ## Shutdown ordering
 
@@ -421,7 +424,7 @@ The switch acts on both roles. An owner with it on never answers `Rdma` and stag
 Both sides record into `path_total`, at different points:
 
 - The owner records at staging time, when `register_data_pinned` falls back (`kill_switch`, `budget`, `pool_exhausted`). It also records at each acquire (`no_offer`, `not_configured`, `kill_switch`, `not_pinned`, `below_min`, `draining`, `ok`).
-- The consumer records when it builds its offer (`not_configured`, `kill_switch`, `no_offer`), after a failure (`decode_error`, `pool_exhausted`, `get_failed`), and when a GET completes (`ok`).
+- The consumer records when it builds its offer (`not_configured`, `kill_switch`, `no_offer`, `no_native_get`), after a failure (`decode_error`, `pool_exhausted`, `get_failed`), and when a GET completes (`ok`).
 
 The series counts decisions, not transfers. With the owner's kill switch on, one slot adds `kill_switch` once at staging and again at each acquire. A fallback acquire carries no offer, so the owner also counts `no_offer` for a consumer whose GET failed. The owner counts `ok` when it sends a descriptor, before the GET runs. The consumer's `ok` is the proof that a GET completed.
 
