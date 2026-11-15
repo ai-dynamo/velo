@@ -9,7 +9,7 @@
 //! path CI runs without RDMA hardware.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -719,6 +719,27 @@ fn assert_pair_balanced(pair: &RmaPair) {
     assert_rma_balanced(&pair.puller);
 }
 
+/// A progress-thread hold, released when dropped, so a failed assertion does
+/// not leave the thread held and its node's shutdown hung.
+struct HoldGuard<'a>(&'a AtomicBool);
+
+impl Drop for HoldGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+/// Set `hold` and wait until the progress thread reports `held`.
+async fn hold_at<'a>(hold: &'a AtomicBool, held: &AtomicBool, what: &str) -> HoldGuard<'a> {
+    hold.store(true, Ordering::Release);
+    let guard = HoldGuard(hold);
+    assert!(
+        wait_until(T, || held.load(Ordering::Acquire)).await,
+        "the progress thread never stopped {what}"
+    );
+    guard
+}
+
 /// Poll `cond` until it holds or `budget` expires.
 async fn wait_until(budget: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = tokio::time::Instant::now() + budget;
@@ -1129,9 +1150,13 @@ async fn get_cancelled_by_endpoint_replacement() {
 
 /// Shutting down under an outstanding GET must answer the caller, not hang.
 ///
-/// Measured over the tcp lane the transfer wins this race and the GET resolves
-/// `Ok` from teardown's flush-close progress loop, so the *cancellation* path is
-/// covered by [`get_cancelled_by_endpoint_replacement`] instead. What this test
+/// Measured over the tcp lane the transfer usually wins this race and the GET
+/// resolves `Ok` from teardown's RMA drain. The *cancellation* path is covered
+/// by [`get_cancelled_by_endpoint_replacement`] and
+/// [`shutdown_cancels_a_get_its_peer_stopped_answering`] instead. Under heavy
+/// load the owner shut down below can still abort in UCX, when it reads the
+/// GET's request only after the puller is gone; see
+/// [`an_owner_survives_a_puller_that_vanishes_mid_get`]. What this test
 /// pins down is the resolution guarantee: nothing is left waiting on a oneshot
 /// the progress thread took to the grave, including the unmap issued afterwards.
 #[tokio::test(flavor = "multi_thread")]
@@ -1178,6 +1203,252 @@ async fn shutdown_with_inflight_get() {
 
     pair.owner.transport.shutdown();
     assert_pair_balanced(&pair);
+}
+
+/// Shutdown must end a GET its peer has stopped answering, so its rkey is
+/// destroyed before the worker is.
+///
+/// Over the tcp lane a GET is software-emulated: the puller sends a request
+/// and the owner streams the data back. Once the request is out, the GET waits
+/// in the endpoint's `proto_reqs` list. A flush-mode close waits for it, and
+/// `ucp_worker_destroy` deletes the endpoint without purging that list. So if
+/// teardown flush-closes the endpoint, the GET's callback never runs: the rkey,
+/// the request and its `Arc` leak, and UCX warns "1 pending operations were not
+/// flushed". Only a FORCE close, which purges `proto_reqs` with
+/// `UCS_ERR_CANCELED`, ends it.
+///
+/// Under load a peer that is merely slow leaves the GET in the same state: 48
+/// copies of this module at once on 8 CPUs failed `shutdown_with_inflight_get`
+/// and `shutdown_resolves_parked_unmap_and_get` with this message. The child
+/// (`rma_teardown_child`) uses holds to make it certain:
+///
+/// 1. The warm-up GET wires the endpoint, so the big GET's request goes out at
+///    once. Otherwise it waits in a pending queue, which `ucp_worker_destroy`
+///    does purge.
+/// 2. The puller is held, so it reads nothing, and the owner runs one whole
+///    pass: it takes the request and sends data until the socket is full.
+///    32 MiB is more than the loopback socket buffers hold, so the GET cannot
+///    finish while the puller reads nothing.
+/// 3. The owner is held for the whole of the puller's teardown.
+///
+/// The owner is never released. It still holds queued replies to a puller
+/// that is gone, and UCX 1.22 can abort the process while it discards that
+/// endpoint (`stubs.c:107`, from `uct_tcp_ep_pending_purge` in
+/// `ucp_worker_discard_uct_ep_destroy_progress`; 2 of 96 copies under load).
+/// That is the owner's UCX defect, not this test's subject (see
+/// `an_owner_survives_a_puller_that_vanishes_mid_get`). So the scenario runs in
+/// a child process, which exits as soon as the puller has been checked.
+#[test]
+fn shutdown_cancels_a_get_its_peer_stopped_answering() {
+    let (status, output) = run_child_test("rma_teardown_child");
+    assert!(
+        status.success() && output.contains(RMA_TEARDOWN_CHECKED),
+        "the child test failed ({status}):\n{output}"
+    );
+}
+
+/// Printed by `rma_teardown_child` once the puller passed its checks.
+const RMA_TEARDOWN_CHECKED: &str = "rma teardown: puller balanced";
+
+/// The child half of `shutdown_cancels_a_get_its_peer_stopped_answering`. Does
+/// nothing unless that test started it.
+#[tokio::test(flavor = "multi_thread")]
+async fn rma_teardown_child() {
+    if std::env::var_os(CHILD_TEST).is_none() {
+        return;
+    }
+    const LEN: usize = 32 * 1024 * 1024;
+    let mut src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    src.fill_pattern();
+
+    let pair = start_rma_pair().await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+    let mut warm_up = get_request(&pair, &src, &remote, &local);
+    warm_up.len = 4096;
+    pair.puller_rma.get(warm_up).await.expect("warm-up get");
+
+    let owner = &pair.owner.transport.shared;
+    let puller = &pair.puller.transport.shared;
+    let owner_hold = hold_at(&owner.progress_hold, &owner.progress_held, "the owner").await;
+
+    let endpoint = pair.puller_rma.clone();
+    let req = get_request(&pair, &src, &remote, &local);
+    let get = tokio::spawn(async move { endpoint.get(req).await });
+    assert!(
+        wait_until(T, || puller.inflight_ops.load(Ordering::SeqCst) >= 1).await,
+        "the GET must be posted before the puller is held"
+    );
+    // The pass that posted the GET sent its request before reaching the hold.
+    let puller_hold = hold_at(&puller.progress_hold, &puller.progress_held, "the puller").await;
+
+    let passes = owner.progress_passes.load(Ordering::Relaxed);
+    drop(owner_hold);
+    assert!(
+        wait_until(T, || owner.progress_passes.load(Ordering::Relaxed)
+            >= passes + 2)
+        .await,
+        "the owner never ran a whole pass"
+    );
+    let _owner_hold = hold_at(&owner.progress_hold, &owner.progress_held, "the owner").await;
+
+    let transport = Arc::clone(&pair.puller.transport);
+    let teardown = tokio::task::spawn_blocking(move || transport.shutdown());
+    drop(puller_hold);
+    tokio::time::timeout(T, teardown)
+        .await
+        .expect("puller shutdown must finish")
+        .expect("shutdown task");
+
+    let outcome = tokio::time::timeout(T, get)
+        .await
+        .expect("the GET must resolve, not hang")
+        .expect("get task");
+    assert!(
+        matches!(
+            outcome,
+            Err(RmaError::Ucx { .. }) | Err(RmaError::ShuttingDown)
+        ),
+        "a GET the owner stopped answering cannot succeed: {outcome:?}"
+    );
+    assert_rma_balanced(&pair.puller);
+    println!("{RMA_TEARDOWN_CHECKED}");
+    // Exit with the owner still held; see the parent test for why.
+    std::process::exit(0);
+}
+
+/// Set in a child process started by `run_child_test`.
+const CHILD_TEST: &str = "VELO_UCX_CHILD_TEST";
+
+/// Run one test of this module in a child process of this test binary, and
+/// return its exit status and output. For scenarios that can abort the
+/// process: the abort then fails one test instead of killing every test in
+/// the binary.
+fn run_child_test(name: &str) -> (std::process::ExitStatus, String) {
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            &format!("transports::ucx::transport::tests::{name}"),
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_TEST, "1")
+        .env("UCX_TLS", "tcp")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the child test");
+    // Read both pipes while the child runs, so a full pipe cannot stall it.
+    let mut stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let out = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+        text
+    });
+    let err = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
+        text
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait for the child") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the child test {name} hung");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let output = format!(
+        "{}{}",
+        out.join().expect("stdout reader"),
+        err.join().expect("stderr reader")
+    );
+    (status, output)
+}
+
+/// An owner must survive a puller that goes away after sending a GET request
+/// the owner has not served yet.
+///
+/// It does not, in UCX 1.22: the owner's software-GET handler
+/// (`ucp_get_req_handler`) sends the reply on an endpoint that has already
+/// failed. `ucp_progress_get_reply` returns the failure status, and
+/// `ucp_request_try_send` (`ucp_request.inl:356`) calls `ucs_fatal` on any
+/// status but `OK`, `INPROGRESS` and `NO_RESOURCE`:
+/// "Fatal: unexpected error: Endpoint timeout", and the process aborts. A
+/// puller that crashes reaches it as surely as one that shuts down, so no
+/// teardown order in velo avoids it. Only the tcp lane emulates GET in
+/// software; an offloaded GET does not involve the owner's CPU.
+///
+/// The scenario runs in a child process, so the abort fails this test instead
+/// of killing the test binary. Under load the same thing can abort
+/// `shutdown_with_inflight_get` and `shutdown_resolves_parked_unmap_and_get`,
+/// which shut the owner down right after the puller.
+#[test]
+#[ignore = "UCX 1.22 aborts the owner: ucp_progress_get_reply passes a failed endpoint's status to ucp_request_try_send, which calls ucs_fatal"]
+fn an_owner_survives_a_puller_that_vanishes_mid_get() {
+    let (status, output) = run_child_test("owner_abort_child");
+    assert!(
+        status.success() && output.contains("1 passed"),
+        "the owner did not survive ({status}):\n{output}"
+    );
+}
+
+/// The child half of `an_owner_survives_a_puller_that_vanishes_mid_get`. Does
+/// nothing unless that test started it.
+#[tokio::test(flavor = "multi_thread")]
+async fn owner_abort_child() {
+    if std::env::var_os(CHILD_TEST).is_none() {
+        return;
+    }
+    const LEN: usize = 32 * 1024 * 1024;
+    let mut src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    src.fill_pattern();
+
+    let pair = start_rma_pair().await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+    let mut warm_up = get_request(&pair, &src, &remote, &local);
+    warm_up.len = 4096;
+    pair.puller_rma.get(warm_up).await.expect("warm-up get");
+
+    // The owner takes nothing until the puller is gone, so the GET request
+    // waits in its socket.
+    let owner = &pair.owner.transport.shared;
+    let owner_hold = hold_at(&owner.progress_hold, &owner.progress_held, "the owner").await;
+    let endpoint = pair.puller_rma.clone();
+    let req = get_request(&pair, &src, &remote, &local);
+    let get = tokio::spawn(async move { endpoint.get(req).await });
+    assert!(
+        wait_until(T, || pair
+            .puller
+            .transport
+            .shared
+            .inflight_ops
+            .load(Ordering::SeqCst)
+            >= 1)
+        .await,
+        "the GET must be posted before shutdown"
+    );
+    pair.puller.transport.shutdown();
+    let _ = tokio::time::timeout(T, get).await;
+
+    // Now the owner reads the request and the puller's departure together.
+    let passes = owner.progress_passes.load(Ordering::Relaxed);
+    drop(owner_hold);
+    assert!(
+        wait_until(T, || owner.progress_passes.load(Ordering::Relaxed)
+            >= passes + 3)
+        .await,
+        "the owner stopped making progress"
+    );
+    pair.owner.transport.shutdown();
 }
 
 /// The progress thread's own validation, reached directly.
@@ -2779,34 +3050,66 @@ async fn reaping_disrupts_the_peers_path_back() {
     assert_rma_balanced(&b);
 }
 
+/// Holds a node's progress thread at the top of its pass until dropped.
+///
+/// Released on drop, so a failed assertion does not leave the thread held and
+/// its node's shutdown hung.
+struct ProgressHold<'a>(&'a Node);
+
+impl<'a> ProgressHold<'a> {
+    async fn new(node: &'a Node) -> Self {
+        let shared = &node.transport.shared;
+        shared.progress_hold.store(true, Ordering::Release);
+        let hold = Self(node);
+        assert!(
+            wait_until(T, || shared.progress_held.load(Ordering::Acquire)).await,
+            "the progress thread never stopped at the hold"
+        );
+        hold
+    }
+}
+
+impl Drop for ProgressHold<'_> {
+    fn drop(&mut self) {
+        self.0
+            .transport
+            .shared
+            .progress_hold
+            .store(false, Ordering::Release);
+    }
+}
+
 /// The in-flight exclusion, isolated: an endpoint old enough to reap is spared
 /// purely because [`WorkerState::rma_ops`] still names its peer.
 ///
-/// Three deliberate choices make this neither vacuous nor flaky.
+/// Four deliberate choices make this neither vacuous nor flaky.
 ///
 /// *Two peers.* The idle one **is** reaped, which is what proves a scan ran past
 /// the timeout while the GETs were still outstanding; the busy one is not, and
 /// exactly one close between the two is the whole claim. A single-peer version
 /// would pass trivially whenever the transfer happened to finish first.
 ///
-/// *A sub-floor timeout, set on the config directly.* The reaper has to act
-/// faster than a 64 MiB transfer over the tcp lane, while the builder's floor
-/// is sized for the opposite concern — dominating endpoint wireup, so that
-/// endpoints do not close between ordinary uses and re-pay wireup each time,
-/// while the peer loses its Messages and pings to us until keepalive fails its
-/// endpoint. Going under it isolates the exclusion from transfer timing, which
-/// is what is under test. Nothing here sends an Active Message, and the idle
-/// peer's close is the point of the test, so those costs do not apply.
+/// *The owner's progress thread is held.* Over the tcp lane a GET needs the
+/// owner's progress thread, so while `progress_hold` is set no GET can finish.
+/// The test holds it from before the GETs are posted until the idle peer is
+/// reaped, so the GETs are outstanding at that scan by construction. Timing
+/// cannot make this certain: a transfer sized to outlast the idle window
+/// finished inside it about 1 run in 125 with 16 copies of the test running at
+/// once. The regions are mapped first, because a map is a command the owner's
+/// progress thread answers.
+///
+/// *A sub-floor timeout, set on the config directly.* The builder's floor is
+/// sized to dominate endpoint wireup, so that endpoints do not close between
+/// ordinary uses and re-pay wireup each time, while the peer loses its Messages
+/// and pings to us until keepalive fails its endpoint. Nothing here sends an
+/// Active Message, and the idle peer's close is the point of the test, so those
+/// costs do not apply, and a short timeout keeps the test short.
 ///
 /// *Eager wireup, no frames.* Both endpoints are established by registration
 /// alone, so neither depends on an AM completing.
-///
-/// The two loads are ordered closed-then-inflight on purpose: nothing posts more
-/// operations after the spawn, so `inflight > 0` now implies it was `> 0` when
-/// the close count was read.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_endpoint_with_an_inflight_get_is_not_reaped() {
-    const CHUNK: usize = 8 * 1024 * 1024;
+    const CHUNK: usize = 64 * 1024;
     const CHUNKS: usize = 8;
     const LEN: usize = CHUNK * CHUNKS;
     let mut src = PageBuf::new(LEN);
@@ -2836,6 +3139,8 @@ async fn an_endpoint_with_an_inflight_get_is_not_reaped() {
         .await
         .expect("map dst");
 
+    let hold = ProgressHold::new(&owner).await;
+
     let mut gets = Vec::with_capacity(CHUNKS);
     for i in 0..CHUNKS {
         let endpoint = puller_rma.clone();
@@ -2849,11 +3154,9 @@ async fn an_endpoint_with_an_inflight_get_is_not_reaped() {
         };
         gets.push(tokio::spawn(async move { endpoint.get(req).await }));
     }
+    let inflight = || puller.transport.shared.inflight_ops.load(Ordering::SeqCst);
     assert!(
-        wait_until(T, || {
-            puller.transport.shared.inflight_ops.load(Ordering::SeqCst) >= CHUNKS
-        })
-        .await,
+        wait_until(T, || inflight() >= CHUNKS).await,
         "all {CHUNKS} GETs must be posted before the idle peer is introduced"
     );
 
@@ -2861,34 +3164,25 @@ async fn an_endpoint_with_an_inflight_get_is_not_reaped() {
     // may already have been reaped (and recreated by the GETs) while the regions
     // above were being mapped.
     let baseline = eps_closed_idle(&puller);
-    // Introduced only now, so its idle window runs entirely inside the transfer.
+    // Introduced only now, so its idle window runs entirely inside the hold.
     cross_register(&puller, &idle_peer);
 
-    let observed = Arc::new(AtomicUsize::new(usize::MAX));
-    let seen = {
-        let observed = Arc::clone(&observed);
-        wait_until(T, || {
-            let closed = eps_closed_idle(&puller);
-            let inflight = puller.transport.shared.inflight_ops.load(Ordering::SeqCst);
-            if closed > baseline && inflight > 0 {
-                observed.store((closed - baseline) as usize, Ordering::SeqCst);
-                true
-            } else {
-                false
-            }
-        })
-        .await
-    };
     assert!(
-        seen,
-        "no scan closed the idle endpoint while the GETs were still outstanding; \
-         64 MiB over the tcp lane finished faster than a 10 ms idle window"
+        wait_until(T, || eps_closed_idle(&puller) > baseline).await,
+        "no scan closed the idle endpoint"
+    );
+    let closed = eps_closed_idle(&puller) - baseline;
+    assert_eq!(
+        inflight(),
+        CHUNKS,
+        "a GET finished while the owner's progress thread was held, so the hold \
+         does not keep a GET in flight and this test proves nothing"
     );
     assert_eq!(
-        observed.load(Ordering::SeqCst),
-        1,
+        closed, 1,
         "the endpoint carrying the in-flight GETs was reaped too"
     );
+    drop(hold);
 
     // The backstop for the same property, and the one that would fail loudly if
     // the exclusion were removed: a reaped endpoint cancels its operations.

@@ -528,10 +528,7 @@ fn answer_acquires_with(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_get_refuses_chunks_that_do_not_fit_the_stated_size() {
     let pair = VeloPair::new().await;
-    let handle = pair
-        .owner
-        .rendezvous_manager()
-        .register_data(Bytes::from_static(b"x"));
+    let handle = pair.owner.register_data(Bytes::from_static(b"x"));
     for (total_len, chunk_size, chunk_count, chunk) in [
         (1, 1, 3, &b"x"[..]),
         (1, 0, 1, &b"x"[..]),
@@ -541,7 +538,7 @@ async fn a_get_refuses_chunks_that_do_not_fit_the_stated_size() {
         answer_acquires_with(&pair.owner, total_len, chunk_size, chunk_count, chunk);
         let got = tokio::spawn({
             let consumer = pair.consumer.clone();
-            async move { consumer.rendezvous_manager().get(handle).await }
+            async move { consumer.get(handle).await }
         })
         .await;
         let row = format!(

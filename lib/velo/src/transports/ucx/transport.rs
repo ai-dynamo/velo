@@ -194,6 +194,8 @@ impl UcxTransport {
             progress_held: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             map_replies_delivered: AtomicU64::new(0),
+            #[cfg(test)]
+            progress_passes: AtomicU64::new(0),
         });
         Self {
             key,

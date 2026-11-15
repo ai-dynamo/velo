@@ -20,6 +20,7 @@
 
 - [Migrate ownership, dispatch, and cancellation to 0.19](guides/migrate-dispatch-and-cancellation.md)
 - [Migrate to the Velo handle in 0.21](guides/migrate-velo-handle.md)
+- [Move off the manager accessors in 0.22.1](guides/migrate-manager-accessors.md)
 - [Services and mux-only mode](guides/migrate-services.md)
 - [Move off the Messenger front door in 0.22.1](guides/migrate-messenger-front-door.md)
 - [Write an out-of-tree transport](guides/out-of-tree-transport.md)
@@ -42,6 +43,7 @@
 - [Versioning](development/versioning.md)
 - [Testing](development/testing.md)
 - [Review for performance](development/performance-review.md)
+- [Coding gotchas](development/coding-gotchas.md)
 - [Documentation](development/documentation.md)
 - [Batched streaming design](development/batched-streaming-design.md)
 - [RDMA design](development/rdma-design.md)

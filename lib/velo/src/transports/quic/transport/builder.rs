@@ -43,6 +43,9 @@ pub struct QuicTransportBuilder {
     idle_timeout: Duration,
     shrink_threshold: usize,
     lanes: std::num::NonZeroU16,
+    close_grace: super::CloseGrace,
+    #[cfg(test)]
+    dialed: Option<super::DialedConnections>,
 }
 
 impl QuicTransportBuilder {
@@ -66,6 +69,9 @@ impl QuicTransportBuilder {
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             shrink_threshold: DEFAULT_SHRINK_THRESHOLD,
             lanes: std::num::NonZeroU16::MIN,
+            close_grace: super::CloseGrace::DEFAULT,
+            #[cfg(test)]
+            dialed: None,
         }
     }
 
@@ -184,6 +190,23 @@ impl QuicTransportBuilder {
         self
     }
 
+    /// Test seam: how long a stopping writer waits for the peer's
+    /// acknowledgement (FINISH_GRACE), and twice that for teardown's close
+    /// wait (CLOSE_WAIT). A test of what shutdown waits for sets these long,
+    /// so that a slow host does not end the waits early.
+    #[cfg(test)]
+    pub(crate) fn close_grace(mut self, finish: Duration) -> Self {
+        self.close_grace = super::CloseGrace::with_finish(finish);
+        self
+    }
+
+    /// Test seam: push every connection this transport dials into `into`.
+    #[cfg(test)]
+    pub(crate) fn record_dialed(mut self, into: super::DialedConnections) -> Self {
+        self.dialed = Some(into);
+        self
+    }
+
     /// Read-buffer size above which a reader gives the excess back after a
     /// frame (default: the TCP transport's). The codec reserves the whole
     /// frame length, so without this one large frame pins that much memory
@@ -283,6 +306,9 @@ impl QuicTransportBuilder {
             numa_hint: self.numa_hint,
             metrics: OnceLock::new(),
             dialed_ctx: OnceLock::new(),
+            close_grace: self.close_grace,
+            #[cfg(test)]
+            dialed: self.dialed,
         })
     }
 }
