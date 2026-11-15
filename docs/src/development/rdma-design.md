@@ -139,20 +139,36 @@ Destroying the rkey in the callback is safe, from the UCX 1.22 source:
 
 - `ucp_rkey_destroy` touches no endpoint. It releases each transport key through its component, a context-level object, and returns the descriptor to the worker's memory pool. What must outlive the rkey is the worker.
 - On the close path the endpoint is still alive. A FORCE close takes a discard reference on the endpoint, and the endpoint is freed only after the purge that drives the callbacks with `UCS_ERR_CANCELED`.
-- Inside `ucp_worker_destroy`, the purges run before the memory pools are destroyed.
+- Inside `ucp_worker_destroy`, a FORCE close whose discard has not finished is completed, and its purge runs, before the memory pools are destroyed.
+- `ucp_worker_destroy` does not complete a GET on an endpoint that was only flush-closed. A GET with a request id waits in the endpoint's `proto_reqs` list, and only a FORCE close or an endpoint failure purges that list. The worker deletes the endpoint without purging it, so the GET's callback never runs, and its rkey and request leak. Teardown therefore FORCE-closes such an endpoint (see below).
 
 ### Progress thread rules
 
 - **No completion callback enqueues onto the ring.** The progress thread is the only consumer of a bounded ring. A callback that blocks on a full ring deadlocks the process. RMA completions resolve a `oneshot` and hand follow-up work to the main loop through a side queue.
 - **A parked unmap gates its region.** An unmap of a region with GETs in flight parks its reply. From then on, new GETs on that region are refused. A repeat unmap attaches as another waiter. A caller that cancels and retries therefore never hears that a live, DMA-active region does not exist.
-- **Every RMA reply resolves, including at teardown.** `ucp_worker_destroy` does not run user callbacks for operations still outstanding when the bounded drain expires. The worker keeps an `Arc` of every posted operation, and teardown answers each survivor with `ShuttingDown`. The reply sits in a take-once slot, so a late callback cannot answer twice.
+- **Every RMA reply resolves, including at teardown.** An operation whose FORCE close has not finished when the bounded drain expires gets its callback only inside `ucp_worker_destroy`. The worker keeps an `Arc` of every posted operation, and teardown answers each survivor with `ShuttingDown`. The reply sits in a take-once slot, so a late callback cannot answer twice.
 - **Offsets are relative to the mapped pointer.** `ucp_mem_map` rounds the pinned range out to page boundaries. A GET destination offset is measured from the caller's pointer and checked against the caller's length. A caller cannot name a byte inside the registration but outside its allocation.
 - **A cancelled map rolls back.** The region id is minted before the command is pushed. A dropped `map_region` future pushes an unmap for that id, and the progress thread also rolls back when it finds the reply channel closed.
 - **Endpoints close only after the ring is observed empty.** Reply commands carry raw endpoint pointers. The parked-endpoint close, the failed-endpoint reaper, the revalidation pass, and the idle reaper all run after the post-progress drain sees an empty ring. An earlier order let a FORCE close free an endpoint that a queued reply still named.
 
-### What teardown cannot promise
+### What teardown does with a GET in flight
 
-Regions unmap before endpoints close for every region idle at teardown, and for every region whose GETs finish during the flush close. A GET posted to a peer that stopped progressing is the exception. The flush close never completes, and the later FORCE close is a no-op: `ucp_ep_close_nbx` returns `UCS_ERR_NOT_CONNECTED` because the flush close already set the closed flag. That GET completes only inside `ucp_worker_destroy`, after the forced unmap. Over TCP this is silent. On InfiniBand the straggler completes with an access error. The caller still gets an answer. The `abandon_rma_ops` path that covers this has no test.
+Teardown first gives RMA operations up to one second to finish while every endpoint is still open, so a GET that is only slow still succeeds. Then it closes the endpoints. An endpoint whose peer still has a GET in flight gets a FORCE close; the others get a flush close.
+
+A flush close would not do for that endpoint. It waits for the GET, and nothing can cancel the GET afterwards: a later FORCE close is a no-op, because `ucp_ep_close_nbx` returns `UCS_ERR_NOT_CONNECTED` for an endpoint already closed. `ucp_worker_destroy` then deletes the endpoint without completing the GET, so its rkey and request leak. Under load this happened to a peer that was only slow: 48 copies of the UCX test module at once on 8 CPUs failed about 1 run in 30 with "an unpacked rkey outlived the transport".
+
+The FORCE close discards the lanes and then purges the endpoint's requests with `UCS_ERR_CANCELED`. The callback runs, the caller gets `RmaError::Ucx`, and the rkey is destroyed while the worker still exists. The purge needs the discard to finish, which takes worker progress; over TCP it finishes at once. A discard that does not finish within the next bounded drain completes inside `ucp_worker_destroy`, after the forced unmap. On InfiniBand that straggler could complete with an access error. That case needs a hardware run. The caller is answered either way.
+
+The rejected alternative was to keep the flush close and only lengthen its deadline. That cannot end a GET to a peer that stopped answering, and a peer can stop answering for any length of time.
+
+### A puller that goes away can abort the owner over TCP
+
+Over TCP, UCX emulates a GET in software. The puller sends a request, and the owner's progress thread sends the data back. If the puller goes away in the middle, UCX 1.22 can abort the owner's process at two sites:
+
+- The owner reads the request only after the puller is gone. It sends the reply on an endpoint that has already failed, and `ucp_request_try_send` calls `ucs_fatal` ("unexpected error: Endpoint timeout").
+- The owner still has replies queued when the puller goes. While UCX discards the failed endpoint, `uct_tcp_ep_pending_purge` finds those replies and fails an assertion (`stubs.c:107`). This happened 2 times in 96 test copies under load.
+
+A puller that crashes reaches both as well as one that shuts down, so no teardown order on the puller side prevents them. velo has a test for the first that runs the scenario in a child process; it is ignored until UCX handles the error. A GET offloaded to the NIC does not involve the owner's CPU, so this is TCP only.
 
 ## A stale rkey aborts the process on InfiniBand
 
