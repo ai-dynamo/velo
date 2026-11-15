@@ -49,7 +49,10 @@ pub enum InterfaceFilter {
     All,
     /// Select a specific interface by name, e.g. "eth0", "mlx5_0".
     ByName(String),
-    /// Manual override with explicit endpoints (useful for testing).
+    /// Manual override with explicit endpoints (useful for testing). Each
+    /// endpoint's port is replaced with the bound port. To advertise a port
+    /// the transport does not bind, use the transport builder's
+    /// `advertise_addrs`.
     Explicit(Vec<InterfaceEndpoint>),
 }
 
@@ -196,6 +199,27 @@ fn subnets_match_ip(a: IpAddr, a_prefix: u8, b: IpAddr, b_prefix: u8) -> bool {
         }
         _ => false, // Cross-family never matches.
     }
+}
+
+/// The endpoints for addresses given by the caller, ports included.
+///
+/// For a transport reached through a proxy, NAT or overlay that maps an
+/// address and port to the bound socket. Each entry reads like a transport
+/// bound to that exact IP: no interface name, a host prefix, no NUMA node.
+pub(crate) fn advertised_endpoints(addrs: &[SocketAddr]) -> Vec<InterfaceEndpoint> {
+    addrs
+        .iter()
+        .map(|addr| InterfaceEndpoint {
+            name: String::new(),
+            ip: addr.ip().to_string(),
+            port: addr.port(),
+            prefix_len: match addr.ip() {
+                IpAddr::V4(_) => 32,
+                IpAddr::V6(_) => 128,
+            },
+            numa_node: None,
+        })
+        .collect()
 }
 
 /// Resolve the set of endpoints to advertise for a given bind address.

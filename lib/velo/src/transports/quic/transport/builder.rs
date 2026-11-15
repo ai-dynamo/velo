@@ -14,7 +14,9 @@ use tracing::warn;
 use velo_ext::TransportKey;
 
 use crate::transports::tcp::framing::DEFAULT_SHRINK_THRESHOLD;
-use crate::transports::utils::interfaces::{InterfaceFilter, resolve_advertise_endpoints};
+use crate::transports::utils::interfaces::{
+    InterfaceFilter, advertised_endpoints, resolve_advertise_endpoints,
+};
 
 use super::super::endpoint::{
     BufferSizes, QuicEndpointInfo, bind_client_socket, bind_server_sockets,
@@ -34,6 +36,7 @@ pub struct QuicTransportBuilder {
     channel_capacity: usize,
     connect_timeout: Duration,
     interface_filter: InterfaceFilter,
+    advertise: Vec<SocketAddr>,
     numa_hint: Option<u32>,
     server_endpoints: usize,
     udp_buffers: BufferSizes,
@@ -54,6 +57,7 @@ impl QuicTransportBuilder {
             channel_capacity: 256,
             connect_timeout: Duration::from_secs(5),
             interface_filter: InterfaceFilter::default(),
+            advertise: Vec::new(),
             numa_hint: None,
             server_endpoints: DEFAULT_SERVER_ENDPOINTS,
             udp_buffers: BufferSizes {
@@ -102,6 +106,20 @@ impl QuicTransportBuilder {
     /// Interface selection for multi-NIC hosts.
     pub fn interface_filter(mut self, filter: InterfaceFilter) -> Self {
         self.interface_filter = filter;
+        self
+    }
+
+    /// Advertise these addresses, ports included, instead of the bound one.
+    ///
+    /// For a transport that peers reach through a proxy, a NAT or an overlay
+    /// that maps another address and port to a server socket. Peers dial
+    /// what is advertised, on every lane: the per-socket ports are not
+    /// advertised, because a mapping covers the one port it names. So lanes
+    /// from one peer share one server socket. Replaces the
+    /// [`interface_filter`](Self::interface_filter) result. An empty list
+    /// (the default) advertises the bound sockets as before.
+    pub fn advertise_addrs(mut self, addrs: impl IntoIterator<Item = SocketAddr>) -> Self {
+        self.advertise = addrs.into_iter().collect();
         self
     }
 
@@ -206,6 +224,10 @@ impl QuicTransportBuilder {
         let client_sockets = (0..self.lanes.get())
             .map(|_| bind_client_socket(bind_addr, self.udp_buffers))
             .collect::<Result<Vec<_>>>()?;
+        let dial_reaches_ipv4 = bind_addr.is_ipv4()
+            || socket2::SockRef::from(&client_sockets[0])
+                .only_v6()
+                .is_ok_and(|only_v6| !only_v6);
 
         let mut transport_config = quinn::TransportConfig::default();
         // One bidirectional stream per connection. Datagrams and
@@ -242,11 +264,20 @@ impl QuicTransportBuilder {
         ));
         server_config.transport_config(transport_config.clone());
 
-        let endpoints = resolve_advertise_endpoints(bind_addr, &self.interface_filter)?;
-        let ports = server_sockets
-            .iter()
-            .map(|socket| socket.local_addr().map(|addr| addr.port()))
-            .collect::<std::io::Result<Vec<u16>>>()?;
+        // With advertised addresses, no per-socket ports: a dialer then dials
+        // the advertised port on every lane, as for a peer without them.
+        let (endpoints, ports) = if self.advertise.is_empty() {
+            let ports = server_sockets
+                .iter()
+                .map(|socket| socket.local_addr().map(|addr| addr.port()))
+                .collect::<std::io::Result<Vec<u16>>>()?;
+            (
+                resolve_advertise_endpoints(bind_addr, &self.interface_filter)?,
+                ports,
+            )
+        } else {
+            (advertised_endpoints(&self.advertise), Vec::new())
+        };
         let info = QuicEndpointInfo {
             endpoints,
             fingerprint: identity.fingerprint,
@@ -281,6 +312,7 @@ impl QuicTransportBuilder {
             lane_offset: super::lane_offset(&identity.fingerprint),
             local_interfaces: OnceLock::new(),
             numa_hint: self.numa_hint,
+            dial_reaches_ipv4,
             metrics: OnceLock::new(),
             dialed_ctx: OnceLock::new(),
         })

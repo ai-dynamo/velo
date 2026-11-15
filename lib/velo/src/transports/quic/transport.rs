@@ -109,6 +109,10 @@ pub struct QuicTransport {
 
     local_interfaces: OnceLock<Vec<InterfaceEndpoint>>,
     numa_hint: Option<u32>,
+    /// Whether the dial sockets reach IPv4 addresses: an IPv4 socket does,
+    /// and so does an IPv6 one with `IPV6_V6ONLY` off, through mapped
+    /// addresses. Only an IPv6 socket reaches IPv6 addresses.
+    dial_reaches_ipv4: bool,
 
     metrics: OnceLock<Arc<dyn velo_ext::TransportObservability>>,
     dialed_ctx: OnceLock<DialedReaderContext>,
@@ -181,6 +185,13 @@ impl QuicTransport {
     /// The SHA-256 fingerprint of this transport's certificate.
     pub fn fingerprint(&self) -> tls::Fingerprint {
         self.fingerprint
+    }
+
+    /// The address of the first server socket, with its bound port. Behind a
+    /// proxy or NAT that maps one port (see
+    /// [`QuicTransportBuilder::advertise_addrs`]), this is where it forwards.
+    pub fn bound_addr(&self) -> SocketAddr {
+        self.bind_addr
     }
 
     fn reap_stale_connection(&self, key: LaneKey) {
@@ -398,8 +409,25 @@ impl Transport for QuicTransport {
         let local = self.local_interfaces.get_or_init(|| {
             resolve_advertise_endpoints(self.bind_addr, &InterfaceFilter::All).unwrap_or_default()
         });
-        let addr = select_best_endpoint(&info.endpoints, local, self.numa_hint)
-            .ok_or(TransportError::InvalidEndpoint)?;
+        // Only the advertised addresses that the dial sockets can reach. A
+        // peer with none is refused here rather than failing every frame.
+        let reachable: Vec<InterfaceEndpoint> = info
+            .endpoints
+            .into_iter()
+            .filter(|ep| {
+                ep.socket_addr().is_some_and(|addr| match addr {
+                    SocketAddr::V4(_) => self.dial_reaches_ipv4,
+                    SocketAddr::V6(_) => self.bind_addr.is_ipv6(),
+                })
+            })
+            .collect();
+        let addr = select_best_endpoint(&reachable, local, self.numa_hint).ok_or_else(|| {
+            error!(
+                "QUIC peer {} advertises no address that this transport's dial sockets reach",
+                peer_info.instance_id(),
+            );
+            TransportError::InvalidEndpoint
+        })?;
         let mut client_config = tls::pinned_client_config(info.fingerprint).map_err(|e| {
             error!("Failed to build the QUIC client config: {e:#}");
             TransportError::InvalidEndpoint
