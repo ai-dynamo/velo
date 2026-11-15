@@ -1440,9 +1440,14 @@ async fn retirement_accounts_for_late_sends_without_removing_the_successor() {
 
 /// Start a transport on a pre-bound loopback listener. The caller keeps the
 /// streams alive for the test.
-/// The `/proc/self/fd` link text of a socket, `socket:[<inode>]`.
-fn socket_link(fd: std::os::fd::RawFd) -> std::path::PathBuf {
-    std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap()
+/// The `/proc/self/fd` link text of a socket, `socket:[<inode>]`, or `None`
+/// on a host without procfs (macOS, or `/proc` hidden).
+fn socket_link(fd: std::os::fd::RawFd) -> Option<std::path::PathBuf> {
+    if !std::path::Path::new("/proc/self/fd").exists() {
+        eprintln!("no /proc/self/fd here: the closed tests skip their socket check");
+        return None;
+    }
+    Some(std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap())
 }
 
 /// Whether any file descriptor of this process still refers to the socket
@@ -1461,7 +1466,7 @@ fn socket_is_open(link: &std::path::Path) -> bool {
 async fn start_prebound() -> (
     TcpTransport,
     SocketAddr,
-    std::path::PathBuf,
+    Option<std::path::PathBuf>,
     crate::transports::DataStreams,
 ) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1500,10 +1505,12 @@ async fn closed_releases_listener_before_returning() {
     .await
     .expect("concurrent close calls must finish");
     // No await between closed and this check: the socket must already be gone.
-    assert!(
-        !socket_is_open(&link),
-        "closed returned with the listener open"
-    );
+    if let Some(link) = &link {
+        assert!(
+            !socket_is_open(link),
+            "closed returned with the listener open"
+        );
+    }
 }
 
 /// `closed` must wait for the accept loop itself, in the usual schedule where
@@ -1522,21 +1529,24 @@ async fn closed_releases_running_listener() {
     for _ in 0..4 {
         tokio::task::yield_now().await;
     }
-    assert!(
-        socket_is_open(&link),
-        "the check must see the live listener"
-    );
+    if let Some(link) = &link {
+        assert!(socket_is_open(link), "the check must see the live listener");
+    }
     transport.shutdown();
     transport.closed().await;
-    assert!(
-        !socket_is_open(&link),
-        "closed returned with the listener open"
-    );
+    if let Some(link) = &link {
+        assert!(
+            !socket_is_open(link),
+            "closed returned with the listener open"
+        );
+    }
 }
 
-/// Run with `/proc` hidden to reproduce hosts without procfs.
+/// The closed tests must still run on a host without procfs. Run it with
+/// `/proc` hidden, for example:
+/// `unshare -rm sh -c 'mount -t tmpfs none /proc && <test binary> --ignored close_checks_without_procfs'`.
 #[test]
-#[ignore = "F1: close tests panic when /proc/self/fd is absent"]
+#[ignore = "needs a host without /proc/self/fd: macOS, or /proc hidden in a mount namespace"]
 fn close_checks_without_procfs() {
     assert!(
         !std::path::Path::new("/proc/self/fd").exists(),

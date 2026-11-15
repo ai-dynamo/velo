@@ -54,7 +54,8 @@ any moment. Pick the holder by what the test asserts:
 
 The same goes for a check that a socket is closed. Do not connect to the
 port a transport has just freed: another test can have bound it. Check the
-process's own file descriptors instead (`/proc/self/fd`).
+process's own file descriptors instead (`/proc/self/fd`, on Linux; where
+it is missing, skip the check rather than fail).
 
 **Failure.** `test_writer_task_drains_on_connect_failure` made its dead peer
 by binding a port and dropping it. With another listener on that port, the
