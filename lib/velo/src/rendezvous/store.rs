@@ -214,6 +214,22 @@ pub enum LeaseOutcome {
     Unknown,
 }
 
+/// How a reader ends its lease, for [`DataStore::end_lease`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaseEnd {
+    /// Drop the read lock only. The reader's reference, if it has one, stays.
+    Detach,
+    /// Drop the read lock and one reference.
+    Release,
+}
+
+/// The two counts that keep a slot alive.
+#[derive(Debug, Clone, Copy)]
+enum Count {
+    ReadLocks,
+    References,
+}
+
 /// A test's code to run inside `DataStore::register_body`.
 #[cfg(test)]
 type RegisterHook = Box<dyn Fn(&DataStore) + Send + Sync>;
@@ -562,20 +578,79 @@ impl DataStore {
     /// slot whose time-to-live runs out in between ends the lease first. Kept,
     /// it would hold the sweep running for the life of the process.
     pub(crate) fn force_release_lease(&self, lease_id: u64, local_id: u64) -> bool {
-        match self.consume_lease(lease_id, local_id) {
-            LeaseOutcome::Consumed => {}
+        match self.end_lease(lease_id, local_id, LeaseEnd::Release) {
+            LeaseOutcome::Consumed => true,
             LeaseOutcome::Unknown => {
                 self.lease_deadlines.remove(&lease_id);
-                return false;
+                false
             }
-            LeaseOutcome::Mismatch { .. } => return false,
+            LeaseOutcome::Mismatch { .. } => false,
         }
-        self.release_read_lock(local_id);
+    }
+
+    /// End a reader's lease: consume it, drop its read lock and transfers,
+    /// drop its reference too for [`LeaseEnd::Release`], and free the slot if
+    /// nothing is left on it.
+    ///
+    /// Every path that ends a lease comes here: local and remote detach and
+    /// release, a `LeaseGuard` drop, and the reaper. The free must not depend
+    /// on which counter this call took to zero. An owner may drop its
+    /// reference while a reader holds a lease, so the reference count is
+    /// already 0 when the last reader leaves. A path that freed only when its
+    /// own `ref_decrement` returned true, or that looked at nothing on a
+    /// detach, left that slot for the life of the process, and an RDMA slot
+    /// kept its region's in-flight guard with it.
+    ///
+    /// The rule: whichever call takes a count to zero calls
+    /// [`try_free`](Self::try_free), which checks both counts as it removes
+    /// the slot. Each count changes under a read guard on the slot's shard and
+    /// `try_free` takes that shard's write lock, so of two calls that each take
+    /// one count to zero, the later `try_free` sees both zeros. Comparing
+    /// relaxed loads of the other count instead can miss on a weakly ordered
+    /// CPU: each side can read the other's old value.
+    ///
+    /// A reaped lease does not prove that the reader's RDMA GET finished.
+    /// Freeing the slot then follows the lease-expiry contract the reaper
+    /// already has (see `RendezvousManager::shutdown` and the RDMA design
+    /// chapter of the book): a peer still reading has its GET fail or read
+    /// freed memory. This call does not wait for a GET in flight.
+    ///
+    /// Returns what [`consume_lease`](Self::consume_lease) found. Nothing is
+    /// changed unless that is [`LeaseOutcome::Consumed`].
+    pub(crate) fn end_lease(&self, lease_id: u64, local_id: u64, end: LeaseEnd) -> LeaseOutcome {
+        let outcome = self.consume_lease(lease_id, local_id);
+        if outcome != LeaseOutcome::Consumed {
+            return outcome;
+        }
+        let mut last = matches!(self.take_one(local_id, Count::ReadLocks), Some((0, _)));
         self.remove_transfers_by_lease(lease_id);
-        if self.ref_decrement(local_id) {
+        if end == LeaseEnd::Release {
+            last |= matches!(self.take_one(local_id, Count::References), Some((0, _)));
+        }
+        if last {
             self.try_free(local_id);
         }
-        true
+        outcome
+    }
+
+    /// Take one from a slot's read locks or references.
+    ///
+    /// Returns what is left of that count and the other count's value, read
+    /// under the same shard guard. `None` if the slot is gone, or the count
+    /// was already zero (logged, not underflowed).
+    fn take_one(&self, local_id: u64, count: Count) -> Option<(u32, u32)> {
+        let slot = self.slots.get(&local_id)?;
+        let (this, other) = match count {
+            Count::ReadLocks => (&slot.read_lock_count, &slot.refcount),
+            Count::References => (&slot.refcount, &slot.read_lock_count),
+        };
+        match this.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1)) {
+            Ok(prev) => Some((prev - 1, other.load(Ordering::Relaxed))),
+            Err(_) => {
+                tracing::warn!("rendezvous: {count:?} already 0 for slot {local_id}");
+                None
+            }
+        }
     }
 
     /// Release a read lock on a slot. Returns true if the slot should be freed
@@ -584,28 +659,7 @@ impl DataStore {
     /// Uses checked arithmetic: returns `false` if the count is already zero
     /// instead of underflowing.
     pub fn release_read_lock(&self, local_id: u64) -> bool {
-        if let Some(slot) = self.slots.get(&local_id) {
-            let result =
-                slot.read_lock_count
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        if v > 0 { Some(v - 1) } else { None }
-                    });
-            match result {
-                Ok(prev) => {
-                    let read_locks = prev - 1;
-                    let refcount = slot.refcount.load(Ordering::Relaxed);
-                    read_locks == 0 && refcount == 0
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "release_read_lock: read_lock_count already 0 for slot {local_id}"
-                    );
-                    false
-                }
-            }
-        } else {
-            false
-        }
+        self.take_one(local_id, Count::ReadLocks) == Some((0, 0))
     }
 
     /// Increment the reference count for a slot.
@@ -624,26 +678,7 @@ impl DataStore {
     /// Uses checked arithmetic: returns `false` if the count is already zero
     /// instead of underflowing.
     pub fn ref_decrement(&self, local_id: u64) -> bool {
-        if let Some(slot) = self.slots.get(&local_id) {
-            let result = slot
-                .refcount
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    if v > 0 { Some(v - 1) } else { None }
-                });
-            match result {
-                Ok(prev) => {
-                    let refcount = prev - 1;
-                    let read_locks = slot.read_lock_count.load(Ordering::Relaxed);
-                    refcount == 0 && read_locks == 0
-                }
-                Err(_) => {
-                    tracing::warn!("ref_decrement: refcount already 0 for slot {local_id}");
-                    false
-                }
-            }
-        } else {
-            false
-        }
+        self.take_one(local_id, Count::References) == Some((0, 0))
     }
 
     /// Remove a slot from the registry and return a copy of its data.
