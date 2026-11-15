@@ -974,7 +974,6 @@ async fn unregister_reclaims_a_peers_get_refusal() {
 
 /// A GET already preparing during unregister must not recreate its memo.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "F4: a GET preparing during unregister recreates the peer's refusal memo after cleanup"]
 async fn an_unregister_outlives_a_get_already_preparing_its_endpoint() {
     const LEN: usize = 64 * 1024;
     let src = PageBuf::new(LEN);

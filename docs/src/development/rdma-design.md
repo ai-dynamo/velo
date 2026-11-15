@@ -185,7 +185,7 @@ What a refusal looks like:
 
 The first transfer to such a peer falls back by itself: the GET fails, and the consumer detaches and pulls chunks (`get_failed`). Every later transfer is chunked from the start. The cost is in [No RDMA rendezvous over a TCP-only lane](../appendix/limitations.md#no-rdma-rendezvous-over-a-tcp-only-lane).
 
-The protection is on the puller's side. The owner's handler for a GET request is registered under `UCP_FEATURE_RMA` whatever the flag says. An owner can still abort if a puller turned software RMA back on, or runs a velo that predates this rule.
+The protection is on the puller's side. The owner's handler for a GET request is registered under `UCP_FEATURE_RMA` whatever the flag says. An owner can still abort if a puller turned software RMA back on, runs a velo that predates this rule, or links a system UCX older than 1.22 through `UCX_DIR`. UCX 1.20 accepts the setting and still emulates the GET. Velo then logs one WARN at transport start, naming the UCX version (`SOFTWARE_RMA_SWITCH_FLOOR` in `transports/ucx/worker.rs`).
 
 Rejected alternatives:
 

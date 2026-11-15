@@ -864,6 +864,8 @@ struct RmaOpState {
     failed_peers: Arc<DashMap<InstanceId, ()>>,
     /// Where a refusal is recorded.
     no_native_get: Arc<DashMap<InstanceId, u64>>,
+    /// Registered peers, read to drop a record that an unregister raced.
+    peers: Arc<DashMap<InstanceId, UcxEndpoint>>,
     /// Region whose in-flight count this operation holds.
     region_id: u64,
     /// Identifies this operation in [`WorkerState::rma_ops`].
@@ -916,7 +918,7 @@ impl RmaOpState {
         } else if self.refused(status) {
             // Recorded before the caller hears of it, so a caller that falls
             // back and tries again already finds the peer marked.
-            self.no_native_get.insert(self.peer, self.incarnation);
+            self.record_refusal();
             Err(RmaError::NoNativeGet)
         } else {
             Err(RmaError::Ucx {
@@ -948,6 +950,26 @@ impl RmaOpState {
             && !self.ep_retired.load(Ordering::Acquire)
             && !self.shutdown_requested.load(Ordering::Acquire)
             && !self.failed_peers.contains_key(&self.peer)
+    }
+
+    /// Record that the peer refused a GET, unless it is no longer registered
+    /// as the incarnation the GET went to.
+    ///
+    /// Insert first, then check: `unregister` removes the peer and then the
+    /// record. If the insert lands after that removal, this check sees the
+    /// peer gone and takes the record out again. Either way no record outlives
+    /// its peer.
+    fn record_refusal(&self) {
+        self.no_native_get.insert(self.peer, self.incarnation);
+        let registered = self
+            .peers
+            .get(&self.peer)
+            .is_some_and(|blob| blob.incarnation == self.incarnation);
+        if !registered {
+            self.no_native_get.remove_if(&self.peer, |_, incarnation| {
+                *incarnation == self.incarnation
+            });
+        }
     }
 
     /// Answer the caller, at most once. Also used by teardown for operations
@@ -1597,6 +1619,32 @@ impl Drop for NativeInit {
     }
 }
 
+/// The oldest UCX release whose software GET obeys `PROTO_EMULATION_ENABLE=n`.
+///
+/// The vendored 1.22.0 does (`get_am.c` reads the flag). A system UCX linked
+/// with ucx-rs's `UCX_DIR` can be as old as 1.17, and 1.20 accepts the
+/// setting but still emulates a GET over tcp.
+const SOFTWARE_RMA_SWITCH_FLOOR: (u32, u32) = (1, 22);
+
+/// Whether UCX `major.minor` turns software RMA off when asked.
+fn software_rma_switch_applies(major: u32, minor: u32) -> bool {
+    (major, minor) >= SOFTWARE_RMA_SWITCH_FLOOR
+}
+
+/// Warn, once per process, that this UCX ignores the switch.
+fn warn_software_rma_still_on(major: u32, minor: u32, release: u32) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        let (floor_major, floor_minor) = SOFTWARE_RMA_SWITCH_FLOOR;
+        warn!(
+            "ucx: UCX {major}.{minor}.{release} ignores PROTO_EMULATION_ENABLE=n \
+             (it needs {floor_major}.{floor_minor} or later), so a GET over a tcp-only \
+             lane is still emulated in software, and a puller that goes away during \
+             one can abort the owner's process"
+        );
+    });
+}
+
 fn config_value(name: &str, value: &str) -> anyhow::Result<std::ffi::CString> {
     std::ffi::CString::new(value)
         .map_err(|_| anyhow::anyhow!("UCX {name} value contains a NUL byte"))
@@ -1647,6 +1695,11 @@ unsafe fn init_ucx(
                 "ucp_config_modify(PROTO_EMULATION_ENABLE=n): {}",
                 status_string(st)
             );
+            let (mut major, mut minor, mut release) = (0, 0, 0);
+            sys::ucp_get_version(&mut major, &mut minor, &mut release);
+            if !software_rma_switch_applies(major, minor) {
+                warn_software_rma_still_on(major, minor, release);
+            }
         }
         if let Some(tls) = &config.tls
             && std::env::var_os("UCX_TLS").is_none()
@@ -2926,6 +2979,7 @@ impl WorkerState {
             shutdown_requested: Arc::clone(&self.shared.shutdown_requested),
             failed_peers: Arc::clone(&self.shared.failed_peers),
             no_native_get: Arc::clone(&self.shared.no_native_get),
+            peers: Arc::clone(&self.shared.peers),
             region_id: prepared.region_id,
             op_id,
             reply: Mutex::new(Some(reply)),
@@ -3285,7 +3339,21 @@ pub(crate) type StartupSlot = OnceLock<StartupOut>;
 
 #[cfg(test)]
 mod initialization_tests {
-    use super::config_value;
+    use super::{config_value, software_rma_switch_applies};
+
+    /// The floor under which velo warns that software GET is still on. UCX
+    /// 1.20 accepts `PROTO_EMULATION_ENABLE=n` and still emulates a GET over
+    /// tcp; the vendored 1.22.0 refuses it. The release number plays no part.
+    #[test]
+    fn the_software_rma_switch_needs_ucx_1_22() {
+        assert!(!software_rma_switch_applies(1, 17));
+        assert!(!software_rma_switch_applies(1, 20));
+        assert!(!software_rma_switch_applies(1, 21));
+        assert!(software_rma_switch_applies(1, 22));
+        assert!(software_rma_switch_applies(1, 23));
+        assert!(software_rma_switch_applies(2, 0));
+        assert!(!software_rma_switch_applies(0, 99));
+    }
 
     #[test]
     fn configuration_strings_reject_nul_with_context() {

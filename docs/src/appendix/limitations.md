@@ -192,7 +192,7 @@ emulation off. See
 |---|---|---|
 | velo frames | 2: acquire and its answer | 8: acquire and its answer, then 3 pulls of 512 KiB and their answers |
 | UCX messages for the payload | 1 GET request and about 129 replies of 8 KiB (`UCX_TCP_TX_SEG_SIZE`) | the 3 chunk answers, each sent as an Active Message |
-| User-space copies of each payload byte, `get` | 3: the owner packs each reply, UCX unpacks it into the consumer's pooled buffer, and velo copies it out | 3 or 4: the owner copies the chunk out of its pinned slot, UCX packs it if it uses bcopy, the receiving transport copies it into a `Bytes`, and the consumer copies it into the result |
+| User-space copies of each payload byte, `get` | 3: the owner packs each reply, UCX unpacks it into the consumer's pooled buffer, and velo copies it out | 4 or 5: the owner copies the chunk out of its pinned slot, UCX packs it if it uses bcopy, UCX joins the fragments of the 512 KiB message (`ucp_am_copy_data_fragment`), the receiving transport copies it into a `Bytes`, and the consumer copies it into the result |
 
 The first transfer to a peer also pays one acquire with a descriptor that is
 not used, and one detach.
@@ -201,6 +201,13 @@ not used, and one detach.
 A TCP-only deployment that accepts the abort risk can set
 `UCX_PROTO_EMULATION_ENABLE=y` on the pullers. Every puller must have the
 emulation off for an owner to be safe.
+
+**Not protected: a system UCX older than 1.22.** The vendored UCX 1.22.0,
+which the `ucx` feature builds by default, refuses the software GET. A build
+that links a system UCX through ucx-rs's `UCX_DIR` can use UCX 1.17 or later,
+and UCX 1.20 accepts `PROTO_EMULATION_ENABLE=n` but still emulates a GET over
+tcp. There the owner abort is still possible. Velo logs one WARN at transport
+start that names the UCX version it found.
 
 **Lifted by.** A UCX release that handles both abort sites. Then the
 emulation can be turned back on. The test
