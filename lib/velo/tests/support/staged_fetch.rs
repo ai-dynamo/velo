@@ -51,6 +51,8 @@ impl Stall {
 
 /// Stall every fetch of a payload that `owner` staged until `stall.gate`
 /// lets it through, then answer as the real handler does.
+// Reads the owner's store directly. The store has no `Velo` form.
+#[allow(deprecated)]
 pub fn stall_fetches(owner: &Velo, stall: &Stall) {
     let store = Arc::clone(owner.rendezvous_manager().data_store());
     let stall = stall.clone();
@@ -77,6 +79,8 @@ pub fn stall_fetches(owner: &Velo, stall: &Stall) {
 }
 
 /// Whether `owner` still holds the staged payload `local_id`.
+// Reads the owner's store directly. The store has no `Velo` form.
+#[allow(deprecated)]
 pub fn still_staged(owner: &Velo, local_id: u64) -> bool {
     owner
         .rendezvous_manager()

@@ -55,7 +55,8 @@ impl Node {
 
     fn mux(&self) -> Arc<MessengerMuxTransport> {
         self.velo
-            .anchor_manager()
+            .inner
+            .anchor_manager
             .mux_handle()
             .and_then(|mux| mux.upgrade())
             .expect("velo installs the mux by default")
@@ -865,7 +866,7 @@ async fn an_attach_that_fails_after_its_bind_gives_its_lane_back() {
     let (consumer, producer) = pair(4, 4).await;
     let mux = consumer.mux();
     let peer = producer.worker();
-    let manager = consumer.velo.anchor_manager();
+    let manager = &consumer.velo.inner.anchor_manager;
     let spsc = Arc::clone(&manager.registry);
     let mpsc = Arc::clone(&manager.mpsc_registry);
     assert!(
@@ -1078,7 +1079,6 @@ async fn a_lane_that_refuses_admission_fails_only_its_own_streams() {
         let anchor = if lane == FAILED {
             consumer
                 .velo
-                .anchor_manager()
                 .create_anchor_with_config::<u32>(crate::streaming::AnchorConfig {
                     heartbeat_interval: Some(FAILED_HEARTBEAT),
                     ..Default::default()
@@ -1170,7 +1170,8 @@ async fn a_prebind_racing_shutdown_returns_none() {
         .await
         .expect("build velo");
     let mux = velo
-        .anchor_manager()
+        .inner
+        .anchor_manager
         .mux_handle()
         .and_then(|mux| mux.upgrade())
         .expect("velo installs the mux by default");
