@@ -8,21 +8,19 @@
 //! via `ShutdownState`.
 
 use anyhow::{Context, Result};
-use futures::StreamExt;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener as TokioUnixListener;
 use tokio::net::UnixStream;
-use tokio_util::codec::Framed;
+use tokio_util::codec::FramedRead;
 use tracing::{debug, error, info, warn};
 
-use crate::observability::TransportRejection;
-use crate::transports::ingress::{Routed, route_frame};
+use crate::transports::ingress::{EchoShuttingDown, FrameRoute, serve_frames};
 
-use velo_ext::{MessageType, ShutdownState, TransportAdapter, TransportErrorHandler};
+use velo_ext::{ShutdownState, TransportAdapter, TransportErrorHandler};
 
 use crate::transports::tcp::TcpFrameCodec;
-use crate::transports::tcp::framing::{maybe_shrink_read_buffer, parse_shrink_threshold};
+use crate::transports::tcp::framing::parse_shrink_threshold;
 
 /// Per-connection configuration handed to [`UdsListener::handle_connection`].
 struct UdsConnectionContext {
@@ -107,7 +105,7 @@ impl UdsListener {
     }
 
     /// Handle a single UDS connection
-    async fn handle_connection(stream: UnixStream, ctx: UdsConnectionContext) -> Result<()> {
+    async fn handle_connection(mut stream: UnixStream, ctx: UdsConnectionContext) -> Result<()> {
         let UdsConnectionContext {
             adapter,
             error_handler,
@@ -117,87 +115,22 @@ impl UdsListener {
             shrink_threshold,
         } = ctx;
 
-        debug!("Configuring UDS connection");
-
-        // Create framed stream with zero-copy codec (same as TCP)
-        let mut framed = Framed::new(stream, TcpFrameCodec::new());
-        let teardown_token = shutdown_state.teardown_token().clone();
-
-        debug!("UDS connection ready for frames");
-
-        loop {
-            tokio::select! {
-                // Prioritize teardown so a saturated connection cannot starve shutdown.
-                biased;
-                _ = teardown_token.cancelled() => {
-                    debug!("UDS connection handler torn down");
-                    break;
-                }
-                frame_result = framed.next() => {
-                    match frame_result {
-                        Some(Ok((msg_type, header, payload))) => {
-                            let frame_size = header.len() + payload.len();
-                            // `route_frame` owns the drain gate for Message
-                            // frames: it acquires the in-flight guard before
-                            // re-reading the flag, so an admitted message is
-                            // counted work even while it is only queued.
-                            // Response/Ack/Event frames always pass through.
-                            match route_frame(
-                                msg_type,
-                                header,
-                                payload,
-                                &adapter,
-                                &error_handler,
-                                &transport_key,
-                                metrics.as_ref(),
-                            )
-                            .await
-                            {
-                                Ok(Routed::Delivered) => {}
-                                Ok(Routed::DrainRejected { header }) => {
-                                    debug!(
-                                        "Rejecting Message frame during drain (sending ShuttingDown)"
-                                    );
-                                    // Echo original header back for correlation, empty payload
-                                    if let Err(e) = TcpFrameCodec::encode_frame(
-                                        framed.get_mut(),
-                                        MessageType::ShuttingDown,
-                                        &header,
-                                        &[],
-                                    )
-                                    .await
-                                    {
-                                        warn!(
-                                            "Failed to send ShuttingDown frame: {}",
-                                            e
-                                        );
-                                    }
-                                }
-                                Err(e) => {
-                                    warn!(
-                                        "Failed to route {:?} frame from UDS: {}",
-                                        msg_type, e
-                                    );
-                                }
-                            }
-
-                            maybe_shrink_read_buffer(framed.read_buffer_mut(), shrink_threshold, frame_size);
-                        }
-                        Some(Err(e)) => {
-                            if let Some(metrics) = metrics.as_ref() {
-                                metrics.record_rejection(TransportRejection::DecodeError);
-                            }
-                            error!("Frame decode error from UDS: {}", e);
-                            break;
-                        }
-                        None => {
-                            debug!("UDS connection closed gracefully");
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        // Borrowed halves: no `Arc`, and no write shutdown when they drop.
+        let (read_half, write_half) = stream.split();
+        serve_frames(
+            FramedRead::new(read_half, TcpFrameCodec::new()),
+            EchoShuttingDown(write_half),
+            shutdown_state.teardown_token(),
+            FrameRoute {
+                adapter: &adapter,
+                error_handler: &error_handler,
+                transport_key: &transport_key,
+                metrics: metrics.as_ref(),
+                shrink_threshold,
+            },
+            "a UDS peer",
+        )
+        .await;
 
         Ok(())
     }
@@ -358,8 +291,10 @@ impl Default for UdsListenerBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transports::ingress::TEARDOWN_ARMS;
     use crate::transports::transport::make_channels;
     use bytes::Bytes;
+    use velo_ext::MessageType;
 
     struct TestErrorHandler;
 
@@ -367,6 +302,60 @@ mod tests {
         fn on_error(&self, _header: Bytes, _payload: Bytes, error: String) {
             eprintln!("Test error handler: {}", error);
         }
+    }
+
+    /// A connection builds its teardown future once, not once per frame: the
+    /// UDS twin of `tcp::listener::a_connection_arms_its_teardown_once`, which
+    /// says why. UDS used to rebuild it per frame on the node-wide token (128
+    /// builds here).
+    #[tokio::test]
+    async fn a_connection_arms_its_teardown_once() {
+        use std::time::Duration;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("review.sock");
+        let listener = TokioUnixListener::bind(&path).unwrap();
+        let client_path = path.clone();
+        let client = tokio::spawn(async move {
+            let mut s = UnixStream::connect(client_path).await.unwrap();
+            while TcpFrameCodec::encode_frame(&mut s, MessageType::Response, b"h", b"p")
+                .await
+                .is_ok()
+            {}
+        });
+        let (stream, _) = listener.accept().await.unwrap();
+        let (adapter, streams) = make_channels();
+        let shutdown_state = ShutdownState::new();
+        let ctx = UdsConnectionContext {
+            adapter,
+            error_handler: Arc::new(TestErrorHandler),
+            shutdown_state: shutdown_state.clone(),
+            transport_key: "uds".to_string(),
+            metrics: None,
+            shrink_threshold: usize::MAX,
+        };
+        let arms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let handler = tokio::spawn(
+            TEARDOWN_ARMS.scope(arms.clone(), UdsListener::handle_connection(stream, ctx)),
+        );
+        for _ in 0..50 {
+            tokio::time::timeout(Duration::from_secs(5), streams.response_stream.recv_async())
+                .await
+                .expect("frame routed")
+                .unwrap();
+        }
+        let responses = streams.response_stream.clone();
+        let drainer = tokio::spawn(async move { while responses.recv_async().await.is_ok() {} });
+        assert!(!client.is_finished(), "the client must still be sending");
+        shutdown_state.teardown_token().cancel();
+        tokio::time::timeout(Duration::from_secs(5), handler)
+            .await
+            .expect("teardown ends the loop")
+            .unwrap()
+            .unwrap();
+        assert_eq!(arms.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(streams);
+        client.abort();
+        drainer.abort();
     }
 
     #[test]
