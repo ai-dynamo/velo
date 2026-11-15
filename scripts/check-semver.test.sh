@@ -24,6 +24,10 @@ trap 'rm -rf "$TMP_ROOT"' EXIT
 pass_count=0
 fail_count=0
 
+# The case run_case ran last, so a failure can name the gate's exit code:
+# "the output is right but the case failed" is otherwise a guess.
+last_case=""
+
 report() {
     local name="$1" ok="$2" detail="$3"
     if [[ "$ok" == "0" ]]; then
@@ -31,7 +35,10 @@ report() {
         pass_count=$((pass_count + 1))
     else
         echo "FAIL - $name"
-        echo "$detail" | sed 's/^/       /'
+        if [[ -n "$last_case" ]]; then
+            echo "       exit code: $(cat "$TMP_ROOT/$last_case.exit" 2>/dev/null || echo missing)"
+        fi
+        sed 's/^/       /' <<<"$detail"
         fail_count=$((fail_count + 1))
     fi
 }
@@ -220,6 +227,7 @@ run_case() {
     # touches only the manifests.
     local change_marker="${6:-change}"
     local repo="$TMP_ROOT/repo-$name"
+    last_case="$name"
     mkdir -p "$repo"
     (
         cd "$repo"
@@ -235,6 +243,37 @@ run_case() {
     )
 }
 
+# ── (pipe) output checks read a here-string, not a pipe ─────────────────────
+# Under pipefail, `echo "$out" | grep -q X` fails when grep finds X and exits
+# before echo has written the rest: echo gets SIGPIPE. bash writes echo's
+# output one line per write(), so this can happen at any size, and it did:
+# a case failed with exit code 0 and the expected line in its output, about
+# once in 100 runs of this script on two busy CPUs. Over the pipe buffer it
+# fails nearly every time. Show both forms on output that size, then check
+# that neither script uses the pipe form.
+big="velo: breaking changes, but version bumped 0.10.0 -> 0.11.0"$'\n'
+big+=$(printf 'padding line %06d\n' $(seq 1 20000))
+piped_failures=0 herestring_failures=0
+for _ in 1 2 3 4 5; do
+    (echo "$big" | grep -qF 'version bumped 0.10.0') || piped_failures=$((piped_failures + 1))
+    grep -qF 'version bumped 0.10.0' <<<"$big" || herestring_failures=$((herestring_failures + 1))
+done
+last_case=""
+ok=1
+if [[ "$piped_failures" -gt 0 && "$herestring_failures" -eq 0 ]]; then
+    ok=0
+fi
+report "(pipe) a here-string check survives output a pipe check fails on" "$ok" \
+    "pipe form failed $piped_failures of 5, here-string form failed $herestring_failures of 5"
+
+pipe_sites=$(grep -nE '(echo|printf)[^|#]*\|[[:space:]]*grep[[:space:]]+-(q|m)' \
+    "$CHECK_SEMVER" "${BASH_SOURCE[0]}" | grep -vE ':[[:space:]]*#' | grep -vF '(echo "$big" |' || true)
+ok=1
+if [[ -z "$pipe_sites" ]]; then
+    ok=0
+fi
+report "(pipe) no script pipes echo or printf into grep -q or grep -m" "$ok" "$pipe_sites"
+
 # ── (a) a breaking change at the published version fails ───────────────────
 # velo inherits its version from [workspace.package] and velo-ext has a
 # literal one, so this also proves both extractions work. The gate must
@@ -247,12 +286,12 @@ run_case a 0.10.0 0.5.0 0.10.0 0.5.0
 out=$(cat "$TMP_ROOT/a.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/a.exit")" == "1" ]] \
-    && echo "$out" | grep -qF 'latest published version: 0.10.0' \
-    && echo "$out" | grep -qF 'latest published version: 0.5.0' \
+    && grep -qF 'latest published version: 0.10.0' <<<"$out" \
+    && grep -qF 'latest published version: 0.5.0' <<<"$out" \
     && grep -qF -- '--package velo --baseline-version 0.10.0' "$CARGO_ARGS_LOG" \
     && grep -qF -- '--package velo-ext --baseline-version 0.5.0' "$CARGO_ARGS_LOG" \
-    && ! echo "$out" | grep -qi 'unbound variable' \
-    && ! echo "$out" | grep -qi 'workspace = true'; then
+    && ! grep -qi 'unbound variable' <<<"$out" \
+    && ! grep -qi 'workspace = true' <<<"$out"; then
     ok=0
 fi
 report "(a) a breaking change at the published version fails, checked against the published baseline" "$ok" "$out"
@@ -270,8 +309,8 @@ run_case b 0.11.0 0.6.0 0.11.0 0.6.0
 out=$(cat "$TMP_ROOT/b.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/b.exit")" == "0" ]] \
-    && echo "$out" | grep -qF 'version bumped 0.10.0 -> 0.11.0' \
-    && echo "$out" | grep -qF 'version bumped 0.5.0 -> 0.6.0'; then
+    && grep -qF 'version bumped 0.10.0 -> 0.11.0' <<<"$out" \
+    && grep -qF 'version bumped 0.5.0 -> 0.6.0' <<<"$out"; then
     ok=0
 fi
 report "(b) a bump main already carries over the published version covers a later breaking change" "$ok" "$out"
@@ -286,7 +325,7 @@ run_case c 0.10.0 0.6.0 0.11.0 0.6.0
 out=$(cat "$TMP_ROOT/c.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/c.exit")" == "0" ]] \
-    && echo "$out" | grep -qF 'version bumped 0.10.0 -> 0.11.0'; then
+    && grep -qF 'version bumped 0.10.0 -> 0.11.0' <<<"$out"; then
     ok=0
 fi
 report "(c) a yanked version is not the baseline" "$ok" "$out"
@@ -302,9 +341,9 @@ run_case d 0.10.0 0.5.0 0.10 0.5.0
 out=$(cat "$TMP_ROOT/d.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/d.exit")" == "1" ]] \
-    && echo "$out" | grep -qi '::error::Could not parse version' \
-    && ! echo "$out" | grep -qi 'unbound variable' \
-    && ! echo "$out" | grep -qi 'invalid arithmetic operator'; then
+    && grep -qi '::error::Could not parse version' <<<"$out" \
+    && ! grep -qi 'unbound variable' <<<"$out" \
+    && ! grep -qi 'invalid arithmetic operator' <<<"$out"; then
     ok=0
 fi
 report "(d) an unparseable version fails loudly with ::error:: and exit 1" "$ok" "$out"
@@ -342,10 +381,10 @@ publish ucx-rs "0.1.0+ucx.1.22.0"
 out=$(cat "$TMP_ROOT/e.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/e.exit")" == "0" ]] \
-    && echo "$out" | grep -qF 'breaking changes, but version bumped' \
+    && grep -qF 'breaking changes, but version bumped' <<<"$out" \
     && grep -qF -- '--package ucx-rs --baseline-version 0.1.0+ucx.1.22.0' "$CARGO_ARGS_LOG" \
-    && ! echo "$out" | grep -qi 'Could not parse version' \
-    && ! echo "$out" | grep -qi 'invalid arithmetic operator'; then
+    && ! grep -qi 'Could not parse version' <<<"$out" \
+    && ! grep -qi 'invalid arithmetic operator' <<<"$out"; then
     ok=0
 fi
 report "(e) ucx-rs's +build metadata compares on the semver core, and the baseline keeps it; a correct bump passes" "$ok" "$out"
@@ -358,7 +397,7 @@ run_case f 0.10.0 0.6.0 0.10.0 0.6.0
 out=$(cat "$TMP_ROOT/f.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/f.exit")" == "0" ]] \
-    && echo "$out" | grep -qF 'velo: never published, skipping semver check' \
+    && grep -qF 'velo: never published, skipping semver check' <<<"$out" \
     && ! grep -qF -- '--package velo ' "$CARGO_ARGS_LOG"; then
     ok=0
 fi
@@ -373,8 +412,8 @@ INDEX_FAIL=1 run_case g 0.10.0 0.5.0 0.10.0 0.5.0
 out=$(cat "$TMP_ROOT/g.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/g.exit")" == "1" ]] \
-    && echo "$out" | grep -qF '::error::Could not reach' \
-    && ! echo "$out" | grep -qF 'never published'; then
+    && grep -qF '::error::Could not reach' <<<"$out" \
+    && ! grep -qF 'never published' <<<"$out"; then
     ok=0
 fi
 report "(g) an unreachable index fails the gate instead of skipping the check" "$ok" "$out"
@@ -388,8 +427,8 @@ INDEX_BODY='<html>sign in</html>' run_case h 0.10.0 0.5.0 0.10.0 0.5.0
 out=$(cat "$TMP_ROOT/h.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/h.exit")" == "1" ]] \
-    && echo "$out" | grep -qF 'with a body that is not an index entry' \
-    && ! echo "$out" | grep -qF 'never published'; then
+    && grep -qF 'with a body that is not an index entry' <<<"$out" \
+    && ! grep -qF 'never published' <<<"$out"; then
     ok=0
 fi
 report "(h) an HTTP 200 whose body is not an index fails the gate" "$ok" "$out"
@@ -403,8 +442,8 @@ run_case i 0.11.0 0.5.0 0.11.0 0.5.0
 out=$(cat "$TMP_ROOT/i.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/i.exit")" == "1" ]] \
-    && echo "$out" | grep -qF 'every published version' \
-    && ! echo "$out" | grep -qF 'never published'; then
+    && grep -qF 'every published version' <<<"$out" \
+    && ! grep -qF 'never published' <<<"$out"; then
     ok=0
 fi
 report "(i) a crate with every version yanked fails the gate" "$ok" "$out"
@@ -415,8 +454,8 @@ INDEX_STATUS=500 run_case j 0.10.0 0.5.0 0.10.0 0.5.0
 out=$(cat "$TMP_ROOT/j.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/j.exit")" == "1" ]] \
-    && echo "$out" | grep -qF 'answered HTTP 500' \
-    && ! echo "$out" | grep -qF 'never published'; then
+    && grep -qF 'answered HTTP 500' <<<"$out" \
+    && ! grep -qF 'never published' <<<"$out"; then
     ok=0
 fi
 report "(j) an index error status other than 404 fails the gate" "$ok" "$out"
@@ -433,7 +472,7 @@ CARGO_SEMVER_EXIT=0 run_case k 0.10.0 0.5.0 0.9.0 0.5.0
 out=$(cat "$TMP_ROOT/k.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/k.exit")" == "1" ]] \
-    && echo "$out" | grep -qF 'is below its latest published version 0.10.0'; then
+    && grep -qF 'is below its latest published version 0.10.0' <<<"$out"; then
     ok=0
 fi
 report "(k) a version below the latest published version fails the gate" "$ok" "$out"
@@ -449,9 +488,9 @@ run_case l 0.11.0 0.5.0 0.10.0 0.5.0 base
 out=$(cat "$TMP_ROOT/l.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/l.exit")" == "1" ]] \
-    && echo "$out" | grep -qF 'Checking velo against 0.10.0' \
-    && echo "$out" | grep -qF 'version on this change:   0.10.0' \
-    && ! echo "$out" | grep -qF 'Checking velo-ext'; then
+    && grep -qF 'Checking velo against 0.10.0' <<<"$out" \
+    && grep -qF 'version on this change:   0.10.0' <<<"$out" \
+    && ! grep -qF 'Checking velo-ext' <<<"$out"; then
     ok=0
 fi
 report "(l) a root-manifest change selects the crates that inherit its version" "$ok" "$out"
@@ -464,8 +503,8 @@ CARGO_SEMVER_EXIT=0 run_case m 0.10.0 0.5.0 0.10.0 0.5.1
 out=$(cat "$TMP_ROOT/m.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/m.exit")" == "0" ]] \
-    && echo "$out" | grep -qF 'velo: ok, cargo-semver-checks accepts 0.10.0 against 0.10.0' \
-    && echo "$out" | grep -qF 'velo-ext: ok, cargo-semver-checks accepts 0.5.1 against 0.5.0'; then
+    && grep -qF 'velo: ok, cargo-semver-checks accepts 0.10.0 against 0.10.0' <<<"$out" \
+    && grep -qF 'velo-ext: ok, cargo-semver-checks accepts 0.5.1 against 0.5.0' <<<"$out"; then
     ok=0
 fi
 report "(m) a change with no breaking change passes" "$ok" "$out"
@@ -480,8 +519,8 @@ INLINE_WS=1 run_case n 0.11.0 0.5.0 0.10.0 0.5.0 base
 out=$(cat "$TMP_ROOT/n.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/n.exit")" == "1" ]] \
-    && echo "$out" | grep -qF 'Checking velo against 0.10.0' \
-    && echo "$out" | grep -qF 'version on this change:   0.10.0'; then
+    && grep -qF 'Checking velo against 0.10.0' <<<"$out" \
+    && grep -qF 'version on this change:   0.10.0' <<<"$out"; then
     ok=0
 fi
 report "(n) a root-manifest change selects a crate written with \`version = { workspace = true }\`" "$ok" "$out"
@@ -497,7 +536,7 @@ run_case o 0.10.0 0.6.0 0.11.0 0.6.0
 out=$(cat "$TMP_ROOT/o.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/o.exit")" == "0" ]] \
-    && echo "$out" | grep -qF 'version bumped 0.10.0 -> 0.11.0'; then
+    && grep -qF 'version bumped 0.10.0 -> 0.11.0' <<<"$out"; then
     ok=0
 fi
 report "(o) a pre-release is not the baseline" "$ok" "$out"
@@ -512,7 +551,7 @@ VELO_REQ=0.10.0 SEMVER_SKIP=true run_case p 0.10.0 0.5.0 0.11.0 0.5.0
 out=$(cat "$TMP_ROOT/p.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/p.exit")" == "1" ]] \
-    && echo "$out" | grep -qF 'does not match the workspace version 0.11.0'; then
+    && grep -qF 'does not match the workspace version 0.11.0' <<<"$out"; then
     ok=0
 fi
 report "(p) a velo requirement on another minor fails, even with semver:skip" "$ok" "$out"
@@ -525,7 +564,7 @@ VELO_REQ=0.11.0 CARGO_SEMVER_EXIT=0 run_case q 0.10.0 0.5.0 0.11.0 0.5.0
 out=$(cat "$TMP_ROOT/q.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/q.exit")" == "0" ]] \
-    && echo "$out" | grep -qF 'velo requirement 0.11.0 tracks workspace version 0.11.0'; then
+    && grep -qF 'velo requirement 0.11.0 tracks workspace version 0.11.0' <<<"$out"; then
     ok=0
 fi
 report "(q) a velo requirement on the workspace minor passes" "$ok" "$out"
@@ -539,7 +578,7 @@ VELO_REQ==0.11.0 run_case r 0.10.0 0.5.0 0.11.0 0.5.0
 out=$(cat "$TMP_ROOT/r.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/r.exit")" == "1" ]] \
-    && echo "$out" | grep -qF 'must be a caret requirement'; then
+    && grep -qF 'must be a caret requirement' <<<"$out"; then
     ok=0
 fi
 report "(r) an exact velo requirement fails" "$ok" "$out"
@@ -555,7 +594,7 @@ stale_case() {
     VELO_DEP_BLOCK="$block" VELO_HUB="${4:-0}" SEMVER_SKIP=true run_case "$name" 0.10.0 0.5.0 0.11.0 0.5.0
     out=$(cat "$TMP_ROOT/$name.out")
     ok=1
-    if [[ "$(cat "$TMP_ROOT/$name.exit")" == "1" ]] && echo "$out" | grep -qF "$expect"; then
+    if [[ "$(cat "$TMP_ROOT/$name.exit")" == "1" ]] && grep -qF "$expect" <<<"$out"; then
         ok=0
     fi
     report "($name) a stale velo requirement as $5 fails" "$ok" "$out"
@@ -584,7 +623,7 @@ VELO_DEP_BLOCK='[workspace.dependencies]\nvelo = { path = "lib/velo", version = 
 out=$(cat "$TMP_ROOT/zb.out")
 ok=1
 if [[ "$(cat "$TMP_ROOT/zb.exit")" == "0" ]] \
-    && echo "$out" | grep -qF 'velo requirement 0.11.0 tracks workspace version 0.11.0-rc.1'; then
+    && grep -qF 'velo requirement 0.11.0 tracks workspace version 0.11.0-rc.1' <<<"$out"; then
     ok=0
 fi
 report "(zb) an explicit caret against a pre-release workspace version passes" "$ok" "$out"
