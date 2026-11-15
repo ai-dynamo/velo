@@ -2295,9 +2295,16 @@ impl VeloMetrics {
             .inc();
     }
 
-    /// Set the pending-response gauge.
-    pub(crate) fn set_pending_responses(&self, count: usize) {
-        self.messenger_pending_responses.set(count as f64);
+    /// Count one more response slot held. The gauge moves by one in a single
+    /// atomic step, so concurrent sends and drops cannot leave a stale value
+    /// last, as setting it from a count read in a separate step could.
+    pub(crate) fn inc_pending_responses(&self) {
+        self.messenger_pending_responses.inc();
+    }
+
+    /// Count one response slot freed. See [`Self::inc_pending_responses`].
+    pub(crate) fn dec_pending_responses(&self) {
+        self.messenger_pending_responses.dec();
     }
 
     /// Record a response-slot acquisition that hit the per-worker capacity
@@ -2748,7 +2755,7 @@ mod tests {
         metrics.record_client_resolution(ClientResolution::DirectSuccess);
 
         // Exercise messenger gauges.
-        metrics.set_pending_responses(3);
+        metrics.inc_pending_responses();
 
         // Exercise streaming metrics.
         metrics.record_streaming_operation(
