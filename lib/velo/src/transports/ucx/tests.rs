@@ -921,6 +921,57 @@ async fn a_get_over_a_tcp_only_lane_is_refused_not_emulated() {
     assert_pair_balanced(&pair);
 }
 
+/// Refusal records must leave with peers, so peer churn cannot grow the memo forever.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "F1: unregister leaves one no_native_get entry per refused peer"]
+async fn unregister_reclaims_a_peers_get_refusal() {
+    const LEN: usize = 64 * 1024;
+    const PEERS: usize = 8;
+    let src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    let pair = start_rma_pair_with(|b| b).await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+
+    for index in 0..PEERS {
+        let peer = if index == 0 {
+            pair.owner.instance_id
+        } else {
+            InstanceId::new_v4()
+        };
+        pair.puller
+            .transport
+            .register(PeerInfo::new(peer, pair.owner.transport.address()))
+            .unwrap();
+        let mut req = get_request(&pair, &src, &remote, &local);
+        req.peer = peer;
+        let outcome = tokio::time::timeout(T, pair.puller_rma.get(req))
+            .await
+            .expect("the GET must resolve");
+        assert!(matches!(outcome, Err(RmaError::NoNativeGet)), "{outcome:?}");
+        assert!(pair.puller_rma.refuses_get(peer));
+
+        pair.puller.transport.unregister(peer);
+        assert!(
+            wait_until(T, || eps_open(&pair.puller) == 0).await,
+            "unregister must retire the endpoint"
+        );
+        assert!(!pair.puller_rma.refuses_get(peer));
+        assert!(pair.puller.transport.shared.peers.is_empty());
+    }
+
+    let retained = pair.puller.transport.shared.no_native_get.len();
+    pair.puller_rma.unmap_region(local.region_id).await.unwrap();
+    pair.owner_rma.unmap_region(remote.region_id).await.unwrap();
+    pair.owner.transport.shutdown();
+    pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
+    assert_eq!(
+        retained, 0,
+        "{PEERS} unregistered peers left {retained} refusal records in a live transport"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn get_zero_length() {
     const LEN: usize = 4096;
