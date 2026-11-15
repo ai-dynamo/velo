@@ -179,8 +179,9 @@ UCX makes the choice for each endpoint, not for the process. It selects a protoc
 What a refusal looks like:
 
 - UCX aborts the request with `UCS_ERR_CANCELED` and leaves the endpoint up. Frames still flow on it. UCX logs `No zero-copy protocol found for get into host from host` at ERROR level.
-- The progress thread answers the caller with `RmaError::NoNativeGet`. It tells the refusal from a FORCE close by two facts: velo marks an endpoint retired before it closes it, and a failed endpoint purges its requests with the failure status, not `CANCELED`.
-- It records the peer's incarnation in `no_native_get`. The rendezvous consumer then does not offer RDMA to that peer, and records `no_native_get` on `velo_rendezvous_rdma_path_total`. A new incarnation of the peer is tried again, because it can have a new lane.
+- The progress thread answers the caller with `RmaError::NoNativeGet`. Two other events also complete a GET with `CANCELED`. Velo's own FORCE close is one: velo marks the endpoint retired before it closes it. A failed RC queue pair is the other: it flushes its outstanding GETs with `IBV_WC_WR_FLUSH_ERR`, which UCX reports as `CANCELED`.
+- It records the peer's incarnation in `no_native_get`. The rendezvous consumer then does not offer RDMA to that peer, and records `no_native_get` on `velo_rendezvous_rdma_path_total`.
+- The record lapses when the peer's endpoint fails, when the peer is unregistered, or when it registers a new incarnation. So a flushed GET on a failed RC lane, which looks like a refusal, keeps the peer on the chunked path only until velo reaps the failed endpoint.
 
 The first transfer to such a peer falls back by itself: the GET fails, and the consumer detaches and pulls chunks (`get_failed`). Every later transfer is chunked from the start. The cost is in [No RDMA rendezvous over a TCP-only lane](../appendix/limitations.md#no-rdma-rendezvous-over-a-tcp-only-lane).
 

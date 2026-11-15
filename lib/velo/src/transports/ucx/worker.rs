@@ -124,10 +124,11 @@
 //! UCX selects the GET protocol per endpoint, so a GET still runs in hardware
 //! where a lane can do it. Where none can, `ucp_proto_reconfig_progress`
 //! aborts the request with `UCS_ERR_CANCELED` and leaves the endpoint up.
-//! [`RmaOpState::refused`] tells that from a FORCE close, answers
-//! [`RmaError::NoNativeGet`], and records the peer's incarnation in
-//! [`WorkerShared::no_native_get`]. The rendezvous consumer reads that record
-//! and stops offering RDMA to the peer.
+//! [`RmaOpState::refused`] tells that from a FORCE close and from a failed RC
+//! queue pair, answers [`RmaError::NoNativeGet`], and records the peer's
+//! incarnation in [`WorkerShared::no_native_get`]. The rendezvous consumer
+//! reads that record and stops offering RDMA to the peer. The record lapses
+//! when the peer's endpoint fails or the peer is unregistered.
 //!
 //! ## The idle-endpoint reaper (D9)
 //!
@@ -858,6 +859,9 @@ struct RmaOpState {
     ep_retired: Arc<AtomicBool>,
     /// Set by `shutdown()`. Teardown cancels operations too.
     shutdown_requested: Arc<AtomicBool>,
+    /// Peers whose endpoint failed. A failed RC queue pair flushes its GETs
+    /// with `CANCELED` too.
+    failed_peers: Arc<DashMap<InstanceId, ()>>,
     /// Where a refusal is recorded.
     no_native_get: Arc<DashMap<InstanceId, u64>>,
     /// Region whose in-flight count this operation holds.
@@ -930,14 +934,20 @@ impl RmaOpState {
     ///
     /// With software RMA off, `ucp_proto_reconfig_progress` (`proto_reconfig.c`)
     /// aborts such a GET with `UCS_ERR_CANCELED` and leaves the endpoint up.
-    /// The only other source of `CANCELED` for a GET is a FORCE close, and
-    /// velo issues every FORCE close itself: it marks the endpoint retired, or
-    /// it is shutting down, before the close. A failed endpoint purges its
-    /// requests with the failure status, not `CANCELED` (`ucp_ep_reqs_purge`).
+    /// Two other sources of `CANCELED` exist:
+    ///
+    /// * A FORCE close. Velo issues every FORCE close itself, and it marks the
+    ///   endpoint retired, or it is shutting down, before the close.
+    /// * A failed RC queue pair, which flushes its outstanding GETs with
+    ///   `IBV_WC_WR_FLUSH_ERR` (`uct_ib_wc_to_ucs_status`). UCX purges them
+    ///   before or after the endpoint's error handler runs. Before: the peer
+    ///   is in `failed_peers` here. After: [`WorkerState::reap_failed_eps`]
+    ///   drops the record this took.
     fn refused(&self, status: sys::ucs_status_t) -> bool {
         status == sys::ucs_status_t_UCS_ERR_CANCELED
             && !self.ep_retired.load(Ordering::Acquire)
             && !self.shutdown_requested.load(Ordering::Acquire)
+            && !self.failed_peers.contains_key(&self.peer)
     }
 
     /// Answer the caller, at most once. Also used by teardown for operations
@@ -2359,6 +2369,11 @@ impl WorkerState {
             std::mem::take(&mut *guard)
         };
         for peer in peers {
+            // A GET the failure flushed can look like a refusal (see
+            // `RmaOpState::refused`), so the record is not trusted past a
+            // failure. A peer that really has no native GET is refused again
+            // on its next GET, at the cost of one more fallback.
+            self.shared.no_native_get.remove(&peer);
             if let Some(entry) = self.eps.remove(&peer) {
                 // The ep already failed: FORCE-close is the only close that
                 // cannot block on the dead peer.
@@ -2909,6 +2924,7 @@ impl WorkerState {
             incarnation: prepared.incarnation,
             ep_retired: prepared.ep_retired,
             shutdown_requested: Arc::clone(&self.shared.shutdown_requested),
+            failed_peers: Arc::clone(&self.shared.failed_peers),
             no_native_get: Arc::clone(&self.shared.no_native_get),
             region_id: prepared.region_id,
             op_id,

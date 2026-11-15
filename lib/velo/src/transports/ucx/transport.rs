@@ -511,6 +511,7 @@ impl Transport for UcxTransport {
     fn unregister(&self, instance_id: InstanceId) {
         let known = self.shared.peers.remove(&instance_id).is_some();
         self.shared.failed_peers.remove(&instance_id);
+        self.shared.no_native_get.remove(&instance_id);
         if let Some((_, handle)) = self.connections.remove(&instance_id) {
             // The forwarder task ends once the last clone of the handle is
             // dropped.

@@ -921,9 +921,9 @@ async fn a_get_over_a_tcp_only_lane_is_refused_not_emulated() {
     assert_pair_balanced(&pair);
 }
 
-/// Refusal records must leave with peers, so peer churn cannot grow the memo forever.
+/// An unregistered peer takes its refusal record with it, so peer churn
+/// cannot grow the records without bound.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "F1: unregister leaves one no_native_get entry per refused peer"]
 async fn unregister_reclaims_a_peers_get_refusal() {
     const LEN: usize = 64 * 1024;
     const PEERS: usize = 8;
@@ -970,6 +970,57 @@ async fn unregister_reclaims_a_peers_get_refusal() {
         retained, 0,
         "{PEERS} unregistered peers left {retained} refusal records in a live transport"
     );
+}
+
+/// A refusal record lapses when the peer's endpoint fails.
+///
+/// The record must hold only a real refusal. On an RC lane, a queue pair that
+/// fails flushes its outstanding work with `IBV_WC_WR_FLUSH_ERR`, which UCX
+/// reports as `UCS_ERR_CANCELED` (`uct_ib_wc_to_ucs_status`), and it can
+/// purge the GETs before the endpoint's error handler runs. Such a GET looks
+/// like a refusal, so a record taken then would keep a peer with GET in
+/// hardware on the chunked path. A failed endpoint therefore drops its peer's
+/// record. Over tcp the same reap path runs when the peer goes away, which is
+/// what this drives.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_endpoint_drops_its_peers_get_refusal() {
+    const LEN: usize = 64 * 1024;
+    let src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    let pair = start_rma_pair_with(|b| b).await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+    let outcome = pair
+        .puller_rma
+        .get(get_request(&pair, &src, &remote, &local))
+        .await;
+    assert!(matches!(outcome, Err(RmaError::NoNativeGet)), "{outcome:?}");
+    assert!(pair.puller_rma.refuses_get(pair.owner.instance_id));
+    pair.owner_rma.unmap_region(remote.region_id).await.unwrap();
+
+    // The owner goes away; frames to it fail the puller's endpoint.
+    pair.owner.transport.shutdown();
+    let errs = CountingErrors::new();
+    let failed = wait_until(T, || {
+        let _ = pair.puller.transport.send_message(
+            pair.owner.instance_id,
+            Bytes::from_static(b"h"),
+            Bytes::from_static(b"p"),
+            MessageType::Message,
+            errs.clone(),
+        );
+        !pair.puller_rma.refuses_get(pair.owner.instance_id)
+    })
+    .await;
+    assert!(
+        failed,
+        "the refusal record outlived the failed endpoint (failed_peers: {})",
+        pair.puller.transport.shared.failed_peers.len()
+    );
+
+    pair.puller_rma.unmap_region(local.region_id).await.unwrap();
+    pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
 }
 
 #[tokio::test(flavor = "multi_thread")]
