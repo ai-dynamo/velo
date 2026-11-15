@@ -3538,11 +3538,22 @@ async fn the_sweep_does_not_shrink_the_queue_it_is_about_to_refill() {
 // ---------------------------------------------------------------------------
 
 /// A sweep interval no test waits out, so the only periodic ticks are the ones
-/// a test runs by hand. The sweep task's first tick is immediate.
+/// a test runs by hand. The sweep task's first tick is immediate, but it runs
+/// when that task is first polled, which on a loaded host can be late. With
+/// this interval one tick retires every idle batcher, so a test that must not
+/// meet a tick it did not run waits for [`first_ticks`] first.
 fn manual_tick_config() -> MuxConfig {
     MuxConfig {
         credit_sweep_interval: Duration::from_secs(3600),
         ..MuxConfig::default()
+    }
+}
+
+/// Wait until each side's sweep task has run its immediate first tick, so
+/// every later tick is one the test runs by hand.
+async fn first_ticks(pair: &Pair) {
+    for side in [&pair.consumer, &pair.producer] {
+        eventually(|| side.core.ticks.load(std::sync::atomic::Ordering::Acquire) > 0).await;
     }
 }
 
@@ -3764,9 +3775,19 @@ fn report_idle_tick(case: &str, mux: &MessengerMuxTransport) {
 /// A retired batcher can still flush a control reply after the idle fixture
 /// returns, and that reply recreates its peer's batcher. The idle count must
 /// wait that out rather than count a tick that walks the new batcher.
+///
+/// The test waits for each sweep task's first tick before it starts. That
+/// tick is immediate, but it runs when the task is first polled. On a loaded
+/// host the producer's first tick ran after `hooks.release()` (2 of 360 runs,
+/// 8 copies and 4 busy loops on one CPU). The late reply arrived and created
+/// a new producer batcher, which refused its grant because that stream had
+/// ended. Then the late tick retired that batcher before the test could see
+/// it: one tick retires an idle batcher under `manual_tick_config`. The reply
+/// was not lost; the test waited for a batcher that had come and gone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_late_reply_after_the_idle_fixture_is_not_counted_as_idle() {
     let pair = mux_pair(manual_tick_config()).await;
+    first_ticks(&pair).await;
     let hooks = Arc::new(TestHooks::default());
     hooks.pause();
     assert!(pair.consumer.core.hooks.set(Arc::clone(&hooks)).is_ok());
