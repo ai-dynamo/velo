@@ -56,3 +56,23 @@ then fails every time. With the port held, it cannot be taken.
 
 Test: `transports::zmq::transport::tests::a_stopping_sender_drains_within_its_budget`
 (`lib/velo/src/transports/zmq/transport.rs`).
+
+## Read what is left of a deadline just before the wait it bounds
+
+**Rule.** When a shared deadline bounds a series of blocking calls, compute
+the time left immediately before each call that blocks, not before the work
+that leads up to it. Setup between the reading and the wait (creating a
+socket, taking a lock, a slow allocation) is spent twice: once from the
+deadline, and once more as the wait the stale reading allows.
+
+**Failure.** A stopping ZMQ sender took each send's timeout from its drain
+budget, then created the socket for the send. When creating the socket used
+up the budget, the send still waited the whole earlier timeout, so the drain
+ran a second past its one-second budget.
+
+**Test.** Hold the code at the point between setup and the wait (a per-thread
+test hook) until the deadline has passed, then check that the call fails at
+once. With the stale reading, it waits the whole earlier timeout.
+
+Test: `transports::zmq::transport::tests::a_stopping_sender_rechecks_its_budget_after_socket_setup`
+(`lib/velo/src/transports/zmq/transport.rs`).
