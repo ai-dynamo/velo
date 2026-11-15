@@ -546,18 +546,12 @@ fn run_sender(cfg: SenderConfig) {
             }
         };
 
-        // While draining, each send gets only what is left of the budget,
-        // and a frame that finds none left fails without being sent.
-        let drain_left = match drain_deadline {
-            Some(deadline) => match deadline.checked_duration_since(std::time::Instant::now()) {
-                Some(left) if !left.is_zero() => Some(left),
-                _ => {
-                    task.on_error("Transport shutting down");
-                    continue;
-                }
-            },
-            None => None,
-        };
+        // While draining, a frame that finds no budget left fails without
+        // being sent, and without a socket being created for it.
+        if drain_deadline.is_some_and(drain_spent) {
+            task.on_error("Transport shutting down");
+            continue;
+        }
 
         let target = task.target;
 
@@ -581,6 +575,8 @@ fn run_sender(cfg: SenderConfig) {
                     cfg.linger_ms,
                 ) {
                     Ok(sock) => {
+                        #[cfg(test)]
+                        tests::after_socket_setup();
                         dealer_sockets.insert(target, sock);
                         dealer_sockets.get(&target).unwrap()
                     }
@@ -592,7 +588,18 @@ fn run_sender(cfg: SenderConfig) {
             }
         };
 
-        if let Some(left) = drain_left {
+        // Each send gets only what is left of the budget. It is read again
+        // here, after the socket was found or created: creating one takes time
+        // too, and a send timeout taken before that would let the drain run
+        // past its budget by the time the creation took.
+        if let Some(deadline) = drain_deadline {
+            let Some(left) = deadline
+                .checked_duration_since(std::time::Instant::now())
+                .filter(|left| !left.is_zero())
+            else {
+                task.on_error("Transport shutting down");
+                continue;
+            };
             let millis = i32::try_from(left.as_millis()).unwrap_or(i32::MAX).max(1);
             if let Err(e) = sock.set_sndtimeo(millis) {
                 task.on_error(format!("ZMQ send failed: {e}"));
@@ -633,6 +640,13 @@ fn run_sender(cfg: SenderConfig) {
     // Close all DEALER sockets
     drop(dealer_sockets);
     debug!("ZMQ sender thread exited");
+}
+
+/// Whether a drain that ends at `deadline` has no budget left.
+fn drain_spent(deadline: std::time::Instant) -> bool {
+    deadline
+        .checked_duration_since(std::time::Instant::now())
+        .is_none_or(|left| left.is_zero())
 }
 
 /// Create and configure a DEALER socket connected to a remote ROUTER.
@@ -1041,6 +1055,94 @@ mod tests {
             "draining {frames} frames to a silent peer took {took:?}"
         );
         assert_eq!(failed.load(Ordering::Relaxed), frames);
+        drop(silent);
+    }
+
+    std::thread_local! {
+        /// Test seam, per thread: `run_sender` calls [`after_socket_setup`]
+        /// once it has created a DEALER socket. A test that installs a gate
+        /// here, on the thread that runs the sender, can hold the sender at
+        /// that point for as long as it likes. Other tests' senders run on
+        /// other threads and never see it.
+        static SETUP_GATE: std::cell::RefCell<Option<(flume::Sender<()>, flume::Receiver<()>)>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// See `SETUP_GATE`.
+    pub(super) fn after_socket_setup() {
+        SETUP_GATE.with(|gate| {
+            if let Some((entered, release)) = gate.borrow().as_ref() {
+                let _ = entered.send(());
+                let _ = release.recv_timeout(SEND_TIMEOUT);
+            }
+        });
+    }
+
+    /// A stopping sender reads its budget again after it creates a socket.
+    ///
+    /// The send timeout used to be taken from the budget before the socket
+    /// was created. When creation used up the budget, the send still waited
+    /// the whole earlier timeout, about one more `DRAIN_BUDGET`, so the drain
+    /// ran past its budget by the time creation took. The gate holds the
+    /// sender just after creation until the budget is gone; the frame must
+    /// then fail as a shutdown, without a send.
+    #[test]
+    fn a_stopping_sender_rechecks_its_budget_after_socket_setup() {
+        struct CaptureError(flume::Sender<String>);
+        impl TransportErrorHandler for CaptureError {
+            fn on_error(&self, _: Bytes, _: Bytes, error: String) {
+                self.0.send(error).unwrap();
+            }
+        }
+
+        // Held for the whole test and never accepted from, as in
+        // `a_stopping_sender_drains_within_its_budget`.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = crate::InstanceId::new_v4();
+        let peers = Arc::new(DashMap::new());
+        peers.insert(target, format!("tcp://{}", silent.local_addr().unwrap()));
+        let (errors_tx, errors) = flume::bounded(1);
+        let (tx, rx) = flume::bounded(1);
+        tx.send(SenderCommand::Send(OutboundTask {
+            target,
+            msg_type: MessageType::Message,
+            header: Bytes::new(),
+            payload: Bytes::new(),
+            on_error: Arc::new(CaptureError(errors_tx)),
+        }))
+        .unwrap();
+        let (ready_tx, _ready) = std::sync::mpsc::sync_channel(1);
+        let cfg = SenderConfig {
+            ctx: Arc::new(zmq::Context::new()),
+            rx,
+            stop: Arc::new(AtomicBool::new(true)),
+            peers,
+            identity: b"setup-budget".to_vec(),
+            sndhwm: 1,
+            linger_ms: 0,
+            ready_tx,
+        };
+        let (entered_tx, entered) = flume::bounded(1);
+        let (release, release_rx) = flume::bounded(1);
+        let worker = std::thread::spawn(move || {
+            SETUP_GATE.with(|gate| *gate.borrow_mut() = Some((entered_tx, release_rx)));
+            run_sender(cfg);
+        });
+
+        entered
+            .recv_timeout(SEND_TIMEOUT)
+            .expect("the sender never created its socket");
+        // Let the whole budget pass while the sender is held after setup.
+        std::thread::sleep(DRAIN_BUDGET);
+        let released = std::time::Instant::now();
+        release.send(()).unwrap();
+        worker.join().unwrap();
+        let after_setup = released.elapsed();
+        assert_eq!(
+            errors.recv_timeout(SEND_TIMEOUT).unwrap(),
+            "Transport shutting down",
+            "socket setup used up the drain budget, but the sender took another {after_setup:?}"
+        );
         drop(silent);
     }
 
