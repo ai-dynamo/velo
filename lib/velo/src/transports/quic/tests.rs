@@ -978,16 +978,17 @@ async fn a_forced_close_warns_of_frames_the_peer_did_not_read() {
 /// unread, and the dialer would warn once per connection on every peer
 /// restart.
 ///
-/// The listener does not call `close()` itself. Its connection task and its
-/// stream task drop their handles at teardown, and quinn closes the
-/// connection when the last one goes; a closed connection sends only
-/// CONNECTION_CLOSE, which supersedes the STOP_SENDING the dropped stream
-/// queued. The runtime is `current_thread`, so the driver runs only after both
-/// tasks have dropped their handles, which makes that order deterministic.
+/// The connection task calls `close()` at teardown, and only then stops its
+/// stream readers; a stream dropped on a closed connection sends nothing. The
+/// runtime has two workers, so a reader can run before the connection task.
+/// When the readers stopped on the teardown token, as the connection task did,
+/// this test failed about 1 run in 100 under parallel load.
+/// `listener::tests::teardown_stops_no_stream_before_the_connection_task_closes`
+/// forces that order on every run.
 ///
 /// Only the teardown token is cancelled, as `graceful_shutdown` does before it
 /// calls `shutdown()`, so the order under test is the listener's own.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_listener_in_teardown_closes_the_connection_before_its_streams() {
     let server = QuicTransportBuilder::new()
         .bind_addr("127.0.0.1:0".parse().unwrap())
@@ -1557,18 +1558,18 @@ async fn retirement_reports_late_sends_and_preserves_successor() {
     assert!(connections.get(&key).unwrap().tx.same_channel(&next.tx));
 }
 
-/// A listener in teardown wakes each connection's task before that
-/// connection's stream readers, so the peer sees the connection close, not a
+/// A listener in teardown shows the peer the connection close, not a
 /// STOP_SENDING from a reader that stopped first (see
 /// `a_listener_in_teardown_closes_the_connection_before_its_streams` for why
-/// that matters).
+/// that matters), even while a cancel of the node-wide token is half done.
 ///
 /// Cancelling a token wakes its children before its own waiters. The reader
-/// of `serve_frames` waits on a child token, so on the node-wide token it
-/// would wake before the connection task. This test holds the cancel after
-/// the children wake and before the node-wide token's own waiters do: a
-/// reader that is a child of the node-wide token stops its stream in that
-/// gap. The readers' tokens must be children of the connection's token.
+/// of `serve_frames` waits on a child token, so a reader on a child of the
+/// node-wide token would wake before the connection task. This test holds the
+/// cancel after the children wake and before the node-wide token's own
+/// waiters do. Such a reader stops its stream in that gap. The readers' token
+/// is not reachable from the node-wide token: the connection task cancels it
+/// after it closes the connection.
 #[tokio::test]
 async fn teardown_closes_the_connection_before_child_readers_stop_streams() {
     use std::future::Future;
