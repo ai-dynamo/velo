@@ -144,6 +144,34 @@ pub struct VeloBackend {
     teardown_outcome: teardown::Outcome,
     runtime: tokio::runtime::Handle,
     observability: Option<Arc<VeloMetrics>>,
+    /// Each registered peer's `PeerInfo`, so that an observer installed
+    /// late hears of it. Written under the peer's `primary_transport` entry.
+    peers: DashMap<InstanceId, PeerInfo>,
+    peer_observer: OnceLock<Arc<dyn PeerTableObserver>>,
+    advertised: OnceLock<PeerInfo>,
+}
+
+/// Told when the backend's peer table changes.
+///
+/// The backend's table is the one every way of learning a peer goes
+/// through: `Velo::register_peer`, `Messenger::register_peer`, `_hello`,
+/// and discovery when a send names an unknown worker. `VeloBuilder::build`
+/// installs one observer that keeps the per-stream transport's own peer
+/// table in step, so that no path can fill one table and not the other.
+///
+/// The backend calls it while it holds the peer's `primary_transport`
+/// entry, so that a register and an unregister of one peer reach it in the
+/// order they change the route. It must not block, and it must not call
+/// back into the backend.
+pub(crate) trait PeerTableObserver: Send + Sync {
+    /// The peer was added: at least one messenger transport accepted it.
+    /// Infallible, because the messenger's registration stands either way;
+    /// an observer logs what it could not do.
+    fn registered(&self, peer: &PeerInfo);
+
+    /// The peer was dropped. Called for every `unregister_peer`, also for a
+    /// peer never registered, so it must be cheap and idempotent.
+    fn unregistered(&self, instance_id: InstanceId);
 }
 
 /// Stop completed transports if construction fails or is cancelled.
@@ -289,6 +317,9 @@ impl VeloBackend {
                 teardown_outcome: Default::default(),
                 runtime,
                 observability,
+                peers: DashMap::new(),
+                peer_observer: OnceLock::new(),
+                advertised: OnceLock::new(),
             },
             data_streams,
         ))
@@ -308,6 +339,54 @@ impl VeloBackend {
     /// Returns a [`PeerInfo`] describing this backend (instance ID + composite address).
     pub fn peer_info(&self) -> PeerInfo {
         PeerInfo::new(self.instance_id, self.address.clone())
+    }
+
+    /// What this node sends to a peer in `_hello`: its complete address.
+    ///
+    /// [`peer_info`](Self::peer_info) has the messenger transports only. A
+    /// `Velo` node also listens for streams on an endpoint of its own, and a
+    /// peer that learns the node by `_hello` must get that endpoint too, or
+    /// it cannot attach to the node's anchors. `VeloBuilder::build` sets the
+    /// complete address; a plain messenger has nothing to add.
+    pub(crate) fn advertised_peer_info(&self) -> PeerInfo {
+        match self.advertised.get() {
+            Some(peer_info) => peer_info.clone(),
+            None => self.peer_info(),
+        }
+    }
+
+    /// Set the address [`advertised_peer_info`](Self::advertised_peer_info)
+    /// returns. Once only: a node's address does not change.
+    pub(crate) fn set_advertised_peer_info(&self, peer_info: PeerInfo) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            peer_info.instance_id() == self.instance_id,
+            "advertised address belongs to another instance"
+        );
+        self.advertised
+            .set(peer_info)
+            .map_err(|_| anyhow::anyhow!("advertised address already set"))
+    }
+
+    /// Install the one [`PeerTableObserver`]. Fails if one is installed.
+    ///
+    /// The observer first hears of every peer already registered: the
+    /// transports start before `VeloBuilder::build` can install it, and a
+    /// `_hello` can register a peer in between.
+    pub(crate) fn set_peer_observer(
+        &self,
+        observer: Arc<dyn PeerTableObserver>,
+    ) -> anyhow::Result<()> {
+        self.peer_observer
+            .set(Arc::clone(&observer))
+            .map_err(|_| anyhow::anyhow!("a peer table observer is already installed"))?;
+        // Installed first, so a register from here on tells it, and one that
+        // the walk also finds is told twice, which is one register. The walk
+        // holds each shard while it calls, so a register or an unregister of
+        // that peer comes after it.
+        for peer in self.peers.iter() {
+            observer.registered(peer.value());
+        }
+        Ok(())
     }
 
     /// Returns `true` if the given instance has been registered via [`register_peer`](Self::register_peer).
@@ -666,12 +745,21 @@ impl VeloBackend {
 
         let primary_transport = self.transports.get(&primary_transport_key).unwrap();
 
-        self.primary_transport
-            .insert(instance_id, primary_transport.clone());
+        // The route's entry orders this against an unregister of the same
+        // peer, so the observer's table ends as the route does. No lock of
+        // the backend's own: a send's error handler can register a peer.
+        let route = self
+            .primary_transport
+            .entry(instance_id)
+            .insert(primary_transport.clone());
+        self.peers.insert(instance_id, peer.clone());
+        if let Some(observer) = self.peer_observer.get() {
+            observer.registered(&peer);
+        }
+        drop(route);
         self.alternative_transports
             .insert(instance_id, alternative_transport_keys);
         self.workers.insert(instance_id.worker_id(), instance_id);
-
         Ok(())
     }
 
@@ -683,11 +771,23 @@ impl VeloBackend {
     /// Idempotent; other peers are not affected.
     pub fn unregister_peer(&self, instance_id: InstanceId) {
         // Routes first, so a new send fails here and does not reach a
-        // transport that is closing the peer's connections.
-        self.primary_transport.remove(&instance_id);
+        // transport that is closing the peer's connections. The observer is
+        // told under the route's entry, as `register_peer` tells it.
+        let route = self.primary_transport.entry(instance_id);
+        self.peers.remove(&instance_id);
+        if let Some(observer) = self.peer_observer.get() {
+            observer.unregistered(instance_id);
+        }
+        // A vacant entry holds the shard too: drop it here, not at return.
+        match route {
+            dashmap::Entry::Occupied(route) => drop(route.remove()),
+            dashmap::Entry::Vacant(route) => drop(route),
+        }
         self.alternative_transports.remove(&instance_id);
         self.workers
             .remove_if(&instance_id.worker_id(), |_, id| *id == instance_id);
+        // A transport fails the peer's queued sends here and runs their
+        // error handlers, so it runs under no entry.
         // Every transport, not only the routes: a re-registration that one
         // transport refused leaves that transport out of the routes, but it
         // can still hold the peer from before.
