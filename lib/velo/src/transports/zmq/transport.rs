@@ -977,9 +977,19 @@ mod tests {
     }
 
     /// Frames queued before a stop are still sent, but only within one shared
-    /// budget. Each send to a peer that is gone blocks for the full send
-    /// timeout, so a drain with no budget held the sender join, and so
-    /// teardown, for that timeout once per queued frame.
+    /// budget. Each send to a peer that never completes a handshake blocks for
+    /// the full send timeout, so a drain with no budget held the sender join,
+    /// and so teardown, for that timeout once per queued frame.
+    ///
+    /// The peer is a TCP listener that this test holds for its whole length
+    /// and never accepts from. The kernel completes the TCP connect into the
+    /// backlog, but no ZMTP greeting ever comes back, so with `ZMQ_IMMEDIATE`
+    /// the dealer never gets a pipe and every send waits. An earlier version
+    /// bound a port and closed it again to make a dead peer. In a full `--lib`
+    /// run another test could bind that free port: a ZMQ ROUTER there takes
+    /// the frames, and the test failed with no frame failed (1 in 72 full
+    /// `--lib` runs, 24 at once on 8 CPUs; 3 of 3 when a ROUTER takes the
+    /// port on purpose).
     #[test]
     fn a_stopping_sender_drains_within_its_budget() {
         struct CountErrors(Arc<std::sync::atomic::AtomicUsize>);
@@ -988,11 +998,10 @@ mod tests {
                 self.0.fetch_add(1, Ordering::Relaxed);
             }
         }
-        // A port nothing listens on: with `ZMQ_IMMEDIATE` the dealer never
-        // gets a pipe, so every send waits out its timeout.
-        let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("tcp://{}", dead.local_addr().unwrap());
-        drop(dead);
+        // Held until the end of the test, so no other socket can take the
+        // port, and never accepted from, so no handshake completes.
+        let silent = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!("tcp://{}", silent.local_addr().unwrap());
         let target = crate::InstanceId::new_v4();
         let peers = Arc::new(DashMap::new());
         peers.insert(target, endpoint);
@@ -1022,12 +1031,17 @@ mod tests {
             linger_ms: 0,
             ready_tx,
         });
+        // The drain takes about `DRAIN_BUDGET` (1.00-1.06 s, even with 96
+        // copies of this test on one CPU). The limit is one `SEND_TIMEOUT`:
+        // a single send without the shared budget already waits that long, and
+        // a drain with no budget waited it once per frame.
         let took = started.elapsed();
         assert!(
-            took < DRAIN_BUDGET + Duration::from_secs(1),
-            "draining {frames} frames to a dead peer took {took:?}"
+            took < SEND_TIMEOUT,
+            "draining {frames} frames to a silent peer took {took:?}"
         );
         assert_eq!(failed.load(Ordering::Relaxed), frames);
+        drop(silent);
     }
 
     /// The listener must stop on the stop flag alone. Its control message is

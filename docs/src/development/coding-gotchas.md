@@ -35,3 +35,24 @@ every time.
 
 Test: `streaming::messenger_mux::tests::a_late_reply_after_the_idle_fixture_is_not_counted_as_idle`
 (`lib/velo/src/streaming/messenger_mux/tests.rs`).
+
+## A port you closed is free for any other test to take
+
+**Rule.** A test that needs a peer which never answers must hold that peer's
+port for the whole test. Do not bind a port and close it again to make a
+"dead" address: the port is free once it is closed, and in a full test run
+another test can bind it at any moment. Keep a `TcpListener` bound and never
+accept from it. The kernel completes the TCP connect, but no protocol
+handshake ever comes back.
+
+**Failure.** The ZMQ drain test made its dead peer by binding a port and
+dropping the listener. In a full `--lib` run another test's ZMQ ROUTER took
+the port, the "dead" peer received every frame, and the test failed with no
+frame failed. It happened 1 time in 72 full runs (24 at once on 8 CPUs). The
+same test passed every time alone.
+
+**Test.** Bind a ZMQ ROUTER to the freed port before the drain: the old test
+then fails every time. With the port held, it cannot be taken.
+
+Test: `transports::zmq::transport::tests::a_stopping_sender_drains_within_its_budget`
+(`lib/velo/src/transports/zmq/transport.rs`).
