@@ -78,6 +78,8 @@ pub mod handlers;
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 pub(crate) mod pinned;
 pub mod protocol;
+#[cfg(test)]
+mod reclaim_tests;
 // The RDMA registration layer, gated exactly as `transports::ucx` is.
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 pub mod rdma;
@@ -1021,17 +1023,17 @@ impl RendezvousManager {
     }
 
     /// Release the read lock WITHOUT decrementing refcount. The handle remains
-    /// alive and can be `get()`-ed again.
+    /// alive and can be `get()`-ed again, unless its owner has already dropped
+    /// its reference: then the last reader's detach frees the slot.
     pub async fn detach(&self, handle: DataHandle, lease_id: u64) -> Result<()> {
         let started = Instant::now();
         let (target_worker, local_id) = handle.unpack();
         let result = if target_worker == self.worker_id {
-            match self.store.consume_lease(lease_id, local_id) {
-                store::LeaseOutcome::Consumed => {
-                    self.store.release_read_lock(local_id);
-                    self.store.remove_transfers_by_lease(lease_id);
-                    Ok(())
-                }
+            match self
+                .store
+                .end_lease(lease_id, local_id, store::LeaseEnd::Detach)
+            {
+                store::LeaseOutcome::Consumed => Ok(()),
                 outcome => {
                     anyhow::bail!(
                         "invalid or already-consumed lease {lease_id} for {handle}: {outcome:?}"
@@ -1061,16 +1063,11 @@ impl RendezvousManager {
         let started = Instant::now();
         let (target_worker, local_id) = handle.unpack();
         let result = if target_worker == self.worker_id {
-            match self.store.consume_lease(lease_id, local_id) {
-                store::LeaseOutcome::Consumed => {
-                    self.store.release_read_lock(local_id);
-                    self.store.remove_transfers_by_lease(lease_id);
-                    let should_free = self.store.ref_decrement(local_id);
-                    if should_free {
-                        self.store.try_free(local_id);
-                    }
-                    Ok(())
-                }
+            match self
+                .store
+                .end_lease(lease_id, local_id, store::LeaseEnd::Release)
+            {
+                store::LeaseOutcome::Consumed => Ok(()),
                 outcome => {
                     anyhow::bail!(
                         "invalid or already-consumed lease {lease_id} for {handle}: {outcome:?}"
@@ -1278,10 +1275,8 @@ impl Drop for LeaseGuard {
 
         let client = match std::mem::replace(&mut self.lease, Lease::Local) {
             Lease::Local => {
-                if self.store.consume_lease(lease_id, local_id) == store::LeaseOutcome::Consumed {
-                    self.store.release_read_lock(local_id);
-                    self.store.remove_transfers_by_lease(lease_id);
-                }
+                self.store
+                    .end_lease(lease_id, local_id, store::LeaseEnd::Detach);
                 return;
             }
             Lease::Remote(Some(client)) => client,
