@@ -48,18 +48,20 @@ fn tcp_transport() -> Arc<crate::transports::tcp::TcpTransport> {
 }
 
 async fn messenger_pair() -> (Arc<Messenger>, Arc<Messenger>) {
-    let a = Messenger::builder()
+    let a = crate::messenger::MessengerParts::new()
         .add_transport(tcp_transport())
         .build()
         .await
         .expect("messenger a");
-    let b = Messenger::builder()
+    let b = crate::messenger::MessengerParts::new()
         .add_transport(tcp_transport())
         .build()
         .await
         .expect("messenger b");
-    a.register_peer(b.peer_info()).expect("register b on a");
-    b.register_peer(a.peer_info()).expect("register a on b");
+    a.register_peer_inner(b.peer_info())
+        .expect("register b on a");
+    b.register_peer_inner(a.peer_info())
+        .expect("register a on b");
     tokio::time::sleep(Duration::from_millis(200)).await;
     (a, b)
 }
@@ -192,7 +194,7 @@ async fn a_stale_payload_refusal_spares_a_stream_in_a_new_epoch() {
     use crate::messenger::large_payload::PayloadTooLarge;
     use protocol::{BatchEncoder, SlotId};
 
-    let messenger = Messenger::builder()
+    let messenger = crate::messenger::MessengerParts::new()
         .add_transport(tcp_transport())
         .build()
         .await
@@ -507,14 +509,14 @@ fn aborting_a_retiring_batchers_final_flush_stops_the_mux() {
         .unwrap();
     let (mux, receiver, _wire) = runtime.block_on(async {
         let (transport, wire) = StallingTransport::new(tokio::runtime::Handle::current());
-        let messenger = Messenger::builder()
+        let messenger = crate::messenger::MessengerParts::new()
             .add_transport(transport.clone())
             .build()
             .await
             .unwrap();
         let peer = velo_ext::InstanceId::new_v4();
         messenger
-            .register_peer(velo_ext::PeerInfo::new(peer, stalling_address()))
+            .register_peer_inner(velo_ext::PeerInfo::new(peer, stalling_address()))
             .unwrap();
         let mux = MessengerMuxTransport::new(
             messenger,
@@ -573,14 +575,14 @@ async fn a_batcher_dropped_by_stop_sending_leaves_slots_to_shutdown() {
     use super::test_support::{StallingTransport, stalling_address};
 
     let (transport, _wire) = StallingTransport::new(tokio::runtime::Handle::current());
-    let messenger = Messenger::builder()
+    let messenger = crate::messenger::MessengerParts::new()
         .add_transport(transport)
         .build()
         .await
         .unwrap();
     let peer = velo_ext::InstanceId::new_v4();
     messenger
-        .register_peer(velo_ext::PeerInfo::new(peer, stalling_address()))
+        .register_peer_inner(velo_ext::PeerInfo::new(peer, stalling_address()))
         .unwrap();
     let mux = MessengerMuxTransport::new(
         messenger,
@@ -793,7 +795,7 @@ fn the_default_credit_window_is_32() {
 /// messenger's one `_stream_batch` handler slot.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_zero_sweep_interval_is_refused_when_the_mux_is_built() {
-    let messenger = Messenger::builder()
+    let messenger = crate::messenger::MessengerParts::new()
         .add_transport(tcp_transport())
         .build()
         .await
@@ -1184,22 +1186,22 @@ async fn one_flush_reaches_every_peer_batcher() {
     const PEERS: usize = 2;
     const SLOTS_PER_PEER: u64 = 3;
 
-    let producer_messenger = Messenger::builder()
+    let producer_messenger = crate::messenger::MessengerParts::new()
         .add_transport(tcp_transport())
         .build()
         .await
         .expect("producer messenger");
     let mut consumers = Vec::with_capacity(PEERS);
     for _ in 0..PEERS {
-        let m = Messenger::builder()
+        let m = crate::messenger::MessengerParts::new()
             .add_transport(tcp_transport())
             .build()
             .await
             .expect("consumer messenger");
         producer_messenger
-            .register_peer(m.peer_info())
+            .register_peer_inner(m.peer_info())
             .expect("register consumer");
-        m.register_peer(producer_messenger.peer_info())
+        m.register_peer_inner(producer_messenger.peer_info())
             .expect("register producer");
         consumers.push(m);
     }
@@ -1307,22 +1309,22 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
     let consumer_metrics =
         Arc::new(VeloMetrics::register(&consumer_reg).expect("register metrics"));
 
-    let producer_messenger = Messenger::builder()
+    let producer_messenger = crate::messenger::MessengerParts::new()
         .add_transport(tcp_transport())
         .build()
         .await
         .expect("producer messenger");
-    let consumer_messenger = Messenger::builder()
+    let consumer_messenger = crate::messenger::MessengerParts::new()
         .add_transport(tcp_transport())
         .metrics(Arc::clone(&consumer_metrics))
         .build()
         .await
         .expect("consumer messenger");
     producer_messenger
-        .register_peer(consumer_messenger.peer_info())
+        .register_peer_inner(consumer_messenger.peer_info())
         .expect("register consumer");
     consumer_messenger
-        .register_peer(producer_messenger.peer_info())
+        .register_peer_inner(producer_messenger.peer_info())
         .expect("register producer");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -1794,7 +1796,7 @@ async fn prebinding_node_with_window(
     unattached_timeout: Option<Duration>,
     accept_window: Duration,
 ) -> PrebindingNode {
-    let messenger = Messenger::builder()
+    let messenger = crate::messenger::MessengerParts::new()
         .add_transport(tcp_transport())
         .build()
         .await

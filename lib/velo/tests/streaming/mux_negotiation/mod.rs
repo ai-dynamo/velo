@@ -824,6 +824,7 @@ struct LegacyReceiver {
     _stream: Arc<velo::streaming::TcpFrameTransport>,
 }
 
+#[allow(deprecated)] // a legacy peer: a bare `Messenger` with no `Velo` around it
 async fn legacy_mpsc_receiver(answers_with: &str) -> LegacyReceiver {
     let messenger = velo::messenger::Messenger::builder()
         .add_transport(tcp_transport())
@@ -886,6 +887,7 @@ async fn legacy_mpsc_receiver(answers_with: &str) -> LegacyReceiver {
 /// where the receiver's streaming listener is. `Velo::register_peer` does both
 /// at once for a `Velo` peer; this peer is not one, and its messenger
 /// `PeerInfo` carries no `tcp-stream` entry to fan out.
+#[allow(deprecated)] // a legacy peer: a bare `Messenger` with no `Velo` around it
 async fn wire_up(producer: &Node, receiver: &LegacyReceiver) {
     producer
         .velo

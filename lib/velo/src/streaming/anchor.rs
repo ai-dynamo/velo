@@ -4326,18 +4326,18 @@ mod tests {
     /// See `a_local_attach_clears_the_unattached_deadline`.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_remote_attach_clears_the_unattached_deadline() {
-        let consumer = crate::messenger::Messenger::builder()
+        let consumer = crate::messenger::MessengerParts::new()
             .add_transport(tcp_messenger_transport())
             .build()
             .await
             .unwrap();
-        let producer = crate::messenger::Messenger::builder()
+        let producer = crate::messenger::MessengerParts::new()
             .add_transport(tcp_messenger_transport())
             .build()
             .await
             .unwrap();
-        consumer.register_peer(producer.peer_info()).unwrap();
-        producer.register_peer(consumer.peer_info()).unwrap();
+        consumer.register_peer_inner(producer.peer_info()).unwrap();
+        producer.register_peer_inner(consumer.peer_info()).unwrap();
         let receiver = Arc::new(
             AnchorManagerBuilder::default()
                 .worker_id(consumer.instance_id().worker_id())
@@ -4786,12 +4786,12 @@ mod tests {
     fn test_register_handlers_stores_messenger_in_lock() {
         // Verify that after register_handlers, messenger_lock.get() is Some
         // and that a second call returns Err.
-        // Note: We use Messenger::builder().build() which requires tokio runtime.
+        // Note: We use MessengerParts::new().build() which requires tokio runtime.
         // This is a compile + behavior test using a real Messenger (no-transport).
         // The test is sync to avoid needing #[tokio::test] but uses a runtime.
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let messenger = crate::messenger::Messenger::builder()
+            let messenger = crate::messenger::MessengerParts::new()
                 .build()
                 .await
                 .expect("messenger");
@@ -4815,11 +4815,11 @@ mod tests {
     fn test_register_handlers_second_call_errors() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let m1 = crate::messenger::Messenger::builder()
+            let m1 = crate::messenger::MessengerParts::new()
                 .build()
                 .await
                 .unwrap();
-            let m2 = crate::messenger::Messenger::builder()
+            let m2 = crate::messenger::MessengerParts::new()
                 .build()
                 .await
                 .unwrap();
@@ -5214,18 +5214,18 @@ mod tests {
     async fn failed_connect_rolls_back_its_identity_and_preserves_legacy_errors() {
         use crate::streaming::control::{AnchorAbortAttachRequest, StreamCancelHandle};
         for upgraded in [true, false] {
-            let consumer = crate::messenger::Messenger::builder()
+            let consumer = crate::messenger::MessengerParts::new()
                 .add_transport(tcp_messenger_transport())
                 .build()
                 .await
                 .unwrap();
-            let producer = crate::messenger::Messenger::builder()
+            let producer = crate::messenger::MessengerParts::new()
                 .add_transport(tcp_messenger_transport())
                 .build()
                 .await
                 .unwrap();
-            consumer.register_peer(producer.peer_info()).unwrap();
-            producer.register_peer(consumer.peer_info()).unwrap();
+            consumer.register_peer_inner(producer.peer_info()).unwrap();
+            producer.register_peer_inner(consumer.peer_info()).unwrap();
             let receiver_transport =
                 crate::streaming::TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
                     .await
@@ -5288,7 +5288,7 @@ mod tests {
             );
             if upgraded {
                 let replacement = receiver.attach_stream_anchor::<u32>(handle).await.unwrap();
-                consumer.begin_drain();
+                consumer.begin_drain_inner();
                 let stale = AnchorAbortAttachRequest {
                     handle,
                     stream_cancel_handle: StreamCancelHandle::pack(
@@ -5333,10 +5333,10 @@ mod tests {
             receiver_transport.shutdown().await;
             sender_transport.shutdown().await;
             consumer
-                .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+                .graceful_shutdown_inner(crate::ShutdownPolicy::WaitForever)
                 .await;
             producer
-                .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
+                .graceful_shutdown_inner(crate::ShutdownPolicy::WaitForever)
                 .await;
             consumer.closed().await;
             producer.closed().await;
@@ -5361,21 +5361,21 @@ mod tests {
         const RTT: &str = "velo_streaming_anchor_attach_rtt_seconds";
         const PEER_CHOSEN: &str = "a-key-this-sender-never-advertised";
 
-        let m_consumer = crate::messenger::Messenger::builder()
+        let m_consumer = crate::messenger::MessengerParts::new()
             .add_transport(tcp_messenger_transport())
             .build()
             .await
             .expect("consumer messenger");
-        let m_producer = crate::messenger::Messenger::builder()
+        let m_producer = crate::messenger::MessengerParts::new()
             .add_transport(tcp_messenger_transport())
             .build()
             .await
             .expect("producer messenger");
         m_consumer
-            .register_peer(m_producer.peer_info())
+            .register_peer_inner(m_producer.peer_info())
             .expect("register producer on consumer");
         m_producer
-            .register_peer(m_consumer.peer_info())
+            .register_peer_inner(m_consumer.peer_info())
             .expect("register consumer on producer");
         tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -5515,21 +5515,21 @@ mod tests {
         use crate::streaming::tcp_transport::TcpFrameTransport;
         use crate::streaming::transport::FrameTransport;
 
-        let m_consumer = crate::messenger::Messenger::builder()
+        let m_consumer = crate::messenger::MessengerParts::new()
             .add_transport(tcp_messenger_transport())
             .build()
             .await
             .expect("consumer messenger");
-        let m_producer = crate::messenger::Messenger::builder()
+        let m_producer = crate::messenger::MessengerParts::new()
             .add_transport(tcp_messenger_transport())
             .build()
             .await
             .expect("producer messenger");
         m_consumer
-            .register_peer(m_producer.peer_info())
+            .register_peer_inner(m_producer.peer_info())
             .expect("register producer on consumer");
         m_producer
-            .register_peer(m_consumer.peer_info())
+            .register_peer_inner(m_consumer.peer_info())
             .expect("register consumer on producer");
 
         let tcp_consumer = TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
@@ -5611,18 +5611,18 @@ mod tests {
     /// zero-RTT integration suite.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn remote_renewal_uses_the_registered_messenger_and_extends_the_lifetime() {
-        let consumer = crate::messenger::Messenger::builder()
+        let consumer = crate::messenger::MessengerParts::new()
             .add_transport(tcp_messenger_transport())
             .build()
             .await
             .unwrap();
-        let producer = crate::messenger::Messenger::builder()
+        let producer = crate::messenger::MessengerParts::new()
             .add_transport(tcp_messenger_transport())
             .build()
             .await
             .unwrap();
-        consumer.register_peer(producer.peer_info()).unwrap();
-        producer.register_peer(consumer.peer_info()).unwrap();
+        consumer.register_peer_inner(producer.peer_info()).unwrap();
+        producer.register_peer_inner(consumer.peer_info()).unwrap();
         let lifetime = Duration::from_secs(60);
         let receiver = Arc::new(
             AnchorManagerBuilder::default()

@@ -743,7 +743,10 @@ mod tests {
     /// teardown would keep them for the life of the process.
     #[tokio::test]
     async fn a_waiting_resolve_ends_at_teardown() {
-        let messenger = crate::Messenger::builder().build().await.unwrap();
+        let messenger = crate::messenger::MessengerParts::new()
+            .build()
+            .await
+            .unwrap();
         let backend = Arc::clone(messenger.backend());
         let resolver: Arc<dyn crate::messenger::large_payload::LargePayloadResolver> =
             Arc::new(NeverResolves);

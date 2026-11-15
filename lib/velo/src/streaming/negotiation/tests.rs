@@ -76,7 +76,7 @@ async fn mux(config: MuxConfig) -> Arc<MessengerMuxTransport> {
             .build()
             .expect("build transport"),
     );
-    let messenger = crate::messenger::Messenger::builder()
+    let messenger = crate::messenger::MessengerParts::new()
         .add_transport(transport)
         .build()
         .await

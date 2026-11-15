@@ -212,6 +212,7 @@ fn a_staged_send_created_outside_tokio_still_expires_on_its_owner() {
     });
 }
 
+#[allow(deprecated)] // a `RendezvousManager` built by hand over a bare `Messenger`, which `Velo` registers itself
 fn ttl_data_expires_after_handler_registration(stage_before_handlers: bool) -> bool {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)

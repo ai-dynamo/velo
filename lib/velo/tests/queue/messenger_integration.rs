@@ -17,6 +17,7 @@ use velo::queue::backends::messenger::{MessengerQueueBackend, MessengerQueueConf
 use velo::queue::options::NextOptions;
 
 /// Set up two messenger instances connected via UDS.
+#[allow(deprecated)] // the queue backend runs over a bare `Messenger`, with no `Velo` around it
 async fn setup_two_messengers() -> (Arc<Messenger>, Arc<Messenger>) {
     let socket_a =
         std::env::temp_dir().join(format!("velo-queue-test-{}.sock", uuid::Uuid::new_v4()));

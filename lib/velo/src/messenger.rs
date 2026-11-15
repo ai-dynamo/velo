@@ -34,4 +34,6 @@ pub use handlers::{
     OverflowPolicy, SyncExecutor, TypedContext, TypedUnaryHandlerBuilder, UnaryHandlerBuilder,
     UnifiedResponse,
 };
+pub(crate) use messenger::MessengerParts;
+#[allow(deprecated)] // re-exported until 0.23.0 removes `MessengerBuilder`
 pub use messenger::{Messenger, MessengerBuilder};
