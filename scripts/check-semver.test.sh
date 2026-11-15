@@ -389,6 +389,16 @@ if [[ "$(cat "$TMP_ROOT/e.exit")" == "0" ]] \
 fi
 report "(e) ucx-rs's +build metadata compares on the semver core, and the baseline keeps it; a correct bump passes" "$ok" "$out"
 
+if [[ "${SEMVER_REVIEW_F1:-0}" == "1" ]]; then
+    review_report=$(report "(e) assertion failure" 1 "$out")
+    review_expected_exit=$(cat "$TMP_ROOT/e.exit")
+    if ! grep -qFx "       exit code: $review_expected_exit" <<<"$review_report"; then
+        printf 'FAIL - review F1: case (e) exited %s, but report used another case\n' "$review_expected_exit"
+        printf '%s\n' "$review_report"
+        exit 1
+    fi
+fi
+
 # ── (f) a crate that was never published is skipped ─────────────────────────
 # The index answers 404 for it, so there is no baseline to break.
 reset_index
