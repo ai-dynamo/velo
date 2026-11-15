@@ -31,6 +31,8 @@ pub mod transports;
 pub mod simulation;
 
 #[cfg(test)]
+mod learned_peer_tests;
+#[cfg(test)]
 pub(crate) mod test_alloc;
 #[cfg(test)]
 mod velo_methods_tests;
@@ -236,10 +238,6 @@ struct VeloInner {
     messenger: Arc<Messenger>,
     anchor_manager: Arc<crate::streaming::AnchorManager>,
     rendezvous_manager: Arc<crate::rendezvous::RendezvousManager>,
-    /// The primary stream transport: the mux in `mux_only` mode, otherwise
-    /// the configured per-stream transport. Used for peer registration and
-    /// address publication. The mux adds no streaming listener or endpoint.
-    stream_transport: Arc<dyn crate::streaming::FrameTransport>,
     stream_owner: StreamOwner,
     /// RDMA registration layer, present only when a UCX transport was added
     /// through [`VeloBuilder::add_ucx_transport`].
@@ -584,6 +582,17 @@ impl VeloBuilder {
                 }
             }
         };
+        // Every way the messenger learns a peer reaches the stream
+        // transport through this observer, and `_hello` carries the stream
+        // endpoint, so a peer that learns this node by `_hello` can attach.
+        let backend = messenger.backend();
+        backend.set_advertised_peer_info(crate::streaming::peer_table::complete_peer_info(
+            messenger.peer_info(),
+            stream_transport.as_ref(),
+        ))?;
+        backend.set_peer_observer(Arc::new(
+            crate::streaming::peer_table::StreamPeerTable::new(Arc::downgrade(&stream_transport)),
+        ))?;
         let mut registry = std::collections::HashMap::new();
         registry.insert(
             stream_transport.key().as_str().to_string(),
@@ -708,7 +717,6 @@ impl VeloBuilder {
                 },
                 anchor_manager,
                 rendezvous_manager,
-                stream_transport,
                 #[cfg(all(target_os = "linux", feature = "ucx"))]
                 rdma,
                 shutdown: ShutdownOnce {
@@ -1058,52 +1066,7 @@ impl Velo {
     /// In [`VeloBuilder::mux_only`] mode the primary stream transport is the
     /// mux, which uses the messenger endpoints and adds no streaming endpoint.
     pub fn peer_info(&self) -> PeerInfo {
-        let messenger_peer = self.inner.messenger.peer_info();
-        let stream_addr = self.inner.stream_transport.address();
-        // Empty streaming address (a transport that opens no listener of its
-        // own, e.g. the messenger mux) → no merge needed.
-        if stream_addr.as_bytes().is_empty()
-            || stream_addr
-                .available_transports()
-                .map(|v| v.is_empty())
-                .unwrap_or(true)
-        {
-            return messenger_peer;
-        }
-        let mut builder = crate::transports::address::WorkerAddressBuilder::new();
-        if let Err(e) = builder.merge(messenger_peer.worker_address()) {
-            tracing::warn!(
-                instance_id = %messenger_peer.instance_id(),
-                error = %e,
-                "peer_info: failed to merge messenger WorkerAddress into builder; \
-                 falling back to messenger-only PeerInfo (streaming peers will not \
-                 see this worker's streaming endpoint)"
-            );
-            return messenger_peer;
-        }
-        if let Err(e) = builder.merge(&stream_addr) {
-            tracing::warn!(
-                instance_id = %messenger_peer.instance_id(),
-                streaming_key = %self.inner.stream_transport.key(),
-                error = %e,
-                "peer_info: failed to merge streaming WorkerAddress into builder; \
-                 falling back to messenger-only PeerInfo (likely a key collision \
-                 with a messenger transport key)"
-            );
-            return messenger_peer;
-        }
-        match builder.build() {
-            Ok(merged) => PeerInfo::new(messenger_peer.instance_id(), merged),
-            Err(e) => {
-                tracing::warn!(
-                    instance_id = %messenger_peer.instance_id(),
-                    error = %e,
-                    "peer_info: WorkerAddressBuilder::build() failed; falling back \
-                     to messenger-only PeerInfo"
-                );
-                messenger_peer
-            }
-        }
+        self.inner.messenger.backend().advertised_peer_info()
     }
 
     /// Get the distributed event system.
@@ -1148,34 +1111,17 @@ impl Velo {
 
     /// Connect to a peer by registering their peer information.
     ///
-    /// Fans out to every messenger transport (via the messenger) and to the
-    /// streaming transport, so each can extract its own entry from the peer's
-    /// [`WorkerAddress`] and cache the resolved endpoint.
+    /// Fans out to every messenger transport and to the streaming transport,
+    /// so each can extract its own entry from the peer's [`WorkerAddress`]
+    /// and cache the resolved endpoint. Fails only if no messenger transport
+    /// accepts the peer. A streaming endpoint this node cannot use is logged
+    /// as a warning; the peer can still be messaged, and an attach to it
+    /// fails as one to a peer never registered.
+    ///
+    /// A peer learned any other way reaches the streaming transport too: by
+    /// its `_hello`, by discovery when a send names its worker, or by the
+    /// messenger's own `register_peer`.
     pub fn register_peer(&self, peer_info: PeerInfo) -> Result<()> {
-        // Streaming-transport register: skip the "no matching entry" case at
-        // debug (e.g., a messenger-only peer or a peer using a different
-        // streaming transport key). Any other failure -- WorkerAddress decode,
-        // endpoint parse, NUMA mismatch -- is a real problem and must propagate
-        // so it surfaces at register time, not at first attach.
-        let stream_key = self.inner.stream_transport.key();
-        match peer_info.worker_address().get_entry(stream_key.as_str()) {
-            Ok(Some(_)) => {
-                self.inner.stream_transport.register(&peer_info)?;
-            }
-            Ok(None) => {
-                tracing::debug!(
-                    peer = %peer_info.worker_id(),
-                    streaming_key = %stream_key,
-                    "streaming transport register: peer has no matching streaming endpoint"
-                );
-            }
-            Err(e) => {
-                return Err(anyhow::anyhow!(
-                    "decoding peer WorkerAddress for streaming key '{}': {e}",
-                    stream_key
-                ));
-            }
-        }
         self.inner.messenger.register_peer(peer_info)
     }
 
@@ -1196,18 +1142,13 @@ impl Velo {
     /// from the peer registers it again too. The messenger mux keeps small
     /// per-peer receive tables that this does not drop.
     pub fn unregister_peer(&self, instance_id: InstanceId) {
-        self.inner.stream_transport.unregister(instance_id);
         self.inner.messenger.unregister_peer(instance_id);
     }
 
     /// Discover a peer by instance_id and register it for communication.
     ///
     /// Resolves the [`PeerInfo`] through the configured [`PeerDiscovery`]
-    /// backend and routes it through [`Self::register_peer`] so the streaming
-    /// transport sees the peer alongside the messenger transports. Calling
-    /// `messenger.discover_and_register_peer` directly would skip the
-    /// streaming-side `register()` and surface as "peer not registered" on
-    /// the next [`Self::attach_anchor`].
+    /// backend and registers it as [`Self::register_peer`] does.
     pub async fn discover_and_register_peer(&self, instance_id: InstanceId) -> Result<()> {
         let discovery = self.inner.messenger.discovery().ok_or_else(|| {
             anyhow::anyhow!(
