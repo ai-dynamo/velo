@@ -72,11 +72,24 @@ struct Node {
     registry: Registry,
 }
 
+/// A UCX transport over the tcp lane that can GET.
+///
+/// Velo leaves UCX's software RMA off, so over tcp a GET is refused (see
+/// `a_tcp_only_lane_moves_the_payload_chunked`). These tests are about the RDMA
+/// path, and CI has no RDMA hardware, so they turn it back on. The known risk:
+/// in UCX 1.22 an owner serving a software GET aborts when its puller goes away
+/// during the reply, so a test here that shuts a puller down mid-GET can abort
+/// the binary under load.
+fn ucx_with_software_get() -> UcxTransportBuilder {
+    UcxTransportBuilder::new()
+        .tls("tcp")
+        .allow_software_rma(true)
+}
+
 impl Node {
     async fn start(config: Option<RdmaConfig>) -> Self {
         let transport = Arc::new(
-            UcxTransportBuilder::new()
-                .tls("tcp")
+            ucx_with_software_get()
                 .build()
                 .expect("build ucx transport"),
         );
@@ -89,6 +102,26 @@ impl Node {
             builder = builder.rdma_config(config);
         }
         let velo = builder.build().await.expect("build velo");
+        Self { velo, registry }
+    }
+
+    /// A node on UCX's defaults for RMA: over a tcp-only lane a GET is
+    /// refused, never emulated in software.
+    async fn start_tcp_only() -> Self {
+        let transport = Arc::new(
+            UcxTransportBuilder::new()
+                .tls("tcp")
+                .build()
+                .expect("build ucx transport"),
+        );
+        let registry = Registry::new();
+        let metrics = Arc::new(VeloMetrics::register(&registry).expect("register metrics"));
+        let velo = Velo::builder()
+            .metrics(metrics)
+            .add_ucx_transport(transport)
+            .build()
+            .await
+            .expect("build velo");
         Self { velo, registry }
     }
 
@@ -131,8 +164,7 @@ impl Node {
                 .expect("build tcp transport"),
         );
         let ucx = Arc::new(
-            UcxTransportBuilder::new()
-                .tls("tcp")
+            ucx_with_software_get()
                 .build()
                 .expect("build ucx transport"),
         );
@@ -226,6 +258,15 @@ impl Pair {
         Self { owner, consumer }
     }
 
+    /// Both nodes on UCX's defaults for RMA, so no GET can run over the tcp
+    /// lane.
+    async fn tcp_only() -> Self {
+        let owner = Node::start_tcp_only().await;
+        let consumer = Node::start_tcp_only().await;
+        connect(&owner, &consumer).await;
+        Self { owner, consumer }
+    }
+
     /// A capable owner and a consumer with no registry at all.
     async fn with_incapable_consumer() -> Self {
         let owner = Node::start(None).await;
@@ -266,6 +307,13 @@ where
 
 /// Whether the owner has freed a slot. Local, so it reflects the owner's own
 /// state rather than a round trip that might race with it.
+/// Arm a fault hook on `velo`'s rendezvous manager. The hook is test-only
+/// and has no `Velo` form.
+#[allow(deprecated)]
+fn arm_rdma_hook(velo: &Velo, hook: RdmaTestHook) {
+    velo.rendezvous_manager().arm_rdma_hook(hook);
+}
+
 async fn slot_is_gone(node: &Node, handle: DataHandle) -> bool {
     node.velo.metadata(handle).await.is_err()
 }
@@ -405,6 +453,160 @@ async fn pinned_owner_and_offering_consumer_take_the_rdma_path() {
     shutdown(pair).await;
 }
 
+/// A transfer over a tcp-only lane completes over the chunked path, with no
+/// help from the caller.
+///
+/// Over tcp UCX has no GET in hardware. It can only emulate one in software,
+/// and UCX 1.22 can abort the owner's process in that code when the puller
+/// goes away, so velo does not use it. The first GET to the owner is refused,
+/// and the consumer falls back to the chunked path by itself. The consumer
+/// then remembers the refusal for that owner and stops offering RDMA to it, so
+/// a later transfer costs only the chunked path: no descriptor, no refused
+/// GET, no fallback.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_tcp_only_lane_moves_the_payload_chunked() {
+    let pair = Pair::tcp_only().await;
+    let len = 1024 * 1024 + 7;
+
+    let first = pair.owner.velo.register_data_pinned(&pattern(len)).await;
+    let (data, lease) = pair.consumer.velo.get(first).await.expect("first get");
+    assert_pattern(&data, len);
+    pair.consumer
+        .velo
+        .release(first, lease)
+        .await
+        .expect("release");
+    assert_eq!(
+        pair.consumer.path_count("ok"),
+        0,
+        "a GET ran over the tcp lane"
+    );
+    assert_eq!(
+        pair.consumer.path_count("get_failed"),
+        1,
+        "the refused GET did not fall back to the chunked path by itself"
+    );
+
+    let second = pair.owner.velo.register_data_pinned(&pattern(len)).await;
+    let (data, lease) = pair.consumer.velo.get(second).await.expect("second get");
+    assert_pattern(&data, len);
+    pair.consumer
+        .velo
+        .release(second, lease)
+        .await
+        .expect("release");
+    assert_eq!(
+        pair.consumer.path_count("no_native_get"),
+        1,
+        "the consumer offered RDMA again to an owner it cannot GET from"
+    );
+    assert_eq!(pair.consumer.path_count("get_failed"), 1);
+    assert_eq!(pair.consumer.path_count("ok"), 0);
+    assert_eq!(
+        pair.owner.path_count("ok"),
+        1,
+        "the owner answered the second acquire with a descriptor"
+    );
+    shutdown(pair).await;
+}
+
+/// Outbound frames this node's transports sent, and their bytes.
+fn outbound_frames(node: &Node) -> (u64, u64) {
+    let sum = |name: &str| -> u64 {
+        node.registry
+            .gather()
+            .iter()
+            .filter(|family| family.name() == name)
+            .flat_map(|family| family.get_metric())
+            .filter(|metric| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|pair| pair.name() == "direction" && pair.value() == "outbound")
+            })
+            .map(|metric| metric.get_counter().value() as u64)
+            .sum()
+    };
+    (
+        sum("velo_transport_frames_total"),
+        sum("velo_transport_frame_bytes_total"),
+    )
+}
+
+/// What one transfer costs in velo frames, on the RDMA path over tcp (software
+/// GET on) and on the chunked path a tcp-only lane takes now.
+///
+/// Counts, not timing. Each pair first moves one payload so the endpoints and
+/// the consumer's refusal record are in place; the second transfer is the one
+/// counted. The UCX messages of a software GET are not velo frames, so they
+/// are not in these counts; the book's limitations derive them.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_cost_of_a_transfer_over_a_tcp_only_lane() {
+    let len = 1024 * 1024 + 7;
+
+    async fn counted(pair: &Pair, len: usize) -> ((u64, u64), (u64, u64)) {
+        let warm = pair.owner.velo.register_data_pinned(&pattern(len)).await;
+        let (_, lease) = pair.consumer.velo.get(warm).await.expect("warm-up get");
+        pair.consumer
+            .velo
+            .release(warm, lease)
+            .await
+            .expect("release");
+
+        let handle = pair.owner.velo.register_data_pinned(&pattern(len)).await;
+        let (c0, o0) = (
+            outbound_frames(&pair.consumer),
+            outbound_frames(&pair.owner),
+        );
+        let (data, lease) = pair.consumer.velo.get(handle).await.expect("get");
+        assert_pattern(&data, len);
+        let (c1, o1) = (
+            outbound_frames(&pair.consumer),
+            outbound_frames(&pair.owner),
+        );
+        pair.consumer
+            .velo
+            .release(handle, lease)
+            .await
+            .expect("release");
+        ((c1.0 - c0.0, c1.1 - c0.1), (o1.0 - o0.0, o1.1 - o0.1))
+    }
+
+    let rdma = Pair::new().await;
+    let (rdma_consumer, rdma_owner) = counted(&rdma, len).await;
+    assert_eq!(rdma.consumer.path_count("ok"), 2, "the GET did not run");
+    shutdown(rdma).await;
+
+    let chunked = Pair::tcp_only().await;
+    let (chunked_consumer, chunked_owner) = counted(&chunked, len).await;
+    assert_eq!(chunked.consumer.path_count("no_native_get"), 1);
+    shutdown(chunked).await;
+
+    println!(
+        "software GET: consumer sent {} frames ({} B), owner sent {} frames ({} B)",
+        rdma_consumer.0, rdma_consumer.1, rdma_owner.0, rdma_owner.1
+    );
+    println!(
+        "chunked:      consumer sent {} frames ({} B), owner sent {} frames ({} B)",
+        chunked_consumer.0, chunked_consumer.1, chunked_owner.0, chunked_owner.1
+    );
+    // The acquire and its answer; the payload rides the GET.
+    assert_eq!((rdma_consumer.0, rdma_owner.0), (1, 1));
+    // The acquire and its answer, then one pull and its 512 KiB answer per
+    // chunk: three chunks for 1 MiB + 7 B.
+    let chunks = len.div_ceil(512 * 1024) as u64;
+    assert_eq!(chunks, 3);
+    assert_eq!(
+        (chunked_consumer.0, chunked_owner.0),
+        (1 + chunks, 1 + chunks)
+    );
+    assert!(
+        chunked_owner.1 >= len as u64,
+        "the payload rides the owner's frames"
+    );
+    assert!(rdma_owner.1 < 1024, "the payload rode a velo frame");
+}
+
 // ---------------------------------------------------------------------------
 // 2. External regions: the raw-pointer chunked path, and the refusal
 // ---------------------------------------------------------------------------
@@ -477,6 +679,96 @@ async fn an_external_region_anchor_serves_the_chunked_path() {
             .expect("unregister after the anchor was released"),
         Deregistered::Drained,
         "the anchor's in-flight guard outlived the slot that held it"
+    );
+
+    shutdown(pair).await;
+}
+
+/// Give `handle` back as its owner, on a plain thread with no tokio runtime,
+/// the way an owner's `Drop` would.
+fn unregister_outside_any_runtime(velo: &Velo, handle: DataHandle) -> bool {
+    let velo = velo.clone();
+    std::thread::spawn(move || {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        velo.unregister_data(handle)
+    })
+    .join()
+    .expect("the owner's thread")
+}
+
+/// An anchor staged in a caller's region holds the region's in-flight count
+/// until its slot is freed. The owner's `unregister_data` frees it, so the
+/// region's drain finishes at once instead of running out its timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_owner_call_lets_a_region_unregister_without_waiting() {
+    let node = Node::start(None).await;
+    let guard = node
+        .velo
+        .register_owned(pattern(512 * 1024).into_boxed_slice())
+        .await
+        .map_err(|e| e.cause)
+        .expect("register the caller's memory");
+    let handle = node
+        .velo
+        .register_data_in_region(&guard, 0..512 * 1024)
+        .expect("stage an anchor inside the region");
+
+    assert!(unregister_outside_any_runtime(&node.velo, handle));
+
+    assert!(
+        slot_is_gone(&node, handle).await,
+        "no reader, so freed at once"
+    );
+    assert_eq!(
+        guard.unregister(T).await.expect("unregister"),
+        Deregistered::Drained,
+        "the owner's call left the anchor's in-flight guard on the region"
+    );
+    node.velo
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(10)))
+        .await;
+}
+
+/// With a reader attached, the owner's call keeps the slot, and the reader's
+/// detach frees it and its hold on the region.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_region_anchor_given_back_while_read_is_freed_by_the_last_reader() {
+    let pair = Pair::with_incapable_consumer().await;
+    let guard = pair
+        .owner
+        .velo
+        .register_owned(pattern(512 * 1024).into_boxed_slice())
+        .await
+        .map_err(|e| e.cause)
+        .expect("register the caller's memory");
+    let handle = pair
+        .owner
+        .velo
+        .register_data_in_region(&guard, 0..512 * 1024)
+        .expect("stage an anchor inside the region");
+    let (_, lease) = pair.consumer.velo.get(handle).await.expect("get");
+
+    assert!(unregister_outside_any_runtime(&pair.owner.velo, handle));
+    assert!(
+        !slot_is_gone(&pair.owner, handle).await,
+        "the reader's lease keeps the slot"
+    );
+
+    pair.consumer
+        .velo
+        .detach(handle, lease)
+        .await
+        .expect("detach");
+    wait_until(
+        "the last reader's detach frees the slot",
+        || slot_is_gone(&pair.owner, handle),
+        || "the slot is still staged".to_string(),
+    )
+    .await;
+    assert_eq!(
+        guard.unregister(T).await.expect("unregister"),
+        Deregistered::Drained,
+        "the freed anchor's in-flight guard outlived its slot"
     );
 
     shutdown(pair).await;
@@ -843,10 +1135,7 @@ async fn a_malformed_descriptor_falls_back_to_chunked() {
     .enumerate()
     {
         let handle = pair.owner.velo.register_data_pinned(&payload).await;
-        pair.consumer
-            .velo
-            .rendezvous_manager()
-            .arm_rdma_hook(hook.clone());
+        arm_rdma_hook(&pair.consumer.velo, hook.clone());
 
         let (data, lease) = pair
             .consumer
@@ -894,10 +1183,7 @@ async fn a_failed_get_falls_back_chunked_exactly_once() {
 
     let payload = pattern(768 * 1024);
     let handle = pair.owner.velo.register_data_pinned(&payload).await;
-    pair.consumer
-        .velo
-        .rendezvous_manager()
-        .arm_rdma_hook(RdmaTestHook::FailGet);
+    arm_rdma_hook(&pair.consumer.velo, RdmaTestHook::FailGet);
 
     let (data, lease) = pair
         .consumer
@@ -1024,10 +1310,7 @@ async fn a_failed_write_after_the_fallback_returns_its_fresh_lease() {
 
     let payload = pattern(512 * 1024);
     let handle = pair.owner.velo.register_data_pinned(&payload).await;
-    pair.consumer
-        .velo
-        .rendezvous_manager()
-        .arm_rdma_hook(RdmaTestHook::FailGet);
+    arm_rdma_hook(&pair.consumer.velo, RdmaTestHook::FailGet);
 
     let mut too_small = [0u8; 64];
     let mut dest: &mut [u8] = &mut too_small;
@@ -1139,19 +1422,23 @@ async fn the_reaper_force_releases_an_abandoned_lease() {
 ///
 /// This test and the arena-shutdown one are the only two here that depend on
 /// real time, and it is unavoidable: what is under test *is* a cadence. The
-/// two-second lease leaves one second for scheduling and renewal delivery on
-/// busy CI runners. The seven-second transfer still spans seven renewal
-/// intervals and three and a half lease periods. Without renewal, the reaper
-/// has five seconds to free the slot before the transfer ends. A longer
-/// transfer alone would not add slack between a renewal and its deadline.
+/// consumer renews every half lease, so the slack between a renewal and its
+/// deadline is half the lease. The five-second lease leaves 2.5 s for
+/// scheduling and renewal delivery. A two-second lease left 1 s, and pausing
+/// the process for 1 to 2 s at random points got the lease reaped in 16 runs
+/// of 16: after the pause the owner's reaper ran before the late renewal
+/// arrived. The fifteen-second transfer still spans six renewal intervals and
+/// three lease periods. Without renewal, the reaper has ten seconds to free
+/// the slot before the transfer ends. A longer transfer alone would not add
+/// slack between a renewal and its deadline.
 #[tokio::test(flavor = "multi_thread")]
 async fn lease_renewal_carries_a_slow_transfer_past_several_deadlines() {
-    const TRANSFER_DELAY: Duration = Duration::from_secs(7);
+    const TRANSFER_DELAY: Duration = Duration::from_secs(15);
 
     let pair = Pair::with_configs(
         Some(RdmaConfig {
             rendezvous: RdmaRendezvousConfig {
-                lease_timeout: Duration::from_secs(2),
+                lease_timeout: Duration::from_secs(5),
                 ..RdmaRendezvousConfig::default()
             },
             ..RdmaConfig::default()
@@ -1162,10 +1449,7 @@ async fn lease_renewal_carries_a_slow_transfer_past_several_deadlines() {
 
     let payload = pattern(512 * 1024);
     let handle = pair.owner.velo.register_data_pinned(&payload).await;
-    pair.consumer
-        .velo
-        .rendezvous_manager()
-        .arm_rdma_hook(RdmaTestHook::SlowGet(TRANSFER_DELAY));
+    arm_rdma_hook(&pair.consumer.velo, RdmaTestHook::SlowGet(TRANSFER_DELAY));
 
     let started = std::time::Instant::now();
     let (data, lease) = pair.consumer.velo.get(handle).await.expect("get");
@@ -1317,10 +1601,10 @@ async fn a_cancelled_transfer_does_not_release_its_destination() {
 
     let payload = pattern(CUT);
     let handle = pair.owner.velo.register_data_pinned(&payload).await;
-    pair.consumer
-        .velo
-        .rendezvous_manager()
-        .arm_rdma_hook(RdmaTestHook::SlowGet(Duration::from_millis(700)));
+    arm_rdma_hook(
+        &pair.consumer.velo,
+        RdmaTestHook::SlowGet(Duration::from_millis(700)),
+    );
 
     // Dropped while the transfer is still running, and only once it holds its
     // destination.
@@ -1392,10 +1676,10 @@ async fn shutdown_waits_for_a_live_transfer_before_unmapping_its_arena() {
 
     let payload = pattern(512 * 1024);
     let handle = pair.owner.velo.register_data_pinned(&payload).await;
-    pair.consumer
-        .velo
-        .rendezvous_manager()
-        .arm_rdma_hook(RdmaTestHook::SlowGet(Duration::from_millis(900)));
+    arm_rdma_hook(
+        &pair.consumer.velo,
+        RdmaTestHook::SlowGet(Duration::from_millis(900)),
+    );
 
     // Abandoned while the transfer is running: the detached task still holds
     // its destination inside the consumer's arena.

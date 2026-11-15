@@ -555,6 +555,13 @@ fn rdma_offer(manager: &RendezvousManager, target: WorkerId) -> Option<RdmaOffer
         store.record_path(RdmaPathReason::NoOffer);
         return None;
     }
+    // A GET to this owner was refused before: over a tcp-only lane velo does
+    // not use UCX's software GET. Offering again would cost a descriptor, a
+    // refused GET and a second acquire per transfer, for the same chunks.
+    if ctx.registry.refuses_get(instance) {
+        store.record_path(RdmaPathReason::NoNativeGet);
+        return None;
+    }
     Some(RdmaOffer {
         backends: vec![key.to_string()],
     })

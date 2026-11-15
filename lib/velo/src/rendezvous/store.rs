@@ -150,6 +150,9 @@ pub(crate) struct DataSlot {
     pub refcount: AtomicU32,
     /// Active read lock count. Prevents cleanup while transfers are in flight.
     pub read_lock_count: AtomicU32,
+    /// Set once the owner has dropped the reference `register` gave it, so a
+    /// second owner call cannot take a reader's reference instead.
+    pub owner_released: AtomicBool,
     /// Cached total length for metadata queries.
     pub total_len: u64,
     /// When this slot was created.
@@ -212,6 +215,22 @@ pub enum LeaseOutcome {
     },
     /// No such lease — never issued, or already ended.
     Unknown,
+}
+
+/// How a reader ends its lease, for [`DataStore::end_lease`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LeaseEnd {
+    /// Drop the read lock only. The reader's reference, if it has one, stays.
+    Detach,
+    /// Drop the read lock and one reference.
+    Release,
+}
+
+/// The two counts that keep a slot alive.
+#[derive(Debug, Clone, Copy)]
+enum Count {
+    ReadLocks,
+    References,
 }
 
 /// A test's code to run inside `DataStore::register_body`.
@@ -322,15 +341,31 @@ impl DataStore {
 
     /// A store that emits into `metrics`.
     pub(crate) fn with_metrics(metrics: Option<Arc<VeloMetrics>>) -> Self {
-        Self {
-            metrics,
-            ..Self::new()
-        }
+        let mut store = Self::new();
+        store.metrics = metrics;
+        store
     }
 
     /// The metrics handle, if this instance was built with one.
+    #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub(crate) fn metrics(&self) -> Option<&Arc<VeloMetrics>> {
         self.metrics.as_ref()
+    }
+
+    /// Take one from `velo_rendezvous_active_slots`.
+    ///
+    /// Called by each call here that removes a slot, so every path that frees
+    /// one moves the gauge: the owner's call, local and remote detach and
+    /// release, a `LeaseGuard` drop, and the reapers. A caller that refreshed
+    /// it after its own free missed the frees it did not know it caused.
+    ///
+    /// A step of one, not the slot count: a count read after a free can be
+    /// older than another thread's, and set last. Only the call whose remove
+    /// returned the slot gets here, so each slot is counted out once.
+    fn note_slot_removed(&self) {
+        if let Some(m) = &self.metrics {
+            m.dec_rendezvous_active_slots();
+        }
     }
 
     /// Bind the RDMA registry and policy. Called once, from
@@ -367,12 +402,18 @@ impl DataStore {
         let local_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let total_len = body.total_len();
         let ttl = opts.as_ref().and_then(|o| o.ttl);
+        // Counted in before the insert, so that a free on another thread
+        // cannot count the slot out first and leave the gauge below 0.
+        if let Some(m) = &self.metrics {
+            m.inc_rendezvous_active_slots();
+        }
         self.slots.insert(
             local_id,
             DataSlot {
                 body,
                 refcount: AtomicU32::new(1),
                 read_lock_count: AtomicU32::new(0),
+                owner_released: AtomicBool::new(false),
                 total_len,
                 created_at: Instant::now(),
                 ttl,
@@ -562,20 +603,79 @@ impl DataStore {
     /// slot whose time-to-live runs out in between ends the lease first. Kept,
     /// it would hold the sweep running for the life of the process.
     pub(crate) fn force_release_lease(&self, lease_id: u64, local_id: u64) -> bool {
-        match self.consume_lease(lease_id, local_id) {
-            LeaseOutcome::Consumed => {}
+        match self.end_lease(lease_id, local_id, LeaseEnd::Release) {
+            LeaseOutcome::Consumed => true,
             LeaseOutcome::Unknown => {
                 self.lease_deadlines.remove(&lease_id);
-                return false;
+                false
             }
-            LeaseOutcome::Mismatch { .. } => return false,
+            LeaseOutcome::Mismatch { .. } => false,
         }
-        self.release_read_lock(local_id);
+    }
+
+    /// End a reader's lease: consume it, drop its read lock and transfers,
+    /// drop its reference too for [`LeaseEnd::Release`], and free the slot if
+    /// nothing is left on it.
+    ///
+    /// Every path that ends a lease comes here: local and remote detach and
+    /// release, a `LeaseGuard` drop, and the reaper. The free must not depend
+    /// on which counter this call took to zero. An owner may drop its
+    /// reference while a reader holds a lease, so the reference count is
+    /// already 0 when the last reader leaves. A path that freed only when its
+    /// own `ref_decrement` returned true, or that looked at nothing on a
+    /// detach, left that slot for the life of the process, and an RDMA slot
+    /// kept its region's in-flight guard with it.
+    ///
+    /// The rule: whichever call takes a count to zero calls
+    /// [`try_free`](Self::try_free), which checks both counts as it removes
+    /// the slot. Each count changes under a read guard on the slot's shard and
+    /// `try_free` takes that shard's write lock, so of two calls that each take
+    /// one count to zero, the later `try_free` sees both zeros. Comparing
+    /// relaxed loads of the other count instead can miss on a weakly ordered
+    /// CPU: each side can read the other's old value.
+    ///
+    /// A reaped lease does not prove that the reader's RDMA GET finished.
+    /// Freeing the slot then follows the lease-expiry contract the reaper
+    /// already has (see `RendezvousManager::shutdown` and the RDMA design
+    /// chapter of the book): a peer still reading has its GET fail or read
+    /// freed memory. This call does not wait for a GET in flight.
+    ///
+    /// Returns what [`consume_lease`](Self::consume_lease) found. Nothing is
+    /// changed unless that is [`LeaseOutcome::Consumed`].
+    pub(crate) fn end_lease(&self, lease_id: u64, local_id: u64, end: LeaseEnd) -> LeaseOutcome {
+        let outcome = self.consume_lease(lease_id, local_id);
+        if outcome != LeaseOutcome::Consumed {
+            return outcome;
+        }
+        let mut last = matches!(self.take_one(local_id, Count::ReadLocks), Some((0, _)));
         self.remove_transfers_by_lease(lease_id);
-        if self.ref_decrement(local_id) {
+        if end == LeaseEnd::Release {
+            last |= matches!(self.take_one(local_id, Count::References), Some((0, _)));
+        }
+        if last {
             self.try_free(local_id);
         }
-        true
+        outcome
+    }
+
+    /// Take one from a slot's read locks or references.
+    ///
+    /// Returns what is left of that count and the other count's value, read
+    /// under the same shard guard. `None` if the slot is gone, or the count
+    /// was already zero (logged, not underflowed).
+    fn take_one(&self, local_id: u64, count: Count) -> Option<(u32, u32)> {
+        let slot = self.slots.get(&local_id)?;
+        let (this, other) = match count {
+            Count::ReadLocks => (&slot.read_lock_count, &slot.refcount),
+            Count::References => (&slot.refcount, &slot.read_lock_count),
+        };
+        match this.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1)) {
+            Ok(prev) => Some((prev - 1, other.load(Ordering::Relaxed))),
+            Err(_) => {
+                tracing::warn!("rendezvous: {count:?} already 0 for slot {local_id}");
+                None
+            }
+        }
     }
 
     /// Release a read lock on a slot. Returns true if the slot should be freed
@@ -584,28 +684,7 @@ impl DataStore {
     /// Uses checked arithmetic: returns `false` if the count is already zero
     /// instead of underflowing.
     pub fn release_read_lock(&self, local_id: u64) -> bool {
-        if let Some(slot) = self.slots.get(&local_id) {
-            let result =
-                slot.read_lock_count
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                        if v > 0 { Some(v - 1) } else { None }
-                    });
-            match result {
-                Ok(prev) => {
-                    let read_locks = prev - 1;
-                    let refcount = slot.refcount.load(Ordering::Relaxed);
-                    read_locks == 0 && refcount == 0
-                }
-                Err(_) => {
-                    tracing::warn!(
-                        "release_read_lock: read_lock_count already 0 for slot {local_id}"
-                    );
-                    false
-                }
-            }
-        } else {
-            false
-        }
+        self.take_one(local_id, Count::ReadLocks) == Some((0, 0))
     }
 
     /// Increment the reference count for a slot.
@@ -618,32 +697,45 @@ impl DataStore {
         }
     }
 
+    /// Drop the reference the owner got from `register`, once.
+    ///
+    /// Returns true if this call dropped it. A second call, a call for a slot
+    /// that is gone, or a call after the count was taken to 0 some other way
+    /// changes nothing and returns false. The flag is what keeps a repeat
+    /// call from taking a reference that `ref_increment` gave a reader.
+    ///
+    /// Frees the slot now if no reader holds a lease. Otherwise the call that
+    /// ends the last lease frees it ([`end_lease`](Self::end_lease)). As
+    /// there, a call that takes its count to 0 always goes to `try_free`,
+    /// which compares both counts under the shard's write lock.
+    ///
+    /// Synchronous and runtime-free, so an owner can call it from `Drop`.
+    pub(crate) fn release_owner_reference(&self, local_id: u64) -> bool {
+        {
+            let Some(slot) = self.slots.get(&local_id) else {
+                return false;
+            };
+            if slot.owner_released.swap(true, Ordering::Relaxed) {
+                return false;
+            }
+        }
+        match self.take_one(local_id, Count::References) {
+            Some((0, _)) => {
+                self.try_free(local_id);
+                true
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
     /// Decrement the reference count. Returns true if the slot should be freed
     /// (refcount == 0 AND read_lock_count == 0).
     ///
     /// Uses checked arithmetic: returns `false` if the count is already zero
     /// instead of underflowing.
     pub fn ref_decrement(&self, local_id: u64) -> bool {
-        if let Some(slot) = self.slots.get(&local_id) {
-            let result = slot
-                .refcount
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
-                    if v > 0 { Some(v - 1) } else { None }
-                });
-            match result {
-                Ok(prev) => {
-                    let refcount = prev - 1;
-                    let read_locks = slot.read_lock_count.load(Ordering::Relaxed);
-                    refcount == 0 && read_locks == 0
-                }
-                Err(_) => {
-                    tracing::warn!("ref_decrement: refcount already 0 for slot {local_id}");
-                    false
-                }
-            }
-        } else {
-            false
-        }
+        self.take_one(local_id, Count::References) == Some((0, 0))
     }
 
     /// Remove a slot from the registry and return a copy of its data.
@@ -657,6 +749,7 @@ impl DataStore {
         if slot.ttl.is_some() {
             self.expiring.remove(&local_id);
         }
+        self.note_slot_removed();
         slot.body.to_bytes()
     }
 
@@ -667,11 +760,13 @@ impl DataStore {
             slot.refcount.load(Ordering::Relaxed) == 0
                 && slot.read_lock_count.load(Ordering::Relaxed) == 0
         });
-        if let Some((_, slot)) = freed
-            && slot.ttl.is_some()
-        {
+        let Some((_, slot)) = freed else {
+            return;
+        };
+        if slot.ttl.is_some() {
             self.expiring.remove(&local_id);
         }
+        self.note_slot_removed();
     }
 
     /// Get the data bytes for a slot (for inline responses or local fast-path).
@@ -819,6 +914,7 @@ impl DataStore {
                 // to preserve and nothing an in-flight pull could have read.
                 Some(None) => {
                     if self.slots.remove(&local_id).is_some() {
+                        self.note_slot_removed();
                         dropped += 1;
                     }
                 }
@@ -873,6 +969,7 @@ impl DataStore {
         if self.slots.remove(&local_id).is_none() {
             return false;
         }
+        self.note_slot_removed();
         let mut ended = Vec::new();
         self.active_leases.retain(|lease_id, held| {
             if *held == local_id {
@@ -969,9 +1066,6 @@ async fn sweep_while_pending(store: Weak<DataStore>, stop: tokio_util::sync::Can
                 slots,
                 "rendezvous: ended staged payloads past their deadline"
             );
-            if let Some(m) = store.metrics() {
-                m.set_rendezvous_active_slots(store.slots.len());
-            }
         }
         if store.has_pending_expiry() {
             continue;
@@ -993,6 +1087,17 @@ async fn sweep_while_pending(store: Weak<DataStore>, stop: tokio_util::sync::Can
 impl Default for DataStore {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for DataStore {
+    /// Count the slots still staged out of the gauge, which counts by steps
+    /// of one: a node rebuilt on the same metrics would start from them.
+    /// `&mut self` means no other call can change the slots now.
+    fn drop(&mut self) {
+        if let Some(m) = &self.metrics {
+            m.sub_rendezvous_active_slots(self.slots.len());
+        }
     }
 }
 
