@@ -1219,8 +1219,8 @@ async fn shutdown_with_inflight_get() {
 ///
 /// Under load a peer that is merely slow leaves the GET in the same state: 48
 /// copies of this module at once on 8 CPUs failed `shutdown_with_inflight_get`
-/// and `shutdown_resolves_parked_unmap_and_get` with this message. Here the
-/// holds make it certain:
+/// and `shutdown_resolves_parked_unmap_and_get` with this message. The child
+/// (`rma_teardown_child`) uses holds to make it certain:
 ///
 /// 1. The warm-up GET wires the endpoint, so the big GET's request goes out at
 ///    once. Otherwise it waits in a pending queue, which `ucp_worker_destroy`
@@ -1231,11 +1231,32 @@ async fn shutdown_with_inflight_get() {
 ///    finish while the puller reads nothing.
 /// 3. The owner is held for the whole of the puller's teardown.
 ///
-/// The owner takes the request before the puller goes away. Had it not, it
-/// would serve the request to a gone peer, which UCX 1.22 turns into a process
-/// abort (see `an_owner_survives_a_puller_that_vanishes_mid_get`).
+/// The owner is never released. It still holds queued replies to a puller
+/// that is gone, and UCX 1.22 can abort the process while it discards that
+/// endpoint (`stubs.c:107`, from `uct_tcp_ep_pending_purge` in
+/// `ucp_worker_discard_uct_ep_destroy_progress`; 2 of 96 copies under load).
+/// That is the owner's UCX defect, not this test's subject (see
+/// `an_owner_survives_a_puller_that_vanishes_mid_get`). So the scenario runs in
+/// a child process, which exits as soon as the puller has been checked.
+#[test]
+fn shutdown_cancels_a_get_its_peer_stopped_answering() {
+    let (status, output) = run_child_test("rma_teardown_child");
+    assert!(
+        status.success() && output.contains(RMA_TEARDOWN_CHECKED),
+        "the child test failed ({status}):\n{output}"
+    );
+}
+
+/// Printed by `rma_teardown_child` once the puller passed its checks.
+const RMA_TEARDOWN_CHECKED: &str = "rma teardown: puller balanced";
+
+/// The child half of `shutdown_cancels_a_get_its_peer_stopped_answering`. Does
+/// nothing unless that test started it.
 #[tokio::test(flavor = "multi_thread")]
-async fn shutdown_cancels_a_get_its_peer_stopped_answering() {
+async fn rma_teardown_child() {
+    if std::env::var_os(CHILD_TEST).is_none() {
+        return;
+    }
     const LEN: usize = 32 * 1024 * 1024;
     let mut src = PageBuf::new(LEN);
     let dst = PageBuf::new(LEN);
@@ -1292,14 +1313,64 @@ async fn shutdown_cancels_a_get_its_peer_stopped_answering() {
         "a GET the owner stopped answering cannot succeed: {outcome:?}"
     );
     assert_rma_balanced(&pair.puller);
-
-    drop(_owner_hold);
-    pair.owner.transport.shutdown();
-    assert_rma_balanced(&pair.owner);
+    println!("{RMA_TEARDOWN_CHECKED}");
+    // Exit with the owner still held; see the parent test for why.
+    std::process::exit(0);
 }
 
-/// Set in the child process of `an_owner_survives_a_puller_that_vanishes_mid_get`.
-const OWNER_ABORT_CHILD: &str = "VELO_UCX_OWNER_ABORT_CHILD";
+/// Set in a child process started by `run_child_test`.
+const CHILD_TEST: &str = "VELO_UCX_CHILD_TEST";
+
+/// Run one test of this module in a child process of this test binary, and
+/// return its exit status and output. For scenarios that can abort the
+/// process: the abort then fails one test instead of killing every test in
+/// the binary.
+fn run_child_test(name: &str) -> (std::process::ExitStatus, String) {
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+        .args([
+            "--exact",
+            &format!("transports::ucx::transport::tests::{name}"),
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD_TEST, "1")
+        .env("UCX_TLS", "tcp")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn the child test");
+    // Read both pipes while the child runs, so a full pipe cannot stall it.
+    let mut stdout = child.stdout.take().expect("stdout");
+    let mut stderr = child.stderr.take().expect("stderr");
+    let out = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stdout, &mut text);
+        text
+    });
+    let err = std::thread::spawn(move || {
+        let mut text = String::new();
+        let _ = std::io::Read::read_to_string(&mut stderr, &mut text);
+        text
+    });
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait for the child") {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the child test {name} hung");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    let output = format!(
+        "{}{}",
+        out.join().expect("stdout reader"),
+        err.join().expect("stderr reader")
+    );
+    (status, output)
+}
 
 /// An owner must survive a puller that goes away after sending a GET request
 /// the owner has not served yet.
@@ -1321,39 +1392,10 @@ const OWNER_ABORT_CHILD: &str = "VELO_UCX_OWNER_ABORT_CHILD";
 #[test]
 #[ignore = "UCX 1.22 aborts the owner: ucp_progress_get_reply passes a failed endpoint's status to ucp_request_try_send, which calls ucs_fatal"]
 fn an_owner_survives_a_puller_that_vanishes_mid_get() {
-    let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
-        .args([
-            "--exact",
-            "transports::ucx::transport::tests::owner_abort_child",
-            "--nocapture",
-            "--test-threads=1",
-        ])
-        .env(OWNER_ABORT_CHILD, "1")
-        .env("UCX_TLS", "tcp")
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn the child test");
-    let deadline = std::time::Instant::now() + Duration::from_secs(120);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("wait for the child") {
-            break status;
-        }
-        if std::time::Instant::now() >= deadline {
-            let _ = child.kill();
-            panic!("the child test hung");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    };
-    let output = child.wait_with_output().expect("child output");
-    let text = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let (status, output) = run_child_test("owner_abort_child");
     assert!(
-        status.success() && text.contains("1 passed"),
-        "the owner did not survive ({status}):\n{text}"
+        status.success() && output.contains("1 passed"),
+        "the owner did not survive ({status}):\n{output}"
     );
 }
 
@@ -1361,7 +1403,7 @@ fn an_owner_survives_a_puller_that_vanishes_mid_get() {
 /// nothing unless that test started it.
 #[tokio::test(flavor = "multi_thread")]
 async fn owner_abort_child() {
-    if std::env::var_os(OWNER_ABORT_CHILD).is_none() {
+    if std::env::var_os(CHILD_TEST).is_none() {
         return;
     }
     const LEN: usize = 32 * 1024 * 1024;

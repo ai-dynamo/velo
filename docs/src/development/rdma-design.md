@@ -163,7 +163,12 @@ The rejected alternative was to keep the flush close and only lengthen its deadl
 
 ### A puller that goes away can abort the owner over TCP
 
-Over TCP, UCX emulates a GET in software. The puller sends a request, and the owner's progress thread sends the data back. If the puller is gone before the owner reads the request, UCX 1.22 sends the reply on an endpoint that has already failed. `ucp_request_try_send` then calls `ucs_fatal` ("unexpected error: Endpoint timeout"), and the owner's process aborts. A puller that crashes reaches this as well as one that shuts down, so no teardown order on the puller side prevents it. velo has a test for it that runs the scenario in a child process; it is ignored until UCX handles the error. A GET offloaded to the NIC does not involve the owner's CPU, so this case is TCP only.
+Over TCP, UCX emulates a GET in software. The puller sends a request, and the owner's progress thread sends the data back. If the puller goes away in the middle, UCX 1.22 can abort the owner's process at two sites:
+
+- The owner reads the request only after the puller is gone. It sends the reply on an endpoint that has already failed, and `ucp_request_try_send` calls `ucs_fatal` ("unexpected error: Endpoint timeout").
+- The owner still has replies queued when the puller goes. While UCX discards the failed endpoint, `uct_tcp_ep_pending_purge` finds those replies and fails an assertion (`stubs.c:107`). This happened 2 times in 96 test copies under load.
+
+A puller that crashes reaches both as well as one that shuts down, so no teardown order on the puller side prevents them. velo has a test for the first that runs the scenario in a child process; it is ignored until UCX handles the error. A GET offloaded to the NIC does not involve the owner's CPU, so this is TCP only.
 
 ## A stale rkey aborts the process on InfiniBand
 

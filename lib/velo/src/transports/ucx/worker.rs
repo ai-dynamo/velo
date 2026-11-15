@@ -302,11 +302,13 @@
 //!
 //! The owner of the memory is the other half, and velo cannot protect it. Over
 //! tcp a GET is emulated in software: the owner serves the request by sending
-//! the data back. If the puller is gone before the owner reads the request, UCX
-//! 1.22 sends the reply on a failed endpoint and `ucp_request_try_send` calls
-//! `ucs_fatal`, aborting the owner's process
+//! the data back. If the puller goes away in the middle, UCX 1.22 can abort
+//! the owner's process: `ucp_request_try_send` calls `ucs_fatal` when the
+//! owner reads the request only after the puller is gone
 //! (`an_owner_survives_a_puller_that_vanishes_mid_get`, ignored for that
-//! reason). A puller that crashes reaches it too.
+//! reason), and `uct_tcp_ep_pending_purge` fails an assertion when UCX
+//! discards the failed endpoint with replies still queued on it. A puller that
+//! crashes reaches both too.
 
 use std::collections::HashMap;
 use std::mem::MaybeUninit;

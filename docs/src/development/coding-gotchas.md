@@ -29,9 +29,12 @@ module at once, on 8 CPUs).
 slow. Hold the puller's progress thread so it reads nothing, let the owner run
 one whole pass so it starts to reply, then hold the owner and shut the puller
 down. Then check that the puller's count of unpacked rkeys is zero. Do not
-hold the owner before it has read the GET's request: UCX 1.22 aborts an owner
-that reads a GET request from a puller that has already gone. Test that case
-in a child process, so the abort fails one test and not the whole test binary.
+let the owner run again once the puller is gone. UCX 1.22 can abort an owner
+whose puller vanished mid-GET: it calls `ucs_fatal` when it reads a GET
+request from a gone puller, and it can fail an assertion while it discards
+the endpoint that still holds queued replies. So run the scenario in a child
+process that exits once the puller is checked. A crash in UCX then fails one
+test, not the whole test binary.
 
 Tests: `transports::ucx::transport::tests::shutdown_cancels_a_get_its_peer_stopped_answering`
 and `transports::ucx::transport::tests::an_owner_survives_a_puller_that_vanishes_mid_get`
