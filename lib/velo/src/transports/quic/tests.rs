@@ -1556,3 +1556,119 @@ async fn retirement_reports_late_sends_and_preserves_successor() {
     assert_eq!(errors.0.lock().unwrap().len(), 2);
     assert!(connections.get(&key).unwrap().tx.same_channel(&next.tx));
 }
+
+/// A listener in teardown wakes each connection's task before that
+/// connection's stream readers, so the peer sees the connection close, not a
+/// STOP_SENDING from a reader that stopped first (see
+/// `a_listener_in_teardown_closes_the_connection_before_its_streams` for why
+/// that matters).
+///
+/// Cancelling a token wakes its children before its own waiters. The reader
+/// of `serve_frames` waits on a child token, so on the node-wide token it
+/// would wake before the connection task. This test holds the cancel after
+/// the children wake and before the node-wide token's own waiters do: a
+/// reader that is a child of the node-wide token stops its stream in that
+/// gap. The readers' tokens must be children of the connection's token.
+#[tokio::test]
+async fn teardown_closes_the_connection_before_child_readers_stop_streams() {
+    use std::future::Future;
+    use std::task::{Context, Wake, Waker};
+
+    struct PauseNotification {
+        reached: Arc<tokio::sync::Notify>,
+        resume: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl Wake for PauseNotification {
+        fn wake(self: Arc<Self>) {
+            self.reached.notify_one();
+            self.resume
+                .lock()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the test releases the paused notification");
+        }
+    }
+
+    let server = QuicTransportBuilder::new()
+        .bind_addr("127.0.0.1:0".parse().unwrap())
+        .build()
+        .unwrap();
+    let (adapter, server_streams) = make_channels();
+    let teardown = adapter.shutdown_state.teardown_token().clone();
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let (resume, resume_rx) = std::sync::mpsc::channel();
+    let waker = Waker::from(Arc::new(PauseNotification {
+        reached: reached.clone(),
+        resume: parking_lot::Mutex::new(resume_rx),
+    }));
+    let mut paused_child = Box::pin(teardown.child_token().cancelled_owned());
+    assert!(
+        paused_child
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+
+    server
+        .start(
+            InstanceId::new_v4(),
+            adapter,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
+    let raw = server.address().get_entry(server.key()).unwrap().unwrap();
+    let addr = QuicEndpointInfo::decode(&raw).unwrap().endpoints[0]
+        .socket_addr()
+        .unwrap();
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint
+        .set_default_client_config(super::tls::pinned_client_config(server.fingerprint()).unwrap());
+    let connection = endpoint
+        .connect(addr, super::tls::SERVER_NAME)
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, _recv) = connection.open_bi().await.unwrap();
+    let mut frame = Vec::new();
+    crate::transports::tcp::TcpFrameCodec::encode_frame_sync(
+        &mut frame,
+        MessageType::Event,
+        b"hdr",
+        b"pay",
+    )
+    .unwrap();
+    send.write_all(&frame).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        server_streams.event_stream.recv_async(),
+    )
+    .await
+    .expect("the reader has started and routed a frame")
+    .unwrap();
+
+    let cancel = std::thread::spawn(move || teardown.cancel());
+    tokio::time::timeout(Duration::from_secs(5), reached.notified())
+        .await
+        .expect("cancellation paused before waking the parent waiters");
+    let before_parent_notification =
+        tokio::time::timeout(Duration::from_secs(1), send.stopped()).await;
+    resume.send(()).unwrap();
+    cancel.join().unwrap();
+    let outcome = match before_parent_notification {
+        Ok(outcome) => outcome,
+        Err(_) => tokio::time::timeout(Duration::from_secs(5), send.stopped())
+            .await
+            .expect("the listener closes after cancellation resumes"),
+    };
+    server.shutdown();
+    server.closed().await;
+    assert!(
+        matches!(
+            outcome,
+            Err(quinn::StoppedError::ConnectionLost(
+                quinn::ConnectionError::ApplicationClosed(_)
+            ))
+        ),
+        "the listener stopped the stream before it closed the connection: {outcome:?}"
+    );
+}

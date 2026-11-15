@@ -111,9 +111,10 @@ that pins it now.
 - **P8. A cancellation future built per frame.** `token.cancelled()`
   inside a per-frame `select!`. It is worst on the node-wide teardown
   token. Cost: R4. Incident: 68f7d12. Pin:
-  `a_connection_arms_its_teardown_once`. It counts builds through
-  `connection_teardown`: removing that call fails it (0 builds), but a
-  second future built elsewhere in the loop escapes it.
+  `a_connection_arms_its_teardown_once` (TCP and UDS) and
+  `a_stream_arms_its_teardown_once` (QUIC). They count builds through
+  `connection_teardown` in `serve_frames`: removing that call fails them (0
+  builds), but a second future built elsewhere in the loop escapes them.
 - **P9. `is_cancelled()` per record where a flag would do, or where no
   check is needed.** Cost: R3, R19; on the node-wide token it also
   contends with every connection. Incident: 442223c (`SenderClosed`). The
