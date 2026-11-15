@@ -210,10 +210,23 @@ async fn started_with(builder: QuicTransportBuilder) -> (QuicTransport, DataStre
     (transport, streams, id)
 }
 
+/// 200 round trips of 64 KiB frames, then the packets quinn declared lost.
+///
+/// A send batch above the UDP datagram limit is refused by the kernel while
+/// quinn-udp reports success, so every flight is lost and quinn counts the
+/// loss. On loopback, with one 64 KiB frame in flight at a time, nothing else
+/// is lost. The test counts lost packets rather than timing the round trips:
+/// a lost flight costs a loss-probe timeout, but a loaded host is slow too,
+/// and time cannot tell the two apart.
 async fn large_frames_round_trip(max_mtu: Option<u16>) {
-    let configure = |b: QuicTransportBuilder| match max_mtu {
-        Some(m) => b.max_mtu(m),
-        None => b,
+    const ROUND_TRIPS: u32 = 200;
+    let dialed = super::DialedConnections::default();
+    let configure = |b: QuicTransportBuilder| {
+        let b = b.record_dialed(Arc::clone(&dialed));
+        match max_mtu {
+            Some(m) => b.max_mtu(m),
+            None => b,
+        }
     };
     let (a, a_streams, a_id) = started_with(configure(QuicTransportBuilder::new())).await;
     let (b, b_streams, b_id) = started_with(configure(QuicTransportBuilder::new())).await;
@@ -223,8 +236,9 @@ async fn large_frames_round_trip(max_mtu: Option<u16>) {
         .unwrap();
     let errors = Arc::new(Errors::default());
     let payload = Bytes::from(vec![7u8; 64 * 1024]);
-    let started_at = std::time::Instant::now();
-    for i in 0..200u32 {
+    // Only catches a hang: a lost flight costs tens of milliseconds.
+    let hang = Duration::from_secs(30);
+    for i in 0..ROUND_TRIPS {
         let _ = a.send_message(
             b_id,
             Bytes::from(i.to_le_bytes().to_vec()),
@@ -232,27 +246,25 @@ async fn large_frames_round_trip(max_mtu: Option<u16>) {
             MessageType::Event,
             errors.clone(),
         );
-        let (h, p) =
-            tokio::time::timeout(Duration::from_secs(5), b_streams.event_stream.recv_async())
-                .await
-                .unwrap_or_else(|_| panic!("request {i} stalled (max_mtu {max_mtu:?})"))
-                .unwrap();
+        let (h, p) = tokio::time::timeout(hang, b_streams.event_stream.recv_async())
+            .await
+            .unwrap_or_else(|_| panic!("request {i} stalled (max_mtu {max_mtu:?})"))
+            .unwrap();
         let _ = b.send_message(a_id, h, p, MessageType::Response, errors.clone());
-        tokio::time::timeout(
-            Duration::from_secs(5),
-            a_streams.response_stream.recv_async(),
-        )
-        .await
-        .unwrap_or_else(|_| panic!("response {i} stalled (max_mtu {max_mtu:?})"))
-        .unwrap();
+        tokio::time::timeout(hang, a_streams.response_stream.recv_async())
+            .await
+            .unwrap_or_else(|_| panic!("response {i} stalled (max_mtu {max_mtu:?})"))
+            .unwrap();
     }
-    // Each round trip takes well under a millisecond on loopback. A lost
-    // send batch costs a loss-probe timeout per flight, tens of ms each, and
-    // 200 round trips then take seconds.
-    let elapsed = started_at.elapsed();
+    let (connections, lost) = {
+        let dialed = dialed.lock();
+        let lost: u64 = dialed.iter().map(|c| c.stats().path.lost_packets).sum();
+        (dialed.len(), lost)
+    };
+    assert_eq!(connections, 2, "each side dials the other once");
     assert!(
-        elapsed < Duration::from_secs(2),
-        "200 round trips of 64 KiB took {elapsed:?} (max_mtu {max_mtu:?}); \
+        lost < u64::from(ROUND_TRIPS) / 10,
+        "{lost} packets lost in {ROUND_TRIPS} round trips of 64 KiB (max_mtu {max_mtu:?}); \
          a send batch above the UDP datagram limit is lost on every flight"
     );
     a.shutdown();
@@ -620,6 +632,14 @@ where
 /// A sender that exits right after `closed()` closes its connection on the
 /// wire; its peer sees an application close, not an idle timeout. The peer is
 /// a raw quinn server, so the test reads the close reason directly.
+///
+/// The peer's idle timeout is 20 s. A short one also fires when a loaded host
+/// stalls the sender between its frame and its close, and the peer then
+/// reports a timeout though the sender closed. The test waits for the close
+/// reason, so a passing run stays short. The sender runs with a 30 s close
+/// grace: an acknowledgement read after a stall gives quinn an RTT sample that
+/// includes the stall, and the close's draining period, three probe timeouts,
+/// can then outlast the default 2 s close wait.
 #[test]
 fn the_senders_exit_closes_its_connection() {
     let rx_rt = tokio::runtime::Builder::new_multi_thread()
@@ -632,7 +652,7 @@ fn the_senders_exit_closes_its_connection() {
     let (peer, peer_id) = rx_rt.block_on(async {
         raw_server(
             1 << 20,
-            Duration::from_millis(1500),
+            Duration::from_secs(20),
             move |connection| async move {
                 let (_send, mut recv) = connection.accept_bi().await.unwrap();
                 let _ = accepted_tx.send(());
@@ -647,7 +667,8 @@ fn the_senders_exit_closes_its_connection() {
         .build()
         .unwrap();
     tx_rt.block_on(async {
-        let (client, _client_streams, _) = started().await;
+        let (client, _client_streams, _) =
+            started_with(QuicTransportBuilder::new().close_grace(Duration::from_secs(30))).await;
         client.register(peer).unwrap();
         let _ = client.send_message(
             peer_id,
@@ -658,7 +679,7 @@ fn the_senders_exit_closes_its_connection() {
         );
         // The peer sees the stream only once the frame arrives, so the
         // connection is up before the shutdown under test.
-        tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+        tokio::time::timeout(Duration::from_secs(30), accepted_rx)
             .await
             .expect("the frame never reached the peer")
             .unwrap();
@@ -672,8 +693,9 @@ fn the_senders_exit_closes_its_connection() {
     });
     drop(tx_rt);
 
+    // Only catches a hang: a missing close ends at the idle timeout.
     let reason = reason_rx
-        .recv_timeout(Duration::from_secs(5))
+        .recv_timeout(Duration::from_secs(60))
         .expect("the connection ends");
     assert!(
         matches!(reason, quinn::ConnectionError::ApplicationClosed(_)),
@@ -754,8 +776,15 @@ async fn closed_fails_frames_still_waiting_in_the_gate() {
 /// close only at its idle timeout and counts that as a decode error.
 ///
 /// The receiver runs on its own runtime and is dropped right after
-/// `shutdown()` and `closed()`. The dialer has a short idle timeout, so a
-/// missing close would time out within the test.
+/// `shutdown()` and `closed()`. Then the test waits until the dialer's
+/// connection has ended, and checks how. A missing close ends it at the
+/// dialer's idle timeout, counted as a decode error.
+///
+/// The idle timeout is 20 s, not a short one. A short timeout also fires when
+/// a loaded host stalls the receiver between the frame and its close, and the
+/// test then fails though the close was sent. Waiting for the connection to
+/// end, not for a fixed time, keeps a passing run short. The receiver runs
+/// with a 30 s close grace, as in `the_senders_exit_closes_its_connection`.
 #[test]
 fn an_accept_only_node_closes_its_connections_before_it_exits() {
     accept_only_node_closes_before_it_exits(
@@ -790,7 +819,7 @@ fn accept_only_node_closes_before_it_exits(server_rt: tokio::runtime::Runtime) {
     let client = dialer_rt.block_on(async {
         let client = QuicTransportBuilder::new()
             .bind_addr("127.0.0.1:0".parse().unwrap())
-            .idle_timeout(Duration::from_millis(1500))
+            .idle_timeout(Duration::from_secs(20))
             .build()
             .unwrap();
         client.set_observability(seen.clone());
@@ -807,7 +836,8 @@ fn accept_only_node_closes_before_it_exits(server_rt: tokio::runtime::Runtime) {
     });
 
     server_rt.block_on(async {
-        let (server, server_streams, server_id) = started().await;
+        let (server, server_streams, server_id) =
+            started_with(QuicTransportBuilder::new().close_grace(Duration::from_secs(30))).await;
         client
             .register(peer_with_fingerprint(
                 &server,
@@ -823,7 +853,7 @@ fn accept_only_node_closes_before_it_exits(server_rt: tokio::runtime::Runtime) {
             Arc::new(Errors::default()),
         );
         tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(30),
             server_streams.event_stream.recv_async(),
         )
         .await
@@ -842,7 +872,18 @@ fn accept_only_node_closes_before_it_exits(server_rt: tokio::runtime::Runtime) {
     // The receiver's process exits.
     drop(server_rt);
 
-    dialer_rt.block_on(async { tokio::time::sleep(Duration::from_secs(3)).await });
+    // The dialed reader records a decode error before it stops the writer,
+    // and the writer then leaves `connections`. The timeout only catches a
+    // hang: a missing close ends the connection at the idle timeout.
+    dialer_rt.block_on(async {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            while !client.connections.is_empty() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dialer's connection never ended")
+    });
     assert_eq!(
         seen.decode_errors(),
         0,
@@ -1061,7 +1102,22 @@ async fn laned_pair(
     DataStreams,
     InstanceId,
 ) {
-    let (client, client_streams, _) = started_with(QuicTransportBuilder::new().lanes(lanes)).await;
+    laned_pair_with(lanes, |b| b).await
+}
+
+/// [`laned_pair`], with the client's builder passed through `configure`.
+async fn laned_pair_with(
+    lanes: u16,
+    configure: impl FnOnce(QuicTransportBuilder) -> QuicTransportBuilder,
+) -> (
+    Arc<QuicTransport>,
+    DataStreams,
+    QuicTransport,
+    DataStreams,
+    InstanceId,
+) {
+    let (client, client_streams, _) =
+        started_with(configure(QuicTransportBuilder::new().lanes(lanes))).await;
     let (server, server_streams, server_id) = started().await;
     client
         .register(peer_with_fingerprint(
@@ -1222,20 +1278,22 @@ async fn send_message_is_lane_zero_and_lanes_wrap() {
 ///
 /// This pins the state after `closed()` returns; the force close of a stuck
 /// lane other than 0 is what `closed_force_closes_a_stuck_lane_other_than_zero`
-/// covers. The endpoint check needs every connection to finish draining within
-/// `CLOSE_WAIT`, 2 s.
+/// covers.
 ///
-/// The accounting also needs the peer to acknowledge what the writers wrote
-/// within `FINISH_GRACE`, 1 s. Past that the writer warns that the stream end
-/// was not acknowledged and closes, and those frames are neither delivered nor
-/// failed. On loopback that is milliseconds of work, so a failure here next to
-/// that warning points at the grace, not at lanes.
+/// The waits are the two shutdown graces: `closed()` gives up on a connection
+/// that has not drained within `CLOSE_WAIT` (2 s), and a writer gives up on
+/// the peer's acknowledgement after `FINISH_GRACE` (1 s), leaving its frames
+/// neither delivered nor failed. On a loaded host the drain can take longer,
+/// and the test then fails though every lane was waited for. So this client
+/// runs with a 30 s finish grace and a 60 s close wait. A `closed()` that does
+/// not wait for a lane still fails here, and a passing run takes no longer.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn closed_waits_for_every_lane() {
     const LANES: u16 = 4;
     const FRAMES: usize = 256;
     const PAYLOAD: usize = 64 * 1024;
-    let (client, _client_streams, server, server_streams, server_id) = laned_pair(LANES).await;
+    let (client, _client_streams, server, server_streams, server_id) =
+        laned_pair_with(LANES, |b| b.close_grace(Duration::from_secs(30))).await;
     let errors = Arc::new(Errors::default());
 
     let send = |lane: u16, seq: usize, bytes: usize| {
@@ -1290,20 +1348,31 @@ async fn closed_waits_for_every_lane() {
         );
     }
 
-    while let Ok(Ok((header, _))) = tokio::time::timeout(
-        Duration::from_secs(3),
-        server_streams.response_stream.recv_async(),
-    )
-    .await
-    {
+    // Every frame was acknowledged or failed when `closed()` returned, but the
+    // server may still be handing the last ones to its stream. Wait for the
+    // count, not for a quiet spell: the timeout only catches a hang.
+    let failed = errors.0.lock().unwrap().len();
+    while delivered + failed < FRAMES {
+        let (header, _) = tokio::time::timeout(
+            Duration::from_secs(30),
+            server_streams.response_stream.recv_async(),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("{delivered} delivered + {failed} failed of {FRAMES} sent, and no more arrive")
+        })
+        .unwrap();
         per_lane[usize::from(u16::from_be_bytes([header[0], header[1]]))] += 1;
         delivered += 1;
     }
-    let failed = errors.0.lock().unwrap().len();
     assert_eq!(
         delivered + failed,
         FRAMES,
         "{delivered} delivered + {failed} failed != {FRAMES} sent"
+    );
+    assert!(
+        server_streams.response_stream.is_empty(),
+        "more frames arrived than were sent"
     );
     server.shutdown();
 }

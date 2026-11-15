@@ -1227,19 +1227,23 @@ async fn the_reaper_force_releases_an_abandoned_lease() {
 ///
 /// This test and the arena-shutdown one are the only two here that depend on
 /// real time, and it is unavoidable: what is under test *is* a cadence. The
-/// two-second lease leaves one second for scheduling and renewal delivery on
-/// busy CI runners. The seven-second transfer still spans seven renewal
-/// intervals and three and a half lease periods. Without renewal, the reaper
-/// has five seconds to free the slot before the transfer ends. A longer
-/// transfer alone would not add slack between a renewal and its deadline.
+/// consumer renews every half lease, so the slack between a renewal and its
+/// deadline is half the lease. The five-second lease leaves 2.5 s for
+/// scheduling and renewal delivery. A two-second lease left 1 s, and pausing
+/// the process for 1 to 2 s at random points got the lease reaped in 16 runs
+/// of 16: after the pause the owner's reaper ran before the late renewal
+/// arrived. The fifteen-second transfer still spans six renewal intervals and
+/// three lease periods. Without renewal, the reaper has ten seconds to free
+/// the slot before the transfer ends. A longer transfer alone would not add
+/// slack between a renewal and its deadline.
 #[tokio::test(flavor = "multi_thread")]
 async fn lease_renewal_carries_a_slow_transfer_past_several_deadlines() {
-    const TRANSFER_DELAY: Duration = Duration::from_secs(7);
+    const TRANSFER_DELAY: Duration = Duration::from_secs(15);
 
     let pair = Pair::with_configs(
         Some(RdmaConfig {
             rendezvous: RdmaRendezvousConfig {
-                lease_timeout: Duration::from_secs(2),
+                lease_timeout: Duration::from_secs(5),
                 ..RdmaRendezvousConfig::default()
             },
             ..RdmaConfig::default()
