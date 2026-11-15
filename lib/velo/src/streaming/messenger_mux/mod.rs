@@ -378,11 +378,15 @@ impl MessengerMuxTransport {
     /// spawned sweep task, so without this check the build returned `Ok` and
     /// the mux ran with no periodic credit backstop, no batcher eviction, and
     /// nobody reading the drain doorbell, which that task alone consumes.
+    ///
+    /// The mux spawns its tasks on `runtime`, or on the messenger's runtime
+    /// when it is `None` (see `VeloBuilder::mux_runtime`).
     pub(crate) fn new(
         messenger: Arc<Messenger>,
         config: MuxConfig,
         metrics: Option<Arc<VeloMetrics>>,
         accept_window: Duration,
+        runtime: Option<tokio::runtime::Handle>,
     ) -> Result<Arc<Self>> {
         let limits = NegotiatedLimits::from_wire(config.initial_credit, config.slot_byte_budget)
             .map_err(|error| anyhow!("messenger mux: {error}"))?;
@@ -398,7 +402,9 @@ impl MessengerMuxTransport {
             ..config
         };
         let (drain_tx, drain_rx) = drain_wake_lane();
-        let tasks = crate::streaming::tasks::StreamTasks::new(messenger.runtime().clone());
+        let tasks = crate::streaming::tasks::StreamTasks::new(
+            runtime.unwrap_or_else(|| messenger.runtime().clone()),
+        );
         let core = Arc::new(MuxCore {
             messenger: Arc::clone(&messenger),
             config,

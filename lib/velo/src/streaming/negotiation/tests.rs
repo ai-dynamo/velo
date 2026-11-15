@@ -86,6 +86,7 @@ async fn mux(config: MuxConfig) -> Arc<MessengerMuxTransport> {
         config,
         None,
         crate::streaming::ReservationConfig::default().prebind_timeout,
+        None,
     )
     .expect("mux")
 }

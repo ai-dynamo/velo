@@ -185,6 +185,7 @@ pub(super) async fn stalled_producer(config: MuxConfig) -> Stalled {
         config,
         None,
         crate::streaming::ReservationConfig::default().prebind_timeout,
+        None,
     )
     .expect("producer mux");
     Stalled {

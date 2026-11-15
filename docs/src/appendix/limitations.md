@@ -164,3 +164,29 @@ time-to-live.
 **Lifted by.** Not scheduled. A default time-to-live for transparently staged
 payloads would lift it, but it would also fail a fetch that is slower than
 that time.
+
+## A producer that holds its thread stalls its peer's streams
+
+**What happens.** While a producer holds its worker thread right after a
+`send`, no stream from its node to the same peer moves: not its records, not
+its heartbeats, and not other streams' records. After
+`DETECTION_MULTIPLIER` heartbeat windows the consumer's watchdog ends the
+producer's stream with `Dropped`, though the producer is alive.
+
+**When.** The mux runs on the producer's multi-thread runtime, which is the
+default, and the producer blocks or computes without yielding after a send:
+`std::thread::sleep`, a blocking call, a long encode. Work under
+`tokio::task::block_in_place` does not stall, because tokio moves the waiting
+task to the shared queue before it blocks.
+
+**Why.** The send wakes the peer's batcher from the producer's worker, and
+tokio puts a task woken there in that worker's LIFO slot, which other workers
+do not steal (tokio-rs/tokio#4941).
+
+**Workaround.** `VeloBuilder::mux_runtime`, which runs the mux's tasks on
+another runtime. Or keep blocking work off the producer's task, with
+`block_in_place` or `spawn_blocking`.
+
+**Lifted by.** A default that runs the mux where a producer's wake cannot
+reach the LIFO slot, once the crossing benchmarks show what the wake across
+runtimes costs. `tests/streaming/blocked_producer.rs` holds the tests.
