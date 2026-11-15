@@ -35,3 +35,25 @@ every time.
 
 Test: `streaming::messenger_mux::tests::a_late_reply_after_the_idle_fixture_is_not_counted_as_idle`
 (`lib/velo/src/streaming/messenger_mux/tests.rs`).
+
+## `echo "$out" | grep -q` fails under `pipefail` when grep wins the race
+
+**Rule.** In a bash script with `set -o pipefail`, do not pipe a variable
+into `grep -q` or `grep -m`. Use a here-string: `grep -q X <<<"$out"`.
+
+**Failure.** `grep -q` exits at its first match and closes the pipe. If
+`echo` still has output to write, it gets SIGPIPE, the pipeline exits 141,
+and `pipefail` makes the check fail although the text is there. bash writes
+`echo`'s output one line per `write()`, so this can happen at any size.
+The semver self-test failed once in CI on a case whose output held the
+expected line; here it failed 1 time in 100 runs on two busy CPUs, 1 time
+in 2000 for one check on one busy CPU, and every time for output larger
+than the pipe buffer. `scripts/check-semver.sh` used the same form to pick
+the crates a change touches, so it could skip a changed crate's check
+(1 to 2 times in 500, idle, for lists of 5 and 200 files).
+
+**Test.** Run the pipe form on output larger than the pipe buffer: it fails
+nearly every time, and the here-string form never does. Then search the
+scripts for the pipe form, with any options.
+
+Test: the two `(pipe)` cases in `scripts/check-semver.test.sh`.
