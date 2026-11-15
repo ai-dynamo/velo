@@ -43,7 +43,7 @@ that the test counts.
 
 | Cost | Fix | Test |
 |---|---|---|
-| A cancellation future built per frame on the node-wide teardown token. Every build and drop takes a lock that all connections share. | Build one future per connection, on a child token. | `a_connection_arms_its_teardown_once` |
+| A cancellation future built per frame on the node-wide teardown token. Every build and drop takes a lock that all connections share. | One frame loop for TCP, UDS and QUIC. It builds one future per connection, on a child token. | `a_connection_arms_its_teardown_once` (TCP, UDS), `a_stream_arms_its_teardown_once` (QUIC) |
 | A `tokio::time::timeout` per record. Each one takes the time driver's lock twice. | One timer per stream, moved forward only inside half a window. | `a_thousand_records_arm_the_heartbeat_timer_a_handful_of_times` |
 | A full decode of each stream item, only to see whether it ends the stream. | Decide from the first bytes. | `classifying_an_item_does_not_allocate` |
 | A task per stream bind, to time out its accept window. | One deadline queue that the credit sweep drains. | `a_finished_zero_rtt_stream_leaves_no_task_behind` |
