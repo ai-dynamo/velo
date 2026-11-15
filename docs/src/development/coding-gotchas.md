@@ -351,3 +351,44 @@ without comparing with the last item, and check that the test fails.
 
 Test: `messenger::server::lanes::tests::lane_is_not_reaped_while_items_keep_arriving`
 (`lib/velo/src/messenger/server/lanes.rs`).
+
+## A port you closed is free for any other test to take
+
+**Rule.** A test that needs a peer which never answers must hold that peer's
+port for the whole test. Do not bind a port and close it again to make a
+"dead" address: the port is free once it is closed, and in a full test run
+another test can bind it at any moment. Keep a `TcpListener` bound and never
+accept from it. The kernel completes the TCP connect, but no protocol
+handshake ever comes back.
+
+**Failure.** The ZMQ drain test made its dead peer by binding a port and
+dropping the listener. In a full `--lib` run another test's ZMQ ROUTER took
+the port, the "dead" peer received every frame, and the test failed with no
+frame failed. It happened 1 time in 72 full runs (24 at once on 8 CPUs). The
+same test passed every time alone.
+
+**Test.** Bind a ZMQ ROUTER to the freed port before the drain: the old test
+then fails every time. With the port held, it cannot be taken.
+
+Test: `transports::zmq::transport::tests::a_stopping_sender_drains_within_its_budget`
+(`lib/velo/src/transports/zmq/transport.rs`).
+
+## Read what is left of a deadline just before the wait it bounds
+
+**Rule.** When a shared deadline bounds a series of blocking calls, compute
+the time left immediately before each call that blocks, not before the work
+that leads up to it. Setup between the reading and the wait (creating a
+socket, taking a lock, a slow allocation) is spent twice: once from the
+deadline, and once more as the wait the stale reading allows.
+
+**Failure.** A stopping ZMQ sender took each send's timeout from its drain
+budget, then created the socket for the send. When creating the socket used
+up the budget, the send still waited the whole earlier timeout, so the drain
+ran a second past its one-second budget.
+
+**Test.** Hold the code at the point between setup and the wait (a per-thread
+test hook) until the deadline has passed, then check that the call fails at
+once. With the stale reading, it waits the whole earlier timeout.
+
+Test: `transports::zmq::transport::tests::a_stopping_sender_rechecks_its_budget_after_socket_setup`
+(`lib/velo/src/transports/zmq/transport.rs`).
