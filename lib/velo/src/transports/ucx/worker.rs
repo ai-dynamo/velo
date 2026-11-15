@@ -1627,13 +1627,22 @@ impl Drop for NativeInit {
 const SOFTWARE_RMA_SWITCH_FLOOR: (u32, u32) = (1, 22);
 
 /// Whether software RMA was asked to be off: by velo's default, or by the
-/// environment, which wins. UCX reads a boolean `n`, `no`, `off` or `0` as
-/// off, in any case.
+/// environment, which wins.
+///
+/// The spellings are the ones UCX 1.22 itself reads as off: `n` and `no` in
+/// any case, `off` in lower case only, and `0`. UCX rejects any other value
+/// (`OFF`, `false`, a leading space) and the transport fails to start, so
+/// treating such a value as off would only misreport the warning.
+/// `documented_off_spellings_are_accepted_by_ucx` checks this list against
+/// UCX's own parser.
 fn software_rma_requested_off(software_rma: bool, env_switch: Option<&str>) -> bool {
     match env_switch {
-        Some(value) => ["n", "no", "off", "0"]
-            .iter()
-            .any(|off| value.trim().eq_ignore_ascii_case(off)),
+        Some(value) => {
+            value.eq_ignore_ascii_case("n")
+                || value.eq_ignore_ascii_case("no")
+                || value == "off"
+                || value == "0"
+        }
         None => !software_rma,
     }
 }
@@ -3356,9 +3365,12 @@ pub(crate) type StartupSlot = OnceLock<StartupOut>;
 mod initialization_tests {
     use super::{config_value, software_rma_requested_off, software_rma_switch_applies};
 
-    /// UCX accepts the off spellings described by `software_rma_requested_off`.
+    /// velo reads an environment value as "software RMA off" exactly when UCX
+    /// accepts it for `PROTO_EMULATION_ENABLE`. Every candidate here is a
+    /// spelling of "off", so UCX accepting it means UCX turns emulation off.
+    /// If the two disagree, velo warns (or stays silent) for a setting UCX
+    /// does not apply the way velo thinks.
     #[test]
-    #[ignore = "F7: UCX 1.22 rejects OFF although the new comment says off is accepted in any case"]
     fn documented_off_spellings_are_accepted_by_ucx() {
         use ucx_rs::sys;
 
@@ -3367,20 +3379,24 @@ mod initialization_tests {
         let status =
             unsafe { sys::ucp_config_read(std::ptr::null(), std::ptr::null(), &mut config) };
         assert_eq!(status, sys::ucs_status_t_UCS_OK);
-        let results = [c"n", c"N", c"no", c"NO", c"off", c"OFF", c"0"].map(|value| {
+        let candidates = [
+            c"n", c"N", c"no", c"No", c"NO", c"off", c"Off", c"OFF", c"0", c"false", c" n",
+        ];
+        let results = candidates.map(|value| {
             // SAFETY: the config is live and both strings are NUL-terminated.
             let status = unsafe {
                 sys::ucp_config_modify(config, c"PROTO_EMULATION_ENABLE".as_ptr(), value.as_ptr())
             };
-            (value, status)
+            (value, status == sys::ucs_status_t_UCS_OK)
         });
         // SAFETY: this test owns the config and no context uses it.
         unsafe { sys::ucp_config_release(config) };
-        for (value, status) in results {
+        for (value, ucx_accepts) in results {
+            let text = value.to_str().expect("ASCII candidate");
             assert_eq!(
-                status,
-                sys::ucs_status_t_UCS_OK,
-                "UCX rejects the documented boolean spelling {value:?}"
+                software_rma_requested_off(true, Some(text)),
+                ucx_accepts,
+                "velo and UCX disagree on {text:?} (UCX accepts it: {ucx_accepts})"
             );
         }
     }
@@ -3391,12 +3407,20 @@ mod initialization_tests {
     fn software_rma_is_requested_off_by_default_or_by_the_environment() {
         assert!(software_rma_requested_off(false, None));
         assert!(!software_rma_requested_off(true, None));
-        for off in ["n", "no", "OFF", "0"] {
+        for off in ["n", "N", "no", "NO", "off", "0"] {
             assert!(software_rma_requested_off(true, Some(off)), "{off}");
             assert!(software_rma_requested_off(false, Some(off)), "{off}");
         }
         for on in ["y", "yes", "1"] {
             assert!(!software_rma_requested_off(false, Some(on)), "{on}");
+        }
+        // UCX rejects these, and then the transport fails to start; velo must
+        // not read them as off.
+        for rejected in ["OFF", "Off", "false", " n"] {
+            assert!(
+                !software_rma_requested_off(true, Some(rejected)),
+                "{rejected}"
+            );
         }
     }
 
