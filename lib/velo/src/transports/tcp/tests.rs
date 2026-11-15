@@ -612,11 +612,19 @@ async fn test_send_message_does_not_fail_on_stale_handle() {
 
 #[tokio::test]
 async fn test_writer_task_drains_on_connect_failure() {
-    // Use an address where nothing is listening so connect will fail.
-    // Binding then immediately dropping gives us a port that is guaranteed closed.
-    let tmp = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = tmp.local_addr().unwrap();
-    drop(tmp);
+    // A peer that refuses the connect. The test holds the port for its whole
+    // length, bound and never listening: the kernel refuses a connect to it,
+    // and the bind keeps every other socket off the port. A port bound and
+    // closed again is free for another test to take, and then the "dead"
+    // peer accepts. A held listener would not do here either: the kernel
+    // completes a connect into its backlog.
+    let dead = tokio::net::TcpSocket::new_v4().unwrap();
+    dead.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+    let addr = dead.local_addr().unwrap();
+    assert!(
+        std::net::TcpListener::bind(addr).is_err(),
+        "another socket could take the held port"
+    );
 
     let iid = crate::InstanceId::new_v4();
     let (handle, rx) = make_handle(8);
@@ -674,6 +682,7 @@ async fn test_writer_task_drains_on_connect_failure() {
         !connections.contains_key(&(iid, 0)),
         "writer task should clean up its DashMap entry on connect failure"
     );
+    drop(dead);
 }
 
 /// Replacing a stale connection must kill the old epoch's queued frames.
@@ -1431,9 +1440,33 @@ async fn retirement_accounts_for_late_sends_without_removing_the_successor() {
 
 /// Start a transport on a pre-bound loopback listener. The caller keeps the
 /// streams alive for the test.
-async fn start_prebound() -> (TcpTransport, SocketAddr, crate::transports::DataStreams) {
+/// The `/proc/self/fd` link text of a socket, `socket:[<inode>]`.
+fn socket_link(fd: std::os::fd::RawFd) -> std::path::PathBuf {
+    std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap()
+}
+
+/// Whether any file descriptor of this process still refers to the socket
+/// whose link text is `link`.
+///
+/// This is how the `closed` tests check that the transport let its listening
+/// socket go. A connect to the freed port cannot: any other test can bind the
+/// port the moment it is free, and the connect then succeeds.
+fn socket_is_open(link: &std::path::Path) -> bool {
+    std::fs::read_dir("/proc/self/fd")
+        .unwrap()
+        .filter_map(Result::ok)
+        .any(|fd| std::fs::read_link(fd.path()).is_ok_and(|l| l == link))
+}
+
+async fn start_prebound() -> (
+    TcpTransport,
+    SocketAddr,
+    std::path::PathBuf,
+    crate::transports::DataStreams,
+) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let address = listener.local_addr().unwrap();
+    let link = socket_link(std::os::fd::AsRawFd::as_raw_fd(&listener));
     let transport = TcpTransportBuilder::new()
         .from_listener(listener)
         .unwrap()
@@ -1448,14 +1481,14 @@ async fn start_prebound() -> (TcpTransport, SocketAddr, crate::transports::DataS
         )
         .await
         .unwrap();
-    (transport, address, streams)
+    (transport, address, link, streams)
 }
 
 // On a current-thread runtime, start can return before the listener task runs.
 // closed must release its pre-bound socket even in that schedule.
 #[tokio::test]
 async fn closed_releases_listener_before_returning() {
-    let (transport, address, _streams) = start_prebound().await;
+    let (transport, address, link, _streams) = start_prebound().await;
     // A close check before shutdown must neither wait nor stop the listener.
     use futures::FutureExt;
     assert!(transport.closed().now_or_never().is_some());
@@ -1466,8 +1499,11 @@ async fn closed_releases_listener_before_returning() {
     })
     .await
     .expect("concurrent close calls must finish");
-    // No await between closed and this probe: the socket must already be gone.
-    assert!(std::net::TcpStream::connect(address).is_err());
+    // No await between closed and this check: the socket must already be gone.
+    assert!(
+        !socket_is_open(&link),
+        "closed returned with the listener open"
+    );
 }
 
 /// `closed` must wait for the accept loop itself, in the usual schedule where
@@ -1482,13 +1518,20 @@ async fn closed_releases_listener_before_returning() {
 /// accept loop start first.
 #[tokio::test]
 async fn closed_releases_running_listener() {
-    let (transport, address, _streams) = start_prebound().await;
+    let (transport, _address, link, _streams) = start_prebound().await;
     for _ in 0..4 {
         tokio::task::yield_now().await;
     }
+    assert!(
+        socket_is_open(&link),
+        "the check must see the live listener"
+    );
     transport.shutdown();
     transport.closed().await;
-    assert!(std::net::TcpStream::connect(address).is_err());
+    assert!(
+        !socket_is_open(&link),
+        "closed returned with the listener open"
+    );
 }
 
 /// Teardown while the first connection is still dialing keeps the dial, and so
