@@ -60,3 +60,28 @@ live slot. They hold credit back until the test returns it with one sweep.
 Tests: `streaming::messenger_mux::tests::a_watchdog_firing_closes_its_slot`
 and `streaming::messenger_mux::tests::the_watchdog_does_not_fire_while_its_sender_is_parked`
 (`lib/velo/src/streaming/messenger_mux/tests.rs`).
+
+## A connection is not idle until both ends have set it up
+
+**Rule.** A timer that closes a connection for being idle must not count the
+time before the peer has answered. Our side's setup ending is not enough: the
+peer may still be setting up its side, and nothing reaches us until it has.
+End setup on the first message from the peer, and bound it, so a peer that
+never answers, or died during setup, still loses its connection.
+
+**Failure.** The UCX idle reaper closed an endpoint 500 ms after its last use.
+A created its endpoint to B by sending to B. B's first frame back waited for
+B's own `ucp_ep_create`, which took 630 to 1250 ms under load. A saw nothing
+from B for longer than the timeout, closed its endpoint, and B's next
+Messages to A were lost. The reaper did nothing wrong by its own rule; the
+rule counted setup as idle time.
+
+**Test.** Hold A's reaper clock. Let A send to B, move A's clock two
+timeouts with nothing from B, and check that A kept the endpoint. Then let B
+answer, and check that idle time counts from B's frame. A second test moves
+the clock past the setup bound with no frame from B, and checks that the
+endpoint is closed.
+
+Tests: `transports::ucx::transport::tests::an_endpoint_is_not_reaped_while_its_peer_sets_up`
+and `transports::ucx::transport::tests::an_endpoint_whose_peer_never_sends_is_reaped_after_the_setup_bound`
+(`lib/velo/src/transports/ucx/tests.rs`).

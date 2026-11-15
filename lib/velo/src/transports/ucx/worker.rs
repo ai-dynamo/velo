@@ -206,6 +206,25 @@
 //! one process), past the floor. An endpoint with no send on it, such as an
 //! eager one, has only this stamp to keep it open.
 //!
+//! **Setup is not idle time.** An endpoint is set up once a frame from its
+//! peer has arrived, not when our own `ucp_ep_create` returns. The peer's
+//! first frame to us waits for the peer's own `ucp_ep_create`, and under load
+//! that took 630-1250 ms, past the 500 ms floor: a reaper that counted that
+//! wait as idle time closed the endpoint before the peer could answer, and the
+//! peer's next Messages were lost. So the scan skips an endpoint whose peer
+//! has not sent since it was created ([`EpEntry::set_up`]).
+//!
+//! Setup has a bound, [`EP_SETUP_BOUND`], so a peer that never sends to us,
+//! or that died during setup, does not hold an endpoint open forever. After
+//! the bound the endpoint is judged on its last use like any other, so an
+//! endpoint already idle for the timeout is closed at the next scan. velo has
+//! no connect or wireup deadline of its own to reuse, and UCX keepalive is not
+//! one: it fails an endpoint whose peer has gone, which the failed-endpoint
+//! reaper then closes, but it does nothing for a live peer that does not
+//! send. The bound costs only that: an endpoint to a peer that never sends to
+//! us, such as one used only for GETs, is closed up to one bound later than
+//! its idle timeout alone would close it.
+//!
 //! **When a use is stamped.** With the reaper on, [`WorkerState::now`] is read
 //! at the top of each loop pass, again after the progress loop, and after each
 //! `ucp_ep_create`. A command in either drain is stamped with the read taken
@@ -584,6 +603,11 @@ pub(crate) struct WorkerShared {
     /// Test seam: `true` while the progress loop waits on `pre_progress_hold`.
     #[cfg(test)]
     pub pre_progress_held: AtomicBool,
+    /// Test seam: the setup bound the reaper uses, in milliseconds; starts at
+    /// [`EP_SETUP_BOUND`]. A reaper test whose subject is not setup sets it to
+    /// zero, so an endpoint counts as set up as soon as it is created.
+    #[cfg(test)]
+    pub ep_setup_bound_ms: AtomicU64,
     /// Test seam: passes of the progress loop that reached the reaper. A test
     /// that moves the reaper's clock waits for two more, so one pass has read
     /// the new time and scanned with it.
@@ -1335,6 +1359,12 @@ struct EpEntry {
     /// which is the only reader, so with the reaper off (the default) a send
     /// pays only two `None` checks, plus one clock read per `ucp_ep_create`.
     sends: Option<Arc<EpSends>>,
+    /// When `ensure_ep` created this endpoint.
+    born: Instant,
+    /// Whether a frame from the peer has arrived since this endpoint was
+    /// created. Until one has, the endpoint is still being set up (see
+    /// [`EpEntry::set_up`]).
+    peer_sent: bool,
 }
 
 impl EpEntry {
@@ -1352,6 +1382,15 @@ impl EpEntry {
         self.sends
             .as_ref()
             .is_some_and(|s| s.inflight.load(Ordering::Relaxed) != 0)
+    }
+
+    /// Whether setup has ended, so idle time may count against the endpoint.
+    ///
+    /// Setup ends with the first frame from the peer, or `bound`
+    /// ([`EP_SETUP_BOUND`]) after creation, whichever comes first. The module
+    /// docs ("Setup is not idle time") say why.
+    fn set_up(&self, now: Instant, bound: Duration) -> bool {
+        self.peer_sent || now.saturating_duration_since(self.born) > bound
     }
 }
 
@@ -1468,6 +1507,16 @@ struct WorkerState {
 pub(super) fn ep_scan_period(timeout: Duration) -> Duration {
     (timeout / 2).clamp(Duration::from_millis(10), Duration::from_secs(1))
 }
+
+/// How long an endpoint may wait for its peer's first frame before idle time
+/// counts against it. See the module docs ("Setup is not idle time").
+///
+/// Sized from the slowest setup measured: under load (48 copies of the UCX
+/// tests at once on 8 CPUs, host load about 300) a peer's `ucp_ep_create` took
+/// 630-1250 ms, and one frame took up to 2250 ms to arrive. Five seconds is
+/// twice the slowest frame. A longer bound only keeps an endpoint to a silent
+/// peer open longer; a shorter one brings back the reap during setup.
+pub(super) const EP_SETUP_BOUND: Duration = Duration::from_secs(5);
 
 /// Backstop park timeout: a lost doorbell costs at most this much latency.
 ///
@@ -2234,6 +2283,8 @@ impl WorkerState {
                 incarnation: blob.incarnation,
                 last_used: self.now,
                 sends: sends.clone(),
+                born: self.now,
+                peer_sent: false,
             },
         );
         debug!("ucx: created endpoint to {peer}");
@@ -2337,6 +2388,10 @@ impl WorkerState {
             for entry in self.eps.values_mut() {
                 if entry.incarnation as usize == seen {
                     entry.last_used = now;
+                    // Only an exact sighting ends setup. The overflow path
+                    // above stamps every endpoint without knowing which peers
+                    // sent, so it leaves setup alone.
+                    entry.peer_sent = true;
                     hit = true;
                 }
             }
@@ -2377,6 +2432,11 @@ impl WorkerState {
             return;
         }
 
+        #[cfg(not(test))]
+        let setup_bound = EP_SETUP_BOUND;
+        #[cfg(test)]
+        let setup_bound =
+            Duration::from_millis(self.shared.ep_setup_bound_ms.load(Ordering::Relaxed));
         // Collected before anything is removed: `close_ep` takes `&mut self`,
         // and the map cannot be iterated across that.
         let idle: Vec<InstanceId> = self
@@ -2384,6 +2444,10 @@ impl WorkerState {
             .iter()
             .filter(|(peer, entry)| {
                 self.now.saturating_duration_since(entry.last_activity()) > timeout
+                    // An endpoint still being set up is not idle: its peer's
+                    // first frame may be waiting on the peer's own endpoint
+                    // creation.
+                    && entry.set_up(self.now, setup_bound)
                     // A send in flight is a use: closing now would cancel it.
                     && !entry.has_send_in_flight()
                     // The in-flight exclusion for RMA. `rma_ops` holds every

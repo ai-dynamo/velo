@@ -89,7 +89,13 @@ pub struct UcxConfig {
 
 /// Floor on [`UcxConfig::ep_idle_timeout`].
 ///
-/// Sized to **dominate endpoint wireup**. A send posted on an endpoint we own
+/// Sized to **dominate our own endpoint wireup**. It does not have to cover
+/// the peer's: until the peer's first frame arrives, the endpoint is still
+/// being set up and the reaper does not count idle time against it (up to a
+/// bound; see `worker::EP_SETUP_BOUND`). Under load the peer's `ucp_ep_create`
+/// took 630-1250 ms, more than this floor, and before that rule a reaper at the
+/// floor closed endpoints whose peer had not yet answered. A send posted on an
+/// endpoint we own
 /// holds that endpoint open at any timeout, so a short timeout cancels none of
 /// those sends. (Replies posted on the endpoint UCX hands the receive callback
 /// are not counted.) What a short timeout does is close endpoints between
@@ -199,6 +205,8 @@ impl UcxTransport {
             pre_progress_held: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
             passes: AtomicU64::new(0),
+            #[cfg(test)]
+            ep_setup_bound_ms: AtomicU64::new(super::worker::EP_SETUP_BOUND.as_millis() as u64),
             #[cfg(test)]
             cmds_handled: AtomicU64::new(0),
             #[cfg(test)]
@@ -869,6 +877,13 @@ impl UcxTransportBuilder {
     /// caused each one refreshes the endpoint in the same loop pass, before the
     /// reaper scans. The time `ucp_ep_create` takes does not count as idle
     /// either.
+    ///
+    /// Setup does not count as idle time. An endpoint is set up once a frame
+    /// from its peer has arrived; until then the peer may still be creating
+    /// its own endpoint back to us, which took up to 1.25 s under load. Setup
+    /// has a bound of 5 s, so an endpoint to a peer that never sends to us (for
+    /// example one used only for RDMA reads) closes up to 5 s later than the
+    /// timeout alone would close it.
     ///
     /// Values below half a second are raised to it; see the transport's
     /// `MIN_EP_IDLE_TIMEOUT` for why that is the number.
