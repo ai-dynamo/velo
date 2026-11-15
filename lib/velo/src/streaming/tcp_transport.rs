@@ -13,8 +13,8 @@
 //! There is no endpoint string in the streaming attach handshake. The
 //! transport advertises its listener interface(s) via `address` (which
 //! the Velo builder merges into the local PeerInfo's WorkerAddress). When a
-//! peer is registered (via `Velo::register_peer` or discovery), the transport
-//! extracts the peer's endpoint, resolves the best socket address using
+//! peer is registered (by `register_peer`, discovery, or its `_hello`), the
+//! transport extracts the peer's endpoint, resolves the best socket address using
 //! [`select_best_endpoint`], and caches it keyed by [`WorkerId`].
 //!
 //! `connect` looks up the cached SocketAddr by `WorkerId` — no
@@ -956,6 +956,14 @@ mod tests {
     /// the frames the kernel cannot take, and the stream is not retired. A
     /// sender that reported as it queued the terminal would say `Sent` here,
     /// with the terminal still on this node.
+    ///
+    /// The first peer never reads, so its window stays at zero, and the
+    /// socket's 30 s `TCP_USER_TIMEOUT` (`configure_socket`) aborts the
+    /// connection if the test is still queueing frames then. Encoding a 1 MiB
+    /// frame is about a million msgpack integers, slow in a debug build on a
+    /// busy host, so the test encodes one frame before it connects and queues
+    /// copies of it. The waits for retirement only catch a hang; they do not
+    /// check speed.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_pump_retires_the_stream_once_it_wrote_the_terminal() {
         use crate::streaming::Retirement;
@@ -964,6 +972,8 @@ mod tests {
         // with the terminal still queued behind it.
         const FRAMES: usize = 64;
         const PAYLOAD: usize = 1 << 20;
+        const HANG: Duration = Duration::from_secs(60);
+        let frame = item(PAYLOAD);
         let client = TcpFrameTransport::default_bound().await.unwrap();
 
         // The peer closes first.
@@ -976,7 +986,7 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..FRAMES {
-            tx.send_async(item(PAYLOAD)).await.unwrap();
+            tx.send_async(frame.clone()).await.unwrap();
         }
         tx.send_async(crate::streaming::sender::cached_finalized().clone())
             .await
@@ -988,7 +998,7 @@ mod tests {
         );
         drop(listener);
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), retired(&closed)).await,
+            tokio::time::timeout(HANG, retired(&closed)).await,
             Ok(Retirement::Discarded)
         );
 
@@ -1006,13 +1016,13 @@ mod tests {
             .await
             .unwrap();
         for _ in 0..FRAMES {
-            tx.send_async(item(PAYLOAD)).await.unwrap();
+            tx.send_async(frame.clone()).await.unwrap();
         }
         tx.send_async(crate::streaming::sender::cached_finalized().clone())
             .await
             .unwrap();
         assert_eq!(
-            tokio::time::timeout(Duration::from_secs(5), retired(&closed)).await,
+            tokio::time::timeout(HANG, retired(&closed)).await,
             Ok(Retirement::Sent)
         );
         drop(tx);
