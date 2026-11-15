@@ -111,6 +111,25 @@
 //! `ShuttingDown`. The reply lives behind a `take`-able slot, which is what
 //! makes double-resolution impossible if the callback later fires anyway.
 //!
+//! ## Software RMA is off
+//!
+//! Over a lane with no RMA in hardware, such as tcp, UCX emulates a GET: the
+//! owner's progress thread serves the read. In UCX 1.22 the owner's process
+//! aborts if the puller goes away during the reply (`ucs_fatal` in
+//! `ucp_request_try_send`, or an assertion in `uct_tcp_ep_pending_purge`), and
+//! a crashed puller reaches both. So [`init_ucx`] sets
+//! `PROTO_EMULATION_ENABLE=n` unless the environment sets it, or a test asked
+//! for software RMA.
+//!
+//! UCX selects the GET protocol per endpoint, so a GET still runs in hardware
+//! where a lane can do it. Where none can, `ucp_proto_reconfig_progress`
+//! aborts the request with `UCS_ERR_CANCELED` and leaves the endpoint up.
+//! [`RmaOpState::refused`] tells that from a FORCE close and from a failed RC
+//! queue pair, answers [`RmaError::NoNativeGet`], and records the peer's
+//! incarnation in [`WorkerShared::no_native_get`]. The rendezvous consumer
+//! reads that record and stops offering RDMA to the peer. The record lapses
+//! when the peer's endpoint fails or the peer is unregistered.
+//!
 //! ## The idle-endpoint reaper (D9)
 //!
 //! [`UcxConfig::ep_idle_timeout`](super::transport::UcxConfig::ep_idle_timeout)
@@ -500,6 +519,15 @@ pub(crate) struct WorkerShared {
     /// Peers whose endpoint hit a transport-level error; consulted by
     /// `check_health` and cleared when a fresh endpoint is established.
     pub failed_peers: Arc<DashMap<InstanceId, ()>>,
+    /// Peers this worker cannot GET from without software emulation, with the
+    /// incarnation whose endpoint refused the GET.
+    ///
+    /// Written by [`RmaOpState::complete`] when UCX refuses a GET for want of
+    /// a native protocol (see "Software RMA is off" in the module docs). Read
+    /// by the rendezvous consumer, which then does not offer RDMA to that
+    /// peer. The incarnation makes the entry lapse when the peer re-registers:
+    /// a new process may be reachable over a lane that has GET in hardware.
+    pub no_native_get: Arc<DashMap<InstanceId, u64>>,
     /// Operations posted with a request outstanding (exit 2). Drained before
     /// worker destruction.
     pub inflight_ops: Arc<AtomicUsize>,
@@ -626,6 +654,9 @@ pub(crate) struct StartupOut {
 /// Everything [`worker_main`] needs, assembled by `UcxTransport::start`.
 pub(crate) struct WorkerArgs {
     pub config: UcxConfig,
+    /// Leave UCX's software RMA emulation on. See "Software RMA is off" in the
+    /// module docs.
+    pub software_rma: bool,
     pub ring_rx: CommandReceiver,
     pub shared: Arc<WorkerShared>,
     pub adapter: TransportAdapter,
@@ -820,6 +851,21 @@ struct RmaOpState {
     /// handle to compare against, whereas the peer is stable and errs toward
     /// keeping an endpoint that might be in use.
     peer: InstanceId,
+    /// The incarnation of the peer the endpoint was created for. Recorded in
+    /// [`WorkerShared::no_native_get`] if UCX refuses the GET.
+    incarnation: u64,
+    /// Set when velo retires the endpoint this operation was posted on. A GET
+    /// that velo's own FORCE close cancelled is not a refusal.
+    ep_retired: Arc<AtomicBool>,
+    /// Set by `shutdown()`. Teardown cancels operations too.
+    shutdown_requested: Arc<AtomicBool>,
+    /// Peers whose endpoint failed. A failed RC queue pair flushes its GETs
+    /// with `CANCELED` too.
+    failed_peers: Arc<DashMap<InstanceId, ()>>,
+    /// Where a refusal is recorded.
+    no_native_get: Arc<DashMap<InstanceId, u64>>,
+    /// Registered peers, read to drop a record that an unregister raced.
+    peers: Arc<DashMap<InstanceId, UcxEndpoint>>,
     /// Region whose in-flight count this operation holds.
     region_id: u64,
     /// Identifies this operation in [`WorkerState::rma_ops`].
@@ -869,6 +915,11 @@ impl RmaOpState {
         }
         self.resolve(if status == sys::ucs_status_t_UCS_OK {
             Ok(())
+        } else if self.refused(status) {
+            // Recorded before the caller hears of it, so a caller that falls
+            // back and tries again already finds the peer marked.
+            self.record_refusal();
+            Err(RmaError::NoNativeGet)
         } else {
             Err(RmaError::Ucx {
                 status_name: status_string(status),
@@ -878,6 +929,47 @@ impl RmaOpState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((self.region_id, self.op_id));
+    }
+
+    /// Whether `status` is UCX refusing the GET because no native protocol
+    /// reaches the peer.
+    ///
+    /// With software RMA off, `ucp_proto_reconfig_progress` (`proto_reconfig.c`)
+    /// aborts such a GET with `UCS_ERR_CANCELED` and leaves the endpoint up.
+    /// Two other sources of `CANCELED` exist:
+    ///
+    /// * A FORCE close. Velo issues every FORCE close itself, and it marks the
+    ///   endpoint retired, or it is shutting down, before the close.
+    /// * A failed RC queue pair, which flushes its outstanding GETs with
+    ///   `IBV_WC_WR_FLUSH_ERR` (`uct_ib_wc_to_ucs_status`). UCX purges them
+    ///   before or after the endpoint's error handler runs. Before: the peer
+    ///   is in `failed_peers` here. After: [`WorkerState::reap_failed_eps`]
+    ///   drops the record this took.
+    fn refused(&self, status: sys::ucs_status_t) -> bool {
+        status == sys::ucs_status_t_UCS_ERR_CANCELED
+            && !self.ep_retired.load(Ordering::Acquire)
+            && !self.shutdown_requested.load(Ordering::Acquire)
+            && !self.failed_peers.contains_key(&self.peer)
+    }
+
+    /// Record that the peer refused a GET, unless it is no longer registered
+    /// as the incarnation the GET went to.
+    ///
+    /// Insert first, then check: `unregister` removes the peer and then the
+    /// record. If the insert lands after that removal, this check sees the
+    /// peer gone and takes the record out again. Either way no record outlives
+    /// its peer.
+    fn record_refusal(&self) {
+        self.no_native_get.insert(self.peer, self.incarnation);
+        let registered = self
+            .peers
+            .get(&self.peer)
+            .is_some_and(|blob| blob.incarnation == self.incarnation);
+        if !registered {
+            self.no_native_get.remove_if(&self.peer, |_, incarnation| {
+                *incarnation == self.incarnation
+            });
+        }
     }
 
     /// Answer the caller, at most once. Also used by teardown for operations
@@ -1326,6 +1418,9 @@ struct EpEntry {
     /// which is the only reader, so with the reaper off (the default) a send
     /// pays only two `None` checks, plus one clock read per `ucp_ep_create`.
     sends: Option<Arc<EpSends>>,
+    /// Set just before velo closes this endpoint, so a GET the close cancels
+    /// is not taken for UCX refusing it (see [`RmaOpState::refused`]).
+    retired: Arc<AtomicBool>,
 }
 
 impl EpEntry {
@@ -1384,6 +1479,9 @@ struct PreparedGet {
     /// Carried through so the posted operation can name its peer for the idle
     /// reaper's in-flight check.
     peer: InstanceId,
+    /// The endpoint's incarnation and retired flag; see [`RmaOpState`].
+    incarnation: u64,
+    ep_retired: Arc<AtomicBool>,
 }
 
 struct WorkerState {
@@ -1474,13 +1572,14 @@ const RMA_DRAIN: Duration = Duration::from_secs(1);
 pub(crate) fn worker_main(args: WorkerArgs) {
     let WorkerArgs {
         config,
+        software_rma,
         ring_rx,
         shared,
         adapter,
         startup,
     } = args;
 
-    let state = match unsafe { init_ucx(&config, &shared, &adapter) } {
+    let state = match unsafe { init_ucx(&config, software_rma, &shared, &adapter) } {
         Ok((state, out)) => {
             let _ = startup.send(Ok(out));
             state
@@ -1520,6 +1619,53 @@ impl Drop for NativeInit {
     }
 }
 
+/// The oldest UCX release whose software GET obeys `PROTO_EMULATION_ENABLE=n`.
+///
+/// The vendored 1.22.0 does (`get_am.c` reads the flag). A system UCX linked
+/// with ucx-rs's `UCX_DIR` can be as old as 1.17, and 1.20 accepts the
+/// setting but still emulates a GET over tcp.
+const SOFTWARE_RMA_SWITCH_FLOOR: (u32, u32) = (1, 22);
+
+/// Whether software RMA was asked to be off: by velo's default, or by the
+/// environment, which wins.
+///
+/// The spellings are the ones UCX 1.22 itself reads as off: `n` and `no` in
+/// any case, `off` in lower case only, and `0`. UCX rejects any other value
+/// (`OFF`, `false`, a leading space) and the transport fails to start, so
+/// treating such a value as off would only misreport the warning.
+/// `documented_off_spellings_are_accepted_by_ucx` checks this list against
+/// UCX's own parser.
+fn software_rma_requested_off(software_rma: bool, env_switch: Option<&str>) -> bool {
+    match env_switch {
+        Some(value) => {
+            value.eq_ignore_ascii_case("n")
+                || value.eq_ignore_ascii_case("no")
+                || value == "off"
+                || value == "0"
+        }
+        None => !software_rma,
+    }
+}
+
+/// Whether UCX `major.minor` turns software RMA off when asked.
+fn software_rma_switch_applies(major: u32, minor: u32) -> bool {
+    (major, minor) >= SOFTWARE_RMA_SWITCH_FLOOR
+}
+
+/// Warn, once per process, that this UCX ignores the switch.
+fn warn_software_rma_still_on(major: u32, minor: u32, release: u32) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        let (floor_major, floor_minor) = SOFTWARE_RMA_SWITCH_FLOOR;
+        warn!(
+            "ucx: UCX {major}.{minor}.{release} ignores PROTO_EMULATION_ENABLE=n \
+             (it needs {floor_major}.{floor_minor} or later), so a GET over a tcp-only \
+             lane is still emulated in software, and a puller that goes away during \
+             one can abort the owner's process"
+        );
+    });
+}
+
 fn config_value(name: &str, value: &str) -> anyhow::Result<std::ffi::CString> {
     std::ffi::CString::new(value)
         .map_err(|_| anyhow::anyhow!("UCX {name} value contains a NUL byte"))
@@ -1528,6 +1674,7 @@ fn config_value(name: &str, value: &str) -> anyhow::Result<std::ffi::CString> {
 /// All UCX object creation, in one place. Runs once, on the progress thread.
 unsafe fn init_ucx(
     config: &UcxConfig,
+    software_rma: bool,
     shared: &Arc<WorkerShared>,
     adapter: &TransportAdapter,
 ) -> anyhow::Result<(WorkerState, StartupOut)> {
@@ -1555,6 +1702,27 @@ unsafe fn init_ucx(
                 let k = std::ffi::CString::new(key).unwrap();
                 let v = std::ffi::CString::new(value).unwrap();
                 let _ = sys::ucp_config_modify(ucp_cfg, k.as_ptr(), v.as_ptr());
+            }
+        }
+        // Software RMA is off: see the module docs. The environment wins here
+        // too, so `UCX_PROTO_EMULATION_ENABLE=y` turns it back on for a
+        // deployment that accepts the risk.
+        let env_switch = std::env::var("UCX_PROTO_EMULATION_ENABLE").ok();
+        if !software_rma && env_switch.is_none() {
+            let k = std::ffi::CString::new("PROTO_EMULATION_ENABLE").unwrap();
+            let v = std::ffi::CString::new("n").unwrap();
+            let st = sys::ucp_config_modify(ucp_cfg, k.as_ptr(), v.as_ptr());
+            anyhow::ensure!(
+                st == sys::ucs_status_t_UCS_OK,
+                "ucp_config_modify(PROTO_EMULATION_ENABLE=n): {}",
+                status_string(st)
+            );
+        }
+        if software_rma_requested_off(software_rma, env_switch.as_deref()) {
+            let (mut major, mut minor, mut release) = (0, 0, 0);
+            sys::ucp_get_version(&mut major, &mut minor, &mut release);
+            if !software_rma_switch_applies(major, minor) {
+                warn_software_rma_still_on(major, minor, release);
             }
         }
         if let Some(tls) = &config.tls
@@ -2223,6 +2391,7 @@ impl WorkerState {
                 incarnation: blob.incarnation,
                 last_used: self.now,
                 sends: sends.clone(),
+                retired: Arc::new(AtomicBool::new(false)),
             },
         );
         debug!("ucx: created endpoint to {peer}");
@@ -2277,6 +2446,11 @@ impl WorkerState {
             std::mem::take(&mut *guard)
         };
         for peer in peers {
+            // A GET the failure flushed can look like a refusal (see
+            // `RmaOpState::refused`), so the record is not trusted past a
+            // failure. A peer that really has no native GET is refused again
+            // on its next GET, at the cost of one more fallback.
+            self.shared.no_native_get.remove(&peer);
             if let Some(entry) = self.eps.remove(&peer) {
                 // The ep already failed: FORCE-close is the only close that
                 // cannot block on the dead peer.
@@ -2432,6 +2606,7 @@ impl WorkerState {
         // than coming through here. Every `EpEntry` passes through exactly one
         // of them, which is what keeps `eps_open` from drifting.
         self.shared.eps_open.fetch_sub(1, Ordering::Relaxed);
+        entry.retired.store(true, Ordering::Release);
         // SAFETY: worker/ep owned by this thread; err_arg was leaked at
         // creation and UCX will not call the handler after close is issued.
         unsafe {
@@ -2740,6 +2915,13 @@ impl WorkerState {
         let (ep, _) = self
             .ensure_ep(req.peer)
             .map_err(|e| RmaError::EndpointUnavailable(e.to_string()))?;
+        let (incarnation, ep_retired) = {
+            let entry = self
+                .eps
+                .get(&req.peer)
+                .ok_or_else(|| RmaError::EndpointUnavailable("no endpoint".into()))?;
+            (entry.incarnation, Arc::clone(&entry.retired))
+        };
 
         // Two distinct over-reads, contained two different ways.
         //
@@ -2793,6 +2975,8 @@ impl WorkerState {
             len: req.len as usize,
             region_id: req.local_region,
             peer: req.peer,
+            incarnation,
+            ep_retired,
         }))
     }
 
@@ -2814,6 +2998,12 @@ impl WorkerState {
         let op = Arc::new(RmaOpState {
             rkey: Mutex::new(Some(prepared.rkey as usize)),
             peer: prepared.peer,
+            incarnation: prepared.incarnation,
+            ep_retired: prepared.ep_retired,
+            shutdown_requested: Arc::clone(&self.shared.shutdown_requested),
+            failed_peers: Arc::clone(&self.shared.failed_peers),
+            no_native_get: Arc::clone(&self.shared.no_native_get),
+            peers: Arc::clone(&self.shared.peers),
             region_id: prepared.region_id,
             op_id,
             reply: Mutex::new(Some(reply)),
@@ -3058,6 +3248,7 @@ impl WorkerState {
                 self.close_ep_raw(entry, true);
                 continue;
             }
+            entry.retired.store(true, Ordering::Release);
             // SAFETY: worker/ep owned by this thread.
             let ptr = unsafe {
                 let param: sys::ucp_request_param_t = MaybeUninit::zeroed().assume_init();
@@ -3172,7 +3363,80 @@ pub(crate) type StartupSlot = OnceLock<StartupOut>;
 
 #[cfg(test)]
 mod initialization_tests {
-    use super::config_value;
+    use super::{config_value, software_rma_requested_off, software_rma_switch_applies};
+
+    /// velo reads an environment value as "software RMA off" exactly when UCX
+    /// accepts it for `PROTO_EMULATION_ENABLE`. Every candidate here is a
+    /// spelling of "off", so UCX accepting it means UCX turns emulation off.
+    /// If the two disagree, velo warns (or stays silent) for a setting UCX
+    /// does not apply the way velo thinks.
+    #[test]
+    fn documented_off_spellings_are_accepted_by_ucx() {
+        use ucx_rs::sys;
+
+        let mut config = std::ptr::null_mut();
+        // SAFETY: UCX initializes this valid output pointer with an owned config.
+        let status =
+            unsafe { sys::ucp_config_read(std::ptr::null(), std::ptr::null(), &mut config) };
+        assert_eq!(status, sys::ucs_status_t_UCS_OK);
+        let candidates = [
+            c"n", c"N", c"no", c"No", c"NO", c"off", c"Off", c"OFF", c"0", c"false", c" n",
+        ];
+        let results = candidates.map(|value| {
+            // SAFETY: the config is live and both strings are NUL-terminated.
+            let status = unsafe {
+                sys::ucp_config_modify(config, c"PROTO_EMULATION_ENABLE".as_ptr(), value.as_ptr())
+            };
+            (value, status == sys::ucs_status_t_UCS_OK)
+        });
+        // SAFETY: this test owns the config and no context uses it.
+        unsafe { sys::ucp_config_release(config) };
+        for (value, ucx_accepts) in results {
+            let text = value.to_str().expect("ASCII candidate");
+            assert_eq!(
+                software_rma_requested_off(true, Some(text)),
+                ucx_accepts,
+                "velo and UCX disagree on {text:?} (UCX accepts it: {ucx_accepts})"
+            );
+        }
+    }
+
+    /// The environment wins over velo's default, as for every `UCX_*`
+    /// setting, so an operator's `n` must also lead to the version check.
+    #[test]
+    fn software_rma_is_requested_off_by_default_or_by_the_environment() {
+        assert!(software_rma_requested_off(false, None));
+        assert!(!software_rma_requested_off(true, None));
+        for off in ["n", "N", "no", "NO", "off", "0"] {
+            assert!(software_rma_requested_off(true, Some(off)), "{off}");
+            assert!(software_rma_requested_off(false, Some(off)), "{off}");
+        }
+        for on in ["y", "yes", "1"] {
+            assert!(!software_rma_requested_off(false, Some(on)), "{on}");
+        }
+        // UCX rejects these, and then the transport fails to start; velo must
+        // not read them as off.
+        for rejected in ["OFF", "Off", "false", " n"] {
+            assert!(
+                !software_rma_requested_off(true, Some(rejected)),
+                "{rejected}"
+            );
+        }
+    }
+
+    /// The floor under which velo warns that software GET is still on. UCX
+    /// 1.20 accepts `PROTO_EMULATION_ENABLE=n` and still emulates a GET over
+    /// tcp; the vendored 1.22.0 refuses it. The release number plays no part.
+    #[test]
+    fn the_software_rma_switch_needs_ucx_1_22() {
+        assert!(!software_rma_switch_applies(1, 17));
+        assert!(!software_rma_switch_applies(1, 20));
+        assert!(!software_rma_switch_applies(1, 21));
+        assert!(software_rma_switch_applies(1, 22));
+        assert!(software_rma_switch_applies(1, 23));
+        assert!(software_rma_switch_applies(2, 0));
+        assert!(!software_rma_switch_applies(0, 99));
+    }
 
     #[test]
     fn configuration_strings_reject_nul_with_context() {

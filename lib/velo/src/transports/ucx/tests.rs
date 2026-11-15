@@ -150,18 +150,89 @@ async fn start_node_with(
     .await
 }
 
+/// The opt-in to UCX's software RMA, for a test whose GET must run over the
+/// tcp lane.
+///
+/// Velo leaves the emulation off: in UCX 1.22 an owner serving a software GET
+/// aborts when its puller goes away during the reply (see
+/// `an_owner_survives_a_puller_that_vanishes_mid_get`). CI has no RDMA
+/// hardware, so every test here that needs a GET to run turns it back on, and
+/// that UCX abort is the known reason such a test can fail under load. Only
+/// the puller's setting decides whether a GET is emulated.
+fn software_rma(builder: UcxTransportBuilder) -> UcxTransportBuilder {
+    builder.allow_software_rma(true)
+}
+
+/// An explicit disable still needs the warning when UCX ignores the switch.
+///
+/// On the vendored UCX 1.22 it checks that no warning is logged; on a system
+/// UCX older than 1.22 (`UCX_DIR`), that exactly one is, whether velo or the
+/// environment turned software RMA off.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_software_rma_disable_keeps_the_ucx_version_warning() {
+    const CHILD: &str = "VELO_UCX_VERSION_WARNING_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .without_time()
+            .with_writer(std::io::stderr)
+            .init();
+        for _ in 0..2 {
+            let node = start_node().await;
+            node.transport.shutdown();
+        }
+        return;
+    }
+
+    let (mut major, mut minor, mut release) = (0, 0, 0);
+    // SAFETY: UCX writes its version into these three valid output pointers.
+    unsafe { ucx_rs::sys::ucp_get_version(&mut major, &mut minor, &mut release) };
+    let expected = usize::from((major, minor) < (1, 22));
+    let warning = format!("UCX {major}.{minor}.{release} ignores PROTO_EMULATION_ENABLE=n");
+    for explicit in [false, true] {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "--exact",
+                "transports::ucx::transport::tests::an_explicit_software_rma_disable_keeps_the_ucx_version_warning",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .env("UCX_TLS", "tcp")
+            .env_remove("UCX_PROTO_EMULATION_ENABLE");
+        if explicit {
+            child.env("UCX_PROTO_EMULATION_ENABLE", "n");
+        }
+        let output = child.output().expect("run the warning check in isolation");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "warning check child failed: {}\n{stderr}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            stderr.matches(&warning).count(),
+            expected,
+            "UCX {major}.{minor}.{release}: expected one warning across two starts on UCX older than 1.22, whether the disable is explicit or default; explicit={explicit}\n{stderr}"
+        );
+    }
+}
+
 /// A node built from a [`UcxConfig`] directly, bypassing the builder.
 ///
 /// The one thing this can do that [`start_node_with`] cannot is set an idle
 /// timeout below `MIN_EP_IDLE_TIMEOUT`. That floor is a builder-level ergonomic
 /// guard sized to dominate endpoint wireup, not an invariant of the reaper, and
 /// a test isolating the reaper from transfer timing needs to go under it.
+///
+/// Its one caller GETs over the tcp lane, so the node opts in to software RMA
+/// as [`software_rma`] does.
 async fn start_node_with_config(config: UcxConfig) -> Node {
-    start_transport(Arc::new(UcxTransport::new(
-        velo_ext::TransportKey::from("ucx"),
-        config,
-    )))
-    .await
+    let mut transport = UcxTransport::new(velo_ext::TransportKey::from("ucx"), config);
+    transport.software_rma = true;
+    start_transport(Arc::new(transport)).await
 }
 
 async fn start_transport(transport: Arc<UcxTransport>) -> Node {
@@ -655,9 +726,18 @@ struct RmaPair {
     puller_rma: RdmaEndpoint,
 }
 
+/// Two nodes that GET from each other over the tcp lane, with software RMA on
+/// (see [`software_rma`]).
 async fn start_rma_pair() -> RmaPair {
-    let owner = start_node().await;
-    let puller = start_node().await;
+    start_rma_pair_with(software_rma).await
+}
+
+/// Two cross-registered nodes, both built with `configure`.
+async fn start_rma_pair_with(
+    configure: impl Fn(UcxTransportBuilder) -> UcxTransportBuilder,
+) -> RmaPair {
+    let owner = start_node_with(&configure).await;
+    let puller = start_node_with(&configure).await;
     cross_register(&owner, &puller);
     let owner_rma = owner.transport.rdma_endpoint();
     let puller_rma = puller.transport.rdma_endpoint();
@@ -841,6 +921,210 @@ async fn map_get_roundtrip() {
         .await
         .expect("unmap source");
     pair.owner.transport.shutdown();
+    pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
+}
+
+/// Over a tcp-only lane UCX has no GET in hardware. It can only emulate one in
+/// software, and then the owner's progress thread serves the read. UCX 1.22
+/// can abort the owner's process in that code when the puller goes away (see
+/// `an_owner_survives_a_puller_that_vanishes_mid_get`), so velo turns the
+/// emulation off.
+///
+/// The GET is then refused before any request reaches the owner, and the
+/// endpoint stays usable for frames. The rendezvous layer above takes the
+/// refusal as its cue to move the bytes over the chunked path
+/// (`a_tcp_only_lane_moves_the_payload_chunked` in `tests/rendezvous_rdma.rs`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_get_over_a_tcp_only_lane_is_refused_not_emulated() {
+    const LEN: usize = 64 * 1024;
+    let mut src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    src.fill_pattern();
+
+    // Default nodes: nothing here asks for software RMA.
+    let pair = start_rma_pair_with(|b| b).await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+
+    let outcome = tokio::time::timeout(
+        T,
+        pair.puller_rma
+            .get(get_request(&pair, &src, &remote, &local)),
+    )
+    .await
+    .expect("a refused GET must resolve, not hang");
+    assert!(
+        matches!(outcome, Err(RmaError::NoNativeGet)),
+        "a GET over a tcp-only lane must be refused, not emulated in software: {outcome:?}"
+    );
+    // Remembered for the peer, so the rendezvous layer stops offering RDMA.
+    assert!(pair.puller_rma.refuses_get(pair.owner.instance_id));
+    assert!(!pair.owner_rma.refuses_get(pair.puller.instance_id));
+    assert!(
+        dst.as_slice().iter().all(|&b| b == 0),
+        "a refused GET must not have written the destination"
+    );
+
+    // The refusal does not fail the endpoint: frames still flow on it.
+    let errs = CountingErrors::new();
+    ping_message(&pair.puller, &pair.owner, &errs).await;
+    assert_eq!(errs.count.load(Ordering::SeqCst), 0);
+
+    pair.puller_rma.unmap_region(local.region_id).await.unwrap();
+    pair.owner_rma.unmap_region(remote.region_id).await.unwrap();
+    pair.owner.transport.shutdown();
+    pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
+}
+
+/// An unregistered peer takes its refusal record with it, so peer churn
+/// cannot grow the records without bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn unregister_reclaims_a_peers_get_refusal() {
+    const LEN: usize = 64 * 1024;
+    const PEERS: usize = 8;
+    let src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    let pair = start_rma_pair_with(|b| b).await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+
+    for index in 0..PEERS {
+        let peer = if index == 0 {
+            pair.owner.instance_id
+        } else {
+            InstanceId::new_v4()
+        };
+        pair.puller
+            .transport
+            .register(PeerInfo::new(peer, pair.owner.transport.address()))
+            .unwrap();
+        let mut req = get_request(&pair, &src, &remote, &local);
+        req.peer = peer;
+        let outcome = tokio::time::timeout(T, pair.puller_rma.get(req))
+            .await
+            .expect("the GET must resolve");
+        assert!(matches!(outcome, Err(RmaError::NoNativeGet)), "{outcome:?}");
+        assert!(pair.puller_rma.refuses_get(peer));
+
+        pair.puller.transport.unregister(peer);
+        assert!(
+            wait_until(T, || eps_open(&pair.puller) == 0).await,
+            "unregister must retire the endpoint"
+        );
+        assert!(!pair.puller_rma.refuses_get(peer));
+        assert!(pair.puller.transport.shared.peers.is_empty());
+    }
+
+    let retained = pair.puller.transport.shared.no_native_get.len();
+    pair.puller_rma.unmap_region(local.region_id).await.unwrap();
+    pair.owner_rma.unmap_region(remote.region_id).await.unwrap();
+    pair.owner.transport.shutdown();
+    pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
+    assert_eq!(
+        retained, 0,
+        "{PEERS} unregistered peers left {retained} refusal records in a live transport"
+    );
+}
+
+/// A GET already preparing during unregister must not recreate its memo.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unregister_outlives_a_get_already_preparing_its_endpoint() {
+    const LEN: usize = 64 * 1024;
+    let src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    let pair = start_rma_pair_with(|b| b).await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+    let shared = &pair.puller.transport.shared;
+    let hold = hold_at(&shared.progress_hold, &shared.progress_held, "the puller").await;
+    shared.ep_create_delay_ms.store(1000, Ordering::Relaxed);
+    let passes = shared.progress_passes.load(Ordering::Relaxed);
+    let mut get = Box::pin(
+        pair.puller_rma
+            .get(get_request(&pair, &src, &remote, &local)),
+    );
+    assert!(futures::poll!(get.as_mut()).is_pending());
+    drop(hold);
+    assert!(
+        wait_until(T, || shared.progress_passes.load(Ordering::Relaxed)
+            > passes)
+        .await
+    );
+    // Let the cold endpoint enter the injected one-second creation delay.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(futures::poll!(get.as_mut()).is_pending());
+    assert_eq!(eps_open(&pair.puller), 0);
+    pair.puller.transport.unregister(pair.owner.instance_id);
+    let outcome = tokio::time::timeout(T, get)
+        .await
+        .expect("the GET must resolve");
+    assert!(wait_until(T, || eps_open(&pair.puller) == 0).await);
+    let retained = shared.no_native_get.len();
+    let registered = shared.peers.len();
+
+    pair.puller_rma.unmap_region(local.region_id).await.unwrap();
+    pair.owner_rma.unmap_region(remote.region_id).await.unwrap();
+    pair.owner.transport.shutdown();
+    pair.puller.transport.shutdown();
+    assert_pair_balanced(&pair);
+    assert!(outcome.is_err(), "the GET must fail: {outcome:?}");
+    assert_eq!(registered, 0);
+    assert_eq!(
+        retained, 0,
+        "a late GET refusal recreated an unregistered peer's memo after {outcome:?}"
+    );
+}
+
+/// A refusal record lapses when the peer's endpoint fails.
+///
+/// The record must hold only a real refusal. On an RC lane, a queue pair that
+/// fails flushes its outstanding work with `IBV_WC_WR_FLUSH_ERR`, which UCX
+/// reports as `UCS_ERR_CANCELED` (`uct_ib_wc_to_ucs_status`), and it can
+/// purge the GETs before the endpoint's error handler runs. Such a GET looks
+/// like a refusal, so a record taken then would keep a peer with GET in
+/// hardware on the chunked path. A failed endpoint therefore drops its peer's
+/// record. Over tcp the same reap path runs when the peer goes away, which is
+/// what this drives.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failed_endpoint_drops_its_peers_get_refusal() {
+    const LEN: usize = 64 * 1024;
+    let src = PageBuf::new(LEN);
+    let dst = PageBuf::new(LEN);
+    let pair = start_rma_pair_with(|b| b).await;
+    let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
+    let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+    let outcome = pair
+        .puller_rma
+        .get(get_request(&pair, &src, &remote, &local))
+        .await;
+    assert!(matches!(outcome, Err(RmaError::NoNativeGet)), "{outcome:?}");
+    assert!(pair.puller_rma.refuses_get(pair.owner.instance_id));
+    pair.owner_rma.unmap_region(remote.region_id).await.unwrap();
+
+    // The owner goes away; frames to it fail the puller's endpoint.
+    pair.owner.transport.shutdown();
+    let errs = CountingErrors::new();
+    let failed = wait_until(T, || {
+        let _ = pair.puller.transport.send_message(
+            pair.owner.instance_id,
+            Bytes::from_static(b"h"),
+            Bytes::from_static(b"p"),
+            MessageType::Message,
+            errs.clone(),
+        );
+        !pair.puller_rma.refuses_get(pair.owner.instance_id)
+    })
+    .await;
+    assert!(
+        failed,
+        "the refusal record outlived the failed endpoint (failed_peers: {})",
+        pair.puller.transport.shared.failed_peers.len()
+    );
+
+    pair.puller_rma.unmap_region(local.region_id).await.unwrap();
     pair.puller.transport.shutdown();
     assert_pair_balanced(&pair);
 }
@@ -1240,7 +1524,7 @@ async fn shutdown_with_inflight_get() {
 /// a child process, which exits as soon as the puller has been checked.
 #[test]
 fn shutdown_cancels_a_get_its_peer_stopped_answering() {
-    let (status, output) = run_child_test("rma_teardown_child");
+    let (status, output) = run_child_test("rma_teardown_child", &[]);
     assert!(
         status.success() && output.contains(RMA_TEARDOWN_CHECKED),
         "the child test failed ({status}):\n{output}"
@@ -1325,7 +1609,7 @@ const CHILD_TEST: &str = "VELO_UCX_CHILD_TEST";
 /// return its exit status and output. For scenarios that can abort the
 /// process: the abort then fails one test instead of killing every test in
 /// the binary.
-fn run_child_test(name: &str) -> (std::process::ExitStatus, String) {
+fn run_child_test(name: &str, envs: &[(&str, &str)]) -> (std::process::ExitStatus, String) {
     let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
         .args([
             "--exact",
@@ -1335,6 +1619,7 @@ fn run_child_test(name: &str) -> (std::process::ExitStatus, String) {
         ])
         .env(CHILD_TEST, "1")
         .env("UCX_TLS", "tcp")
+        .envs(envs.iter().copied())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -1372,74 +1657,122 @@ fn run_child_test(name: &str) -> (std::process::ExitStatus, String) {
     (status, output)
 }
 
-/// An owner must survive a puller that goes away after sending a GET request
-/// the owner has not served yet.
+/// An owner must survive a puller that goes away while the owner still has to
+/// answer its GET.
 ///
-/// It does not, in UCX 1.22: the owner's software-GET handler
-/// (`ucp_get_req_handler`) sends the reply on an endpoint that has already
-/// failed. `ucp_progress_get_reply` returns the failure status, and
-/// `ucp_request_try_send` (`ucp_request.inl:356`) calls `ucs_fatal` on any
-/// status but `OK`, `INPROGRESS` and `NO_RESOURCE`:
-/// "Fatal: unexpected error: Endpoint timeout", and the process aborts. A
-/// puller that crashes reaches it as surely as one that shuts down, so no
-/// teardown order in velo avoids it. Only the tcp lane emulates GET in
-/// software; an offloaded GET does not involve the owner's CPU.
+/// With software RMA on, it does not, in UCX 1.22 (see
+/// `software_get_aborts_an_owner_whose_puller_vanishes`). With it off, which
+/// is velo's default, a GET over the tcp lane is refused on the puller's side
+/// before any request reaches the owner, so the owner has nothing to serve.
+/// The child checks that both GETs were refused, and that the owner keeps
+/// making progress after the puller is gone.
 ///
-/// The scenario runs in a child process, so the abort fails this test instead
-/// of killing the test binary. Under load the same thing can abort
-/// `shutdown_with_inflight_get` and `shutdown_resolves_parked_unmap_and_get`,
-/// which shut the owner down right after the puller.
+/// The scenario runs in a child process, so an abort fails this test instead
+/// of killing the test binary.
 #[test]
-#[ignore = "UCX 1.22 aborts the owner: ucp_progress_get_reply passes a failed endpoint's status to ucp_request_try_send, which calls ucs_fatal"]
 fn an_owner_survives_a_puller_that_vanishes_mid_get() {
-    let (status, output) = run_child_test("owner_abort_child");
+    let (status, output) = run_child_test("owner_abort_child", &[]);
     assert!(
-        status.success() && output.contains("1 passed"),
+        status.success() && output.contains(OWNER_SURVIVED),
         "the owner did not survive ({status}):\n{output}"
     );
 }
 
-/// The child half of `an_owner_survives_a_puller_that_vanishes_mid_get`. Does
-/// nothing unless that test started it.
+/// The control for `an_owner_survives_a_puller_that_vanishes_mid_get`: the
+/// same scenario with software RMA turned back on through the environment,
+/// as a deployment could, aborts the owner.
+///
+/// The owner's software-GET handler (`ucp_get_req_handler`) sends the reply on
+/// an endpoint that has already failed. `ucp_progress_get_reply` returns the
+/// failure status, and `ucp_request_try_send` (`ucp_request.inl:356`) calls
+/// `ucs_fatal` on any status but `OK`, `INPROGRESS` and `NO_RESOURCE`:
+/// "Fatal: unexpected error: Endpoint timeout". A puller that crashes reaches
+/// it as surely as one that shuts down, so no teardown order in velo avoids
+/// it. A second site, an assertion in `uct_tcp_ep_pending_purge`, aborts the
+/// owner when UCX discards its endpoint with replies still queued.
+///
+/// This test fails once a UCX release handles both sites. Then software RMA
+/// can be reconsidered.
+#[test]
+fn software_get_aborts_an_owner_whose_puller_vanishes() {
+    let (status, output) =
+        run_child_test("owner_abort_child", &[("UCX_PROTO_EMULATION_ENABLE", "y")]);
+    assert_eq!(
+        std::os::unix::process::ExitStatusExt::signal(&status),
+        Some(SIGABRT),
+        "with software GET on, UCX 1.22 aborts the owner; did UCX change? ({status}):\n{output}"
+    );
+}
+
+/// `SIGABRT` on Linux, the signal `ucs_fatal` and a failed UCX assertion end
+/// the process with.
+const SIGABRT: i32 = 6;
+
+/// Printed by `owner_abort_child` once the owner has outlived the puller.
+const OWNER_SURVIVED: &str = "owner survived the puller";
+
+/// The child half of `an_owner_survives_a_puller_that_vanishes_mid_get` and of
+/// its control. Does nothing unless one of them started it.
 #[tokio::test(flavor = "multi_thread")]
 async fn owner_abort_child() {
     if std::env::var_os(CHILD_TEST).is_none() {
         return;
     }
+    // The control sets this; velo then leaves software RMA on.
+    let software_get = std::env::var("UCX_PROTO_EMULATION_ENABLE").is_ok_and(|v| v == "y");
     const LEN: usize = 32 * 1024 * 1024;
     let mut src = PageBuf::new(LEN);
     let dst = PageBuf::new(LEN);
     src.fill_pattern();
 
-    let pair = start_rma_pair().await;
+    // Velo's defaults: no builder opt-in.
+    let pair = start_rma_pair_with(|b| b).await;
     let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
     let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
     let mut warm_up = get_request(&pair, &src, &remote, &local);
     warm_up.len = 4096;
-    pair.puller_rma.get(warm_up).await.expect("warm-up get");
+    let warmed = pair.puller_rma.get(warm_up).await;
+    if software_get {
+        warmed.expect("warm-up get");
+    } else {
+        assert!(
+            matches!(warmed, Err(RmaError::NoNativeGet)),
+            "the warm-up GET was not refused: {warmed:?}"
+        );
+    }
 
-    // The owner takes nothing until the puller is gone, so the GET request
-    // waits in its socket.
+    // The owner takes nothing until the puller is gone, so a GET request
+    // would wait in its socket.
     let owner = &pair.owner.transport.shared;
     let owner_hold = hold_at(&owner.progress_hold, &owner.progress_held, "the owner").await;
     let endpoint = pair.puller_rma.clone();
     let req = get_request(&pair, &src, &remote, &local);
     let get = tokio::spawn(async move { endpoint.get(req).await });
-    assert!(
-        wait_until(T, || pair
-            .puller
-            .transport
-            .shared
-            .inflight_ops
-            .load(Ordering::SeqCst)
-            >= 1)
-        .await,
-        "the GET must be posted before shutdown"
-    );
+    if software_get {
+        assert!(
+            wait_until(T, || pair
+                .puller
+                .transport
+                .shared
+                .inflight_ops
+                .load(Ordering::SeqCst)
+                >= 1)
+            .await,
+            "the GET must be posted before shutdown"
+        );
+    } else {
+        let refused = tokio::time::timeout(T, get)
+            .await
+            .expect("a refused GET must resolve")
+            .expect("get task");
+        assert!(
+            matches!(refused, Err(RmaError::NoNativeGet)),
+            "the GET was not refused: {refused:?}"
+        );
+    }
     pair.puller.transport.shutdown();
-    let _ = tokio::time::timeout(T, get).await;
 
-    // Now the owner reads the request and the puller's departure together.
+    // Now the owner reads whatever the puller sent, and its departure.
     let passes = owner.progress_passes.load(Ordering::Relaxed);
     drop(owner_hold);
     assert!(
@@ -1449,6 +1782,7 @@ async fn owner_abort_child() {
         "the owner stopped making progress"
     );
     pair.owner.transport.shutdown();
+    println!("{OWNER_SURVIVED}");
 }
 
 /// The progress thread's own validation, reached directly.
@@ -3239,7 +3573,7 @@ async fn an_rma_get_slower_than_the_timeout_restarts_the_idle_clock() {
     let dst = PageBuf::new(LEN);
     src.fill_pattern();
 
-    let puller = start_node_with(|b| b.ep_idle_timeout(Some(TIMEOUT))).await;
+    let puller = start_node_with(|b| software_rma(b).ep_idle_timeout(Some(TIMEOUT))).await;
     let owner = start_node().await;
     cross_register(&puller, &owner);
     let owner_rma = owner.transport.rdma_endpoint();
