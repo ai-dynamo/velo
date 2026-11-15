@@ -83,13 +83,42 @@ Another wake can reach the task first: a heartbeat, a credit reply, or a timer. 
 
 Test: `block_in_place_keeps_the_stream` is the live test of the workaround, and `a_held_worker_thread_cuts_the_stream` is the ignored demonstration of the stall (`lib/velo/tests/streaming/held_thread.rs`).
 
+## A gauge set from a count read in a separate step can go stale
+
+**Rule.** Do not set a gauge to a count that you read in a step apart from
+the change to that count. Move the gauge with `inc()` and `dec()` where the
+count changes, or set it under the lock that orders the changes.
+
+Two threads can each change the count and then set the gauge. The thread
+that read the older count can set it last. The gauge then holds a value
+that is not true, and keeps it until the next change, which may not come
+for a long time once a burst ends. An `inc()` or `dec()` is one atomic step
+on the gauge, so no older value can land last.
+
+**Failure.** The messenger set `velo_messenger_pending_responses` from the
+value that its `fetch_add` or `fetch_sub` returned. With sends and drops at
+the same time, it read 1 with every awaiter dropped, or 2 with one slot
+held. The rendezvous store set `velo_rendezvous_active_slots` from
+`DashMap::len()` after a free, and two frees at once could set their
+lengths in either order.
+
+**Test.** Line threads up with a `std::sync::Barrier`, so that their changes
+overlap. Then read the gauge while every thread waits at the next barrier,
+and compare it with the true count. Run many rounds in one test, because
+the window is a few instructions wide. Set from a count, both tests below
+failed in under 2,000 rounds on every run.
+
+Tests: `messenger::common::pending_gauge_tests::concurrent_drops_leave_the_gauge_at_zero`
+(`lib/velo/src/messenger/common/pending_gauge_tests.rs`) and
+`rendezvous::active_slots_tests::concurrent_frees_leave_the_gauge_at_zero`
+(`lib/velo/src/rendezvous/active_slots_tests.rs`).
+
 ## A cancel wakes child tokens before the parent's own waiters
 
 **Rule.** A task on a child token wakes before a task on the parent token.
 When you move a task to a child token, check what other tasks stop on the same
-cancel, and keep the wake order they had. If one task must act before another
-stops, do not rely on the wake order. Make the second task wait on a token
-that the first task cancels after it acts.
+cancel, and keep the wake order they had. If one task must wake before another,
+put the second one on a child of the first one's token.
 
 `CancellationToken::cancel` (tokio-util 0.7) wakes the waiters of each child
 token before the waiters of the token itself. It moves a child's own children
@@ -99,26 +128,27 @@ time a loop moves to a child token.
 
 A wake order is not a run order. On a current-thread runtime, tasks run in the
 order they woke. On a multi-thread runtime, a task that woke second can run
-first. Child-token nesting orders only the wakes. Keep the second task's token
-out of reach of the shared cancel, so that only the first task can cancel it.
+first. When the order must hold there too, make the second task wait for the
+first one, for example on a token that the first one cancels when it is done.
 
-**Failure.** At teardown the QUIC listener must close each connection before
-its stream readers drop their streams. A stream dropped on an open connection
-sends STOP_SENDING, and the dialer reads that as frames left unread and warns
-on every peer restart. When the readers stopped on the teardown token, a
-reader could run before the connection task on a multi-thread runtime, even
-when it woke second. Now the connection task calls `close()` and then cancels
-a token of its own, and the readers stop only on that token.
+**Failure.** The QUIC listener's stream readers wait on a child token. As
+children of the node-wide teardown token, they woke before the connection
+task. A reader dropped its stream first, and the peer got a STOP_SENDING
+instead of the connection close. The dialer reads that as frames left unread,
+and warns on every peer restart. The readers' tokens are now children of the
+connection task's token, so the connection task wakes first, as it did when
+all of them waited on the node-wide token. On a multi-thread runtime a reader
+can still run first, then and now: this keeps the old order, and does not make
+it certain.
 
-**Test.** Cancel the shared token, and do not poll the task that must act
-first. Check that the peer sees nothing from the second task. Then poll the
-first task to the end, and check that the peer sees its action. This order is
-the worst one a scheduler can choose, so the test fails on every run while the
-order is only likely. A loop of the plain test on two workers fails only about
-1 run in 100.
+**Test.** Use a current-thread runtime, where the wake order is the run
+order. Hold the cancel at the point between the two wakes: build your own child token before
+the code under test starts, so the cancel reaches it last, and poll it with a
+waker that blocks until the test releases it. Then check what the peer sees
+while the cancel is held.
 
-Test: `transports::quic::listener::tests::teardown_stops_no_stream_before_the_connection_task_closes`
-(`lib/velo/src/transports/quic/listener.rs`).
+Test: `transports::quic::transport::tests::teardown_closes_the_connection_before_child_readers_stop_streams`
+(`lib/velo/src/transports/quic/tests.rs`).
 
 ## A peer's close does not mean its frames were read
 

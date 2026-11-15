@@ -8,8 +8,8 @@
 //!   end-to-end so transport corruption shows up as a hard failure.
 //! - **R3** refcount fuzz: many concurrent ref / detach / release on a small
 //!   slot pool. Asserts no slot is freed while refcount > 0.
-//! - **R4** gauge accuracy under churn: track outstanding handles ourselves and
-//!   bound `velo_rendezvous_active_slots` against it.
+//! - **R4** gauge accuracy under churn: `velo_rendezvous_active_slots` returns
+//!   to 0 once every handle is released.
 //!
 //! Faults:
 //! - **F1r** consumer disconnect mid-pull: drop the consumer Velo while
@@ -17,19 +17,11 @@
 //! - **F2r** owner death between metadata and pull: drop the owner Velo;
 //!   consumer's `get()` must error cleanly, no panics.
 //!
-//! ## Known runtime issue surfaced by this harness
-//!
-//! The `_rv_release` AM handler at `lib/velo/src/rendezvous/handlers.rs:147`
-//! does not update `velo_rendezvous_active_slots` after freeing a slot. The
-//! local fast-path at `lib/velo/src/rendezvous.rs:348` does. So the gauge is
-//! monotone-up-only when a remote consumer drives release, even though the
-//! underlying `DataStore` correctly drops the slot. The scenarios below assert
-//! correctness via the oracle's own `sent`/`received` counters; the gauge
-//! check is left as a "best effort" so this harness becomes a regression
-//! signal once the gauge bug is fixed.
+//! The owner frees a slot in its `_rv_release` handler, which runs after the
+//! consumer's `release` returns, so the gauge checks wait for it to settle.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -108,13 +100,8 @@ pub async fn run_r1_inline(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
         oracle.inc_received();
     }
 
-    let snap = snapshot(&pair.server.registry);
-    let active = rendezvous_active_slots(&snap);
-    let note = if active == 0.0 {
-        format!("{cycles} inline cycles, slots back to 0")
-    } else {
-        format!("{cycles} inline cycles, active_slots={active} (known gauge bug, see file docs)")
-    };
+    slots_settle_to_zero(&pair.server.registry).await?;
+    let note = format!("{cycles} inline cycles, slots back to 0");
 
     drop(pair);
     Ok(ScenarioReport::from_oracle(
@@ -238,6 +225,22 @@ pub async fn run_r3_refcount(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     ))
 }
 
+/// Wait up to 5 s for the owner's `velo_rendezvous_active_slots` to read 0,
+/// once every handle has been released.
+async fn slots_settle_to_zero(registry: &prometheus::Registry) -> Result<()> {
+    settle_until(Duration::from_secs(5), Duration::from_millis(20), || {
+        let active = rendezvous_active_slots(&snapshot(registry));
+        if active == 0.0 {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "velo_rendezvous_active_slots={active} with every handle released"
+            ))
+        }
+    })
+    .await
+}
+
 // ---------------------------------------------------------------------------
 // R4 — gauge accuracy
 // ---------------------------------------------------------------------------
@@ -250,19 +253,14 @@ pub async fn run_r4_gauge(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
     let owner = pair.server.velo.clone();
     let consumer = pair.client.velo.clone();
 
-    // The owner-side gauge update is broken on the AM-driven release path
-    // (see file-level docs). Until that's fixed we can't strictly assert
-    // "gauge ≤ outstanding" without false positives — instead we walk the
-    // cycles and report peak observed gauge for diagnostics.
-    let outstanding = Arc::new(AtomicU64::new(0));
+    // The peak is for diagnostics: a release frees its slot on the owner
+    // after `release` returns, so a sample can count slots still in flight.
     let cycles = ctx.tier.budget().rendezvous_cycles;
     let mut peak_active: f64 = 0.0;
     for i in 0..cycles {
         let h = owner.register_data(make_payload(256, i as u32));
-        outstanding.fetch_add(1, Ordering::AcqRel);
         let (_, lease) = consumer.get(h).await?;
         consumer.release(h, lease).await?;
-        outstanding.fetch_sub(1, Ordering::AcqRel);
         oracle.inc_sent();
         oracle.inc_received();
         if i.is_multiple_of(64) {
@@ -270,6 +268,7 @@ pub async fn run_r4_gauge(ctx: &ScenarioCtx) -> Result<ScenarioReport> {
             peak_active = peak_active.max(rendezvous_active_slots(&snap));
         }
     }
+    slots_settle_to_zero(&pair.server.registry).await?;
 
     drop(pair);
     Ok(ScenarioReport::from_oracle(
