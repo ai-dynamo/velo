@@ -1534,6 +1534,18 @@ async fn closed_releases_running_listener() {
     );
 }
 
+/// Run with `/proc` hidden to reproduce hosts without procfs.
+#[test]
+#[ignore = "F1: close tests panic when /proc/self/fd is absent"]
+fn close_checks_without_procfs() {
+    assert!(
+        !std::path::Path::new("/proc/self/fd").exists(),
+        "run on macOS or in a mount namespace with /proc hidden"
+    );
+    closed_releases_listener_before_returning();
+    closed_releases_running_listener();
+}
+
 /// Teardown while the first connection is still dialing keeps the dial, and so
 /// the frames queued behind it, until the teardown deadline. Those frames were
 /// admitted, and a sender may already act on that (the messenger mux reports a
