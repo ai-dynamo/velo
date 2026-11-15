@@ -3356,6 +3356,35 @@ pub(crate) type StartupSlot = OnceLock<StartupOut>;
 mod initialization_tests {
     use super::{config_value, software_rma_requested_off, software_rma_switch_applies};
 
+    /// UCX accepts the off spellings described by `software_rma_requested_off`.
+    #[test]
+    #[ignore = "F7: UCX 1.22 rejects OFF although the new comment says off is accepted in any case"]
+    fn documented_off_spellings_are_accepted_by_ucx() {
+        use ucx_rs::sys;
+
+        let mut config = std::ptr::null_mut();
+        // SAFETY: UCX initializes this valid output pointer with an owned config.
+        let status =
+            unsafe { sys::ucp_config_read(std::ptr::null(), std::ptr::null(), &mut config) };
+        assert_eq!(status, sys::ucs_status_t_UCS_OK);
+        let results = [c"n", c"N", c"no", c"NO", c"off", c"OFF", c"0"].map(|value| {
+            // SAFETY: the config is live and both strings are NUL-terminated.
+            let status = unsafe {
+                sys::ucp_config_modify(config, c"PROTO_EMULATION_ENABLE".as_ptr(), value.as_ptr())
+            };
+            (value, status)
+        });
+        // SAFETY: this test owns the config and no context uses it.
+        unsafe { sys::ucp_config_release(config) };
+        for (value, status) in results {
+            assert_eq!(
+                status,
+                sys::ucs_status_t_UCS_OK,
+                "UCX rejects the documented boolean spelling {value:?}"
+            );
+        }
+    }
+
     /// The environment wins over velo's default, as for every `UCX_*`
     /// setting, so an operator's `n` must also lead to the version check.
     #[test]
