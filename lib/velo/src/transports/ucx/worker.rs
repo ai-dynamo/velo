@@ -72,11 +72,22 @@
 //!   `UCS_ERR_CANCELED`.
 //!
 //! The worker-lifetime requirement holds even on the one path where a callback
-//! fires from *inside* `ucp_worker_destroy`: that function drives purges
-//! (`ucp_worker_discard_uct_ep_cleanup`, `ucp_worker_destroy_eps`, lines
-//! 3053-3055) well before `ucp_worker_destroy_mpools` tears down `rkey_mp`
-//! (`ucp_worker.c:2129`). So the rkey outlives no endpoint and precedes no
-//! mpool, whichever path completes it.
+//! fires from *inside* `ucp_worker_destroy`: a FORCE close whose lane discard
+//! has not finished is completed by `ucp_worker_discard_uct_ep_cleanup`, and
+//! its completion purges the endpoint's requests, well before
+//! `ucp_worker_destroy_mpools` tears down `rkey_mp` (`ucp_worker.c:2129`). So
+//! the rkey outlives no endpoint and precedes no mpool, whichever path
+//! completes it.
+//!
+//! What `ucp_worker_destroy` does **not** do is complete a GET on an endpoint
+//! that was only flush-closed. Once a GET has a request id (over tcp, once its
+//! request has gone to the owner), it waits in the endpoint's `proto_reqs`
+//! list. Only `ucp_ep_reqs_purge` empties that list, and only a FORCE close or
+//! an endpoint failure calls it. `ucp_worker_destroy_eps` purges the lanes'
+//! pending queues and then deletes the endpoint, so such a GET's callback never
+//! runs: its rkey, its request and its `RmaOpState` leak. That is why teardown
+//! FORCE-closes every endpoint whose peer still has an RMA operation in flight
+//! (see "What teardown does with an RMA operation in flight" below).
 //!
 //! **A parked unmap gates its region.** `Cmd::UnmapRegion` for a region with
 //! operations in flight parks its reply in the region entry; from that moment
@@ -99,6 +110,25 @@
 //! and teardown takes the reply out of each survivor and answers
 //! `ShuttingDown`. The reply lives behind a `take`-able slot, which is what
 //! makes double-resolution impossible if the callback later fires anyway.
+//!
+//! ## Software RMA is off
+//!
+//! Over a lane with no RMA in hardware, such as tcp, UCX emulates a GET: the
+//! owner's progress thread serves the read. In UCX 1.22 the owner's process
+//! aborts if the puller goes away during the reply (`ucs_fatal` in
+//! `ucp_request_try_send`, or an assertion in `uct_tcp_ep_pending_purge`), and
+//! a crashed puller reaches both. So [`init_ucx`] sets
+//! `PROTO_EMULATION_ENABLE=n` unless the environment sets it, or a test asked
+//! for software RMA.
+//!
+//! UCX selects the GET protocol per endpoint, so a GET still runs in hardware
+//! where a lane can do it. Where none can, `ucp_proto_reconfig_progress`
+//! aborts the request with `UCS_ERR_CANCELED` and leaves the endpoint up.
+//! [`RmaOpState::refused`] tells that from a FORCE close and from a failed RC
+//! queue pair, answers [`RmaError::NoNativeGet`], and records the peer's
+//! incarnation in [`WorkerShared::no_native_get`]. The rendezvous consumer
+//! reads that record and stops offering RDMA to the peer. The record lapses
+//! when the peer's endpoint fails or the peer is unregistered.
 //!
 //! ## The idle-endpoint reaper (D9)
 //!
@@ -286,21 +316,37 @@
 //! behind a gate belong to a connection that is still perfectly good. They reach
 //! the ring later and wire an endpoint up again on the way.
 //!
-//! ## What teardown cannot promise
+//! ## What teardown does with an RMA operation in flight
 //!
-//! D8 asks for regions to be unmapped before endpoints are closed. That holds
-//! for every region that is idle when teardown starts, and for every region
-//! whose operations complete during the flush-close. It cannot hold for a
-//! region whose GET is posted to a peer that has stopped progressing: Phase A's
-//! flush-close never completes, and Phase B's FORCE close on that same endpoint
-//! is a **no-op** — `ucp_ep_close_nbx` returns `UCS_ERR_NOT_CONNECTED` at its
-//! `UCP_EP_FLAG_CLOSED` guard (`ucp_ep.c:2221`) because Phase A already set the
-//! flag, so no second discard and no `CANCELED` purge happen. Such an operation
-//! is completed only by the purges inside `ucp_worker_destroy`, i.e. *after*
-//! `force_unmap_regions` has already deregistered its destination. Over tcp that
-//! is silent; on IB the straggler completes with an access error. Accepted, and
-//! a hardware-checkpoint item — the caller is still answered, which is the part
-//! that had to be fixed.
+//! D8 asks for regions to be unmapped before endpoints are closed. Teardown
+//! first gives RMA operations a bounded time ([`RMA_DRAIN`]) to finish while
+//! every endpoint is still open, so a GET that is only slow still answers
+//! `Ok`. An endpoint whose peer still has an operation after that is
+//! FORCE-closed, not flush-closed. A flush close would wait for the operation,
+//! and nothing could cancel it afterwards: a FORCE close of an endpoint
+//! already closed is refused at the `UCP_EP_FLAG_CLOSED` guard
+//! (`ucp_ep.c:2221`) and returns `UCS_ERR_NOT_CONNECTED`, with no second
+//! discard and no purge. The FORCE close discards the lanes and then purges
+//! `proto_reqs` with `UCS_ERR_CANCELED`, so the callback runs: the caller is
+//! answered `RmaError::Ucx`, and the rkey is destroyed while the worker exists.
+//!
+//! The purge runs when the lane discard completes, which takes progress. The
+//! in-flight drain below gives it that. Over tcp the discard completes at once
+//! (`shutdown_cancels_a_get_its_peer_stopped_answering`). A discard that does
+//! not complete within that drain is completed inside `ucp_worker_destroy`,
+//! *after* `force_unmap_regions` has deregistered the destination; on IB such
+//! a straggler could complete with an access error. That is a hardware
+//! checkpoint item. The caller is answered either way, by `abandon_rma_ops`.
+//!
+//! The owner of the memory is the other half, and velo cannot protect it. Over
+//! tcp a GET is emulated in software: the owner serves the request by sending
+//! the data back. If the puller goes away in the middle, UCX 1.22 can abort
+//! the owner's process: `ucp_request_try_send` calls `ucs_fatal` when the
+//! owner reads the request only after the puller is gone
+//! (`an_owner_survives_a_puller_that_vanishes_mid_get`, ignored for that
+//! reason), and `uct_tcp_ep_pending_purge` fails an assertion when UCX
+//! discards the failed endpoint with replies still queued on it. A puller that
+//! crashes reaches both too.
 
 use std::collections::HashMap;
 use std::mem::MaybeUninit;
@@ -493,6 +539,15 @@ pub(crate) struct WorkerShared {
     /// Peers whose endpoint hit a transport-level error; consulted by
     /// `check_health` and cleared when a fresh endpoint is established.
     pub failed_peers: Arc<DashMap<InstanceId, ()>>,
+    /// Peers this worker cannot GET from without software emulation, with the
+    /// incarnation whose endpoint refused the GET.
+    ///
+    /// Written by [`RmaOpState::complete`] when UCX refuses a GET for want of
+    /// a native protocol (see "Software RMA is off" in the module docs). Read
+    /// by the rendezvous consumer, which then does not offer RDMA to that
+    /// peer. The incarnation makes the entry lapse when the peer re-registers:
+    /// a new process may be reachable over a lane that has GET in hardware.
+    pub no_native_get: Arc<DashMap<InstanceId, u64>>,
     /// Operations posted with a request outstanding (exit 2). Drained before
     /// worker destruction.
     pub inflight_ops: Arc<AtomicUsize>,
@@ -631,6 +686,12 @@ pub(crate) struct WorkerShared {
     /// this: the region exists a moment before its reply goes out.
     #[cfg(test)]
     pub map_replies_delivered: AtomicU64,
+    /// Test seam: passes the progress loop has begun, counted after the
+    /// `progress_hold` wait. A test that releases the hold and needs one whole
+    /// pass to have run, its progress loop included, waits for this to move
+    /// by two.
+    #[cfg(test)]
+    pub progress_passes: AtomicU64,
 }
 
 /// What the progress thread reports back once UCX is initialised.
@@ -644,6 +705,9 @@ pub(crate) struct StartupOut {
 /// Everything [`worker_main`] needs, assembled by `UcxTransport::start`.
 pub(crate) struct WorkerArgs {
     pub config: UcxConfig,
+    /// Leave UCX's software RMA emulation on. See "Software RMA is off" in the
+    /// module docs.
+    pub software_rma: bool,
     pub ring_rx: CommandReceiver,
     pub shared: Arc<WorkerShared>,
     pub adapter: TransportAdapter,
@@ -845,6 +909,21 @@ struct RmaOpState {
     /// handle to compare against, whereas the peer is stable and errs toward
     /// keeping an endpoint that might be in use.
     peer: InstanceId,
+    /// The incarnation of the peer the endpoint was created for. Recorded in
+    /// [`WorkerShared::no_native_get`] if UCX refuses the GET.
+    incarnation: u64,
+    /// Set when velo retires the endpoint this operation was posted on. A GET
+    /// that velo's own FORCE close cancelled is not a refusal.
+    ep_retired: Arc<AtomicBool>,
+    /// Set by `shutdown()`. Teardown cancels operations too.
+    shutdown_requested: Arc<AtomicBool>,
+    /// Peers whose endpoint failed. A failed RC queue pair flushes its GETs
+    /// with `CANCELED` too.
+    failed_peers: Arc<DashMap<InstanceId, ()>>,
+    /// Where a refusal is recorded.
+    no_native_get: Arc<DashMap<InstanceId, u64>>,
+    /// Registered peers, read to drop a record that an unregister raced.
+    peers: Arc<DashMap<InstanceId, UcxEndpoint>>,
     /// Region whose in-flight count this operation holds.
     region_id: u64,
     /// Identifies this operation in [`WorkerState::rma_ops`].
@@ -894,6 +973,11 @@ impl RmaOpState {
         }
         self.resolve(if status == sys::ucs_status_t_UCS_OK {
             Ok(())
+        } else if self.refused(status) {
+            // Recorded before the caller hears of it, so a caller that falls
+            // back and tries again already finds the peer marked.
+            self.record_refusal();
+            Err(RmaError::NoNativeGet)
         } else {
             Err(RmaError::Ucx {
                 status_name: status_string(status),
@@ -903,6 +987,47 @@ impl RmaOpState {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push((self.region_id, self.op_id));
+    }
+
+    /// Whether `status` is UCX refusing the GET because no native protocol
+    /// reaches the peer.
+    ///
+    /// With software RMA off, `ucp_proto_reconfig_progress` (`proto_reconfig.c`)
+    /// aborts such a GET with `UCS_ERR_CANCELED` and leaves the endpoint up.
+    /// Two other sources of `CANCELED` exist:
+    ///
+    /// * A FORCE close. Velo issues every FORCE close itself, and it marks the
+    ///   endpoint retired, or it is shutting down, before the close.
+    /// * A failed RC queue pair, which flushes its outstanding GETs with
+    ///   `IBV_WC_WR_FLUSH_ERR` (`uct_ib_wc_to_ucs_status`). UCX purges them
+    ///   before or after the endpoint's error handler runs. Before: the peer
+    ///   is in `failed_peers` here. After: [`WorkerState::reap_failed_eps`]
+    ///   drops the record this took.
+    fn refused(&self, status: sys::ucs_status_t) -> bool {
+        status == sys::ucs_status_t_UCS_ERR_CANCELED
+            && !self.ep_retired.load(Ordering::Acquire)
+            && !self.shutdown_requested.load(Ordering::Acquire)
+            && !self.failed_peers.contains_key(&self.peer)
+    }
+
+    /// Record that the peer refused a GET, unless it is no longer registered
+    /// as the incarnation the GET went to.
+    ///
+    /// Insert first, then check: `unregister` removes the peer and then the
+    /// record. If the insert lands after that removal, this check sees the
+    /// peer gone and takes the record out again. Either way no record outlives
+    /// its peer.
+    fn record_refusal(&self) {
+        self.no_native_get.insert(self.peer, self.incarnation);
+        let registered = self
+            .peers
+            .get(&self.peer)
+            .is_some_and(|blob| blob.incarnation == self.incarnation);
+        if !registered {
+            self.no_native_get.remove_if(&self.peer, |_, incarnation| {
+                *incarnation == self.incarnation
+            });
+        }
     }
 
     /// Answer the caller, at most once. Also used by teardown for operations
@@ -1365,6 +1490,9 @@ struct EpEntry {
     /// created. Until one has, the endpoint is still being set up (see
     /// [`EpEntry::set_up`]).
     peer_sent: bool,
+    /// Set just before velo closes this endpoint, so a GET the close cancels
+    /// is not taken for UCX refusing it (see [`RmaOpState::refused`]).
+    retired: Arc<AtomicBool>,
 }
 
 impl EpEntry {
@@ -1432,6 +1560,9 @@ struct PreparedGet {
     /// Carried through so the posted operation can name its peer for the idle
     /// reaper's in-flight check.
     peer: InstanceId,
+    /// The endpoint's incarnation and retired flag; see [`RmaOpState`].
+    incarnation: u64,
+    ep_retired: Arc<AtomicBool>,
 }
 
 struct WorkerState {
@@ -1524,17 +1655,22 @@ pub(super) const EP_SETUP_BOUND: Duration = Duration::from_secs(5);
 /// reaper tests use to size their margins.
 pub(super) const PARK_MS: c_int = 100;
 
+/// How long teardown waits for RMA operations to finish on open endpoints
+/// before it FORCE-closes the endpoints they still use. See `teardown`.
+const RMA_DRAIN: Duration = Duration::from_secs(1);
+
 /// Entry point of the dedicated progress thread.
 pub(crate) fn worker_main(args: WorkerArgs) {
     let WorkerArgs {
         config,
+        software_rma,
         ring_rx,
         shared,
         adapter,
         startup,
     } = args;
 
-    let state = match unsafe { init_ucx(&config, &shared, &adapter) } {
+    let state = match unsafe { init_ucx(&config, software_rma, &shared, &adapter) } {
         Ok((state, out)) => {
             let _ = startup.send(Ok(out));
             state
@@ -1574,6 +1710,53 @@ impl Drop for NativeInit {
     }
 }
 
+/// The oldest UCX release whose software GET obeys `PROTO_EMULATION_ENABLE=n`.
+///
+/// The vendored 1.22.0 does (`get_am.c` reads the flag). A system UCX linked
+/// with ucx-rs's `UCX_DIR` can be as old as 1.17, and 1.20 accepts the
+/// setting but still emulates a GET over tcp.
+const SOFTWARE_RMA_SWITCH_FLOOR: (u32, u32) = (1, 22);
+
+/// Whether software RMA was asked to be off: by velo's default, or by the
+/// environment, which wins.
+///
+/// The spellings are the ones UCX 1.22 itself reads as off: `n` and `no` in
+/// any case, `off` in lower case only, and `0`. UCX rejects any other value
+/// (`OFF`, `false`, a leading space) and the transport fails to start, so
+/// treating such a value as off would only misreport the warning.
+/// `documented_off_spellings_are_accepted_by_ucx` checks this list against
+/// UCX's own parser.
+fn software_rma_requested_off(software_rma: bool, env_switch: Option<&str>) -> bool {
+    match env_switch {
+        Some(value) => {
+            value.eq_ignore_ascii_case("n")
+                || value.eq_ignore_ascii_case("no")
+                || value == "off"
+                || value == "0"
+        }
+        None => !software_rma,
+    }
+}
+
+/// Whether UCX `major.minor` turns software RMA off when asked.
+fn software_rma_switch_applies(major: u32, minor: u32) -> bool {
+    (major, minor) >= SOFTWARE_RMA_SWITCH_FLOOR
+}
+
+/// Warn, once per process, that this UCX ignores the switch.
+fn warn_software_rma_still_on(major: u32, minor: u32, release: u32) {
+    static WARNED: std::sync::Once = std::sync::Once::new();
+    WARNED.call_once(|| {
+        let (floor_major, floor_minor) = SOFTWARE_RMA_SWITCH_FLOOR;
+        warn!(
+            "ucx: UCX {major}.{minor}.{release} ignores PROTO_EMULATION_ENABLE=n \
+             (it needs {floor_major}.{floor_minor} or later), so a GET over a tcp-only \
+             lane is still emulated in software, and a puller that goes away during \
+             one can abort the owner's process"
+        );
+    });
+}
+
 fn config_value(name: &str, value: &str) -> anyhow::Result<std::ffi::CString> {
     std::ffi::CString::new(value)
         .map_err(|_| anyhow::anyhow!("UCX {name} value contains a NUL byte"))
@@ -1582,6 +1765,7 @@ fn config_value(name: &str, value: &str) -> anyhow::Result<std::ffi::CString> {
 /// All UCX object creation, in one place. Runs once, on the progress thread.
 unsafe fn init_ucx(
     config: &UcxConfig,
+    software_rma: bool,
     shared: &Arc<WorkerShared>,
     adapter: &TransportAdapter,
 ) -> anyhow::Result<(WorkerState, StartupOut)> {
@@ -1609,6 +1793,27 @@ unsafe fn init_ucx(
                 let k = std::ffi::CString::new(key).unwrap();
                 let v = std::ffi::CString::new(value).unwrap();
                 let _ = sys::ucp_config_modify(ucp_cfg, k.as_ptr(), v.as_ptr());
+            }
+        }
+        // Software RMA is off: see the module docs. The environment wins here
+        // too, so `UCX_PROTO_EMULATION_ENABLE=y` turns it back on for a
+        // deployment that accepts the risk.
+        let env_switch = std::env::var("UCX_PROTO_EMULATION_ENABLE").ok();
+        if !software_rma && env_switch.is_none() {
+            let k = std::ffi::CString::new("PROTO_EMULATION_ENABLE").unwrap();
+            let v = std::ffi::CString::new("n").unwrap();
+            let st = sys::ucp_config_modify(ucp_cfg, k.as_ptr(), v.as_ptr());
+            anyhow::ensure!(
+                st == sys::ucs_status_t_UCS_OK,
+                "ucp_config_modify(PROTO_EMULATION_ENABLE=n): {}",
+                status_string(st)
+            );
+        }
+        if software_rma_requested_off(software_rma, env_switch.as_deref()) {
+            let (mut major, mut minor, mut release) = (0, 0, 0);
+            sys::ucp_get_version(&mut major, &mut minor, &mut release);
+            if !software_rma_switch_applies(major, minor) {
+                warn_software_rma_still_on(major, minor, release);
             }
         }
         if let Some(tls) = &config.tls
@@ -1847,6 +2052,8 @@ fn run_loop(mut state: WorkerState, mut ring_rx: CommandReceiver) {
         take_test_delay(&state.shared.progress_stall_ms);
         #[cfg(test)]
         wait_while_held(&state.shared.progress_hold, &state.shared.progress_held);
+        #[cfg(test)]
+        state.shared.progress_passes.fetch_add(1, Ordering::Relaxed);
         // The reaper's clock. It is read here, again after the progress loop,
         // and after each `ucp_ep_create`, and only moves forward. The two
         // per-pass reads run only with the reaper on. Every
@@ -2285,6 +2492,7 @@ impl WorkerState {
                 sends: sends.clone(),
                 born: self.now,
                 peer_sent: false,
+                retired: Arc::new(AtomicBool::new(false)),
             },
         );
         debug!("ucx: created endpoint to {peer}");
@@ -2339,6 +2547,11 @@ impl WorkerState {
             std::mem::take(&mut *guard)
         };
         for peer in peers {
+            // A GET the failure flushed can look like a refusal (see
+            // `RmaOpState::refused`), so the record is not trusted past a
+            // failure. A peer that really has no native GET is refused again
+            // on its next GET, at the cost of one more fallback.
+            self.shared.no_native_get.remove(&peer);
             if let Some(entry) = self.eps.remove(&peer) {
                 // The ep already failed: FORCE-close is the only close that
                 // cannot block on the dead peer.
@@ -2531,6 +2744,7 @@ impl WorkerState {
         // than coming through here. Every `EpEntry` passes through exactly one
         // of them, which is what keeps `eps_open` from drifting.
         self.shared.eps_open.fetch_sub(1, Ordering::Relaxed);
+        entry.retired.store(true, Ordering::Release);
         // SAFETY: worker/ep owned by this thread; err_arg was leaked at
         // creation and UCX will not call the handler after close is issued.
         unsafe {
@@ -2839,6 +3053,13 @@ impl WorkerState {
         let (ep, _) = self
             .ensure_ep(req.peer)
             .map_err(|e| RmaError::EndpointUnavailable(e.to_string()))?;
+        let (incarnation, ep_retired) = {
+            let entry = self
+                .eps
+                .get(&req.peer)
+                .ok_or_else(|| RmaError::EndpointUnavailable("no endpoint".into()))?;
+            (entry.incarnation, Arc::clone(&entry.retired))
+        };
 
         // Two distinct over-reads, contained two different ways.
         //
@@ -2892,6 +3113,8 @@ impl WorkerState {
             len: req.len as usize,
             region_id: req.local_region,
             peer: req.peer,
+            incarnation,
+            ep_retired,
         }))
     }
 
@@ -2913,6 +3136,12 @@ impl WorkerState {
         let op = Arc::new(RmaOpState {
             rkey: Mutex::new(Some(prepared.rkey as usize)),
             peer: prepared.peer,
+            incarnation: prepared.incarnation,
+            ep_retired: prepared.ep_retired,
+            shutdown_requested: Arc::clone(&self.shared.shutdown_requested),
+            failed_peers: Arc::clone(&self.shared.failed_peers),
+            no_native_get: Arc::clone(&self.shared.no_native_get),
+            peers: Arc::clone(&self.shared.peers),
             region_id: prepared.region_id,
             op_id,
             reply: Mutex::new(Some(reply)),
@@ -3079,13 +3308,12 @@ impl WorkerState {
     /// run, then let the registry go.
     ///
     /// Called once, after teardown's bounded in-flight drain has expired. An
-    /// operation still here has been abandoned inside UCX's request bookkeeping;
-    /// `ucp_worker_destroy` may or may not purge it, and the caller cannot be
-    /// left awaiting a `oneshot` that outcome decides. Taking the reply out is
-    /// safe against a late callback by construction: it finds `None` and stays
-    /// silent. The `Arc`s themselves are dropped here; the one UCX still holds
-    /// keeps the state alive, and its rkey is leaked with it — the same leak the
-    /// `inflight_ops` warning already reports.
+    /// operation still here was FORCE-closed in Phase A, but its lane discard
+    /// has not completed yet; `ucp_worker_destroy` completes it, and the caller
+    /// cannot be left awaiting a `oneshot` until then. Taking the reply out is
+    /// safe against the late callback by construction: it finds `None` and
+    /// stays silent. The `Arc`s themselves are dropped here; the one UCX still
+    /// holds keeps the state alive until that callback destroys the rkey.
     fn abandon_rma_ops(&mut self) {
         for (op_id, op) in std::mem::take(&mut self.rma_ops) {
             debug!("ucx: abandoning rma op {op_id} at teardown");
@@ -3112,6 +3340,19 @@ impl WorkerState {
         self.drain_rma_completions();
         self.unmap_idle_regions();
 
+        // Give RMA operations a bounded chance to finish while every endpoint
+        // is still open, so a GET that is only slow still answers `Ok`. One
+        // second is the budget the flush-close below used to give it, and the
+        // same as each other bound here: `shutdown()`'s caller blocks on all
+        // of them.
+        let deadline = Instant::now() + RMA_DRAIN;
+        while !self.rma_ops.is_empty() && Instant::now() < deadline {
+            // SAFETY: worker owned by this thread.
+            unsafe { sys::ucp_worker_progress(self.worker) };
+            self.drain_rma_completions();
+        }
+        self.unmap_idle_regions();
+
         // Close every endpoint CONCURRENTLY under one global deadline, so
         // teardown latency is bounded by the slowest peer, not the sum. This
         // runs on `shutdown()`'s caller-blocking path.
@@ -3121,9 +3362,31 @@ impl WorkerState {
             all.append(&mut self.parked_for_close);
             all
         };
+        // An RMA operation still outstanding gets a FORCE close, not a flush
+        // close. A flush close waits for the operation, and once it has begun
+        // nothing can cancel it: the FORCE close of Phase B is refused for an
+        // endpoint already closed. A GET left like that is never completed, not
+        // even by `ucp_worker_destroy`, which deletes the endpoint without
+        // purging its `proto_reqs`, so its callback never runs and its rkey
+        // and request leak. FORCE discards the lanes and then purges
+        // `proto_reqs` with `UCS_ERR_CANCELED`, which runs the callback: the
+        // caller is answered `RmaError::Ucx`, and the rkey is destroyed while
+        // the worker still exists. Chosen by peer, as the idle reaper does,
+        // because an operation names its peer and not its endpoint.
+        let rma_peers: std::collections::HashSet<InstanceId> =
+            self.rma_ops.values().map(|op| op.peer).collect();
         // Phase A: flush-mode close, all at once.
         let mut pending: Vec<(EpEntry, sys::ucs_status_ptr_t)> = Vec::new();
         for entry in entries {
+            // SAFETY: `err_arg` was leaked at creation and is freed only when
+            // the entry is closed, which has not happened yet.
+            let peer = unsafe { (*entry.err_arg).peer };
+            if rma_peers.contains(&peer) {
+                debug!("ucx: force-closing endpoint to {peer} with rma op(s) in flight");
+                self.close_ep_raw(entry, true);
+                continue;
+            }
+            entry.retired.store(true, Ordering::Release);
             // SAFETY: worker/ep owned by this thread.
             let ptr = unsafe {
                 let param: sys::ucp_request_param_t = MaybeUninit::zeroed().assume_init();
@@ -3174,10 +3437,9 @@ impl WorkerState {
         // `UCP_EP_FLAG_CLOSED` guard (`ucp_ep.c:2221`) for an endpoint Phase A
         // already close-initiated, so the FORCE flag buys nothing here: no
         // second discard, no `CANCELED` purge, no completion callbacks. What it
-        // does is free the request and the leaked `ErrArg`. Operations posted to
-        // a peer that stopped progressing are completed — if at all — by the
-        // purges inside `ucp_worker_destroy`, long after this point; that is why
-        // `abandon_rma_ops` below has to answer their callers directly.
+        // does is free the request and the leaked `ErrArg`. That is why an
+        // endpoint with an RMA operation in flight was FORCE-closed in Phase A
+        // instead of flush-closed.
         for (entry, req) in pending {
             // SAFETY: the flush-close request is abandoned; freeing it and
             // issuing the (guarded, hence no-op) force close is the documented
@@ -3239,7 +3501,80 @@ pub(crate) type StartupSlot = OnceLock<StartupOut>;
 
 #[cfg(test)]
 mod initialization_tests {
-    use super::config_value;
+    use super::{config_value, software_rma_requested_off, software_rma_switch_applies};
+
+    /// velo reads an environment value as "software RMA off" exactly when UCX
+    /// accepts it for `PROTO_EMULATION_ENABLE`. Every candidate here is a
+    /// spelling of "off", so UCX accepting it means UCX turns emulation off.
+    /// If the two disagree, velo warns (or stays silent) for a setting UCX
+    /// does not apply the way velo thinks.
+    #[test]
+    fn documented_off_spellings_are_accepted_by_ucx() {
+        use ucx_rs::sys;
+
+        let mut config = std::ptr::null_mut();
+        // SAFETY: UCX initializes this valid output pointer with an owned config.
+        let status =
+            unsafe { sys::ucp_config_read(std::ptr::null(), std::ptr::null(), &mut config) };
+        assert_eq!(status, sys::ucs_status_t_UCS_OK);
+        let candidates = [
+            c"n", c"N", c"no", c"No", c"NO", c"off", c"Off", c"OFF", c"0", c"false", c" n",
+        ];
+        let results = candidates.map(|value| {
+            // SAFETY: the config is live and both strings are NUL-terminated.
+            let status = unsafe {
+                sys::ucp_config_modify(config, c"PROTO_EMULATION_ENABLE".as_ptr(), value.as_ptr())
+            };
+            (value, status == sys::ucs_status_t_UCS_OK)
+        });
+        // SAFETY: this test owns the config and no context uses it.
+        unsafe { sys::ucp_config_release(config) };
+        for (value, ucx_accepts) in results {
+            let text = value.to_str().expect("ASCII candidate");
+            assert_eq!(
+                software_rma_requested_off(true, Some(text)),
+                ucx_accepts,
+                "velo and UCX disagree on {text:?} (UCX accepts it: {ucx_accepts})"
+            );
+        }
+    }
+
+    /// The environment wins over velo's default, as for every `UCX_*`
+    /// setting, so an operator's `n` must also lead to the version check.
+    #[test]
+    fn software_rma_is_requested_off_by_default_or_by_the_environment() {
+        assert!(software_rma_requested_off(false, None));
+        assert!(!software_rma_requested_off(true, None));
+        for off in ["n", "N", "no", "NO", "off", "0"] {
+            assert!(software_rma_requested_off(true, Some(off)), "{off}");
+            assert!(software_rma_requested_off(false, Some(off)), "{off}");
+        }
+        for on in ["y", "yes", "1"] {
+            assert!(!software_rma_requested_off(false, Some(on)), "{on}");
+        }
+        // UCX rejects these, and then the transport fails to start; velo must
+        // not read them as off.
+        for rejected in ["OFF", "Off", "false", " n"] {
+            assert!(
+                !software_rma_requested_off(true, Some(rejected)),
+                "{rejected}"
+            );
+        }
+    }
+
+    /// The floor under which velo warns that software GET is still on. UCX
+    /// 1.20 accepts `PROTO_EMULATION_ENABLE=n` and still emulates a GET over
+    /// tcp; the vendored 1.22.0 refuses it. The release number plays no part.
+    #[test]
+    fn the_software_rma_switch_needs_ucx_1_22() {
+        assert!(!software_rma_switch_applies(1, 17));
+        assert!(!software_rma_switch_applies(1, 20));
+        assert!(!software_rma_switch_applies(1, 21));
+        assert!(software_rma_switch_applies(1, 22));
+        assert!(software_rma_switch_applies(1, 23));
+        assert!(software_rma_switch_applies(2, 0));
+        assert!(!software_rma_switch_applies(0, 99));
+    }
 
     #[test]
     fn configuration_strings_reject_nul_with_context() {

@@ -354,8 +354,13 @@ jobs:
       # The example exits non-zero if either side answered chunked, so this is
       # the only place the split-transport deployment is exercised as two
       # processes rather than two instances in one.
+      #
+      # Over tcp velo refuses UCX's software GET by default, so this step turns
+      # it back on. The known risk: in UCX 1.22 an owner serving a software GET
+      # aborts if the consumer goes away during the reply.
       env:
         UCX_TLS: tcp
+        UCX_PROTO_EMULATION_ENABLE: "y"
       run: cargo run --manifest-path examples/Cargo.toml --release --all-features --example rendezvous_rdma_two_proc
     - name: sccache stats
       if: always()

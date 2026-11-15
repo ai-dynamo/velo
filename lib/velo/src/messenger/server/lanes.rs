@@ -613,7 +613,7 @@ mod tests {
         assert_eq!(observer.closed.load(Ordering::Acquire), 1);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn lane_is_not_reaped_while_items_keep_arriving() {
         // The sharp edge of the hoisted idle timer: it is armed once and
         // re-armed only when it fires, so a fire that lands mid-stream must
@@ -621,6 +621,15 @@ mod tests {
         // `no_reap_while_pending` this lane is genuinely empty and idle each
         // time the timer could fire -- what keeps it alive is that it was fed
         // inside its TTL, not that it had a backlog.
+        //
+        // The clock is paused, so the gap between two items is the 5 ms the
+        // test sleeps plus the 1 ms polls in `wait_for`, whatever the host's
+        // load. On a real clock, a host that stops this process for more than
+        // the 100 ms TTL between two items reaps the lane, and the test
+        // fails though the lane did nothing wrong. With the clock paused the
+        // runtime advances time only when every task is idle, so the lane
+        // handles each item before the clock moves.
+        tokio::time::pause();
         let observer = Arc::new(CountingObserver::default());
         let handled = Arc::new(AtomicUsize::new(0));
 
@@ -635,15 +644,10 @@ mod tests {
             config(Some(Duration::from_millis(100)), Arc::clone(&observer)),
         );
 
-        // Forty items 5 ms apart is a 20x margin against the 100 ms TTL --
-        // wide enough that a single scheduling stall on a loaded runner does
-        // not reap the lane and flip the assertions below (a real-clock test
-        // with no invariant to fall back on, unlike `no_reap_while_pending`'s
-        // `pending > 0` or `no_reap_while_handler_in_flight`'s handler still
-        // running). At that rate the receive-arm re-arm keeps the deadline
-        // half a TTL ahead and the timer never fires, so what this asserts is
-        // the outcome -- a lane fed inside its TTL stays live -- for whichever
-        // of the two arms ends up moving the timer on a loaded runner.
+        // Forty items 5 ms apart under a 100 ms TTL. At that rate the
+        // receive-arm re-arm keeps the deadline half a TTL ahead and the timer
+        // never fires, so what this asserts is the outcome -- a lane fed
+        // inside its TTL stays live.
         const ITEMS: usize = 40;
         for handled_so_far in 1..=ITEMS {
             let _ = router.route(9, (), None);
