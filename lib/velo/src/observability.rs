@@ -2470,8 +2470,21 @@ impl VeloMetrics {
             .inc();
     }
 
-    pub(crate) fn set_rendezvous_active_slots(&self, count: usize) {
-        self.rendezvous_active_slots.set(count as f64);
+    /// Count one more staged slot. The gauge moves by one in a single atomic
+    /// step, so concurrent registrations and frees cannot leave a stale value
+    /// last, as setting it from a count read in a separate step could.
+    pub(crate) fn inc_rendezvous_active_slots(&self) {
+        self.rendezvous_active_slots.inc();
+    }
+
+    /// Count one staged slot freed. See [`Self::inc_rendezvous_active_slots`].
+    pub(crate) fn dec_rendezvous_active_slots(&self) {
+        self.rendezvous_active_slots.dec();
+    }
+
+    /// Count `slots` staged slots out at once, when their store is dropped.
+    pub(crate) fn sub_rendezvous_active_slots(&self, slots: usize) {
+        self.rendezvous_active_slots.sub(slots as f64);
     }
 
     /// Publish how many regions the backend currently holds registered.

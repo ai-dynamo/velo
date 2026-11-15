@@ -42,6 +42,8 @@ async fn test_velo_builder_tcp_transport() {
 
     // The StreamConfig branch and the mux, which the builder installs by
     // default beside it.
+    // The transport registry has no `Velo` form.
+    #[allow(deprecated)]
     let registry = &velo.anchor_manager().transport_registry;
     assert!(
         registry.contains_key("tcp-stream"),
@@ -90,6 +92,8 @@ async fn test_velo_builder_grpc_transport() {
         .expect("VeloBuilder with Grpc config should build successfully");
 
     // The chosen streaming transport, and the mux beside it (the default).
+    // The transport registry has no `Velo` form.
+    #[allow(deprecated)]
     let registry = &velo.anchor_manager().transport_registry;
     assert!(
         registry.contains_key("grpc-stream"),
@@ -267,6 +271,8 @@ async fn test_velo_builder_default_stream_config_is_tcp() {
         .await
         .unwrap();
 
+    // The transport registry has no `Velo` form.
+    #[allow(deprecated)]
     let registry = &velo.anchor_manager().transport_registry;
     assert!(
         registry.contains_key("tcp-stream"),
@@ -503,6 +509,8 @@ async fn mux_only_carries_streams_and_large_messages() {
         producer.register_peer(consumer.peer_info()).unwrap();
         consumer.register_peer(producer.peer_info()).unwrap();
         for node in [&producer, &consumer] {
+            // The transport registry has no `Velo` form.
+            #[allow(deprecated)]
             let registry = &node.anchor_manager().transport_registry;
             assert_eq!(registry.len(), 1);
             assert!(registry.contains_key(MESSENGER_MUX_KEY));

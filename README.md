@@ -21,6 +21,8 @@ Velo 0.19 gives Velo and Messenger explicit drop lifetimes, removes value-level 
 
 Velo 0.21 makes `Velo` a handle. `VeloBuilder::build()` returns `Velo`, not `Arc<Velo>`. To share it, clone it. See [Migrate to the Velo handle](docs/src/guides/migrate-velo-handle.md).
 
+Velo 0.22.1 deprecates `Velo::anchor_manager()` and `Velo::rendezvous_manager()`. Their methods are on `Velo`, with three new ones: `create_anchor_with_config`, `active_anchor_count`, `renew_reservations`. Also new: `staging_threshold` and the owner's `unregister_data`. See [Move off the manager accessors](docs/src/guides/migrate-manager-accessors.md).
+
 Use `Velo::shutdown(policy)` to close resources and join owned tasks while Tokio keeps running. The instance and its handles stay valid after shutdown, and shutdown does not release them from memory. Accepted requests remain counted until their replies are submitted, including error replies. See [Shutdown and drain](docs/src/concepts/shutdown.md).
 
 Call `Velo::unregister_peer` when a peer leaves. A restarted peer has a new instance id, so without the call a long-lived node keeps state and connections for every peer it ever served. See [Forget a peer](docs/src/concepts/discovery.md#forget-a-peer).
@@ -48,7 +50,7 @@ A stream item larger than the eager limit (256 KiB by default) goes through rend
 
 A payload that goes through rendezvous states its own size, and the receiver allocates that size before it reads a byte. `VeloBuilder::staged_payload_max` sets the largest one a node takes. A larger one is refused before anything of its size is allocated: a request gets an error that names both sizes, and a stream item ends its own stream with that error while other streams go on. See [The receiver's limit](docs/src/concepts/rendezvous.md#the-receivers-limit).
 
-A staged payload is freed when its last reference and its last reader are both gone, whichever goes last. An owner can drop its reference while a reader holds a lease: the reader's detach, release, or reaped lease then frees it. See [When a slot is freed](docs/src/concepts/rendezvous.md#when-a-slot-is-freed).
+A staged payload is freed when its last reference and its last reader are both gone, whichever goes last. An owner drops its reference with `Velo::unregister_data`, which is synchronous and safe to call from `Drop`. If a reader still holds a lease, the reader's detach, release, or reaped lease then frees it. See [When a slot is freed](docs/src/concepts/rendezvous.md#when-a-slot-is-freed).
 
 The local ID in an anchor handle is random. The handle is all that a peer needs to attach to an anchor or open its mux slot, and velo does not authenticate peers, so a host that can reach a node cannot guess the handle of another request's stream. See [Streaming](docs/src/concepts/streaming.md).
 

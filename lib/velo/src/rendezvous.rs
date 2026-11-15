@@ -57,6 +57,8 @@
 //! transfer is running. Holding an RDMA lease idle past its deadline is not
 //! supported in v1 — hold it briefly, or take the data and release.
 
+#[cfg(test)]
+mod active_slots_tests;
 pub mod consumer;
 /// The RDMA transfer descriptor. Runtime-internal: it is a wire format velo
 /// owns end to end, and nothing outside the crate constructs or reads one.
@@ -72,6 +74,8 @@ pub mod consumer;
 pub(crate) mod descriptor;
 pub mod handle;
 pub mod handlers;
+#[cfg(test)]
+mod owner_release_tests;
 /// Slot bodies staged in RDMA-registered memory. Gated with the registration
 /// layer it depends on, and runtime-internal: a `PinnedSlot` is how the store
 /// holds staged memory, not something a caller names.
@@ -364,7 +368,6 @@ impl RendezvousManager {
                 started.elapsed(),
             );
             m.record_rendezvous_bytes(RendezvousOp::Register, data_len);
-            m.set_rendezvous_active_slots(self.store.slots.len());
         }
         DataHandle::pack(self.worker_id, local_id)
     }
@@ -1087,7 +1090,6 @@ impl RendezvousManager {
                 HandlerOutcome::Error
             };
             m.record_rendezvous_operation(RendezvousOp::Release, outcome, started.elapsed());
-            m.set_rendezvous_active_slots(self.store.slots.len());
         }
         result
     }
@@ -1095,6 +1097,16 @@ impl RendezvousManager {
     /// Get the worker ID of this manager.
     pub fn worker_id(&self) -> WorkerId {
         self.worker_id
+    }
+
+    /// Drop the owner's reference to a handle this worker staged. See
+    /// [`Velo::unregister_data`](crate::Velo::unregister_data).
+    ///
+    /// A handle another worker staged is not this worker's to drop, and a
+    /// synchronous call cannot reach that worker anyway, so it does nothing.
+    pub(crate) fn unregister_data(&self, handle: DataHandle) -> bool {
+        let (worker, local_id) = handle.unpack();
+        worker == self.worker_id && self.store.release_owner_reference(local_id)
     }
 
     /// Get direct access to the data store (for transparent mode integration).
@@ -1410,7 +1422,6 @@ async fn reap_expired_leases(
         if let Some(m) = store.metrics() {
             if reaped != 0 {
                 m.record_rendezvous_leases_reaped(reaped);
-                m.set_rendezvous_active_slots(store.slots.len());
             }
             // Sampled on the tick rather than pushed from the registration
             // paths, so the gauge reads current at scrape time instead of
