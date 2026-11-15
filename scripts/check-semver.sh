@@ -116,8 +116,10 @@ for crate_dir in lib/*/ crates/*/; do
     # Cargo.toml features/deps) — match the whole crate directory.
     # A crate whose version is `version.workspace = true` takes it from the
     # root manifest, so a change to the root manifest alone can change it.
-    if echo "$changed_files" | grep -qE "^${crate_dir}/" \
-        || { echo "$changed_files" | grep -qx 'Cargo.toml' && inherits_workspace_version "$crate_dir"; }; then
+    # Here-strings, not `echo | grep -q`: grep -q can exit before echo has
+    # written every line, and under pipefail echo's SIGPIPE fails the match.
+    if grep -qE "^${crate_dir}/" <<<"$changed_files" \
+        || { grep -qx 'Cargo.toml' <<<"$changed_files" && inherits_workspace_version "$crate_dir"; }; then
         changed_crates+=("$crate_name")
         crate_dirs["$crate_name"]="$crate_dir"
     fi
@@ -133,7 +135,8 @@ echo ""
 
 # ── Ensure cargo-semver-checks is installed ──────────────────────────────────
 SEMVER_CHECKS_VERSION="0.47.0"
-if ! cargo-semver-checks --version 2>/dev/null | grep -qF "$SEMVER_CHECKS_VERSION"; then
+installed_version=$(cargo-semver-checks --version 2>/dev/null) || installed_version=""
+if ! grep -qF "$SEMVER_CHECKS_VERSION" <<<"$installed_version"; then
     echo "Installing cargo-semver-checks@${SEMVER_CHECKS_VERSION}..."
     cargo install "cargo-semver-checks@${SEMVER_CHECKS_VERSION}" --locked
 fi
@@ -164,7 +167,7 @@ extract_crate_version() {
     local crate_manifest raw
 
     crate_manifest=$(cat "${crate_dir}/Cargo.toml" 2>/dev/null) || crate_manifest=""
-    raw=$(printf '%s\n' "$crate_manifest" | grep -m1 '^version') || raw=""
+    raw=$(grep -m1 '^version' <<<"$crate_manifest") || raw=""
 
     if inherits_workspace_version "$crate_dir"; then
         # Inherited version: the real value lives in [workspace.package] in
@@ -329,7 +332,7 @@ for crate_name in "${changed_crates[@]}"; do
     fi
 
     # Distinguish tool errors from actual semver violations
-    if ! echo "$crate_output" | grep -qiE '(BREAKING|--- failure|semver requires)'; then
+    if ! grep -qiE '(BREAKING|--- failure|semver requires)' <<<"$crate_output"; then
         echo "::error::cargo-semver-checks failed for ${crate_name} (not a semver violation — likely a build error):"
         echo "$crate_output"
         exit 1
