@@ -274,6 +274,28 @@ if [[ -z "$pipe_sites" ]]; then
 fi
 report "(pipe) no script pipes echo or printf into grep -q or grep -m" "$ok" "$pipe_sites"
 
+if [[ "${SEMVER_REVIEW_F2:-0}" == "1" ]]; then
+    review_gate_source=$(cat "$CHECK_SEMVER")
+    review_here_string='grep -qE "^${crate_dir}/" <<<"$changed_files"'
+    review_pipe='echo "$changed_files" | grep -Eq "^${crate_dir}/"'
+    if [[ "$review_gate_source" != *"$review_here_string"* ]]; then
+        printf 'FAIL - review F2: could not find the crate selection check\n'
+        exit 1
+    fi
+    review_gate_source=${review_gate_source/"$review_here_string"/"$review_pipe"}
+    review_gate="$TMP_ROOT/review-piped-gate.sh"
+    printf '%s\n' "$review_gate_source" > "$review_gate"
+    review_nested_exit=0
+    SEMVER_REVIEW_F1=0 SEMVER_REVIEW_F2=0 CHECK_SEMVER="$review_gate" \
+        timeout 300 bash "${BASH_SOURCE[0]}" > "$TMP_ROOT/review-lint.out" 2>&1 || review_nested_exit=$?
+    if [[ "$review_nested_exit" == "0" ]] \
+        || ! grep -qF 'FAIL - (pipe) no script pipes echo or printf into grep -q or grep -m' "$TMP_ROOT/review-lint.out"; then
+        printf 'FAIL - review F2: lint must reject pipe into grep -Eq (nested exit %s)\n' "$review_nested_exit"
+        sed -n '/(pipe) no script/p; /passed:/p' "$TMP_ROOT/review-lint.out"
+        exit 1
+    fi
+fi
+
 # ── (a) a breaking change at the published version fails ───────────────────
 # velo inherits its version from [workspace.package] and velo-ext has a
 # literal one, so this also proves both extractions work. The gate must
