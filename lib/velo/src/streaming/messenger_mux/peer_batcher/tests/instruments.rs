@@ -138,6 +138,13 @@ async fn sent_records_are_counted_by_type() {
 /// An over-budget record rides the singleton path (`writer::dispatch_singleton`)
 /// rather than the packed-batch one (`writer::flush`) — the two places that
 /// read a batch's per-type counts out of its encoder, so both need the count.
+///
+/// The two counters move at different times. `dispatch_singleton` counts the
+/// records before it hands the batch to the messenger, so they are counted by
+/// the time the batch reaches the capture. `send_singleton` counts the
+/// rendezvous transfer only after `fire_singleton` returns, and on a loaded
+/// host the batch can reach the capture first. So the test waits for that
+/// count to move, not for the batch.
 #[tokio::test(flavor = "multi_thread")]
 async fn singleton_records_are_counted_by_type() {
     let cap = 256;
@@ -148,9 +155,12 @@ async fn singleton_records_are_counted_by_type() {
     .await;
     let (inlet, _slot) = harness.open_credited(1, 1, CREDIT).await;
     let before = sent(&harness, "data");
-    let singletons_before = harness
-        .snapshot()
-        .counter("velo_streaming_mux_rendezvous_singletons_total", &[]);
+    let singletons = || {
+        harness
+            .snapshot()
+            .counter("velo_streaming_mux_rendezvous_singletons_total", &[])
+    };
+    let singletons_before = singletons();
 
     let oversized = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::Item(vec![
         7u8;
@@ -171,11 +181,11 @@ async fn singleton_records_are_counted_by_type() {
         1.0,
         "the singleton path packs a record too, and must count it"
     );
+    // The hand-off: `send_singleton` counts the transfer once
+    // `fire_singleton` returns.
+    eventually(|| singletons() > singletons_before).await;
     assert_eq!(
-        harness
-            .snapshot()
-            .counter("velo_streaming_mux_rendezvous_singletons_total", &[])
-            - singletons_before,
+        singletons() - singletons_before,
         1.0,
         "pins that this record actually rode dispatch_singleton, the only \
          caller of MuxMetricsHandle::rendezvous_singleton, rather than a \

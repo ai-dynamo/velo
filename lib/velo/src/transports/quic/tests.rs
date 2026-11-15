@@ -978,16 +978,17 @@ async fn a_forced_close_warns_of_frames_the_peer_did_not_read() {
 /// unread, and the dialer would warn once per connection on every peer
 /// restart.
 ///
-/// The listener does not call `close()` itself. Its connection task and its
-/// stream task drop their handles at teardown, and quinn closes the
-/// connection when the last one goes; a closed connection sends only
-/// CONNECTION_CLOSE, which supersedes the STOP_SENDING the dropped stream
-/// queued. The runtime is `current_thread`, so the driver runs only after both
-/// tasks have dropped their handles, which makes that order deterministic.
+/// The connection task calls `close()` at teardown, and only then stops its
+/// stream readers; a stream dropped on a closed connection sends nothing. The
+/// runtime has two workers, so a reader can run before the connection task.
+/// When the readers stopped on the teardown token, as the connection task did,
+/// this test failed about 1 run in 100 under parallel load.
+/// `listener::tests::teardown_stops_no_stream_before_the_connection_task_closes`
+/// forces that order on every run.
 ///
 /// Only the teardown token is cancelled, as `graceful_shutdown` does before it
 /// calls `shutdown()`, so the order under test is the listener's own.
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_listener_in_teardown_closes_the_connection_before_its_streams() {
     let server = QuicTransportBuilder::new()
         .bind_addr("127.0.0.1:0".parse().unwrap())
@@ -1555,4 +1556,120 @@ async fn retirement_reports_late_sends_and_preserves_successor() {
         .unwrap();
     assert_eq!(errors.0.lock().unwrap().len(), 2);
     assert!(connections.get(&key).unwrap().tx.same_channel(&next.tx));
+}
+
+/// A listener in teardown shows the peer the connection close, not a
+/// STOP_SENDING from a reader that stopped first (see
+/// `a_listener_in_teardown_closes_the_connection_before_its_streams` for why
+/// that matters), even while a cancel of the node-wide token is half done.
+///
+/// Cancelling a token wakes its children before its own waiters. The reader
+/// of `serve_frames` waits on a child token, so a reader on a child of the
+/// node-wide token would wake before the connection task. This test holds the
+/// cancel after the children wake and before the node-wide token's own
+/// waiters do. Such a reader stops its stream in that gap. The readers' token
+/// is not reachable from the node-wide token: the connection task cancels it
+/// after it closes the connection.
+#[tokio::test]
+async fn teardown_closes_the_connection_before_child_readers_stop_streams() {
+    use std::future::Future;
+    use std::task::{Context, Wake, Waker};
+
+    struct PauseNotification {
+        reached: Arc<tokio::sync::Notify>,
+        resume: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+    impl Wake for PauseNotification {
+        fn wake(self: Arc<Self>) {
+            self.reached.notify_one();
+            self.resume
+                .lock()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the test releases the paused notification");
+        }
+    }
+
+    let server = QuicTransportBuilder::new()
+        .bind_addr("127.0.0.1:0".parse().unwrap())
+        .build()
+        .unwrap();
+    let (adapter, server_streams) = make_channels();
+    let teardown = adapter.shutdown_state.teardown_token().clone();
+    let reached = Arc::new(tokio::sync::Notify::new());
+    let (resume, resume_rx) = std::sync::mpsc::channel();
+    let waker = Waker::from(Arc::new(PauseNotification {
+        reached: reached.clone(),
+        resume: parking_lot::Mutex::new(resume_rx),
+    }));
+    let mut paused_child = Box::pin(teardown.child_token().cancelled_owned());
+    assert!(
+        paused_child
+            .as_mut()
+            .poll(&mut Context::from_waker(&waker))
+            .is_pending()
+    );
+
+    server
+        .start(
+            InstanceId::new_v4(),
+            adapter,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
+    let raw = server.address().get_entry(server.key()).unwrap().unwrap();
+    let addr = QuicEndpointInfo::decode(&raw).unwrap().endpoints[0]
+        .socket_addr()
+        .unwrap();
+    let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+    endpoint
+        .set_default_client_config(super::tls::pinned_client_config(server.fingerprint()).unwrap());
+    let connection = endpoint
+        .connect(addr, super::tls::SERVER_NAME)
+        .unwrap()
+        .await
+        .unwrap();
+    let (mut send, _recv) = connection.open_bi().await.unwrap();
+    let mut frame = Vec::new();
+    crate::transports::tcp::TcpFrameCodec::encode_frame_sync(
+        &mut frame,
+        MessageType::Event,
+        b"hdr",
+        b"pay",
+    )
+    .unwrap();
+    send.write_all(&frame).await.unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        server_streams.event_stream.recv_async(),
+    )
+    .await
+    .expect("the reader has started and routed a frame")
+    .unwrap();
+
+    let cancel = std::thread::spawn(move || teardown.cancel());
+    tokio::time::timeout(Duration::from_secs(5), reached.notified())
+        .await
+        .expect("cancellation paused before waking the parent waiters");
+    let before_parent_notification =
+        tokio::time::timeout(Duration::from_secs(1), send.stopped()).await;
+    resume.send(()).unwrap();
+    cancel.join().unwrap();
+    let outcome = match before_parent_notification {
+        Ok(outcome) => outcome,
+        Err(_) => tokio::time::timeout(Duration::from_secs(5), send.stopped())
+            .await
+            .expect("the listener closes after cancellation resumes"),
+    };
+    server.shutdown();
+    server.closed().await;
+    assert!(
+        matches!(
+            outcome,
+            Err(quinn::StoppedError::ConnectionLost(
+                quinn::ConnectionError::ApplicationClosed(_)
+            ))
+        ),
+        "the listener stopped the stream before it closed the connection: {outcome:?}"
+    );
 }
