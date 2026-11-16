@@ -224,7 +224,9 @@ impl DrainSignal {
     /// credit quantum (`claim.quantum`, off by default) is a filter in front of
     /// the wake, not a replacement: the slot's window grows by what it holds,
     /// and a slot whose sender has no credit (`sender_dry`) posts on every
-    /// drain, as before.
+    /// drain, as before. The drain that brings `owed` to the quantum posts
+    /// even when a wake is outstanding, and marks it urgent, so the visit does
+    /// not wait out the floor (`a_quantum_covers_a_shifted_doorbell_floor`).
     ///
     /// Orderings: the count's `fetch_add` is `Relaxed` and the listing's
     /// `fetch_or` is `AcqRel`, so a take whose swap reads the listing (or any
@@ -251,7 +253,7 @@ impl DrainSignal {
                 // wake may be the deferred one.
                 urgent.store(true, Ordering::Release);
                 claim.dirty.mark(claim.slot.index());
-                claim.pending.store(true, Ordering::Release);
+                claim.pending.swap(true, Ordering::AcqRel);
                 if self.wake.try_send(claim.key).is_err() {
                     claim.pending.store(false, Ordering::Release);
                 }
