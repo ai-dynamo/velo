@@ -183,4 +183,124 @@ mod tests {
             .collect();
         assert_eq!(seen, want);
     }
+
+    /// An older wake must not consume urgency before its slot becomes visible to the walk.
+    #[test]
+    #[ignore = "N4: an older wake takes the urgent flag before the slot is listed"]
+    fn an_urgent_drain_is_not_deferred_after_an_older_wake_takes_its_flag() {
+        use std::sync::atomic::Ordering;
+        use std::time::Duration;
+
+        use super::super::{DrainSignal, IngressRegistry, handle_batch};
+        use crate::streaming::messenger_mux::lane_choice::LaneReservation;
+        use crate::streaming::messenger_mux::peer_batcher::ReplyRecord;
+        use crate::streaming::messenger_mux::protocol::{BatchEncoder, SlotId};
+        use crate::streaming::messenger_mux::sweep::DrainVisits;
+        use crate::streaming::messenger_mux::{LaneIndex, MuxConfig, PeerLane};
+
+        let config = MuxConfig {
+            initial_credit: 5,
+            credit_quantum: 2,
+            ..MuxConfig::default()
+        };
+        let registry = IngressRegistry::default();
+        let key = PeerLane::new(velo_ext::WorkerId::from_u64(7), LaneIndex::ZERO);
+        let (wake_tx, wakes) = flume::unbounded();
+        let mut receivers = Vec::new();
+        let mut signals = Vec::new();
+        let body = crate::streaming::frame::encode_bytes_item(b"small").unwrap();
+        let mut encoder = BatchEncoder::new(1, 0, LaneIndex::ZERO);
+        let ids = [SlotId::new(0, 0).unwrap(), SlotId::new(4096, 0).unwrap()];
+        for (at, id) in ids.into_iter().enumerate() {
+            let (tx, rx) = flume::bounded(6);
+            let signal = Arc::new(DrainSignal::new(wake_tx.clone()));
+            registry.register_bind(
+                7,
+                at as u64 + 1,
+                tx,
+                Arc::clone(&signal),
+                LaneReservation::uncounted(LaneIndex::ZERO),
+                tokio::time::Instant::now(),
+            );
+            encoder.push_open_slot(id, 0, 7, at as u64 + 1).unwrap();
+            for seq in 1..=if at == 0 { 5 } else { 2 } {
+                encoder.push_data(id, seq, &body).unwrap();
+            }
+            receivers.push(rx);
+            signals.push(signal);
+        }
+        assert_eq!(
+            handle_batch(&registry, &config, None, key, &encoder.finish().freeze()).closed,
+            0
+        );
+        let dirty = {
+            let entry = registry.peers.get(&key).unwrap();
+            Arc::clone(&super::super::lock(entry.value()).dirty)
+        };
+        receivers[0].try_recv().unwrap();
+        signals[0].drained();
+        assert_eq!(wakes.len(), 1, "the dry slot posts an ordinary wake");
+        let urgent = registry.urgent_wake(key);
+        assert!(!urgent.load(Ordering::Acquire));
+        receivers[1].try_recv().unwrap();
+        signals[1].drained();
+
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let held = Arc::clone(&dirty);
+        let initializer = std::thread::spawn(move || {
+            held.chunks[1].get_or_init(|| {
+                started_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                Box::new([const { AtomicU64::new(0) }; CHUNK_WORDS])
+            });
+        });
+        started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let rx = receivers[1].clone();
+        let signal = Arc::clone(&signals[1]);
+        let draining = std::thread::spawn(move || {
+            rx.try_recv().unwrap();
+            signal.drained();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while signals[1].owed() != 2 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the second drain did not run"
+            );
+            std::thread::yield_now();
+        }
+        while !urgent.load(Ordering::Acquire) && std::time::Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(!draining.is_finished());
+        let start = tokio::time::Instant::now();
+        let mut visits = DrainVisits::new(Duration::from_millis(2));
+        assert_eq!(wakes.try_recv(), Ok(key));
+        assert_eq!(
+            visits.answer(key, start, registry.take_urgent_wake(key)),
+            Some(key)
+        );
+        registry.clear_pending_wake(key);
+        assert_eq!(
+            registry.sweep_drained(key),
+            vec![ReplyRecord::CreditUpdate {
+                slot: ids[0],
+                delta: 1
+            }]
+        );
+        assert_eq!(signals[1].owed(), 2, "the urgent slot was not listed yet");
+
+        release_tx.send(()).unwrap();
+        initializer.join().unwrap();
+        draining.join().unwrap();
+        assert_eq!(wakes.try_recv(), Ok(key), "the urgent drain always posts");
+        let at = start + Duration::from_millis(1);
+        let answer = visits.answer(key, at, registry.take_urgent_wake(key));
+        assert_eq!(
+            answer,
+            Some(key),
+            "the q-th drain lost its urgency and waits for the floor"
+        );
+    }
 }
