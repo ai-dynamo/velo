@@ -134,8 +134,10 @@ ignored = ["axum", "http", "http-body", "http-body-util", "hyper", "hyper-util",
 # `velo_endurance` is a rustc --cfg flag (NOT a Cargo feature) so `--all-features`
 # in CI never enables the endurance suites. Opt in locally with:
 #   RUSTFLAGS="--cfg velo_endurance" cargo test --test streaming_endurance
+#
+# `velo_rdma` is set by `build.rs`.
 [lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(velo_endurance)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(velo_endurance)', 'cfg(velo_rdma)'] }
 
 # ── Integration tests (subdirectory layout) ─────────────────────────────────
 # Tests inherited from the pre-fold sibling crates live under
