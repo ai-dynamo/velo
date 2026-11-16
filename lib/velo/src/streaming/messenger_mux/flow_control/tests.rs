@@ -560,23 +560,22 @@ fn many_slots_cannot_together_exceed_the_peer_budget() {
     );
 }
 
-/// A quantum's window and byte budget: the window grows by `q - 1`, and the
-/// slot byte budget by the records that may overtake a slow one,
-/// `(C + q - 2) / (C - 1)`, rounded up. 0 and 1 change nothing.
+/// A quantum's window grows by `q - 1`, the advertised slot byte budget does
+/// not change, and the reorder hold's limit grows to `q` slot budgets. 0 and 1
+/// change nothing.
 #[test]
 fn quantum_terms_grow_the_window_and_the_hold_together() {
     const MIB: u32 = 1024 * 1024;
     assert_eq!(quantum_terms(32, MIB, 0), Ok((32, MIB)));
     assert_eq!(quantum_terms(32, MIB, 1), Ok((32, MIB)));
-    let (window, budget) = quantum_terms(32, MIB, 8).expect("valid");
-    assert_eq!(window, 39);
+    assert_eq!(quantum_terms(32, MIB, 8), Ok((39, MIB)));
+    assert_eq!(hold_byte_budget(MIB, 0), u64::from(MIB));
+    assert_eq!(hold_byte_budget(MIB, 1), u64::from(MIB));
     assert_eq!(
-        u64::from(budget),
-        (u64::from(MIB) * 38).div_ceil(31),
-        "38 records may overtake where 31 could"
+        hold_byte_budget(MIB, 8),
+        8 * u64::from(MIB),
+        "7 more records, each at most one slot budget"
     );
-    // The boundary review found: 38 records of 33,825 bytes fit.
-    assert!(38 * 33_825 <= u64::from(budget));
     assert!(
         quantum_terms(4, MIB, 5).is_err(),
         "q above the window is refused"
@@ -586,9 +585,9 @@ fn quantum_terms_grow_the_window_and_the_hold_together() {
         "the window must fit u32"
     );
     assert_eq!(
-        quantum_terms(2, u32::MAX, 2).map(|(_, budget)| budget),
-        Ok(u32::MAX),
-        "the budget saturates rather than overflows"
+        hold_byte_budget(u32::MAX, u32::MAX),
+        u64::from(u32::MAX) * u64::from(u32::MAX),
+        "the hold limit is u64 and cannot overflow"
     );
 }
 

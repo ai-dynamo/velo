@@ -2493,6 +2493,7 @@ fn under_a_quantum_only_the_drain_that_reaches_it_arms_the_wake() {
         Arc::clone(&pending),
         Arc::clone(&dirty),
         4,
+        None,
     );
 
     for n in 1..=3 {
@@ -2883,7 +2884,10 @@ fn the_sender_never_has_less_credit_with_a_quantum() {
         let mut deliveries = vec![Vec::<u32>::new(); 400];
         let mut credit_back = vec![0u32; 400];
         let (mut staged, mut flush_at) = (0u32, None::<u32>);
-        let (mut visit_at, mut last_visit) = (None::<u32>, None::<u32>);
+        let mut visits = crate::streaming::messenger_mux::sweep::DrainVisits::new(
+            std::time::Duration::from_millis(2),
+        );
+        let start = tokio::time::Instant::now();
         let (mut waiting, mut sent, mut batch_seq) = (0u32, 0u32, 1u32);
         let mut free = Vec::new();
         fn stage(replies: Vec<ReplyRecord>, t: u32, staged: &mut u32, flush_at: &mut Option<u32>) {
@@ -2905,19 +2909,17 @@ fn the_sender_never_has_less_credit_with_a_quantum() {
                 stage(outcome.replies, t, &mut staged, &mut flush_at);
                 consumer.pump();
             }
-            if wakes.drain().count() > 0 && visit_at.is_none() {
-                visit_at = Some(last_visit.map_or(t, |last| t.max(last + 2)));
+            // The sweep task's own decision: a wake is walked unless the
+            // floor defers it, and an urgent one is walked at once.
+            let at = start + std::time::Duration::from_millis(u64::from(t));
+            let mut ready = Vec::new();
+            for key in wakes.drain() {
+                ready.extend(visits.answer(key, at, registry.take_urgent_wake(key)));
             }
-            if visit_at == Some(t) {
-                visit_at = None;
-                last_visit = Some(t);
-                registry.clear_pending_wake(peer());
-                stage(
-                    registry.sweep_drained(peer()),
-                    t,
-                    &mut staged,
-                    &mut flush_at,
-                );
+            ready.extend(visits.due(at));
+            for key in ready {
+                registry.clear_pending_wake(key);
+                stage(registry.sweep_drained(key), t, &mut staged, &mut flush_at);
             }
             if t > 0 && t % 200 == 0 {
                 stage(registry.sweep_credit(peer()), t, &mut staged, &mut flush_at);
@@ -2969,9 +2971,17 @@ fn the_sender_never_has_less_credit_with_a_quantum() {
     }
 }
 
+/// A stream whose reorder hold fits the slot budget without a quantum still
+/// fits with one, whatever its record sizes.
+///
+/// Scaling the hold by a ratio of record counts assumed the extra records are
+/// no larger than the ones before them. Here 31 records of 32 KiB fill the
+/// hold behind a delayed one, and the extra window then admits 56 KiB
+/// records: the ratio left the 37th without room. Each extra record is at
+/// most one slot budget (a larger held record closes the slot with the
+/// quantum off too), so the hold grows by one slot budget per extra record.
 #[test]
-#[ignore = "F1: the larger window overflows the scaled reorder budget for mixed record sizes"]
-fn f1_a_mixed_size_stream_that_fits_without_a_quantum_stays_open() {
+fn a_mixed_size_stream_that_fits_without_a_quantum_stays_open() {
     use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
 
     fn byte_item(size: usize) -> Vec<u8> {
@@ -3034,9 +3044,16 @@ fn f1_a_mixed_size_stream_that_fits_without_a_quantum_stays_open() {
     }
 }
 
+/// The credit a quantum holds does not also wait out the doorbell's floor.
+///
+/// Records arrive 1, 7 and 17 at 1, 2 and 3 ms. Without a quantum, the floor
+/// spaces visits at 3 and 5 ms. With a quantum of 8, the drain that reaches 8
+/// moves the first visit to 4 ms, and the floor then deferred the 17 to 6 ms:
+/// at 8 ms the sender had 22 credits against 32 without the quantum, and a
+/// 23-record burst stalled. The extra window covers what a slot holds, not a
+/// deferred visit, so the drain that reaches the quantum is walked at once.
 #[test]
-#[ignore = "F2: shifting the doorbell visits can starve a sender despite the extra window"]
-fn f2_a_quantum_covers_a_shifted_doorbell_floor() {
+fn a_quantum_covers_a_shifted_doorbell_floor() {
     use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
     use crate::streaming::messenger_mux::sweep::DrainVisits;
     use std::time::Duration;
@@ -3076,7 +3093,7 @@ fn f2_a_quantum_covers_a_shifted_doorbell_floor() {
             let now = start + Duration::from_millis(t as u64);
             let mut ready = Vec::new();
             for key in wakes.drain() {
-                ready.extend(visits.admit(key, now));
+                ready.extend(visits.answer(key, now, registry.take_urgent_wake(key)));
             }
             ready.extend(visits.due(now));
             for key in ready {
@@ -3084,7 +3101,11 @@ fn f2_a_quantum_covers_a_shifted_doorbell_floor() {
                 stage(registry.sweep_drained(key), t, &mut staged, &mut flush_at);
             }
             if quantum == 8 && t == 5 {
-                assert_eq!(consumer.drain.owed(), 17);
+                assert_eq!(
+                    consumer.drain.owed(),
+                    0,
+                    "the drain that reached the quantum was walked at once, not after the floor"
+                );
                 assert!(!consumer.drain.sender_parked());
             }
             if flush_at == Some(t) {

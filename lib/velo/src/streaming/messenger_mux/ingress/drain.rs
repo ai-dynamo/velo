@@ -103,6 +103,8 @@ struct SlotClaim {
     /// The consumer's [`MuxConfig::credit_quantum`](super::super::MuxConfig::credit_quantum);
     /// 0 and 1 mean off.
     quantum: u32,
+    /// The peer's urgent-visit flag, under a quantum.
+    urgent: Option<Arc<AtomicBool>>,
 }
 
 impl DrainSignal {
@@ -132,7 +134,7 @@ impl DrainSignal {
         pending: Arc<AtomicBool>,
         dirty: Arc<DirtySlots>,
     ) -> Lifecycle {
-        self.claimed_with_quantum(key, slot, pending, dirty, 0)
+        self.claimed_with_quantum(key, slot, pending, dirty, 0, None)
     }
 
     /// [`claimed_by`](Self::claimed_by), for a consumer with a credit quantum.
@@ -143,6 +145,7 @@ impl DrainSignal {
         pending: Arc<AtomicBool>,
         dirty: Arc<DirtySlots>,
         quantum: u32,
+        urgent: Option<Arc<AtomicBool>>,
     ) -> Lifecycle {
         let lifecycle = self.lifecycle.lock();
         let _ = self.claim.set(SlotClaim {
@@ -151,6 +154,7 @@ impl DrainSignal {
             pending,
             dirty,
             quantum,
+            urgent,
         });
         *lifecycle
     }
@@ -238,6 +242,21 @@ impl DrainSignal {
             // One count that drains add to and grants subtract from, so a
             // drain racing a reconcile still sees all the credit owed.
             let owed = self.owed.fetch_add(1, Ordering::Relaxed) + 1;
+            if owed == claim.quantum
+                && let Some(urgent) = &claim.urgent
+            {
+                // The held credit must not also wait out the doorbell's floor:
+                // the window covers what the slot holds, not a deferred visit.
+                // Posted even when a wake is already outstanding, because that
+                // wake may be the deferred one.
+                urgent.store(true, Ordering::Release);
+                claim.dirty.mark(claim.slot.index());
+                claim.pending.store(true, Ordering::Release);
+                if self.wake.try_send(claim.key).is_err() {
+                    claim.pending.store(false, Ordering::Release);
+                }
+                return;
+            }
             if owed < claim.quantum && !self.sender_dry.load(Ordering::Relaxed) {
                 return; // below the quantum, and the sender still has credit
             }

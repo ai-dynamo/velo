@@ -148,6 +148,8 @@ pub(super) struct SlotTerms {
     pub(super) initial_credit: u32,
     pub(super) slot_byte_budget: u32,
     pub(super) quantum: u32,
+    /// The reorder hold's limit: [`hold_byte_budget`](super::super::flow_control::hold_byte_budget).
+    pub(super) hold_byte_budget: u64,
 }
 
 impl Drop for IngressSlot {
@@ -171,6 +173,7 @@ impl IngressSlot {
             initial_credit,
             slot_byte_budget,
             quantum,
+            hold_byte_budget,
         } = terms;
         Self {
             session_id: 0,
@@ -185,7 +188,7 @@ impl IngressSlot {
             byte_watermark: u64::from(slot_byte_budget),
             next_seq: first_seq,
             hold: BTreeMap::new(),
-            hold_bytes: ByteBudget::new(u64::from(slot_byte_budget)),
+            hold_bytes: ByteBudget::new(hold_byte_budget),
             touched: false,
             pending_close: None,
         }

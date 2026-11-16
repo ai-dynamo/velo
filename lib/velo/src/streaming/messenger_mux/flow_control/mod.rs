@@ -67,10 +67,12 @@ pub(crate) const fn slot_buffer_depth(data_credit: u32) -> usize {
     data_credit as usize + 1
 }
 
-/// The window and slot byte budget a node advertises under a credit quantum.
+/// The window and slot byte budget a node advertises under a credit quantum:
+/// the window grows by `quantum - 1`, and the slot byte budget is unchanged
+/// (the reorder hold's own limit grows instead; see [`hold_byte_budget`]).
 ///
 /// `slot_byte_budget` is the resolved budget (never the "use the default"
-/// zero). Returns them unchanged for `quantum` 0 or 1.
+/// zero). Returns both unchanged for `quantum` 0 or 1.
 ///
 /// # Errors
 ///
@@ -91,12 +93,20 @@ pub(crate) fn quantum_terms(
     let window = initial_credit.checked_add(quantum - 1).ok_or_else(|| {
         format!("initial_credit {initial_credit} plus credit_quantum {quantum} overflows u32")
     })?;
-    // A slow record lets up to `window - 1` later ones into the reorder hold,
-    // where `initial_credit - 1` fit before; `quantum <= initial_credit` and
-    // `quantum >= 2` make that divisor at least 1.
-    let budget = (u64::from(slot_byte_budget) * u64::from(window - 1))
-        .div_ceil(u64::from(initial_credit - 1));
-    Ok((window, u32::try_from(budget).unwrap_or(u32::MAX)))
+    Ok((window, slot_byte_budget))
+}
+
+/// The bytes a slot's reorder hold may reserve under a credit quantum.
+///
+/// The extra `quantum - 1` credit lets as many more records overtake a slow
+/// one into the hold. A held record larger than `slot_byte_budget` closes
+/// the slot with the quantum off too, so each extra record is at most that
+/// large: room for `quantum - 1` more of them keeps every stream that fits
+/// with the quantum off fitting with it, whatever its record sizes. The hold
+/// is a cap on reservations, not an allocation; the peer byte budget still
+/// bounds what a peer's holds use together.
+pub(crate) fn hold_byte_budget(slot_byte_budget: u32, quantum: u32) -> u64 {
+    u64::from(slot_byte_budget) * u64::from(quantum.max(1))
 }
 
 // ---------------------------------------------------------------------------

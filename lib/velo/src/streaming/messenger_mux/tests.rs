@@ -3734,9 +3734,9 @@ async fn a_quantum_slot_opens_on_the_terms_its_ticket_and_attach_quote() {
     let advertised = pair.consumer.advertised_limits();
     assert_eq!(advertised.initial_credit(), 7, "5 + 3 - 1");
     assert_eq!(
-        u64::from(advertised.slot_byte_budget()),
-        (1024u64 * 1024 * 6).div_ceil(4),
-        "the default 1 MiB, scaled by the 6 records that may overtake where 4 could"
+        advertised.slot_byte_budget(),
+        1024 * 1024,
+        "the slot byte budget is the default 1 MiB: the hold grows, not the advertisement"
     );
     let manager = AnchorManagerBuilder::default()
         .worker_id(pair.consumer_worker)

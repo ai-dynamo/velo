@@ -130,6 +130,30 @@ impl DrainVisits {
         Some(peer)
     }
 
+    /// Answer a wake, walking at once when it is `urgent`: a drain brought a
+    /// slot's owed credit to the credit quantum, and that credit must not
+    /// wait out the floor. An urgent walk is stamped as a visit, so the floor
+    /// runs from it; a walk already queued for the peer stays queued and finds
+    /// little to do when it comes due.
+    pub(super) fn answer(
+        &mut self,
+        peer: PeerLane,
+        now: tokio::time::Instant,
+        urgent: bool,
+    ) -> Option<PeerLane> {
+        if !urgent {
+            return self.admit(peer, now);
+        }
+        self.peers
+            .entry(peer)
+            .and_modify(|state| state.last = now)
+            .or_insert(PeerVisits {
+                last: now,
+                queued: false,
+            });
+        Some(peer)
+    }
+
     /// Peers whose deferred walk has come due.
     pub(super) fn due(&mut self, now: tokio::time::Instant) -> Vec<PeerLane> {
         let mut ready = Vec::new();
@@ -141,7 +165,9 @@ impl DrainVisits {
             // Back through `admit`, which is the one place the floor is decided.
             // An entry exists only for a peer `admit` has refused to walk since
             // it was queued, and its due instant is one floor past that peer's
-            // last walk, so this always comes back `Some` and never re-queues.
+            // last walk, so this comes back `Some` — unless an urgent walk
+            // (`answer`) moved that last walk later, in which case it queues
+            // again, still one entry for the peer.
             ready.extend(self.admit(peer, now));
         }
         ready
@@ -234,7 +260,10 @@ pub(super) fn spawn_sweep(core: &Arc<MuxCore>) {
             match wake {
                 Wake::Tick => periodic_tick(&core, &mut visits, now),
                 Wake::Peer(peer) => {
-                    if let Some(peer) = visits.admit(peer, now) {
+                    // No lookup with the quantum off: no drain sets the flag.
+                    let urgent =
+                        core.config.credit_quantum > 1 && core.ingress.take_urgent_wake(peer);
+                    if let Some(peer) = visits.answer(peer, now, urgent) {
                         core.visit_drained_peer(peer);
                     }
                 }

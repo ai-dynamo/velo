@@ -157,6 +157,11 @@ pub(crate) struct IngressRegistry {
     /// only be removed under the same visibility that retires slots and binds,
     /// and until that is worth building, unbounded-but-tiny is the honest trade.
     drain_pending: DashMap<PeerLane, Arc<AtomicBool>>,
+    /// Under a credit quantum, per (peer, lane): a drain brought a slot's owed
+    /// credit to the quantum, so the next visit must not wait for the
+    /// doorbell's floor. Kept for the same life as `drain_pending`, for the
+    /// same reason.
+    drain_urgent: DashMap<PeerLane, Arc<AtomicBool>>,
     /// Live slots per lane, summed over every peer.
     ///
     /// Each [`IngressSlot`] holds one count on the lane the consumer placed
@@ -441,6 +446,23 @@ impl IngressRegistry {
                 .or_insert_with(|| Arc::new(AtomicBool::new(false)))
                 .value(),
         )
+    }
+
+    /// `key`'s urgent-visit flag, created on first use.
+    pub(crate) fn urgent_wake(&self, key: PeerLane) -> Arc<AtomicBool> {
+        Arc::clone(
+            self.drain_urgent
+                .entry(key)
+                .or_insert_with(|| Arc::new(AtomicBool::new(false)))
+                .value(),
+        )
+    }
+
+    /// Whether a drain asked for `key`'s next visit at once; clears the ask.
+    pub(crate) fn take_urgent_wake(&self, key: PeerLane) -> bool {
+        self.drain_urgent
+            .get(&key)
+            .is_some_and(|flag| flag.swap(false, Ordering::AcqRel))
     }
 
     /// Take this peer's wake down, so drains landing during the visit post a
@@ -901,6 +923,7 @@ fn open_slot(
         ctx.registry.pending_wake(ctx.key),
         Arc::clone(&state.dirty),
         ctx.config.credit_quantum,
+        (ctx.config.credit_quantum > 1).then(|| ctx.registry.urgent_wake(ctx.key)),
     );
 
     // Counted before `bind` drops at the end of this function, so the stream
@@ -926,6 +949,10 @@ fn open_slot(
             initial_credit: ctx.config.initial_credit,
             slot_byte_budget: ctx.config.slot_byte_budget,
             quantum: ctx.config.credit_quantum,
+            hold_byte_budget: super::flow_control::hold_byte_budget(
+                ctx.config.slot_byte_budget,
+                ctx.config.credit_quantum,
+            ),
         },
         record.frame_seq.saturating_add(1),
     );
