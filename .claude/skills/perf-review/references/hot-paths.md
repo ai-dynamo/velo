@@ -173,7 +173,7 @@ mux harnesses install them, so these are T1 when metrics are on.
 | `DEFAULT_SHRINK_THRESHOLD`, `SHRINK_RESET_CAPACITY` | `transports/tcp/framing.rs` | code comments |
 | `channel_capacity` 256 | `transports/tcp/transport/builder.rs`, `transports/uds/transport.rs` | `tx_budget --channel-capacity` |
 | `BURST_REFRESH` 128 | `messenger/server/mod.rs` | code comment |
-| `MuxConfig::default()`: `initial_credit` 32, `max_batch_bytes` 60 KiB, `credit_sweep_interval` 200 ms, `drain_visit_floor` 2 ms, `reply_linger` 1 ms, `async_open_ack` false, `flush_policy` Auto | `streaming/messenger_mux/config.rs` | guides/tune-batched-streaming.md; operations/response-plane-performance.md |
+| `MuxConfig::default()`: `initial_credit` 32, `max_batch_bytes` 60 KiB, `credit_sweep_interval` 200 ms, `drain_visit_floor` 2 ms, `reply_linger` 1 ms, `async_open_ack` false, `flush_policy` Auto, `credit_quantum` 0 (off) | `streaming/messenger_mux/config.rs` | guides/tune-batched-streaming.md; operations/response-plane-performance.md |
 | `DEFAULT_PEER_BYTE_BUDGET`, `DEFAULT_SLOT_BYTE_BUDGET` | `streaming/messenger_mux/flow_control/mod.rs` | guides/tune-batched-streaming.md, "Change the byte budgets" |
 | `GSO_SAFE_MAX_MTU` 6550, `DEFAULT_SERVER_ENDPOINTS`, UDP buffers | `transports/quic/transport/builder.rs` | operations/quic-performance.md |
 | `UcxConfig::spin_us` 20 | `transports/ucx/transport.rs` | operations/rdma-performance.md |

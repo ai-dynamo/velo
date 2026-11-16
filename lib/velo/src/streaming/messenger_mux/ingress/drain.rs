@@ -213,10 +213,14 @@ impl DrainSignal {
     /// does, `pending` goes back down, since leaving it up would claim a visit
     /// is coming when none is.
     ///
-    /// A per-slot record threshold was the alternative to the wake and is
-    /// worse on both counts: it withholds credit for the first `T` records of
-    /// every slot, which is latency on the path this change exists to speed up,
-    /// and with a thousand slots on one peer it still posts a thousand times.
+    /// A per-slot record threshold *in place of* the wake would be worse on
+    /// both counts: it withholds credit for the first `T` records of every
+    /// slot, which is latency on the path the wake exists to speed up, and
+    /// with a thousand slots on one peer it still posts a thousand times. The
+    /// credit quantum (`claim.quantum`, off by default) is a filter in front of
+    /// the wake, not a replacement: the slot's window grows by what it holds,
+    /// and a slot whose sender has no credit (`sender_dry`) posts on every
+    /// drain, as before.
     ///
     /// Orderings: the count's `fetch_add` is `Relaxed` and the listing's
     /// `fetch_or` is `AcqRel`, so a take whose swap reads the listing (or any

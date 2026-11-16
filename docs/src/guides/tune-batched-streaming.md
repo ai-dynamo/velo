@@ -107,6 +107,7 @@ The settings below are fields of `MuxConfig`. Always build it with `..Default::d
 | `flush_policy` | `Auto` with `on_admission: true` | When a batcher writes. See [Select a flush policy](#select-a-flush-policy). |
 | `async_open_ack` | `false` | Whether a slot open returns before the transport admits its `OpenSlot`. |
 | `reply_linger` | 1 ms | How long a credit reply waits for other records to share its batch. Zero writes each reply at once. |
+| `credit_quantum` | 0 (off) | Records a slot drains before it returns their credit. 0 and 1 are off. With q of 2 or more, the node advertises a window of `initial_credit + q - 1` and a larger slot byte budget. See [Return credit in quanta at sparse spacing](#return-credit-in-quanta-at-sparse-spacing). Values above `initial_credit` are refused at build time. |
 
 ## Change the credit window
 
@@ -120,6 +121,16 @@ The settings below are fields of `MuxConfig`. Always build it with `..Default::d
 - Do not set zero. Zero on the wire means "not offering the mux", and the build refuses it.
 
 Each slot buffer holds `initial_credit + 1` records. The byte budgets, not the record count, bound the memory.
+
+## Return credit in quanta at sparse spacing
+
+By default a consumer node returns each record's credit as soon as the record is drained. When records arrive far apart, as tokens do in real serving, each one then costs the consumer node a doorbell visit, two batcher wakes and a write that carries only credit, and costs the producer a read.
+
+`credit_quantum` (q) makes a slot hold drained credit until q records have drained. A slot whose sender has no credit left gets its credit back on each drain, as before. To pay for the credit it holds, the node advertises `q - 1` more credit (`initial_credit + q - 1`) and scales `slot_byte_budget` by `(initial_credit + q - 2) / (initial_credit - 1)`. A sender then never has less credit than with the quantum off, and the reorder hold has room for every record that may overtake a slow one.
+
+- Set it on the consumer node. The producer needs no change and no new version: it sees a larger window and fewer, larger grants.
+- The larger window is the cost. Each stream can put `q - 1` more records into the shared path to a saturated consumer, so a new stream's first record can wait behind more. See [The credit window and a saturated frontend](../operations/response-plane-performance.md#the-credit-window-and-a-saturated-frontend).
+- Measure before you set it. [Sparse token spacing](../operations/response-plane-performance.md#sparse-token-spacing) has the numbers for a prototype.
 
 ## Change the byte budgets
 
@@ -200,7 +211,7 @@ Without zero-RTT setup, the order does not matter. Each new attach negotiates th
 
 These changes were measured and did not help. Do not try them again without a new reason:
 
-- A grant threshold of half a window, measured at a window of 256. It cut credit traffic 19-fold, did not change CPU, and made inter-token p99 worse.
+- A grant threshold of half a window, measured at a window of 256. It cut credit traffic 19-fold, did not change CPU, and made inter-token p99 worse. It held half the window with no extra credit, so a slow reader ran out sooner. `credit_quantum` is a different design: it adds to the window what it holds, and grants at once to a sender with no credit.
 - A 500 µs data linger on the producers (`Auto { max_linger }`). It saved about 1 ms of frontend CPU per request and added about 10 ms to the request path.
 - A shorter `credit_sweep_interval` for faster credit. The arrival path already returns credit on the next batch.
 - `async_open_ack`, as described above.

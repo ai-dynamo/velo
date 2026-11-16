@@ -33,7 +33,7 @@ Use `Velo::shutdown(policy)` to close resources and join owned tasks while Tokio
 
 Call `Velo::unregister_peer` when a peer leaves. A restarted peer has a new instance id, so without the call a long-lived node keeps state and connections for every peer it ever served. See [Forget a peer](docs/src/concepts/discovery.md#forget-a-peer).
 
-Batched streams give each stream a window of 32 records in flight by default. A larger window lets a saturated consumer node queue a new stream's first record behind every other stream's backlog. See [Change the credit window](docs/src/guides/tune-batched-streaming.md#change-the-credit-window).
+Batched streams give each stream a window of 32 records in flight by default. A larger window lets a saturated consumer node queue a new stream's first record behind every other stream's backlog. See [Change the credit window](docs/src/guides/tune-batched-streaming.md#change-the-credit-window). At sparse token spacing, `credit_quantum` returns credit in quanta instead of once per record; it is off by default.
 
 ## Crates
 

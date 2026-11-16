@@ -71,7 +71,7 @@ These changes were measured or traced and did not help. They are recorded so tha
 
 | Change | What was measured | Verdict |
 |---|---|---|
-| Grant credit once per half window | Measured at a credit window of 256. Credit updates per rep fell from 54–59 million to 2.8–3.1 million. Frontend batches fell from 307,000–484,000 to 7,800–10,200. CPU per request did not change. Inter-token p99 rose to 68 and 76 ms against 40 and 42 ms on the same nodes, and sender credit exhaustion rose to 1,431 per rep. | Rejected. A threshold makes a slow reader exhaust the sender sooner. |
+| Grant credit once per half window | Measured at a credit window of 256. Credit updates per rep fell from 54–59 million to 2.8–3.1 million. Frontend batches fell from 307,000–484,000 to 7,800–10,200. CPU per request did not change. Inter-token p99 rose to 68 and 76 ms against 40 and 42 ms on the same nodes, and sender credit exhaustion rose to 1,431 per rep. | Rejected. A threshold makes a slow reader exhaust the sender sooner. `credit_quantum` adds what it holds to the window instead; see [Sparse token spacing](#sparse-token-spacing). |
 | An urgent grant for a starved slot | Measured at a credit window of 256, on the 8-process rig with output length 256. A sender runs out of credit about 300 times per rep and waits under 2 ms. Long gaps rise slightly in the last four token positions (76 to 106 gaps of 63.5 million). Only 21% to 30% of credit batches wait out the reply window. | Not built at 256. It has under 1 ms to win on about 300 of 250,000 streams, and an urgent reply per wake returns one batch per wake. On the 16-process rig with output length 900, in the first repetition of the allocation that ran 32 against 256 on 24 frontend cores, senders ran out of credit about 240,000 times at 256 and about 1.2 million times at 32, so a starved slot is common at 32. |
 | A 32-worker frontend runtime | CPU per request fell 1.4 to 1.8 ms. TTFT p95 at one holder rose from about 206 ms to 317–366 ms, and the p50 lead disappeared. | Rejected. velo's larger task count needs the workers. |
 | Coalesce SSE flushes | hyper drains the body until `Pending` and flushes once per poll, in both planes. velo flushes about 0.9 times per record, the comparison plane about 0.54, because its body task runs further behind. | No lever. More records per flush need a linger. |
@@ -218,6 +218,32 @@ The default window is 32. At 24 cores it brings velo's TTFT to the comparison pl
 
 At 32 the surplus waits in each stream's own withheld queue on the producer rather than in the shared path. In the first repetition of the 24-core allocation that ran 32 against 256, summed over the 16 worker processes, sender credit exhaustion rose from about 240,000 to about 1.2 million events; the worker's mean egress queue wait per frame fell from 9.5 to 1.2 ms, and the frontend's mean lane wait per batch from 1.8 to 0.7 ms. The per-stream backlog itself does not go away while the frontend is the bottleneck; it moves to where it delays only its own stream.
 
+
+### Sparse token spacing
+
+Measured on 2026-11-16 on one GB300 node (72 Neoverse-V2 cores). The stack is the Dynamo frontend on cores 0-15, four mocker workers on cores 16-31, and aiperf on cores 32-63. The load is chat streaming with input length 1,024 and output length 256. At mocker speedup 1, each stream gets a token every 5.8 to 8 ms, which is close to real serving. velo is 0.22.1 with Dynamo's mux settings: a 2 ms window (`max_linger`), a 1 ms reply linger and a credit window of 32. Each value is the median of three runs, and each run starts a new stack.
+
+| Concurrency 8, per output token | TCP plane | velo | velo, `on_complete` and a credit quantum of 8 (prototype) |
+|---|---|---|---|
+| TTFT p50 | 42.4 ms | 45.5 ms | 42.4 ms |
+| Frontend CPU | 55.6 µs | 122.2 µs | 74.2 µs |
+| Worker CPU | 58.7 µs | 112.7 µs | 76.1 µs |
+| Frontend context switches | 1.16 | 3.89 | 1.40 |
+
+Two mechanisms cause the difference.
+
+- **The window delays a lone record.** A record alone on its peer and lane waits for the whole 2 ms window and about 1.15 ms more, measured at windows of 1, 2 and 4 ms. Stamps on each request show the first token's trip from the worker to the frontend at 3.21 ms on velo and 0.055 ms on TCP. Stream setup costs the same on both. `AutoFlush::on_complete` writes the batch when every live slot has a record in it, so a lone stream does not wait, and it removes the TTFT gap.
+- **Credit came back once per token.** Each drained record rang the doorbell, staged a `CreditUpdate`, armed the reply-linger timer and wrote a batch that carried only credit, and the worker then read it. This path was 48 µs of the frontend's 67 µs surplus. A prototype of the credit quantum cut credit batches from 0.97 to 0.12 per token. The prototype did not add the extra window, so these numbers are not for `credit_quantum` as built. At mocker speedup 10 it raised TTFT p50 by 0.4 to 0.8 ms in two runs, which is not yet explained.
+
+When tokens are dense, batching hides both costs. At mocker speedup 10 (a token every 0.56 to 1.4 ms per stream) and concurrency 64, velo uses 27.5 µs of frontend CPU per token against 47.5 µs for TCP, and 28.6 µs with `on_complete`.
+
+Rejected: `on_admission` (`DYN_VELO_RESPONSE_BATCH_MS=0` in Dynamo). It also removes the TTFT gap, but at speedup 10 and concurrency 64 frontend CPU rose from 27.5 to 54.2 µs per token, because the frontend received 12 times more batches.
+
+Not a lever: a longer `reply_linger` alone. The frontend's own 2 ms window ends the wait first, so 5 ms and 20 ms changed nothing. Heartbeats add about one record per request.
+
+With both changes, velo's receive path still costs 18.6 µs more per token than TCP at concurrency 8. The cost is spread over the kernel, tokio, the ingress and the mux, and no single change removes it.
+
+Commands: four `python -m dynamo.mocker --model-path Qwen/Qwen3-0.6B --speedup-ratio 1 --request-plane tcp` on cores 16-31, `python -m dynamo.frontend` with `DYN_RESPONSE_PLANE=velo` or `tcp` on cores 0-15, and `aiperf profile --endpoint-type chat --streaming --synthetic-input-tokens-mean 1024 --output-tokens-mean 256 --concurrency 8 --request-count 160` on cores 32-63. CPU per token is the process's user and system time from `/proc`, over aiperf's request window, divided by requests times 256.
 
 ## UCX transport instability
 

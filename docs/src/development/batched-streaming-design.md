@@ -178,7 +178,19 @@ The doorbell's deferral queue holds at most one entry per peer. An earlier versi
 
 The periodic sweep defaults to 200 ms and must be non-zero. `tokio::time::interval` panics on a zero period inside the spawned sweep task. The build returned `Ok` and the mux then ran with no credit backstop, no eviction and nobody reading the doorbell. The build now refuses a zero interval.
 
-A grant threshold (grant only when half the window has drained) was built and measured. It cut credit updates 19-fold and did not change CPU. It made the inter-token p99 worse, because a slow reader exhausts the sender sooner when drained credit is held back. Do not build it again.
+A grant threshold (grant only when half the window has drained) was built and measured. It cut credit updates 19-fold and did not change CPU. It made the inter-token p99 worse, because a slow reader exhausts the sender sooner when drained credit is held back. Do not build a threshold that holds credit without adding it to the window. The credit quantum below does both.
+
+### Credit in quanta, off by default
+
+`MuxConfig::credit_quantum` (q) holds a slot's drained credit until q records have drained. It exists for sparse spacing: one record per drain means one credit-only batch per token, written by the consumer and read by the sender. It is off by default.
+
+- **The sender never has less credit than with the quantum off.** The consumer cannot see records or grants in flight, so a hold based on its view of the sender's free credit can starve the sender while it sees credit to spare (a review model: window 32, q = 8, 25 records in flight, the sender at zero while the consumer saw 24 free). The node instead advertises `C + q - 1` and holds at most `q - 1`. The test `the_sender_never_has_less_credit_with_a_quantum` runs two delayed-path schedules against the quantum-off case.
+- **A sender with no credit gets credit on every drain.** The slot publishes `sender_dry`, and a drain posts at once while it is set. This keeps the tail grant on the next batch, which "Why the arrival path reads the dirty set" above requires.
+- **One count, not two.** A drain adds 1 to the slot's `owed` and posts when it reaches q. A grant subtracts what it takes. A held count published after the reconcile's swap let drains that landed between the two read the old count and skip the post (`a_drain_racing_a_reconcile_still_posts_at_the_quantum`).
+- **The reorder hold grows with the window.** A slow record lets up to `C + q - 2` later ones overtake it into the hold, where `C - 1` could before, so the slot byte budget scales by that ratio. Scaling it by the window ratio left a 38th record of 33,825 bytes without room (`the_reorder_hold_fits_a_full_window_of_overtaking_records`).
+- **One effective config.** `MessengerMuxTransport::new` writes the window and the budget back into the config. The attach response, the zero-RTT ticket and the slot account then read one value. If only the advertisement grew, a sender that spent its advertised window would close its slot with `ProtocolError` (`a_quantum_slot_opens_on_the_terms_its_ticket_and_attach_quote`).
+
+The per-slot threshold that "Why wakes coalesce per peer" rejects held the first T records of every slot. The quantum adds those to the window, so it holds nothing the sender needs, and it filters which drains post to the same per-peer wake rather than replacing it. With many busy slots it still posts once per slot per quantum.
 
 ### Zero-RTT: pre-bind is the synchronous twin of bind
 
