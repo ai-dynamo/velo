@@ -47,7 +47,7 @@ pub(crate) use self::dirty::DirtySlots;
 pub(crate) use self::drain::DrainSignal;
 use self::epoch::{accept_epoch, note_batch_seq, retire_epoch};
 use self::reconcile::{collect_grants, collect_touched_grants, list_drained_slots};
-use self::slot::{Applied, IngressSlot, LiveCounts, heartbeat_frame};
+use self::slot::{Applied, IngressSlot, LiveCounts, SlotTerms, heartbeat_frame};
 use super::flow_control::SharedByteBudget;
 use super::lane_choice::{LaneCounts, LaneReservation, PeerLaneCounts};
 use super::peer_batcher::ReplyRecord;
@@ -895,11 +895,12 @@ fn open_slot(
     // The bind now has an owner, so its drain signal can start counting and
     // posting. Before this point it is inert: nothing has been delivered on
     // this slot, so nothing can have drained.
-    let lifecycle = bind.drain.claimed_by(
+    let lifecycle = bind.drain.claimed_with_quantum(
         ctx.key,
         id,
         ctx.registry.pending_wake(ctx.key),
         Arc::clone(&state.dirty),
+        ctx.config.credit_quantum,
     );
 
     // Counted before `bind` drops at the end of this function, so the stream
@@ -921,8 +922,11 @@ fn open_slot(
         ),
         bind.frame_tx.clone(),
         Arc::clone(&bind.drain),
-        ctx.config.initial_credit,
-        ctx.config.slot_byte_budget,
+        SlotTerms {
+            initial_credit: ctx.config.initial_credit,
+            slot_byte_budget: ctx.config.slot_byte_budget,
+            quantum: ctx.config.credit_quantum,
+        },
         record.frame_seq.saturating_add(1),
     );
     slot.session_id = session_id;

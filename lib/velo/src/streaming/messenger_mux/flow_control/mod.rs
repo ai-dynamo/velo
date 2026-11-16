@@ -67,6 +67,38 @@ pub(crate) const fn slot_buffer_depth(data_credit: u32) -> usize {
     data_credit as usize + 1
 }
 
+/// The window and slot byte budget a node advertises under a credit quantum.
+///
+/// `slot_byte_budget` is the resolved budget (never the "use the default"
+/// zero). Returns them unchanged for `quantum` 0 or 1.
+///
+/// # Errors
+///
+/// When `quantum` exceeds `initial_credit`, or the window overflows `u32`.
+pub(crate) fn quantum_terms(
+    initial_credit: u32,
+    slot_byte_budget: u32,
+    quantum: u32,
+) -> Result<(u32, u32), String> {
+    if quantum <= 1 {
+        return Ok((initial_credit, slot_byte_budget));
+    }
+    if quantum > initial_credit {
+        return Err(format!(
+            "credit_quantum {quantum} exceeds initial_credit {initial_credit}"
+        ));
+    }
+    let window = initial_credit.checked_add(quantum - 1).ok_or_else(|| {
+        format!("initial_credit {initial_credit} plus credit_quantum {quantum} overflows u32")
+    })?;
+    // A slow record lets up to `window - 1` later ones into the reorder hold,
+    // where `initial_credit - 1` fit before; `quantum <= initial_credit` and
+    // `quantum >= 2` make that divisor at least 1.
+    let budget = (u64::from(slot_byte_budget) * u64::from(window - 1))
+        .div_ceil(u64::from(initial_credit - 1));
+    Ok((window, u32::try_from(budget).unwrap_or(u32::MAX)))
+}
+
 // ---------------------------------------------------------------------------
 // Negotiated limits
 // ---------------------------------------------------------------------------
@@ -319,6 +351,10 @@ pub(crate) struct SlotCreditAccount {
     buffered: u32,
     ungranted: u32,
     terminal: TerminalReserve,
+    /// Drained records whose credit is held back; see
+    /// [`MuxConfig::credit_quantum`](super::MuxConfig::credit_quantum).
+    /// 0 and 1 mean off.
+    quantum: u32,
 }
 
 impl SlotCreditAccount {
@@ -330,7 +366,14 @@ impl SlotCreditAccount {
             buffered: 0,
             ungranted: 0,
             terminal: TerminalReserve::Unspent,
+            quantum: 0,
         }
+    }
+
+    /// The same account, holding grants below `quantum` records.
+    pub(crate) const fn with_quantum(mut self, quantum: u32) -> Self {
+        self.quantum = quantum;
+        self
     }
 
     /// Data credit `C` granted to the peer.
@@ -439,6 +482,11 @@ impl SlotCreditAccount {
     pub(crate) fn take_pending_grant(&mut self) -> Option<u32> {
         let delta = self.ungranted;
         if delta == 0 {
+            return None;
+        }
+        // Under a quantum, hold a grant below it while the peer still has
+        // credit; the window it advertised covers what is held.
+        if self.quantum > 1 && delta < self.quantum && self.peer_holds_credit() {
             return None;
         }
         self.ungranted = 0;

@@ -2415,3 +2415,556 @@ fn a_claim_during_shutdown_is_retired_or_refused() {
     );
     assert!(consumer.rx.is_disconnected());
 }
+
+// ---------------------------------------------------------------------------
+// Credit quantum
+// ---------------------------------------------------------------------------
+
+/// A config with a credit quantum, normalised the way
+/// `MessengerMuxTransport::new` normalises it: the window and the slot byte
+/// budget the node advertises.
+fn quantum_config(initial_credit: u32, slot_byte_budget: u32, quantum: u32) -> MuxConfig {
+    let (initial_credit, slot_byte_budget) =
+        crate::streaming::messenger_mux::flow_control::quantum_terms(
+            initial_credit,
+            slot_byte_budget,
+            quantum,
+        )
+        .expect("valid quantum");
+    MuxConfig {
+        initial_credit,
+        slot_byte_budget,
+        peer_byte_budget: 64 * 1024 * 1024,
+        credit_quantum: quantum,
+        ..MuxConfig::default()
+    }
+}
+
+/// As [`register`], with a wake lane the test reads: each post is one wake.
+fn register_live(
+    registry: &IngressRegistry,
+    config: &MuxConfig,
+    session: u64,
+) -> (Consumer, flume::Receiver<PeerLane>) {
+    let (wake_tx, wake_rx) = flume::unbounded();
+    let (tx, rx) = flume::bounded(
+        crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
+    );
+    let drain = Arc::new(DrainSignal::new(wake_tx));
+    registry.register_bind(
+        ANCHOR,
+        session,
+        tx,
+        Arc::clone(&drain),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+        tokio::time::Instant::now(),
+    );
+    (Consumer { rx, drain }, wake_rx)
+}
+
+/// Deliver records `seqs` into slot `id`, one batch.
+fn deliver(
+    registry: &IngressRegistry,
+    config: &MuxConfig,
+    id: SlotId,
+    batch_seq: u32,
+    seqs: impl IntoIterator<Item = u32>,
+) -> BatchOutcome {
+    let payload = batch(1, batch_seq, |encoder| {
+        for seq in seqs {
+            encoder.push_data(id, seq, &item(seq as u8)).unwrap();
+        }
+    });
+    handle_batch(registry, config, None, peer(), &payload)
+}
+
+/// Twin of `a_drain_of_a_listed_slot_leaves_the_pending_flag_alone`, with a
+/// quantum: a drain below the quantum neither lists its slot nor touches the
+/// peer's pending flag, and the drain that reaches it does both, once.
+#[test]
+fn under_a_quantum_only_the_drain_that_reaches_it_arms_the_wake() {
+    let (wake_tx, wake_rx) = flume::bounded(8);
+    let drain = DrainSignal::new(wake_tx);
+    let pending = Arc::new(AtomicBool::new(false));
+    let dirty = Arc::new(DirtySlots::new());
+    drain.claimed_with_quantum(
+        peer(),
+        slot(3, 0),
+        Arc::clone(&pending),
+        Arc::clone(&dirty),
+        4,
+    );
+
+    for n in 1..=3 {
+        drain.drained();
+        assert!(
+            !pending.load(Ordering::Acquire),
+            "drain {n} of a quantum of 4 must not arm the wake"
+        );
+    }
+    assert_eq!(wake_rx.len(), 0, "and must not post one");
+    let mut listed = Vec::new();
+    dirty.take(|index| listed.push(index));
+    assert!(listed.is_empty(), "nor list the slot: {listed:?}");
+
+    drain.drained();
+    assert!(pending.load(Ordering::Acquire), "the fourth drain arms it");
+    assert_eq!(wake_rx.len(), 1);
+    assert_eq!(
+        drain.take_drained(),
+        4,
+        "the visit collects all four drains"
+    );
+}
+
+/// Twin of `a_batch_returns_the_credit_of_every_slot_that_drained` and of
+/// `a_doorbell_visit_reconciles_only_the_slots_that_drained`, with a quantum:
+/// a slot gives its credit back once `q` of its records have drained, by the
+/// next batch or the doorbell, and holds it below that.
+#[test]
+fn under_a_quantum_a_slot_returns_credit_once_q_records_drained() {
+    let config = quantum_config(8, 4096, 4);
+    let registry = IngressRegistry::default();
+    let consumers = open_many(&registry, &config, 2);
+    let a = slot(0, 0);
+    let b = slot(1, 0);
+
+    let payload = batch(1, 1, |encoder| {
+        for seq in 1..=3u32 {
+            encoder.push_data(a, seq, &item(seq as u8)).unwrap();
+            encoder.push_data(b, seq, &item(seq as u8)).unwrap();
+        }
+    });
+    handle_batch(&registry, &config, None, peer(), &payload);
+
+    // B drains three, below its quantum of four: nothing is listed, so a
+    // doorbell visit has nothing to answer and a batch into A carries nothing.
+    assert_eq!(consumers[1].pump().len(), 3);
+    assert!(registry.sweep_drained(peer()).is_empty(), "3 of 4 drained");
+    let outcome = deliver(&registry, &config, a, 2, [4]);
+    assert!(
+        outcome.replies.is_empty(),
+        "below the quantum the batch holds B's credit: {:?}",
+        outcome.replies
+    );
+
+    // B's fourth drain reaches the quantum, and the next batch into A carries
+    // B's four credits.
+    let outcome = deliver(&registry, &config, b, 3, [4]);
+    assert!(outcome.replies.is_empty());
+    assert_eq!(consumers[1].pump().len(), 1);
+    let outcome = deliver(&registry, &config, a, 4, [5]);
+    assert_eq!(
+        outcome.replies,
+        vec![ReplyRecord::CreditUpdate { slot: b, delta: 4 }],
+        "four drained, so four come back on the next batch"
+    );
+    assert!(registry.sweep_credit(peer()).is_empty(), "and only once");
+}
+
+/// Twin of `the_periodic_walk_takes_the_dirty_set_and_the_next_drain_lists_again`,
+/// with a quantum: the walk reconciles a slot below its quantum and holds the
+/// credit, and the drain that brings it to the quantum lists the slot again.
+#[test]
+fn under_a_quantum_the_periodic_walk_holds_and_the_next_drain_lists_at_q() {
+    let config = quantum_config(8, 4096, 4);
+    let registry = IngressRegistry::default();
+    let consumer = register(&registry, &config, SESSION);
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+
+    deliver(&registry, &config, id, 1, 1..=3);
+    assert_eq!(consumer.pump().len(), 3);
+    assert!(
+        registry.sweep_credit(peer()).is_empty(),
+        "the walk takes three drains and holds them, below the quantum"
+    );
+    deliver(&registry, &config, id, 2, [4]);
+    assert_eq!(consumer.pump().len(), 1);
+    let dirty = registry.dirty_slots(peer());
+    let mut listed = Vec::new();
+    dirty.take(|index| listed.push(index));
+    assert_eq!(
+        listed,
+        vec![id.index()],
+        "three held plus this drain reach the quantum, so the slot is listed"
+    );
+}
+
+/// Twin of `a_reused_index_reconciles_its_replacement_and_grants_it_nothing`,
+/// with a quantum: credit held by a retired slot goes with it, and its
+/// replacement at the same index is granted nothing.
+#[test]
+fn under_a_quantum_a_reused_index_grants_its_replacement_nothing() {
+    let config = quantum_config(8, 4096, 2);
+    let registry = IngressRegistry::default();
+    let consumer = register(&registry, &config, SESSION);
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+    deliver(&registry, &config, id, 1, 1..=2);
+    assert_eq!(
+        consumer.pump().len(),
+        2,
+        "two drains reach the quantum and list index 0"
+    );
+
+    let replacement = register(&registry, &config, SESSION + 1);
+    let new_id = slot(0, 1);
+    let payload = batch(1, 2, |encoder| {
+        encoder
+            .push_close_slot(id, 3, CloseReason::TerminalSent)
+            .unwrap();
+        encoder
+            .push_open_slot(new_id, 0, ANCHOR, SESSION + 1)
+            .unwrap();
+    });
+    let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+    assert_eq!(outcome.closed, 1);
+    assert!(
+        outcome.replies.is_empty(),
+        "the listed drains belonged to the retired slot: {:?}",
+        outcome.replies
+    );
+    assert_eq!(replacement.drain.owed(), 0, "the replacement owes nothing");
+}
+
+/// Twin of `a_claim_and_its_wake_name_the_arrival_lane`, with a quantum: the
+/// wake that the quantum's last drain posts names the arrival lane.
+#[test]
+fn under_a_quantum_the_wake_names_the_arrival_lane() {
+    let config = quantum_config(4, 4096, 2);
+    let registry = IngressRegistry::default();
+    let (wake_tx, wake_rx) = flume::unbounded();
+    let (tx, rx) = flume::bounded(
+        crate::streaming::messenger_mux::flow_control::slot_buffer_depth(config.initial_credit),
+    );
+    let drain = Arc::new(DrainSignal::new(wake_tx));
+    registry.register_bind(
+        ANCHOR,
+        SESSION,
+        tx,
+        Arc::clone(&drain),
+        LaneReservation::uncounted(LaneIndex::ZERO),
+        tokio::time::Instant::now(),
+    );
+    let consumer = Consumer { rx, drain };
+    let one = PeerLane::new(peer().peer, LaneIndex::new(1));
+    let id = slot(4, 2);
+    let payload = batch_on(one.lane, 3, 0, |encoder| {
+        encoder.push_open_slot(id, 0, ANCHOR, SESSION).unwrap();
+        encoder.push_data(id, 1, &item(7)).unwrap();
+        encoder.push_data(id, 2, &item(8)).unwrap();
+    });
+    handle_batch(&registry, &config, None, one, &payload);
+
+    assert_eq!(consumer.pump_n(1), vec![item(7)]);
+    assert!(
+        wake_rx.is_empty(),
+        "one drain of a quantum of two posts nothing"
+    );
+    assert_eq!(consumer.pump_n(1), vec![item(8)]);
+    assert_eq!(
+        wake_rx.try_recv(),
+        Ok(one),
+        "the wake names the arrival lane"
+    );
+}
+
+/// A drain that lands between a reconcile's swap of the drain count and its
+/// grant still posts when the slot owes a quantum.
+///
+/// The failing design published the held count after the grant: the drains
+/// in the gap read the old held count (0), saw at most 7 of a quantum of 8,
+/// and none posted. The reconcile then held its 7, and the slot owed 14 with
+/// no visit coming, until the next arrival or the periodic walk. One counter
+/// that a drain adds to and a grant subtracts from cannot miss them.
+#[test]
+fn a_drain_racing_a_reconcile_still_posts_at_the_quantum() {
+    let config = quantum_config(8, 64 * 1024, 8);
+    let registry = IngressRegistry::default();
+    let (consumer, wakes) = register_live(&registry, &config, SESSION);
+    let consumer = Arc::new(consumer);
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+    deliver(&registry, &config, id, 1, 1..=14);
+
+    assert_eq!(consumer.pump_n(7).len(), 7);
+    assert!(wakes.is_empty(), "7 of 8: nothing posted");
+
+    let gap = Arc::clone(&consumer);
+    let guard = super::reconcile::tests_hook::set(move || {
+        assert_eq!(gap.pump_n(7).len(), 7, "seven drains in the gap");
+    });
+    assert!(
+        registry.sweep_credit(peer()).is_empty(),
+        "the walk swaps 7 and holds them, below the quantum"
+    );
+    drop(guard);
+
+    assert_eq!(
+        wakes.drain().count(),
+        1,
+        "7 held plus 7 drained in the gap owe 14: a drain must have posted"
+    );
+    registry.clear_pending_wake(peer());
+    assert_eq!(
+        registry.sweep_drained(peer()),
+        vec![ReplyRecord::CreditUpdate {
+            slot: id,
+            delta: 14
+        }],
+        "the visit returns all fourteen"
+    );
+    assert_eq!(consumer.drain.owed(), 0);
+}
+
+/// A sender with no credit left gets each drained credit back at once, with
+/// no quantum to wait for.
+#[test]
+fn under_a_quantum_a_dry_sender_gets_credit_back_on_each_drain() {
+    let config = quantum_config(4, 4096, 4);
+    let window = config.initial_credit;
+    let registry = IngressRegistry::default();
+    let (consumer, wakes) = register_live(&registry, &config, SESSION);
+    let id = slot(0, 0);
+    open(&registry, &config, id, 1);
+    deliver(&registry, &config, id, 1, 1..=window);
+
+    assert_eq!(consumer.pump_n(1).len(), 1);
+    assert_eq!(
+        wakes.drain().count(),
+        1,
+        "the sender has spent its whole window, so one drain must post"
+    );
+    registry.clear_pending_wake(peer());
+    assert_eq!(
+        registry.sweep_drained(peer()),
+        vec![ReplyRecord::CreditUpdate { slot: id, delta: 1 }],
+        "and the visit grants it, below the quantum"
+    );
+}
+
+/// The reorder hold has room for every record a sender may send ahead of a
+/// slow one, with the quantum's larger window.
+///
+/// A record waiting on rendezvous (seq 1 here, never delivered) lets every
+/// later record overtake it into the hold, which reserves their bytes against
+/// the slot byte budget and closes the slot with `ProtocolError` when one does
+/// not fit. Without a quantum, 31 records of 33,825 bytes and a terminal fit
+/// the default 1 MiB. With a quantum of 8 the window is 39, so 38 may
+/// overtake: scaling the budget by the window (39/32) left the 39th without
+/// room; scaling it by the records that may overtake (38/31) does not.
+#[test]
+fn the_reorder_hold_fits_a_full_window_of_overtaking_records() {
+    const MIB: u32 = 1024 * 1024;
+    let terminal = cached_finalized().len();
+    // The largest record for which today's 31 overtaking records and a
+    // terminal fit the default budget.
+    let today = (MIB as usize - terminal) / 31;
+    let cases = [
+        (0u32, today, true, "no quantum, today's worst case"),
+        (8, today, true, "quantum 8, today's worst case scaled"),
+        (
+            8,
+            33_825usize,
+            false,
+            "quantum 8, the boundary the window ratio missed",
+        ),
+        (8, 30 * 1024, true, "quantum 8, 30 KiB records"),
+    ];
+    for (quantum, size, with_terminal, case) in cases {
+        let config = quantum_config(32, MIB, quantum);
+        let window = config.initial_credit;
+        let registry = IngressRegistry::default();
+        let _consumer = register(&registry, &config, SESSION);
+        let id = slot(0, 0);
+        open(&registry, &config, id, 1);
+        let body = vec![7u8; size];
+        let body = &body[..];
+        // Every record after seq 1 overtakes it, then the terminal.
+        for seq in 2..=window {
+            let payload = batch(1, seq, |encoder| {
+                encoder.push_data(id, seq, body).unwrap();
+            });
+            let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+            assert_eq!(
+                outcome.closed, 0,
+                "{case}: record {seq} of {window} closed the slot"
+            );
+        }
+        if with_terminal {
+            let payload = batch(1, window + 1, |encoder| {
+                encoder
+                    .push_data(id, window + 1, cached_finalized())
+                    .unwrap();
+            });
+            let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+            assert_eq!(outcome.closed, 0, "{case}: the terminal closed the slot");
+        }
+        assert_eq!(registry.live_slots(peer()), 1, "{case}");
+    }
+}
+
+/// A many-slot peer at sparse spacing: each slot returns credit once per
+/// quantum, not once per record.
+#[test]
+fn under_a_quantum_many_slots_return_credit_once_per_quantum() {
+    const SLOTS: u32 = 256;
+    const RECORDS: u32 = 16;
+    let config = quantum_config(8, 64 * 1024, 4);
+    let registry = IngressRegistry::default();
+    let consumers = open_many(&registry, &config, SLOTS);
+    let mut updates = 0usize;
+    let mut credit = 0u32;
+    for seq in 1..=RECORDS {
+        // One record per slot per pass, each drained before the next pass.
+        let payload = batch(1, seq, |encoder| {
+            for index in 0..SLOTS {
+                encoder
+                    .push_data(slot(index, 0), seq, &item(seq as u8))
+                    .unwrap();
+            }
+        });
+        let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+        for reply in outcome
+            .replies
+            .iter()
+            .chain(&registry.sweep_drained(peer()))
+        {
+            if let ReplyRecord::CreditUpdate { delta, .. } = reply {
+                updates += 1;
+                credit += delta;
+            }
+        }
+        for consumer in &consumers {
+            assert_eq!(consumer.pump().len(), 1);
+        }
+    }
+    for reply in registry.sweep_drained(peer()) {
+        if let ReplyRecord::CreditUpdate { delta, .. } = reply {
+            updates += 1;
+            credit += delta;
+        }
+    }
+    assert_eq!(
+        credit,
+        SLOTS * RECORDS,
+        "every drained record's credit comes back"
+    );
+    assert_eq!(
+        updates,
+        (SLOTS * RECORDS / 4) as usize,
+        "one update per slot per quantum of 4, not one per record"
+    );
+}
+
+/// The sender never has less credit with a quantum than without, whatever is
+/// in flight.
+///
+/// A time-stepped run of one slot: the sender spends credit as records are
+/// produced, each record reaches the consumer after a data-path delay, the
+/// consumer drains it at once, a posted drain gets a doorbell visit no sooner
+/// than 2 ms after the last one, a grant waits 1 ms of reply linger, and
+/// credit takes 2 ms to come back. Two schedules from review: a steady
+/// stream behind a 25 ms data path, where a quantum without its extra window
+/// starved the sender while the consumer saw 24 credits free; and a burst
+/// where seven drains landed after a reconcile had held seven, which a
+/// quantum that counted only new drains held past its extra window.
+#[test]
+fn the_sender_never_has_less_credit_with_a_quantum() {
+    fn run(quantum: u32, schedule: &dyn Fn(u32, u32) -> (u32, u32)) -> Vec<u32> {
+        use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
+        let config = quantum_config(32, 1024 * 1024, quantum);
+        let registry = IngressRegistry::default();
+        let (consumer, wakes) = register_live(&registry, &config, SESSION);
+        let id = slot(0, 0);
+        open(&registry, &config, id, 1);
+        let mut sender = SlotCredit::new(config.initial_credit);
+        let mut deliveries = vec![Vec::<u32>::new(); 400];
+        let mut credit_back = vec![0u32; 400];
+        let (mut staged, mut flush_at) = (0u32, None::<u32>);
+        let (mut visit_at, mut last_visit) = (None::<u32>, None::<u32>);
+        let (mut waiting, mut sent, mut batch_seq) = (0u32, 0u32, 1u32);
+        let mut free = Vec::new();
+        fn stage(replies: Vec<ReplyRecord>, t: u32, staged: &mut u32, flush_at: &mut Option<u32>) {
+            for reply in replies {
+                if let ReplyRecord::CreditUpdate { delta, .. } = reply {
+                    *staged += delta;
+                    flush_at.get_or_insert(t + 1);
+                }
+            }
+        }
+        for t in 0..300u32 {
+            let now = t as usize;
+            sender.grant(std::mem::take(&mut credit_back[now]));
+            let arrived = std::mem::take(&mut deliveries[now]);
+            if !arrived.is_empty() {
+                let outcome = deliver(&registry, &config, id, batch_seq, arrived.iter().copied());
+                batch_seq += 1;
+                assert_eq!(outcome.closed, 0);
+                stage(outcome.replies, t, &mut staged, &mut flush_at);
+                consumer.pump();
+            }
+            if wakes.drain().count() > 0 && visit_at.is_none() {
+                visit_at = Some(last_visit.map_or(t, |last| t.max(last + 2)));
+            }
+            if visit_at == Some(t) {
+                visit_at = None;
+                last_visit = Some(t);
+                registry.clear_pending_wake(peer());
+                stage(
+                    registry.sweep_drained(peer()),
+                    t,
+                    &mut staged,
+                    &mut flush_at,
+                );
+            }
+            if t > 0 && t % 200 == 0 {
+                stage(registry.sweep_credit(peer()), t, &mut staged, &mut flush_at);
+            }
+            if flush_at == Some(t) {
+                credit_back[now + 2] += std::mem::take(&mut staged);
+                flush_at = None;
+            }
+            waiting += schedule(t, u32::MAX).0;
+            while waiting > 0 && sender.can_spend(CreditClass::Data) {
+                sender.try_spend(CreditClass::Data).expect("credit");
+                sent += 1;
+                let at = schedule(t, sent).1;
+                deliveries[at as usize].push(sent);
+                waiting -= 1;
+            }
+            free.push(sender.data_available());
+        }
+        free
+    }
+    // (produced at t, delivery time of the n-th record sent at t)
+    let steady = |t: u32, _n: u32| (u32::from(t < 36), t + 25);
+    let burst = |t: u32, n: u32| {
+        let produced = match t {
+            0 => 32,
+            12 => 7,
+            13 => 1,
+            _ => 0,
+        };
+        let at = match n {
+            1..=7 => n,
+            8..=14 => 8,
+            _ => 25u32.max(t + 1),
+        };
+        (produced, at)
+    };
+    for (name, schedule) in [
+        ("steady", &steady as &dyn Fn(u32, u32) -> (u32, u32)),
+        ("burst", &burst),
+    ] {
+        let off = run(0, schedule);
+        let on = run(8, schedule);
+        for (t, (on, off)) in on.iter().zip(&off).enumerate() {
+            assert!(
+                on >= off,
+                "{name}: at t={t} the sender had {on} credits with the quantum against {off} without"
+            );
+        }
+    }
+}

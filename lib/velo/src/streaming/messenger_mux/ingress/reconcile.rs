@@ -121,10 +121,46 @@ pub(super) fn collect_touched_grants(state: &mut PeerIngress, replies: &mut Vec<
 /// Reconcile one slot and stage the `CreditUpdate` it earned, if any.
 fn reconcile_slot(slot: &mut IngressSlot, replies: &mut Vec<ReplyRecord>) {
     slot.reconcile();
+    #[cfg(test)]
+    tests_hook::between_swap_and_grant();
     if let Some(delta) = slot.take_grant() {
         replies.push(ReplyRecord::CreditUpdate {
             slot: slot.id,
             delta,
         });
+    }
+}
+
+/// A test's hook between a reconcile's swap of the drain count and its grant,
+/// where a drain on another thread can land.
+#[cfg(test)]
+pub(super) mod tests_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
+    }
+
+    /// Run `hook` between the swap and the grant of every reconcile on this
+    /// thread, until the returned guard drops.
+    pub(crate) fn set(hook: impl FnMut() + 'static) -> Guard {
+        HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+        Guard
+    }
+
+    pub(super) fn between_swap_and_grant() {
+        HOOK.with(|slot| {
+            if let Some(hook) = slot.borrow_mut().as_mut() {
+                hook();
+            }
+        });
+    }
+
+    pub(crate) struct Guard;
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOK.with(|slot| *slot.borrow_mut() = None);
+        }
     }
 }

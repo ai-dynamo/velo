@@ -472,6 +472,24 @@ pub struct MuxConfig {
     ///
     /// Defaults to 1 ms.
     pub reply_linger: Duration,
+    /// Records a slot's consumer drains before it returns their credit, `q`.
+    ///
+    /// **Defaults to 0, off**: every drained record's credit goes back on the
+    /// next reconcile, as it always has. At sparse token spacing that is one
+    /// credit-only batch per record, written by the consumer and read by the
+    /// sender, which costs both sides a write, a read and several wakes per
+    /// token. With `q >= 2`, a slot holds its drained credit until `q` records
+    /// have drained, and grants at once whenever its sender has no credit
+    /// left.
+    ///
+    /// To pay for what it holds, a node with a quantum advertises a window of
+    /// `initial_credit + q - 1` and scales `slot_byte_budget` by
+    /// `(initial_credit + q - 2) / (initial_credit - 1)`, so a sender never has
+    /// less credit, and a reorder hold never less room per record, than with
+    /// the quantum off. Both are written back into the effective config at
+    /// build, so the attach response, the zero-RTT ticket and the slot agree.
+    /// `q = 1` is the same as off. Building a mux refuses `q > initial_credit`.
+    pub credit_quantum: u32,
 }
 
 impl Default for MuxConfig {
@@ -488,6 +506,7 @@ impl Default for MuxConfig {
             flush_policy: FlushPolicy::Auto(AutoFlush::default()),
             async_open_ack: false,
             reply_linger: Duration::from_millis(1),
+            credit_quantum: 0,
         }
     }
 }

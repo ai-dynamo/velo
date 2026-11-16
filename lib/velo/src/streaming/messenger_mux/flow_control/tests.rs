@@ -559,3 +559,58 @@ fn many_slots_cannot_together_exceed_the_peer_budget() {
         "the two scopes agree on what is outstanding"
     );
 }
+
+/// A quantum's window and byte budget: the window grows by `q - 1`, and the
+/// slot byte budget by the records that may overtake a slow one,
+/// `(C + q - 2) / (C - 1)`, rounded up. 0 and 1 change nothing.
+#[test]
+fn quantum_terms_grow_the_window_and_the_hold_together() {
+    const MIB: u32 = 1024 * 1024;
+    assert_eq!(quantum_terms(32, MIB, 0), Ok((32, MIB)));
+    assert_eq!(quantum_terms(32, MIB, 1), Ok((32, MIB)));
+    let (window, budget) = quantum_terms(32, MIB, 8).expect("valid");
+    assert_eq!(window, 39);
+    assert_eq!(
+        u64::from(budget),
+        (u64::from(MIB) * 38).div_ceil(31),
+        "38 records may overtake where 31 could"
+    );
+    // The boundary review found: 38 records of 33,825 bytes fit.
+    assert!(38 * 33_825 <= u64::from(budget));
+    assert!(
+        quantum_terms(4, MIB, 5).is_err(),
+        "q above the window is refused"
+    );
+    assert!(
+        quantum_terms(u32::MAX, MIB, 2).is_err(),
+        "the window must fit u32"
+    );
+    assert_eq!(
+        quantum_terms(2, u32::MAX, 2).map(|(_, budget)| budget),
+        Ok(u32::MAX),
+        "the budget saturates rather than overflows"
+    );
+}
+
+/// A quantum holds grants below `q` while the sender has credit, and grants
+/// at once when it has none.
+#[test]
+fn a_quantum_holds_grants_until_q_or_until_the_sender_is_dry() {
+    let mut account = SlotCreditAccount::new(11).with_quantum(4);
+    for _ in 0..3 {
+        account.admit(CreditClass::Data).unwrap();
+        account.release(1);
+        assert_eq!(account.take_pending_grant(), None);
+    }
+    account.admit(CreditClass::Data).unwrap();
+    account.release(1);
+    assert_eq!(account.take_pending_grant(), Some(4));
+
+    // The sender spends its whole window: one drain is granted at once.
+    let mut account = SlotCreditAccount::new(11).with_quantum(4);
+    for _ in 0..11 {
+        account.admit(CreditClass::Data).unwrap();
+    }
+    account.release(1);
+    assert_eq!(account.take_pending_grant(), Some(1));
+}

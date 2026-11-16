@@ -3710,3 +3710,156 @@ async fn a_late_reply_after_the_idle_fixture_is_not_counted_as_idle() {
         "the producer, once its recreated batcher has aged out again",
     );
 }
+
+// ---------------------------------------------------------------------------
+// Credit quantum
+// ---------------------------------------------------------------------------
+
+/// Under a credit quantum, the window and byte budget a node advertises on
+/// attach, quotes in a zero-RTT ticket and opens its slot with are one value:
+/// the configured window plus `q - 1`, and the byte budget scaled with it.
+///
+/// The slot account reads the effective config, not the advertisement, so if
+/// only the advertisement grew, a sender spending its advertised window would
+/// close its slot with `ProtocolError`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quantum_slot_opens_on_the_terms_its_ticket_and_attach_quote() {
+    let config = MuxConfig {
+        initial_credit: 5,
+        slot_byte_budget: 0,
+        credit_quantum: 3,
+        ..test_config()
+    };
+    let pair = mux_pair(config).await;
+    let advertised = pair.consumer.advertised_limits();
+    assert_eq!(advertised.initial_credit(), 7, "5 + 3 - 1");
+    assert_eq!(
+        u64::from(advertised.slot_byte_budget()),
+        (1024u64 * 1024 * 6).div_ceil(4),
+        "the default 1 MiB, scaled by the 6 records that may overtake where 4 could"
+    );
+    let manager = AnchorManagerBuilder::default()
+        .worker_id(pair.consumer_worker)
+        .transport(
+            Arc::clone(&pair.consumer) as Arc<dyn crate::streaming::transport::FrameTransport>
+        )
+        .build()
+        .expect("anchor manager");
+    manager
+        .install_mux(Arc::clone(&pair.consumer))
+        .expect("install mux");
+    let anchor = manager.create_anchor::<u32>();
+    let (_, local_id) = anchor.handle().unpack();
+    let ticket = manager.prebind_anchor(anchor.handle()).expect("ticket");
+    assert_eq!(ticket.initial_credit, advertised.initial_credit());
+    assert_eq!(ticket.slot_byte_budget, advertised.slot_byte_budget());
+
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
+        .await
+        .expect("connect");
+    tx.send_async(item(0)).await.expect("send item");
+    eventually(|| {
+        pair.consumer
+            .live_ingress_slots(lane0(pair.producer_worker))
+            == 1
+    })
+    .await;
+    let id = pair.consumer.live_slot_ids(lane0(pair.producer_worker))[0];
+    let (credit, byte_budget) = pair
+        .consumer
+        .slot_open_terms(lane0(pair.producer_worker), id)
+        .expect("the claimed slot is live");
+    assert_eq!(
+        credit, ticket.initial_credit,
+        "the slot reserved what the ticket quoted"
+    );
+    assert_eq!(byte_budget, u64::from(ticket.slot_byte_budget));
+    drop(anchor);
+}
+
+/// A stream several windows long, with the periodic sweep an hour away,
+/// finishes under a credit quantum: its tail credit comes back by the doorbell
+/// and the next arrival alone, and the slot buffer never overflows.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_long_stream_finishes_under_a_quantum_without_the_periodic_sweep() {
+    for quantum in [0u32, 4] {
+        let config = MuxConfig {
+            credit_quantum: quantum,
+            ..manual_tick_config()
+        };
+        let pair = mux_pair(config).await;
+        let window = pair.consumer.advertised_limits().initial_credit();
+        let total = 3 * window + 4;
+        let receiver = pair.bind(5, 5).await;
+        let sender = pair
+            .producer
+            .connect(pair.consumer_worker, 5, 5)
+            .await
+            .expect("connect");
+        let send = tokio::spawn(async move {
+            for n in 0..total {
+                sender.send_async(item(n)).await.expect("send item");
+            }
+            sender
+        });
+        tokio::time::timeout(Duration::from_secs(20), async {
+            for n in 0..total {
+                assert_eq!(
+                    receiver.recv().await,
+                    item(n),
+                    "quantum {quantum}: record {n}"
+                );
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("quantum {quantum}: the stream stalled"));
+        drop(send.await.expect("sender task"));
+        pair.assert_no_reader_stall();
+    }
+}
+
+/// Twin of `a_late_reply_after_the_idle_fixture_is_not_counted_as_idle`, under
+/// a credit quantum of 2: the late reply is the grant the second drain earns.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_late_quantum_reply_after_the_idle_fixture_is_not_counted_as_idle() {
+    let pair = mux_pair(MuxConfig {
+        credit_quantum: 2,
+        ..manual_tick_config()
+    })
+    .await;
+    let hooks = Arc::new(TestHooks::default());
+    hooks.pause();
+    assert!(pair.consumer.core.hooks.set(Arc::clone(&hooks)).is_ok());
+
+    let receiver = pair.bind(9, 9).await;
+    let sender = pair
+        .producer
+        .connect(pair.consumer_worker, 9, 9)
+        .await
+        .expect("connect");
+    for n in 0..2 {
+        sender.send_async(item(n)).await.expect("send item");
+        assert_eq!(receiver.recv().await, item(n));
+    }
+    hooks.wait_until_parked().await;
+    sender
+        .send_async(cached_finalized().clone())
+        .await
+        .expect("send terminal");
+    assert_eq!(receiver.recv().await, *cached_finalized());
+    drop(sender);
+    eventually(|| receiver.is_disconnected() && pair.live_slots() == 0.0).await;
+
+    serve_one_stream_then_idle(&pair).await;
+    assert!(pair.consumer.core.batchers.is_empty());
+    assert!(pair.producer.core.batchers.is_empty());
+    hooks.release();
+    eventually(|| !pair.producer.core.batchers.is_empty()).await;
+    assert_eq!(
+        quiet_tick_allocations(&pair, &pair.producer).await,
+        0,
+        "the producer, once its recreated batcher has aged out again",
+    );
+}

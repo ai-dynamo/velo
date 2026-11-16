@@ -68,6 +68,15 @@ pub(crate) struct DrainSignal {
     /// reorder hold, published by the slot. The watchdog's exemption: a
     /// sender without credit cannot heartbeat.
     sender_parked: AtomicBool,
+    /// Whether the sender holds no data credit, as the slot's account sees
+    /// it, whatever waits in the reorder hold. Published only under a credit
+    /// quantum, where it lets a drain post at once for a starved sender.
+    sender_dry: AtomicBool,
+    /// Under a credit quantum: drains whose credit has not been granted, held
+    /// or not yet reconciled. A drain adds one and a grant subtracts what it
+    /// takes, so a drain that races a reconcile still counts every credit the
+    /// slot owes. Unused with the quantum off.
+    owed: AtomicU32,
     /// Set with `closed`, readable without a lock; see `is_released`.
     released: AtomicBool,
     /// Fired when the mux lets go of this bind's buffer: an unclaimed bind
@@ -91,6 +100,9 @@ struct SlotClaim {
     slot: SlotId,
     /// The peer's dirty-slot set, for naming this slot as having drained.
     dirty: Arc<DirtySlots>,
+    /// The consumer's [`MuxConfig::credit_quantum`](super::super::MuxConfig::credit_quantum);
+    /// 0 and 1 mean off.
+    quantum: u32,
 }
 
 impl DrainSignal {
@@ -101,6 +113,8 @@ impl DrainSignal {
             drained: AtomicU32::new(0),
             arrivals: AtomicU64::new(0),
             sender_parked: AtomicBool::new(false),
+            sender_dry: AtomicBool::new(false),
+            owed: AtomicU32::new(0),
             released: AtomicBool::new(false),
             closed: tokio_util::sync::CancellationToken::new(),
             wake,
@@ -110,6 +124,7 @@ impl DrainSignal {
     /// Name the (peer, lane) this bind turned out to belong to, its slot
     /// index, that table's dirty-slot set and its pending-wake flag. Called
     /// once, when an `OpenSlot` claims the bind.
+    #[cfg(test)]
     pub(crate) fn claimed_by(
         &self,
         key: PeerLane,
@@ -117,12 +132,25 @@ impl DrainSignal {
         pending: Arc<AtomicBool>,
         dirty: Arc<DirtySlots>,
     ) -> Lifecycle {
+        self.claimed_with_quantum(key, slot, pending, dirty, 0)
+    }
+
+    /// [`claimed_by`](Self::claimed_by), for a consumer with a credit quantum.
+    pub(crate) fn claimed_with_quantum(
+        &self,
+        key: PeerLane,
+        slot: SlotId,
+        pending: Arc<AtomicBool>,
+        dirty: Arc<DirtySlots>,
+        quantum: u32,
+    ) -> Lifecycle {
         let lifecycle = self.lifecycle.lock();
         let _ = self.claim.set(SlotClaim {
             key,
             slot,
             pending,
             dirty,
+            quantum,
         });
         *lifecycle
     }
@@ -202,6 +230,14 @@ impl DrainSignal {
             return;
         };
         self.drained.fetch_add(1, Ordering::Relaxed);
+        if claim.quantum > 1 {
+            // One count that drains add to and grants subtract from, so a
+            // drain racing a reconcile still sees all the credit owed.
+            let owed = self.owed.fetch_add(1, Ordering::Relaxed) + 1;
+            if owed < claim.quantum && !self.sender_dry.load(Ordering::Relaxed) {
+                return; // below the quantum, and the sender still has credit
+            }
+        }
         if !claim.dirty.mark(claim.slot.index()) {
             return; // already listed; that listing's visit collects this count
         }
@@ -237,6 +273,32 @@ impl DrainSignal {
     /// behind; its detection window is several heartbeats long.
     pub(crate) fn sender_parked(&self) -> bool {
         self.sender_parked.load(Ordering::Relaxed)
+    }
+
+    /// Record whether the sender holds no data credit, under a credit quantum.
+    pub(super) fn set_sender_dry(&self, dry: bool) {
+        if self.sender_dry.load(Ordering::Relaxed) != dry {
+            self.sender_dry.store(dry, Ordering::Relaxed);
+        }
+    }
+
+    /// A grant of `delta` left the slot under a credit quantum: those drains
+    /// are no longer owed.
+    ///
+    /// Saturating: a grant that takes a drain whose `owed` increment it does
+    /// not yet see leaves the count one high, which only posts sooner.
+    pub(super) fn granted(&self, delta: u32) {
+        let _ = self
+            .owed
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |owed| {
+                Some(owed.saturating_sub(delta))
+            });
+    }
+
+    /// Credit the slot owes under a quantum, for tests.
+    #[cfg(test)]
+    pub(super) fn owed(&self) -> u32 {
+        self.owed.load(Ordering::Relaxed)
     }
 
     /// The mux let go of this bind's buffer. Idempotent.

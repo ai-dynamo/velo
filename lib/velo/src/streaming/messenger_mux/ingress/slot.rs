@@ -93,6 +93,8 @@ pub(super) struct IngressSlot {
     /// most one slot.
     drain: Arc<DrainSignal>,
     account: SlotCreditAccount,
+    /// The consumer's credit quantum; 0 and 1 mean off.
+    quantum: u32,
     /// Encoded sizes of the records currently sitting in `frame_tx`, oldest
     /// first. One entry per record that *entered* the channel — a record
     /// parked in the hold has none until its release puts it there. Popped as
@@ -139,6 +141,15 @@ enum DeliverFault {
     ConsumerGone,
 }
 
+/// What a slot opens holding: the node's effective window and slot byte
+/// budget, and its credit quantum.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct SlotTerms {
+    pub(super) initial_credit: u32,
+    pub(super) slot_byte_budget: u32,
+    pub(super) quantum: u32,
+}
+
 impl Drop for IngressSlot {
     /// The slot is retiring, so the buffer it wrote is closed for good.
     fn drop(&mut self) {
@@ -153,17 +164,22 @@ impl IngressSlot {
         live: LiveCounts,
         frame_tx: flume::Sender<Vec<u8>>,
         drain: Arc<DrainSignal>,
-        initial_credit: u32,
-        slot_byte_budget: u32,
+        terms: SlotTerms,
         first_seq: u32,
     ) -> Self {
+        let SlotTerms {
+            initial_credit,
+            slot_byte_budget,
+            quantum,
+        } = terms;
         Self {
             session_id: 0,
             id,
             _live: live,
             frame_tx,
             drain,
-            account: SlotCreditAccount::new(initial_credit),
+            account: SlotCreditAccount::new(initial_credit).with_quantum(quantum),
+            quantum,
             sizes: VecDeque::new(),
             buffered_bytes: 0,
             byte_watermark: u64::from(slot_byte_budget),
@@ -316,6 +332,11 @@ impl IngressSlot {
         }
         let grant = self.account.take_pending_grant();
         self.publish_credit();
+        if self.quantum > 1
+            && let Some(delta) = grant
+        {
+            self.drain.granted(delta);
+        }
         grant
     }
 
@@ -327,8 +348,11 @@ impl IngressSlot {
     /// gap that never closes would leave the sender "parked" for good and the
     /// stuck stream exempt from the watchdog.
     fn publish_credit(&self) {
-        self.drain
-            .set_sender_parked(!self.account.peer_holds_credit() && self.hold.is_empty());
+        let dry = !self.account.peer_holds_credit();
+        self.drain.set_sender_parked(dry && self.hold.is_empty());
+        if self.quantum > 1 {
+            self.drain.set_sender_dry(dry);
+        }
     }
 
     /// Inject the `Dropped` sentinel a consumer sees when its sender dies.

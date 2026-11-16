@@ -385,7 +385,16 @@ impl MessengerMuxTransport {
         metrics: Option<Arc<VeloMetrics>>,
         accept_window: Duration,
     ) -> Result<Arc<Self>> {
-        let limits = NegotiatedLimits::from_wire(config.initial_credit, config.slot_byte_budget)
+        let configured =
+            NegotiatedLimits::from_wire(config.initial_credit, config.slot_byte_budget)
+                .map_err(|error| anyhow!("messenger mux: {error}"))?;
+        let (initial_credit, slot_byte_budget) = flow_control::quantum_terms(
+            configured.initial_credit(),
+            configured.slot_byte_budget(),
+            config.credit_quantum,
+        )
+        .map_err(|error| anyhow!("messenger mux: {error}"))?;
+        let limits = NegotiatedLimits::from_wire(initial_credit, slot_byte_budget)
             .map_err(|error| anyhow!("messenger mux: {error}"))?;
         if config.credit_sweep_interval.is_zero() {
             return Err(anyhow!(
@@ -395,6 +404,7 @@ impl MessengerMuxTransport {
         // Normalised so every reader of the config sees the effective budget
         // rather than the "use the default" zero.
         let config = MuxConfig {
+            initial_credit: limits.initial_credit(),
             slot_byte_budget: limits.slot_byte_budget(),
             ..config
         };
