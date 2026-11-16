@@ -285,7 +285,10 @@ pub struct MuxConfig {
     pub credit_sweep_interval: Duration,
     /// Shortest gap between two doorbell-driven reconciles of the *same*
     /// (peer, lane) — so a ceiling of `1 / drain_visit_floor` visits per second
-    /// per (peer, lane).
+    /// per (peer, lane). Under a [`credit_quantum`](Self::credit_quantum) the
+    /// drain that brings a slot to its quantum is walked outside this ceiling,
+    /// once per quantum per slot, so the visit rate per (peer, lane) can reach
+    /// the drain rate of its slots divided by the quantum.
     ///
     /// Per lane, not per peer, because each lane has its own slot table, dirty
     /// set and wake, and a visit walks and locks one lane's table only. The
