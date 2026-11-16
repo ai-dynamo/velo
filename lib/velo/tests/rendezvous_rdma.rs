@@ -1923,3 +1923,154 @@ async fn a_draining_owner_still_records_a_heap_staged_slot_as_not_pinned() {
     assert_eq!(pair.owner.path_count("ok"), 0);
     shutdown(pair).await;
 }
+
+// ---------------------------------------------------------------------------
+// Diagnosis: pinned pool space held by a slot nobody can reach
+// ---------------------------------------------------------------------------
+//
+// These tests run the same body on two revisions. They show how a slot whose
+// reference is gone before its last lease ends keeps its pinned pool space,
+// and that the next pinned staging is then refused by the budget and counted
+// as `reason="budget"` on `velo_rendezvous_rdma_path_total`. A refused staging
+// is a fallback to the chunked path for every transfer of that payload.
+
+/// One pooled arena of `DIAG_ARENA` bytes and room in the budget for no second
+/// one, so one leaked `DIAG_CUT` slot is enough to refuse the next staging.
+const DIAG_ARENA: u64 = 1 << 20;
+const DIAG_CUT: usize = 768 * 1024;
+
+fn diag_pool(lease_timeout: Option<Duration>) -> RdmaConfig {
+    let mut config = RdmaConfig {
+        pool: RdmaPoolConfig {
+            initial_arena_bytes: DIAG_ARENA,
+            max_arena_bytes: DIAG_ARENA,
+            dedicated_arena_min: 64 << 20,
+            registered_bytes_budget: DIAG_ARENA + (DIAG_ARENA / 2),
+            ..RdmaPoolConfig::default()
+        },
+        ..RdmaConfig::default()
+    };
+    if let Some(timeout) = lease_timeout {
+        config.rendezvous.lease_timeout = timeout;
+    }
+    config
+}
+
+/// Two readers on one reference. The first reader's `release` takes the only
+/// reference, so the count is 0 while the second reader still holds a lease.
+/// When the second reader detaches, the slot has no reader and no reference
+/// and must be freed, with its pool space.
+///
+/// If it is not freed, nothing can reach it again: the pool space stays used
+/// for the life of the process, and the next pinned staging of the same size
+/// is refused by the budget (`reason="budget"`).
+#[tokio::test(flavor = "multi_thread")]
+async fn diag_a_slot_read_twice_on_one_reference_gives_back_its_pool_space() {
+    let node = Node::start(Some(diag_pool(None))).await;
+
+    let payload = pattern(DIAG_CUT);
+    let handle = node.velo.register_data_pinned(&payload).await;
+    assert!(node.velo.metadata(handle).await.unwrap().pinned);
+    assert_eq!(node.path_count("budget"), 0);
+
+    let (_, first) = node.velo.get(handle).await.expect("first get");
+    let (_, second) = node.velo.get(handle).await.expect("second get");
+    node.velo.release(handle, first).await.expect("release");
+    node.velo.detach(handle, second).await.expect("detach");
+
+    let slot_left = node.velo.metadata(handle).await.is_ok();
+    let next = node.velo.register_data_pinned(&payload).await;
+    let next_pinned = node.velo.metadata(next).await.unwrap().pinned;
+    let budget = node.path_count("budget");
+
+    node.velo.shutdown(ShutdownPolicy::Timeout(T)).await;
+    assert!(
+        !slot_left && next_pinned && budget == 0,
+        "slot_left={slot_left} next_pinned={next_pinned} budget={budget}: the slot \
+         outlived its last reader and its last reference, and holds its pool space"
+    );
+}
+
+/// The same leak through the lease reaper, across two nodes. The consumer
+/// takes an RDMA lease and abandons it, as a crashed reader, or a fallback
+/// whose detach was lost, does. It then reads again and releases, which takes
+/// the slot's only reference. The reaper force-releases the abandoned lease
+/// (`velo_rendezvous_rdma_leases_reaped_total` goes up), and that is the end
+/// of the slot's last lease, so the slot must be freed.
+#[tokio::test(flavor = "multi_thread")]
+async fn diag_a_reaped_lease_frees_a_slot_whose_reference_is_gone() {
+    let pair = Pair::with_configs(Some(diag_pool(Some(Duration::from_millis(300)))), None).await;
+
+    let payload = pattern(DIAG_CUT);
+    let handle = pair.owner.velo.register_data_pinned(&payload).await;
+    assert!(pair.owner.velo.metadata(handle).await.unwrap().pinned);
+
+    let (data, _abandoned) = pair.consumer.velo.get(handle).await.expect("first get");
+    assert_pattern(&data, payload.len());
+    let (data, lease) = pair.consumer.velo.get(handle).await.expect("second get");
+    assert_pattern(&data, payload.len());
+    assert_eq!(
+        pair.consumer.path_count("ok"),
+        2,
+        "both reads must hold RDMA leases, which carry a deadline"
+    );
+    pair.consumer
+        .velo
+        .release(handle, lease)
+        .await
+        .expect("release");
+
+    wait_until(
+        "the abandoned lease is reaped",
+        || async {
+            pair.owner
+                .counter("velo_rendezvous_rdma_leases_reaped_total")
+                >= 1
+        },
+        || "no lease reaped".to_string(),
+    )
+    .await;
+    // The reaper frees in the same pass that counts the reap, so one more
+    // poll window is enough for the freed slot to show.
+    let freed = tokio::time::timeout(Duration::from_secs(2), async {
+        while !slot_is_gone(&pair.owner, handle).await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok();
+
+    let next = pair.owner.velo.register_data_pinned(&payload).await;
+    let next_pinned = pair.owner.velo.metadata(next).await.unwrap().pinned;
+    let budget = pair.owner.path_count("budget");
+
+    shutdown(pair).await;
+    assert!(
+        freed && next_pinned && budget == 0,
+        "freed={freed} next_pinned={next_pinned} budget={budget}: the reaper ended \
+         the slot's last lease and left the slot staged, holding its pool space"
+    );
+}
+
+/// `RegisterOptions::ttl` ends a slot nobody comes for. Without it a payload
+/// whose reader gave up stays staged until the owner shuts down.
+#[tokio::test(flavor = "multi_thread")]
+async fn diag_a_slot_with_a_ttl_is_freed_after_it() {
+    let node = Node::start(None).await;
+    let handle = node.velo.register_data_with(
+        Bytes::from(pattern(4096)),
+        RegisterOptions::new().ttl(Duration::from_millis(200)),
+    );
+    assert!(node.velo.metadata(handle).await.is_ok());
+
+    let freed = tokio::time::timeout(Duration::from_secs(5), async {
+        while !slot_is_gone(&node, handle).await {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+
+    node.velo.shutdown(ShutdownPolicy::Timeout(T)).await;
+    assert!(freed, "the slot was still staged 5 s after a 200 ms ttl");
+}
