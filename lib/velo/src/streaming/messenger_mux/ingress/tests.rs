@@ -3033,3 +3033,83 @@ fn f1_a_mixed_size_stream_that_fits_without_a_quantum_stays_open() {
         assert_eq!(registry.live_slots(peer()), 1, "q={quantum}");
     }
 }
+
+#[test]
+#[ignore = "F2: shifting the doorbell visits can starve a sender despite the extra window"]
+fn f2_a_quantum_covers_a_shifted_doorbell_floor() {
+    use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
+    use crate::streaming::messenger_mux::sweep::DrainVisits;
+    use std::time::Duration;
+
+    fn stage(replies: Vec<ReplyRecord>, t: usize, staged: &mut u32, flush_at: &mut Option<usize>) {
+        for reply in replies {
+            if let ReplyRecord::CreditUpdate { delta, .. } = reply {
+                *staged += delta;
+                flush_at.get_or_insert(t + 1);
+            }
+        }
+    }
+
+    for quantum in [0, 8] {
+        let config = quantum_config(32, 1024 * 1024, quantum);
+        let registry = IngressRegistry::default();
+        let (consumer, wakes) = register_live(&registry, &config, SESSION);
+        let id = slot(0, 0);
+        open(&registry, &config, id, 1);
+        let mut sender = SlotCredit::new(config.initial_credit);
+        let mut visits = DrainVisits::new(Duration::from_millis(2));
+        let start = tokio::time::Instant::now();
+        let mut deliveries = vec![Vec::new(); 16];
+        let mut credit_back = [0; 16];
+        let (mut staged, mut flush_at) = (0, None);
+        let (mut frame_seq, mut batch_seq) = (0, 1);
+        for t in 0..=8 {
+            sender.grant(credit_back[t]);
+            let arrived = std::mem::take(&mut deliveries[t]);
+            if !arrived.is_empty() {
+                let outcome = deliver(&registry, &config, id, batch_seq, arrived);
+                assert_eq!(outcome.closed, 0);
+                batch_seq += 1;
+                stage(outcome.replies, t, &mut staged, &mut flush_at);
+                consumer.pump();
+            }
+            let now = start + Duration::from_millis(t as u64);
+            let mut ready = Vec::new();
+            for key in wakes.drain() {
+                ready.extend(visits.admit(key, now));
+            }
+            ready.extend(visits.due(now));
+            for key in ready {
+                registry.clear_pending_wake(key);
+                stage(registry.sweep_drained(key), t, &mut staged, &mut flush_at);
+            }
+            if quantum == 8 && t == 5 {
+                assert_eq!(consumer.drain.owed(), 17);
+                assert!(!consumer.drain.sender_parked());
+            }
+            if flush_at == Some(t) {
+                credit_back[t + 2] += std::mem::take(&mut staged);
+                flush_at = None;
+            }
+            if t == 8 {
+                assert!(
+                    sender.data_available() >= 23,
+                    "q={quantum}: at 8 ms the next burst needs 23 credits, but only {} are available",
+                    sender.data_available()
+                );
+                break;
+            }
+            let produced = match t {
+                1 => 1,
+                2 => 7,
+                3 => 17,
+                _ => 0,
+            };
+            for _ in 0..produced {
+                sender.try_spend(CreditClass::Data).unwrap();
+                frame_seq += 1;
+                deliveries[t + 2].push(frame_seq);
+            }
+        }
+    }
+}
