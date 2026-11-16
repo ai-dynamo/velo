@@ -3134,3 +3134,63 @@ fn a_quantum_covers_a_shifted_doorbell_floor() {
         }
     }
 }
+
+/// Extra credit can move an oversized record from in-order delivery into the hold.
+#[test]
+#[ignore = "N1: extra credit parks an oversized successor that arrives in order with q=0"]
+fn a_quantum_keeps_an_in_order_oversized_successor_open() {
+    use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
+
+    for quantum in [0, 2] {
+        let config = quantum_config(4, 256, quantum);
+        let registry = IngressRegistry::default();
+        let consumer = register(&registry, &config, SESSION);
+        let id = slot(0, 0);
+        open(&registry, &config, id, 1);
+        let mut sender = SlotCredit::new(config.initial_credit);
+        sender.try_spend(CreditClass::Data).unwrap();
+        for _ in 2..=4 {
+            sender.try_spend(CreditClass::Data).unwrap();
+        }
+        assert_eq!(deliver(&registry, &config, id, 1, 2..=4).closed, 0);
+        let large = crate::streaming::frame::encode_bytes_item(&vec![7; 600]).unwrap();
+        let sent_early = sender.can_spend(CreditClass::Data);
+        if sent_early {
+            sender.try_spend(CreditClass::Data).unwrap();
+            let payload = batch(1, 2, |encoder| {
+                encoder.push_data(id, 5, &large).unwrap();
+            });
+            assert_eq!(
+                handle_batch(&registry, &config, None, peer(), &payload).closed,
+                0,
+                "q={quantum}: record 5 spends advertised credit but exceeds the hold cap"
+            );
+        }
+        let delayed = crate::streaming::frame::encode_bytes_item(&vec![1; 70 * 1024]).unwrap();
+        let payload = batch(1, 3, |encoder| {
+            encoder.push_data(id, 1, &delayed).unwrap();
+        });
+        assert_eq!(
+            handle_batch(&registry, &config, None, peer(), &payload).closed,
+            0
+        );
+        assert_eq!(consumer.pump().len(), if sent_early { 5 } else { 4 });
+        if !sent_early {
+            for reply in registry.sweep_credit(peer()) {
+                if let ReplyRecord::CreditUpdate { delta, .. } = reply {
+                    sender.grant(delta);
+                }
+            }
+            sender.try_spend(CreditClass::Data).unwrap();
+            let payload = batch(1, 4, |encoder| {
+                encoder.push_data(id, 5, &large).unwrap();
+            });
+            assert_eq!(
+                handle_batch(&registry, &config, None, peer(), &payload).closed,
+                0
+            );
+            assert_eq!(consumer.pump(), vec![large]);
+        }
+        assert_eq!(registry.live_slots(peer()), 1, "q={quantum}");
+    }
+}
