@@ -2968,3 +2968,68 @@ fn the_sender_never_has_less_credit_with_a_quantum() {
         }
     }
 }
+
+#[test]
+#[ignore = "F1: the larger window overflows the scaled reorder budget for mixed record sizes"]
+fn f1_a_mixed_size_stream_that_fits_without_a_quantum_stays_open() {
+    use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
+
+    fn byte_item(size: usize) -> Vec<u8> {
+        let frame = crate::streaming::frame::encode_bytes_item(&vec![7; size - 9]).unwrap();
+        assert_eq!(frame.len(), size);
+        frame
+    }
+
+    for quantum in [0, 8] {
+        let config = quantum_config(32, 1024 * 1024, quantum);
+        let registry = IngressRegistry::default();
+        let consumer = register(&registry, &config, SESSION);
+        let id = slot(0, 0);
+        open(&registry, &config, id, 1);
+        let mut sender = SlotCredit::new(config.initial_credit);
+        // Record 1 waits for rendezvous while eager successors overtake it.
+        sender.try_spend(CreditClass::Data).unwrap();
+        let mut seq = 2;
+        let mut batch_seq = 1;
+        while seq <= 39 && sender.can_spend(CreditClass::Data) {
+            sender.try_spend(CreditClass::Data).unwrap();
+            let body = byte_item(if seq <= 32 { 32 * 1024 } else { 56 * 1024 });
+            let payload = batch(1, batch_seq, |encoder| {
+                encoder.push_data(id, seq, &body).unwrap();
+            });
+            let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+            assert_eq!(
+                outcome.closed, 0,
+                "q={quantum}, seq={seq}: a sender spending only advertised credit was closed: {:?}",
+                outcome.replies
+            );
+            seq += 1;
+            batch_seq += 1;
+        }
+        let payload = batch(1, batch_seq, |encoder| {
+            encoder.push_data(id, 1, &byte_item(64 * 1024)).unwrap();
+        });
+        let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+        assert_eq!(outcome.closed, 0);
+        batch_seq += 1;
+        assert_eq!(consumer.pump().len(), (seq - 1) as usize);
+        for reply in registry.sweep_credit(peer()) {
+            if let ReplyRecord::CreditUpdate { delta, .. } = reply {
+                sender.grant(delta);
+            }
+        }
+        while seq <= 39 {
+            sender.try_spend(CreditClass::Data).unwrap();
+            let body = byte_item(56 * 1024);
+            let payload = batch(1, batch_seq, |encoder| {
+                encoder.push_data(id, seq, &body).unwrap();
+            });
+            let outcome = handle_batch(&registry, &config, None, peer(), &payload);
+            assert_eq!(outcome.closed, 0, "q={quantum}, seq={seq}");
+            assert_eq!(consumer.pump().len(), 1);
+            seq += 1;
+            batch_seq += 1;
+        }
+        assert_eq!(registry.live_slots(peer()), 1, "q={quantum}");
+    }
+}
