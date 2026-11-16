@@ -393,11 +393,11 @@ mod tests {
     /// the merits rather than failing the acquire.
     #[test]
     fn an_offer_of_unknown_backends_still_parses() {
-        let json = br#"{"handle":{"hi":1,"lo":2},"rdma":{"backends":["nixl","libfabric"]}}"#;
+        let json = br#"{"handle":{"hi":1,"lo":2},"rdma":{"backends":["verbs","libfabric"]}}"#;
         let req: RvAcquireRequest = serde_json::from_slice(json).expect("deserialize");
         assert_eq!(
             req.rdma.expect("offer").backends,
-            vec!["nixl".to_string(), "libfabric".to_string()]
+            vec!["verbs".to_string(), "libfabric".to_string()]
         );
     }
 
