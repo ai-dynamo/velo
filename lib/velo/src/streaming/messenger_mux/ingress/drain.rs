@@ -201,7 +201,14 @@ impl DrainSignal {
             // Nothing has been delivered on this bind yet, so nothing drained.
             return;
         };
-        self.drained.fetch_add(1, Ordering::Relaxed);
+        let drained = self.drained.fetch_add(1, Ordering::Relaxed) + 1;
+        // SCRATCH (STRGT-1434): below the credit quantum the visit could not
+        // grant anything, unless the sender is parked; the next arrival
+        // reconciles this count anyway.
+        let quantum = crate::streaming::messenger_mux::flow_control::scratch_credit_quantum();
+        if drained < quantum && !self.sender_parked.load(Ordering::Relaxed) {
+            return;
+        }
         if !claim.dirty.mark(claim.slot.index()) {
             return; // already listed; that listing's visit collects this count
         }

@@ -559,3 +559,33 @@ fn many_slots_cannot_together_exceed_the_peer_budget() {
         "the two scopes agree on what is outstanding"
     );
 }
+
+/// SCRATCH (STRGT-1434): a quantized grant waits for `quantum` drained
+/// records while the peer still has that much credit free, and goes at once
+/// when the peer's free credit falls below it.
+#[test]
+fn quantized_grant_holds_small_grants_until_the_peer_runs_low() {
+    let mut account = SlotCreditAccount::new(32);
+    for _ in 0..7 {
+        account.admit(CreditClass::Data).unwrap();
+        account.release(1);
+        assert_eq!(account.take_pending_grant_quantized(8), None);
+    }
+    account.admit(CreditClass::Data).unwrap();
+    account.release(1);
+    assert_eq!(account.take_pending_grant_quantized(8), Some(8));
+
+    // The peer spends 28 of its 32: 4 free. One drained record is granted at
+    // once, because 4 free plus nothing granted is below the quantum.
+    let mut account = SlotCreditAccount::new(32);
+    for _ in 0..28 {
+        account.admit(CreditClass::Data).unwrap();
+    }
+    account.release(1);
+    assert_eq!(account.take_pending_grant_quantized(8), Some(1));
+    // Quantum 0 and 1 are the shipped behaviour.
+    account.release(1);
+    assert_eq!(account.take_pending_grant_quantized(1), Some(1));
+    account.release(1);
+    assert_eq!(account.take_pending_grant_quantized(0), Some(1));
+}

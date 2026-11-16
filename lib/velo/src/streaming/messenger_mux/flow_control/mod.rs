@@ -34,6 +34,17 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// SCRATCH (STRGT-1434): `VELO_SCRATCH_CREDIT_QUANTUM`, read once; 0 when unset.
+pub(crate) fn scratch_credit_quantum() -> u32 {
+    static QUANTUM: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("VELO_SCRATCH_CREDIT_QUANTUM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
+    });
+    *QUANTUM
+}
+
 use super::protocol::RecordType;
 
 /// Per-peer byte budget across all of that peer's slots, on every lane.
@@ -437,8 +448,21 @@ impl SlotCreditAccount {
     /// keeps the zeroing safe. `docs/src/development/batched-streaming-design.md`
     /// records the loss this used to be and the fix.
     pub(crate) fn take_pending_grant(&mut self) -> Option<u32> {
+        self.take_pending_grant_quantized(scratch_credit_quantum())
+    }
+
+    /// SCRATCH (STRGT-1434): hold a grant below `quantum` while the peer still
+    /// has at least `quantum` data credit free, as this side sees it. A
+    /// quantum of 0 or 1 is the shipped behaviour.
+    pub(crate) fn take_pending_grant_quantized(&mut self, quantum: u32) -> Option<u32> {
         let delta = self.ungranted;
         if delta == 0 {
+            return None;
+        }
+        let free = self
+            .limit
+            .saturating_sub(self.data_outstanding.saturating_add(self.ungranted));
+        if delta < quantum && free >= quantum {
             return None;
         }
         self.ungranted = 0;
