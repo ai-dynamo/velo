@@ -3243,3 +3243,84 @@ fn a_quantum_keeps_the_drained_prefix_credit_at_the_byte_watermark() {
         available[2]
     );
 }
+
+/// A partial grant must leave another urgent visit for a whole quantum of racing drains.
+#[test]
+#[ignore = "N3: a partial grant leaves owed above q without another urgent wake"]
+fn racing_drains_after_the_urgent_take_keep_credit_ahead_of_quantum_off() {
+    use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
+    use crate::streaming::messenger_mux::sweep::DrainVisits;
+    use std::time::Duration;
+
+    let mut available = Vec::new();
+    for quantum in [0, 8] {
+        let config = quantum_config(32, 1024 * 1024, quantum);
+        let registry = IngressRegistry::default();
+        let (consumer, wakes) = register_live(&registry, &config, SESSION);
+        let consumer = Arc::new(consumer);
+        let id = slot(0, 0);
+        open(&registry, &config, id, 1);
+        let mut sender = SlotCredit::new(config.initial_credit);
+        for _ in 0..24 {
+            sender.try_spend(CreditClass::Data).unwrap();
+        }
+        assert_eq!(deliver(&registry, &config, id, 1, 1..=24).closed, 0);
+        let mut visits = DrainVisits::new(Duration::from_millis(2));
+        let start = tokio::time::Instant::now();
+        let grant = |replies: Vec<ReplyRecord>, sender: &mut SlotCredit| {
+            for reply in replies {
+                if let ReplyRecord::CreditUpdate { delta, .. } = reply {
+                    sender.grant(delta);
+                }
+            }
+        };
+
+        assert_eq!(consumer.pump_n(1).len(), 1);
+        for key in wakes.drain() {
+            if let Some(key) = visits.answer(key, start, registry.take_urgent_wake(key)) {
+                registry.clear_pending_wake(key);
+                grant(registry.sweep_drained(key), &mut sender);
+            }
+        }
+        assert_eq!(consumer.pump_n(7).len(), 7);
+        let now = start + Duration::from_millis(1);
+        let key = wakes.try_recv().expect("eight drains have posted a wake");
+        let ready = visits.answer(key, now, registry.take_urgent_wake(key));
+        if quantum == 8 {
+            assert_eq!(ready, Some(key));
+            registry.clear_pending_wake(key);
+            let racing = Arc::clone(&consumer);
+            let hook = super::reconcile::tests_hook::set(move || {
+                assert_eq!(racing.pump_n(16).len(), 16);
+            });
+            let replies = registry.sweep_drained(key);
+            drop(hook);
+            assert_eq!(
+                replies,
+                vec![ReplyRecord::CreditUpdate { slot: id, delta: 8 }]
+            );
+            grant(replies, &mut sender);
+            assert_eq!(consumer.drain.owed(), 16);
+        } else {
+            assert_eq!(ready, None);
+            assert_eq!(consumer.pump_n(16).len(), 16);
+        }
+        for key in wakes.drain() {
+            if let Some(key) = visits.answer(key, now, registry.take_urgent_wake(key)) {
+                registry.clear_pending_wake(key);
+                grant(registry.sweep_drained(key), &mut sender);
+            }
+        }
+        for key in visits.due(start + Duration::from_millis(2)) {
+            registry.clear_pending_wake(key);
+            grant(registry.sweep_drained(key), &mut sender);
+        }
+        available.push(sender.data_available());
+    }
+    assert!(
+        available[1] >= available[0],
+        "after 24 equal drains, quantum off has {} credits and quantum 8 has {}",
+        available[0],
+        available[1]
+    );
+}
