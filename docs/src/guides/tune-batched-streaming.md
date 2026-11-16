@@ -130,6 +130,7 @@ By default a consumer node returns each record's credit as soon as the record is
 
 - Set it on the consumer node. The producer needs no change and no new version: it sees a larger window and fewer, larger grants.
 - The larger window is the cost. Each stream can put `q - 1` more records into the shared path to a saturated consumer, so a new stream's first record can wait behind more. See [The credit window and a saturated frontend](../operations/response-plane-performance.md#the-credit-window-and-a-saturated-frontend).
+- The drain that brings a slot to q is walked at once, outside `drain_visit_floor`. At dense spacing with many slots per peer, that raises the doorbell walks taken under the ingress lock. This cost is not measured yet.
 - Measure before you set it. [Sparse token spacing](../operations/response-plane-performance.md#sparse-token-spacing) has the numbers for a prototype.
 
 ## Change the byte budgets
