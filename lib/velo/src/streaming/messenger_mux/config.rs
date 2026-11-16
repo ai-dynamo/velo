@@ -483,11 +483,19 @@ pub struct MuxConfig {
     /// left.
     ///
     /// To pay for what it holds, a node with a quantum advertises a window of
-    /// `initial_credit + q - 1` and scales `slot_byte_budget` by
-    /// `(initial_credit + q - 2) / (initial_credit - 1)`, so a sender never has
-    /// less credit, and a reorder hold never less room per record, than with
-    /// the quantum off. Both are written back into the effective config at
-    /// build, so the attach response, the zero-RTT ticket and the slot agree.
+    /// `initial_credit + q - 1`, written back into the effective config at
+    /// build so the attach response, the zero-RTT ticket and the slot agree.
+    /// The advertised `slot_byte_budget` does not change; each slot's reorder
+    /// hold may reserve `q` slot budgets instead of one. The drain that brings
+    /// a slot to `q` is answered at once, not after `drain_visit_floor`.
+    ///
+    /// What the tests show: in two delayed-path schedules and a burst behind
+    /// the visit floor, the sender never has less credit than with the
+    /// quantum off (`the_sender_never_has_less_credit_with_a_quantum`,
+    /// `a_quantum_covers_a_shifted_doorbell_floor`); a stream whose reorder
+    /// hold fits with the quantum off still fits with it
+    /// (`the_reorder_hold_fits_a_full_window_of_overtaking_records`,
+    /// `a_mixed_size_stream_that_fits_without_a_quantum_stays_open`).
     /// `q = 1` is the same as off. Building a mux refuses `q > initial_credit`.
     pub credit_quantum: u32,
 }
