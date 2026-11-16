@@ -3194,3 +3194,52 @@ fn a_quantum_keeps_an_in_order_oversized_successor_open() {
         assert_eq!(registry.live_slots(peer()), 1, "q={quantum}");
     }
 }
+
+/// The extra window must also cover credit withheld by the byte watermark.
+#[test]
+#[ignore = "N2: the extra buffered records block all grants at the unchanged byte watermark"]
+fn a_quantum_keeps_the_drained_prefix_credit_at_the_byte_watermark() {
+    use crate::streaming::messenger_mux::flow_control::{CreditClass, SlotCredit};
+
+    const MIB: u32 = 1024 * 1024;
+    let relaxed_watermark = (u64::from(MIB) * 38).div_ceil(31) as u32;
+    let mut available = Vec::new();
+    for (quantum, watermark) in [(0, MIB), (8, relaxed_watermark), (8, MIB)] {
+        let config = quantum_config(32, watermark, quantum);
+        let registry = IngressRegistry::default();
+        let (consumer, wakes) = register_live(&registry, &config, SESSION);
+        let id = slot(0, 0);
+        open(&registry, &config, id, 1);
+        let mut sender = SlotCredit::new(config.initial_credit);
+        let body = crate::streaming::frame::encode_bytes_item(&vec![7; 160 * 1024]).unwrap();
+        for seq in 1..=config.initial_credit {
+            sender.try_spend(CreditClass::Data).unwrap();
+            let payload = batch(1, seq, |encoder| {
+                encoder.push_data(id, seq, &body).unwrap();
+            });
+            assert_eq!(
+                handle_batch(&registry, &config, None, peer(), &payload).closed,
+                0
+            );
+        }
+        assert_eq!(consumer.pump_n(32).len(), 32);
+        assert!(!wakes.is_empty());
+        registry.clear_pending_wake(peer());
+        for reply in registry.sweep_drained(peer()) {
+            if let ReplyRecord::CreditUpdate { delta, .. } = reply {
+                sender.grant(delta);
+            }
+        }
+        available.push(sender.data_available());
+    }
+    assert_eq!(
+        available[1], available[0],
+        "raising only the watermark restores credit"
+    );
+    assert!(
+        available[2] >= available[0],
+        "quantum off has {} credits, quantum 8 has {} after the same 32 drains",
+        available[0],
+        available[2]
+    );
+}
