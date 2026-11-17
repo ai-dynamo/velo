@@ -183,7 +183,7 @@ The ticket stays valid for the configured accept window (180 seconds by default)
 
 ## Roll back
 
-A rollback needs a per-stream path on every node that rolls back. A node without `stream_config` or `stream_bind_addr` fails to start with the mux off: add one first.
+A rollback needs a per-stream path on both ends of every stream. A node without `stream_config` or `stream_bind_addr` fails to start with the mux off. A node on the default build has only the mux, so it shares no transport with a peer that turned the mux off, and its attaches to that peer fail. So first give every node, the producers and the consumers, `stream_config` or `stream_bind_addr`, and restart them with the mux still on. Then:
 
 1. Set `enabled: false`, or set `VELO_MESSENGER_MUX_DISABLE=1`, on the nodes that mint tickets.
 2. Restart those nodes.

@@ -211,7 +211,9 @@ pub struct MuxConfig {
     /// wire change. `VELO_MESSENGER_MUX_DISABLE=1` does the same at build
     /// time, for an application that does not expose this field; it wins over
     /// `enabled: true` set in code. A node with no stream config has no
-    /// per-stream path, so either form makes its `build` fail.
+    /// per-stream path, so either form makes its `build` fail. Its peers need
+    /// a per-stream transport too: a peer on the default build has only the
+    /// mux, and an attach between the two finds no transport in common.
     ///
     /// Complete on the node that mints zero-RTT tickets — with no mux there is
     /// no ticket, and every stream attaches the ordinary way — but not

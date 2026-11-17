@@ -447,8 +447,10 @@ impl VeloBuilder {
     /// advertised, so a peer without the mux is still served. On such a node
     /// **rollback is the same flag**: set it to `false` and the node stops
     /// advertising `messenger-mux-v2`, so the next attach negotiates the
-    /// per-stream path. No wire change and no coordination with peers,
-    /// because a key that is never advertised is never selected. An
+    /// per-stream path, with no wire change. The peer needs a per-stream
+    /// transport too: a peer on the default build has only the mux, and an
+    /// attach between the two finds no transport in common. Give the peers
+    /// `stream_config` or `stream_bind_addr` before the mux goes off. An
     /// application that never calls this can still turn the mux off: set
     /// `VELO_MESSENGER_MUX_DISABLE=1` and restart. The variable is read once,
     /// per [`build`](Self::build), and it wins over `enabled: true` set in
