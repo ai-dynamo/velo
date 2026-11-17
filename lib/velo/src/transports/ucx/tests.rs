@@ -2295,12 +2295,13 @@ async fn shutdown_resolves_parked_unmap_and_get() {
 ///
 /// The GET is held in flight with the owner's `progress_hold`: over the tcp
 /// lane a GET needs the owner's progress thread, so it cannot finish until the
-/// hold is released. The test used to cancel with a 1 ms timeout and hope the
-/// transfer was still running. A test thread descheduled just after the post
-/// let the GET finish first, and the timeout then returned its result. That
-/// failed the precondition once in CI, and every time when forced with a stall
-/// after the first poll. A GET dropped after it finished releases its region
-/// too, so that order was a test fault, not a leak.
+/// hold is released. Timing cannot make this certain. A short timeout around
+/// the GET polls the GET first, so a test thread descheduled just after the
+/// post sees the GET finish and the timeout return its result. A stall forced
+/// after the first poll does that every time.
+///
+/// `live_rkeys`, not `inflight_ops`, shows the GET is posted: only a GET
+/// unpacks an rkey, while `inflight_ops` also counts Active Message sends.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_cancel_still_releases_the_region() {
     const LEN: usize = 32 * 1024 * 1024;
@@ -2327,7 +2328,7 @@ async fn get_cancel_still_releases_the_region() {
     let req = get_request(&pair, &src, &remote, &local);
     let get = tokio::spawn(async move { endpoint.get(req).await });
     assert!(
-        wait_until(T, || puller.inflight_ops.load(Ordering::SeqCst) >= 1).await,
+        wait_until(T, || puller.live_rkeys.load(Ordering::SeqCst) >= 1).await,
         "the GET must be posted before it is cancelled"
     );
     get.abort();
@@ -2337,7 +2338,7 @@ async fn get_cancel_still_releases_the_region() {
         "the GET must be cancelled, not finished: {joined:?}"
     );
     assert!(
-        puller.inflight_ops.load(Ordering::SeqCst) >= 1,
+        puller.live_rkeys.load(Ordering::SeqCst) >= 1,
         "the GET must still be in flight after its caller dropped it"
     );
     drop(owner_hold);
