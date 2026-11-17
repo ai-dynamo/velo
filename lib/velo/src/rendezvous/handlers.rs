@@ -64,6 +64,7 @@ pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::Handler {
 /// for a test that wraps the handler, for example to stall it. It answers as
 /// an owner that is not draining.
 #[cfg(feature = "test-helpers")]
+#[doc(hidden)]
 pub fn acquire_lease(
     store: &Arc<DataStore>,
     request: &RvAcquireRequest,

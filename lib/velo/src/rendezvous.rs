@@ -647,6 +647,7 @@ impl RendezvousManager {
     /// sees a second descriptor — a property of the code under test, which is
     /// not something a test should quietly rely on.
     #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    #[doc(hidden)]
     pub fn arm_rdma_hook(&self, hook: RdmaTestHook) {
         *self.test_hook.lock() = Some(hook);
     }

@@ -2065,6 +2065,7 @@ impl Velo {
     /// future instead races the acquire round trip, and a cancelled future
     /// looks identical whether the transfer began or never did.
     #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    #[doc(hidden)]
     pub fn rdma_in_flight_transfers(&self) -> usize {
         self.inner
             .rdma
