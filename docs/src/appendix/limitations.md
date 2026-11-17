@@ -60,10 +60,11 @@ installed the transport. An `AnchorManager` built by hand, with
 terminal enters the egress channel, while the pump still has to write it.
 The same holds for a frame transport from outside velo.
 
-**When.** Only on the per-stream path, which a node has when it opts in
-with `stream_config` or `stream_bind_addr`: a producer that builds its
-`AnchorManager` itself, or a `FrameTransport` implementation from another
-crate.
+**When.** A producer that builds its `AnchorManager` itself, whether or not
+its node calls `stream_config` or `stream_bind_addr`, and a `FrameTransport`
+implementation from another crate. The `Velo` builder installs the retiring
+transports only for the per-stream transport it builds after one of those
+two calls.
 
 **Why.** `FrameTransport` is published in `velo-ext`, so the retirement does
 not go through it. The `Velo` builder names the in-crate transports to the
