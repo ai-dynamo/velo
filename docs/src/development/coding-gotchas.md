@@ -300,9 +300,11 @@ waited 200 ms for a reply with a 50 ms window, and
 `a_singleton_at_the_eager_frame_limit_reaches_its_peer` waited 2 s for a
 16 MiB record. A host that stopped the test process for longer failed them
 with the record on its way. With random stops of up to 2.5 s, 12 of 640
-replies took more than 200 ms, and all of them arrived. The reply tests now
-count the batcher's `linger` wakes, which show that the reply window moved
-the batch.
+replies took more than 200 ms, and all of them arrived. Under `Manual`
+nothing else in the reply tests moves a batch, so a reply that waits for a
+flush never arrives, and the long wait still catches it. Do not count which
+wake wrote the batch: after a stall, the reply window can be over at the
+wake that staged the reply, and that wake writes it.
 
 **Test.** Run the test with many copies of the suite at once. Then break the
 code on purpose, for example make `clamp_to_gso_batch` return its input, and
