@@ -572,3 +572,37 @@ endpoint is closed.
 Tests: `transports::ucx::transport::tests::an_endpoint_is_not_reaped_while_its_peer_sets_up`
 and `transports::ucx::transport::tests::an_endpoint_whose_peer_never_sends_is_reaped_after_the_setup_bound`
 (`lib/velo/src/transports/ucx/tests.rs`).
+
+## A bare SIGSEGV from a test binary is not a stack overflow
+
+**Rule.** When a Rust test binary dies with `signal: 11, SIGSEGV` and prints
+nothing else, do not look for a stack overflow. Rust reports an overflow on
+any thread it starts as SIGABRT, with `thread '<name>' has overflowed its
+stack`. Look at native code, at `unsafe`, and at the host.
+
+Two things make this hold. Rust installs a SIGSEGV handler that knows the
+guard page of each thread it starts: test threads, `std::thread`s, and tokio
+workers. Stack probes make each large frame touch that guard page, so a
+frame of 256 KiB cannot jump over it. Both hold in the debug build and in
+the `-C instrument-coverage` build of the Coverage job. The rule breaks in
+one case: if SIGSEGV already has a handler when Rust starts, or is ignored,
+Rust does not install its own handler. An overflow then gives a bare SIGSEGV.
+
+**Failure.** One CI Coverage run of the `velo` unit-test binary died with a
+bare SIGSEGV in the mux tests, 6 s after it started. A stack overflow in the
+instrumented build was the first suspect. In local runs, no UCX thread was
+alive at that point: the `rendezvous::rdma` tests had ended, and the
+`transports::ucx` tests had not started. With `RUST_MIN_STACK` at 64 KiB or 128 KiB, the binary stopped
+every time with SIGABRT and the overflow message. Under a memory limit it
+was killed with SIGKILL (exit 137). In 173 full runs, and 320 runs of the
+mux tests alone, with 4 to 12 copies at a time, it never gave a SIGSEGV. In
+the same ten minutes, three other Coverage jobs on the same runner pool were
+killed with exit 137 before their tests started.
+
+**Test.** Run the binary again from a test, overflow a 64 KiB stack in the
+child, and check that the child ends with SIGABRT and the message. Run it
+once with SIGSEGV ignored (`trap '' SEGV` in the shell that starts it). The
+test must then fail, with a bare SIGSEGV.
+
+Test: `crash_report_tests::a_stack_overflow_aborts_with_a_message_not_a_bare_sigsegv`
+(`lib/velo/src/crash_report_tests.rs`).
