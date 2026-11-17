@@ -148,8 +148,11 @@ struct MessengerLink {
 /// velo-side response this phase is responsible for. Arming it is how those
 /// responses stay covered.
 ///
-/// Behind `test-helpers`, so it is not part of a release build's surface.
+/// Behind `test-helpers`, so it is not part of a release build's surface,
+/// and hidden, so that `cargo semver-checks`, which builds with every
+/// feature, does not count it either.
 #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+#[doc(hidden)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum RdmaTestHook {

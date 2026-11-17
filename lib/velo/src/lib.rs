@@ -35,7 +35,10 @@ pub mod transports;
 #[cfg(feature = "simulation")]
 pub mod simulation;
 
+// Not a supported API, and hidden so that `cargo semver-checks`, which
+// builds with every feature, does not gate releases on it.
 #[cfg(feature = "test-helpers")]
+#[doc(hidden)]
 pub mod test_helpers;
 
 #[cfg(test)]
@@ -1840,6 +1843,7 @@ impl Velo {
     /// branch it is on. Without it, a change to transport priority could move
     /// the coverage back onto the primary path with nothing failing.
     #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
     pub fn primary_transport_key(&self, instance: InstanceId) -> Option<String> {
         self.inner
             .messenger
@@ -1855,6 +1859,7 @@ impl Velo {
     /// its result is dropped) must give its slot back, and the arena is fixed
     /// size, so a leak shows up here long before it exhausts the arena.
     #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
     pub fn response_slots_in_use(&self) -> usize {
         self.inner
             .messenger
@@ -1871,6 +1876,7 @@ impl Velo {
     /// it out of the sender registry. A sender left there keeps its cancel
     /// path and its heartbeat state alive for the life of the node.
     #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
     pub fn stream_senders_in_use(&self) -> usize {
         self.inner.anchor_manager.sender_registry.senders.len()
     }
@@ -1884,6 +1890,7 @@ impl Velo {
     /// the result, and the peer address shows only the transports that
     /// listen.
     #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
     pub fn stream_transport_keys(&self) -> Vec<String> {
         let mut keys: Vec<String> = self
             .inner
@@ -1903,6 +1910,7 @@ impl Velo {
     /// Exposed for tests only, for the same reason as
     /// [`stream_transport_keys`](Self::stream_transport_keys).
     #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
     pub fn default_stream_transport_key(&self) -> String {
         crate::streaming::FrameTransport::key(self.inner.anchor_manager.transport.as_ref())
             .as_str()
@@ -1917,6 +1925,7 @@ impl Velo {
     /// slot, and a slot that is never freed holds its bytes for the life of
     /// the node.
     #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
     pub fn staged_payload_len(&self, local_id: u64) -> Option<u64> {
         self.inner
             .rendezvous_manager
@@ -1930,6 +1939,7 @@ impl Velo {
     /// Exposed for tests only, for a test that wraps the handler, for example
     /// to stall a fetch.
     #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
     pub fn serve_rv_acquire(
         &self,
         request: &crate::test_helpers::RvAcquireRequest,
@@ -1947,6 +1957,7 @@ impl Velo {
     ///
     /// Exposed for tests only.
     #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    #[doc(hidden)]
     pub fn arm_rdma_hook(&self, hook: crate::rendezvous::RdmaTestHook) {
         self.inner.rendezvous_manager.arm_rdma_hook(hook);
     }
