@@ -572,3 +572,13 @@ endpoint is closed.
 Tests: `transports::ucx::transport::tests::an_endpoint_is_not_reaped_while_its_peer_sets_up`
 and `transports::ucx::transport::tests::an_endpoint_whose_peer_never_sends_is_reaped_after_the_setup_bound`
 (`lib/velo/src/transports/ucx/tests.rs`).
+
+## A store can learn it is fenced from the call you are making
+
+**Rule.** When code skips a step because the store is fenced, read the fence again after that step fails. Only then decide whether to report the failure. A remote store learns of a fence in two ways: from its watch, or from its own next write, whose lock compare fails. Either can come first. A check made only before the call covers the first way, not the second.
+
+**Failure.** A hub's stop skips the remove of its own entry when the etcd store is fenced, and reports Ok. The test revoked the hub's lock lease and stopped the hub at once. When the stop ran before the watch saw the lock go, the remove went out, its lock compare failed, and the store marked itself fenced in that same call. The stop then reported "the etcd store is fenced" as an error. This happened in 1 run of 200 with 8 copies on one CPU, and once in CI.
+
+**Test.** Make the store's next remove report the fence and fail in one call, then stop the hub, and check that the stop reports Ok. As a control, make a remove fail with no fence, and check that the stop reports it.
+
+Test: `a_stop_that_finds_the_store_fenced_by_its_own_remove_reports_ok` (`lib/velo-hub/tests/lifecycle.rs`), with `FaultStore::fence_next_remove`.
