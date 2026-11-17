@@ -57,7 +57,6 @@ pub use velo_ext::{
 pub use velo_ext as ext;
 
 // Messenger surface
-pub use crate::messenger::Messenger;
 pub use crate::messenger::client::builders::{
     Admitted, AmSendBuilder, AmSyncBuilder, FireResult, RequestTimeout, SyncResult,
     TypedUnaryBuilder, TypedUnaryResult, UnaryBuilder, UnaryResult,
@@ -67,6 +66,7 @@ pub use crate::messenger::handlers::{
     OverflowPolicy, SyncExecutor, TypedContext, TypedUnaryHandlerBuilder, UnaryHandlerBuilder,
     UnifiedResponse,
 };
+pub use crate::messenger::messenger::Messenger;
 
 // Events
 #[cfg(feature = "services")]

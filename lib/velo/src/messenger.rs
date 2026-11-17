@@ -10,7 +10,7 @@
 pub(crate) mod client;
 pub(crate) mod large_payload;
 #[allow(clippy::module_inception)]
-mod messenger;
+pub(crate) mod messenger;
 
 pub(crate) mod common;
 pub(crate) mod handlers;
@@ -25,5 +25,5 @@ pub(crate) mod events;
 pub(crate) use client::ActiveMessageClient;
 pub use common::MessageId;
 pub(crate) use discovery::PeerDiscovery;
-pub use messenger::Messenger;
+pub(crate) use messenger::Messenger;
 pub(crate) use messenger::MessengerParts;

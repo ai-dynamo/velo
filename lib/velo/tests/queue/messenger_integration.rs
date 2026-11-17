@@ -9,8 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
+use velo::Messenger;
 use velo::Velo;
-use velo::messenger::Messenger;
 use velo::transports::uds::UdsTransportBuilder;
 
 use velo::queue::NextOptions;
