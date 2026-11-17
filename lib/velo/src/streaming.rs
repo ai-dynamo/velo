@@ -7,19 +7,22 @@
 //! - [`handle::StreamAnchorHandle`]: compact u128 encoding WorkerId + local anchor ID
 //! - [`frame::StreamFrame`]: seven-variant enum representing all frame types on the wire
 //!
-//! Transport abstraction:
-//! - [`transport::FrameTransport`]: pluggable ordered-delivery transport trait
-//!   returning [`flume::Receiver<Vec<u8>>`] and [`flume::Sender<Vec<u8>>`]
-//!   channel endpoints via [`futures::future::BoxFuture`]
+//! Transports: a stream rides the messenger mux by default. A node that asks
+//! for it with [`StreamConfig`](crate::StreamConfig) also runs a per-stream
+//! TCP or gRPC transport, which answers to [`tcp_transport::TCP_STREAM_KEY`]
+//! or `grpc_transport::GRPC_STREAM_KEY`. Both transports, and the frame
+//! transport trait they implement, are private to this crate; a new
+//! transport implements the messenger [`Transport`](crate::Transport)
+//! instead.
 //!
-//! Anchor registry:
-//! - [`anchor::AnchorManager`]: creates and tracks streaming anchors
+//! Anchors:
 //! - [`anchor::StreamAnchor`]: typed receive stream for anchor consumers
 //! - [`anchor::AttachError`]: errors for exclusive-attach operations
-//! - [`anchor::AnchorManager::prebind_anchor`] /
-//!   [`anchor::AnchorManager::open_anchor_stream`]: zero-RTT stream setup — the
-//!   receiver mints the terms as a [`control::StreamOpenTicket`] and the sender
-//!   opens on them, with no `_anchor_attach` round trip
+//! - [`Velo::prebind_anchor`](crate::Velo::prebind_anchor) /
+//!   [`Velo::open_anchor_stream`](crate::Velo::open_anchor_stream): zero-RTT
+//!   stream setup — the receiver mints the terms as a
+//!   [`control::StreamOpenTicket`] and the sender opens on them, with no
+//!   `_anchor_attach` round trip
 //!
 //! Sender:
 //! - [`sender::StreamSender`]: typed sender for pushing frames with heartbeat and drop safety
@@ -48,20 +51,21 @@ pub mod sender;
 pub(crate) mod sweep;
 mod tasks;
 pub mod tcp_transport;
-pub mod transport;
+pub(crate) mod transport;
 
 pub use anchor::{
-    AnchorConfig, AnchorManager, AnchorManagerBuilder, AnchorReservation, AttachError,
-    ReservationConfig, StreamAnchor, StreamController,
+    AnchorConfig, AnchorReservation, AttachError, ReservationConfig, StreamAnchor, StreamController,
 };
+pub(crate) use anchor::{AnchorManager, AnchorManagerBuilder};
 pub use frame::{ByteItemBuilder, ByteItemFrame, SendError, StreamError, StreamFrame};
 #[cfg(feature = "grpc")]
-pub use grpc_transport::GrpcFrameTransport;
+pub(crate) use grpc_transport::GrpcFrameTransport;
 pub use handle::{AnchorKind, StreamAnchorHandle};
 pub use messenger_mux::{AutoFlush, FlushPolicy, MESSENGER_MUX_KEY, MuxConfig};
 pub use mpsc::{
     MpscAnchorConfig, MpscFrame, MpscStreamAnchor, MpscStreamController, MpscStreamSender, SenderId,
 };
 pub use sender::{Retired, Retirement, StreamSender};
-pub use tcp_transport::TcpFrameTransport;
-pub use transport::{FrameTransport, MAX_ITEM_BYTES};
+pub(crate) use tcp_transport::TcpFrameTransport;
+pub(crate) use transport::FrameTransport;
+pub use transport::MAX_ITEM_BYTES;

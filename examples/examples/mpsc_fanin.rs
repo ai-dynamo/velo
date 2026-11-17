@@ -23,8 +23,7 @@ use anyhow::Result;
 use clap::Parser;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use velo::WorkerId;
-use velo::streaming::{AnchorManager, FrameTransport};
+use velo::Velo;
 use velo::streaming::mpsc::{MpscAnchorConfig, MpscFrame, MpscStreamSender, SenderId};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,42 +47,6 @@ struct Args {
     /// Heartbeat interval in milliseconds.
     #[arg(long = "heartbeat-ms", default_value = "200")]
     heartbeat_ms: u64,
-}
-
-/// In-memory transport — sufficient for a same-process fan-in demo.
-struct LoopbackTransport;
-
-impl FrameTransport for LoopbackTransport {
-    fn key(&self) -> velo::ext::TransportKey {
-        velo::ext::TransportKey::new("loopback-stream")
-    }
-
-    fn address(&self) -> velo::ext::WorkerAddress {
-        velo::ext::WorkerAddress::empty()
-    }
-
-    fn bind(
-        &self,
-        _anchor_id: u64,
-        _session_id: u64,
-    ) -> futures::future::BoxFuture<'_, anyhow::Result<flume::Receiver<Vec<u8>>>> {
-        Box::pin(async move {
-            let (_tx, rx) = flume::bounded::<Vec<u8>>(256);
-            Ok(rx)
-        })
-    }
-
-    fn connect(
-        &self,
-        _peer: velo::ext::WorkerId,
-        _anchor_id: u64,
-        _session_id: u64,
-    ) -> futures::future::BoxFuture<'_, anyhow::Result<flume::Sender<Vec<u8>>>> {
-        Box::pin(async move {
-            let (tx, _rx) = flume::bounded::<Vec<u8>>(1);
-            Ok(tx)
-        })
-    }
 }
 
 async fn producer(id: u32, sender: MpscStreamSender<WorkItem>, items: u32, detach_at: Option<u32>) {
@@ -113,10 +76,14 @@ async fn main() -> Result<()> {
         args.producers, args.items, heartbeat
     );
 
-    let mgr = Arc::new(AnchorManager::new(
-        WorkerId::from_u64(1),
-        Arc::new(LoopbackTransport),
-    ));
+    // One node: every producer attaches on the same worker, so the frames go
+    // straight into the anchor and no transport carries them. A `Velo` still
+    // needs a messenger transport to build.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    let tcp = velo::transports::tcp::TcpTransportBuilder::new()
+        .from_listener(listener)?
+        .build()?;
+    let mgr = Velo::builder().add_transport(Arc::new(tcp)).build().await?;
 
     let config = MpscAnchorConfig {
         heartbeat_interval: Some(heartbeat),
@@ -130,7 +97,7 @@ async fn main() -> Result<()> {
     let mut tasks = Vec::new();
     for i in 0..args.producers {
         let sender = mgr
-            .attach_mpsc_stream_anchor::<WorkItem>(handle)
+            .attach_mpsc_anchor::<WorkItem>(handle)
             .await
             .expect("attach producer");
         println!("[consumer] attached producer {i} → {}", sender.sender_id());

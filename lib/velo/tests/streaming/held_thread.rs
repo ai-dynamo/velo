@@ -89,21 +89,16 @@ async fn pair() -> (Velo, Velo) {
 /// A new anchor on `consumer` with a short heartbeat, and a stream to it from
 /// `producer`. The sender sends item 0, waits for `go`, yields once, sends
 /// item 1, and then runs `hold` before it finalizes.
-// Until `Velo` has its own call for a single-consumer anchor with a config,
-// `anchor_manager()` is the way to give one a heartbeat interval.
-#[allow(deprecated)]
 async fn stream(
     producer: &Velo,
     consumer: &Velo,
     go: Arc<Notify>,
     hold: fn(),
 ) -> StreamAnchor<u32> {
-    let anchor = consumer
-        .anchor_manager()
-        .create_anchor_with_config::<u32>(AnchorConfig {
-            heartbeat_interval: Some(HEARTBEAT),
-            ..AnchorConfig::default()
-        });
+    let anchor = consumer.create_anchor_with_config::<u32>(AnchorConfig {
+        heartbeat_interval: Some(HEARTBEAT),
+        ..AnchorConfig::default()
+    });
     let ticket = consumer.prebind_anchor(anchor.handle()).expect("ticket");
     let sender = producer
         .open_anchor_stream::<u32>(anchor.handle(), ticket)
