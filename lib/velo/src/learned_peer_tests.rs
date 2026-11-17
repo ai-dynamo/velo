@@ -116,11 +116,10 @@ async fn close(nodes: &[&Velo]) {
 
 #[derive(Clone, Copy, Debug)]
 enum Learned {
-    /// `Velo::register_peer`, which reached the stream transport before.
+    /// `Velo::register_peer`, which reached the stream transport before. It
+    /// forwards to the crate-private `Messenger::register_peer`, which
+    /// `_hello` also calls, so this row covers that call too.
     Velo,
-    /// The crate-private `Messenger::register_peer`, which `_hello` and
-    /// `Velo::register_peer` both call.
-    Messenger,
     /// The `_hello` the producer sends on its first message to the consumer.
     Hello,
     /// Discovery of the consumer when the producer first sends to its worker id.
@@ -137,16 +136,12 @@ async fn attach_after_learning(path: Learned, mux: bool) {
     let producer = node(discovery, mux).await;
     match path {
         Learned::Velo => producer.register_peer(consumer.peer_info()).unwrap(),
-        Learned::Messenger => producer
-            .messenger()
-            .register_peer(consumer.peer_info())
-            .unwrap(),
         Learned::Hello | Learned::Discovery => {}
     }
     match path {
         // The consumer answers an attach through its own peer table, so it
         // learns the producer from the `_hello` of this first message.
-        Learned::Velo | Learned::Messenger => ping(&producer, &consumer, false).await,
+        Learned::Velo => ping(&producer, &consumer, false).await,
         Learned::Hello => {
             consumer.register_peer(producer.peer_info()).unwrap();
             // The consumer's first message carries its `_hello`.
@@ -205,11 +200,6 @@ async fn hello_registers_the_sender_with_the_stream_transport() {
 #[tokio::test]
 async fn send_time_discovery_registers_with_the_stream_transport() {
     attach_after_learning(Learned::Discovery, false).await;
-}
-
-#[tokio::test]
-async fn messenger_register_peer_registers_with_the_stream_transport() {
-    attach_after_learning(Learned::Messenger, false).await;
 }
 
 /// Control: the path that always reached the stream transport.
@@ -346,40 +336,26 @@ async fn a_hello_with_a_stream_endpoint_reaches_a_receiver_without_one() {
     }
 }
 
-/// Unregistering through `Velo` or `Messenger` drops the peer from the
-/// stream transport too, and so does it for a peer the node learned by
-/// `_hello`, which no caller registered by hand.
+/// Unregistering drops the peer from the stream transport too, and so does
+/// it for a peer the node learned by `_hello`, which no caller registered by
+/// hand. `Velo::unregister_peer` forwards to the crate-private messenger
+/// call, so one path covers both.
 #[tokio::test]
 async fn unregister_reaches_the_stream_transport_on_every_path() {
-    for through_messenger in [false, true] {
-        let a = node(None, false).await;
-        let b = node(None, false).await;
-        a.register_peer(b.peer_info()).unwrap();
-        // b learns a by a's `_hello`.
-        ping(&a, &b, false).await;
-        let forget = |node: &Velo, peer: InstanceId| {
-            if through_messenger {
-                node.messenger().unregister_peer(peer);
-            } else {
-                node.unregister_peer(peer);
-            }
-        };
-        assert!(stream_knows(&a, b.instance_id()));
-        assert!(stream_knows(&b, a.instance_id()));
-        forget(&a, b.instance_id());
-        forget(&b, a.instance_id());
-        let a_knows = stream_knows(&a, b.instance_id());
-        let b_knows = stream_knows(&b, a.instance_id());
-        close(&[&a, &b]).await;
-        assert!(
-            !a_knows,
-            "messenger path {through_messenger}: registered by hand"
-        );
-        assert!(
-            !b_knows,
-            "messenger path {through_messenger}: learned by _hello"
-        );
-    }
+    let a = node(None, false).await;
+    let b = node(None, false).await;
+    a.register_peer(b.peer_info()).unwrap();
+    // b learns a by a's `_hello`.
+    ping(&a, &b, false).await;
+    assert!(stream_knows(&a, b.instance_id()));
+    assert!(stream_knows(&b, a.instance_id()));
+    a.unregister_peer(b.instance_id());
+    b.unregister_peer(a.instance_id());
+    let a_knows = stream_knows(&a, b.instance_id());
+    let b_knows = stream_knows(&b, a.instance_id());
+    close(&[&a, &b]).await;
+    assert!(!a_knows, "registered by hand");
+    assert!(!b_knows, "learned by _hello");
 }
 
 /// The stream transport follows the messenger's peer table; it does not
