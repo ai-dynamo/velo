@@ -93,4 +93,4 @@ Add `stream_config` or `stream_bind_addr` to a default node in these cases:
 - This node attaches to a peer that has the mux off. The peer answers with `no common streaming transport`. That error comes from the peer, so it does not name the fix.
 - This node must be able to turn the mux off. With the mux off by `MuxConfig { enabled: false, .. }` or `VELO_MESSENGER_MUX_DISABLE=1`, and no stream config, `build()` fails. The error names `stream_config` and `stream_bind_addr`.
 
-So the kill switch is a rollback only for a node that opted in to the per-stream path. On a default node, a rollback is a code change: add `stream_bind_addr`, then set the switch and restart.
+So the kill switch is a rollback only for a node that opted in to the per-stream path. On a default node, a rollback is a code change: add `stream_bind_addr` to it and to its peers, so that both ends have the same per-stream transport, then set the switch and restart.

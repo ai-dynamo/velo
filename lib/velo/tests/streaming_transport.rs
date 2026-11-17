@@ -736,6 +736,81 @@ async fn a_default_node_rejects_peers_that_need_a_stream_listener() {
     refuses_peers_that_need_a_stream_listener(velo::Velo::builder()).await;
 }
 
+/// A mux rollback needs the *same* per-stream transport on both ends, not
+/// just some per-stream transport on each. A TCP node and a gRPC node attach
+/// over the mux; with the mux off on both, each offers only its own key
+/// (`tcp-stream`, `grpc-stream`), and the receiver selects only its own, so
+/// the attach is refused in both directions. The tuning guide's rollback
+/// steps rest on this.
+#[cfg(feature = "grpc")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_mux_rollback_needs_the_same_per_stream_transport_on_both_ends() {
+    fn mux(enabled: bool) -> velo::streaming::MuxConfig {
+        velo::streaming::MuxConfig {
+            enabled,
+            ..Default::default()
+        }
+    }
+    async fn pair(mux_on: bool) -> (velo::Velo, velo::Velo) {
+        let tcp = tcp_node(
+            velo::Velo::builder()
+                .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
+                .messenger_mux(mux(mux_on))
+                .unwrap(),
+        )
+        .await;
+        let grpc = tcp_node(
+            velo::Velo::builder()
+                .stream_config(velo::StreamConfig::Grpc(Some(velo::GrpcConfig {
+                    bind_addr: "127.0.0.1:0".parse().unwrap(),
+                })))
+                .unwrap()
+                .messenger_mux(mux(mux_on))
+                .unwrap(),
+        )
+        .await;
+        tcp.register_peer(grpc.peer_info()).unwrap();
+        grpc.register_peer(tcp.peer_info()).unwrap();
+        (tcp, grpc)
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        // Control: with the mux on, the two attach over it.
+        let (tcp, grpc) = pair(true).await;
+        for (producer, consumer) in [(&tcp, &grpc), (&grpc, &tcp)] {
+            let anchor = consumer.create_anchor::<u32>();
+            let sender = producer
+                .attach_anchor::<u32>(anchor.handle())
+                .await
+                .expect("a TCP node and a gRPC node share the mux");
+            sender.finalize().unwrap();
+            drop(anchor);
+        }
+        tcp.shutdown(velo::ShutdownPolicy::WaitForever).await;
+        grpc.shutdown(velo::ShutdownPolicy::WaitForever).await;
+
+        // With the mux off on both, no key is shared.
+        let (tcp, grpc) = pair(false).await;
+        for (producer, consumer, missing) in
+            [(&tcp, &grpc, "grpc-stream"), (&grpc, &tcp, "tcp-stream")]
+        {
+            let anchor = consumer.create_anchor::<u32>();
+            let error = producer
+                .attach_anchor::<u32>(anchor.handle())
+                .await
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("no common streaming transport"), "{error}");
+            assert!(error.contains(missing), "{error}");
+            drop(anchor);
+        }
+        tcp.shutdown(velo::ShutdownPolicy::WaitForever).await;
+        grpc.shutdown(velo::ShutdownPolicy::WaitForever).await;
+    })
+    .await
+    .expect("the rollback check must finish promptly");
+}
+
 #[tokio::test]
 async fn mux_only_rejects_conflicting_configuration_before_startup() {
     for builder in [

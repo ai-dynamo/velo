@@ -175,7 +175,7 @@ let sender = match envelope.ticket {
 };
 ```
 
-`prebind_anchor` returns a ticket whenever the consumer has the mux and the anchor can be pre-bound, and the mux is on by default. A producer without the mux cannot open that ticket: `open_anchor_stream` fails, and the first `attach_anchor` is refused. The refusal releases the pre-bind, so a retry attaches on the per-stream path. To avoid these failures when you roll the mux out, upgrade the producers before the consumers that mint tickets, or keep the mux off on those consumers until every producer has it.
+`prebind_anchor` returns a ticket whenever the consumer has the mux and the anchor can be pre-bound, and the mux is on by default. A producer without the mux cannot open that ticket: `open_anchor_stream` fails, and the first `attach_anchor` is refused. The refusal releases the pre-bind, so a retry attaches on the per-stream path, but only if the consumer has the same per-stream transport as the producer. A consumer on the default build has only the mux and refuses the retry too. To avoid these failures when you roll the mux out, upgrade the producers before the consumers that mint tickets, or keep the mux off on those consumers until every producer has it.
 
 A ticket sender observes `stop_token()` and `cancellation_token()` through the mux's slot lifecycle. Stop leaves the stream open for final output. Cancel or consumer drop wakes an idle producer and ends delivery; it does not need a later send.
 
@@ -183,7 +183,7 @@ The ticket stays valid for the configured accept window (180 seconds by default)
 
 ## Roll back
 
-A rollback needs a per-stream path on both ends of every stream. A node without `stream_config` or `stream_bind_addr` fails to start with the mux off. A node on the default build has only the mux, so it shares no transport with a peer that turned the mux off, and its attaches to that peer fail. So first give every node, the producers and the consumers, `stream_config` or `stream_bind_addr`, and restart them with the mux still on. Then:
+A rollback needs the same per-stream transport on both ends of every stream. With the mux off, a node offers only its own per-stream key, `tcp-stream` (`StreamConfig::Tcp` or `stream_bind_addr`) or `grpc-stream` (`StreamConfig::Grpc`), and accepts only that key. So a TCP node and a gRPC node that stream over the mux today cannot stream once it is off. A node without `stream_config` or `stream_bind_addr` fails to start with the mux off, and a node on the default build has only the mux, so its attaches to a peer that turned the mux off fail. So first give every node, the producers and the consumers, the same `stream_config`, or `stream_bind_addr` on all of them, and restart them with the mux still on. Then:
 
 1. Set `enabled: false`, or set `VELO_MESSENGER_MUX_DISABLE=1`, on the nodes that mint tickets.
 2. Restart those nodes.
