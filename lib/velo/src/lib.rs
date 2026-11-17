@@ -1378,21 +1378,18 @@ impl Velo {
             .await
     }
 
-    /// Attach a sender to an existing anchor, establishing the transport connection.
+    /// Attach a sender to an existing anchor.
     ///
-    /// It:
-    /// 1. Detects remote handles (`handle.worker_id != self.worker_id`) and routes through
-    ///    the remote attach path for cross-worker AM dispatch.
-    /// 2. For local handles: validates the anchor exists and is unattached,
-    ///    atomically marks the anchor as attached, and returns a
-    ///    [`StreamSender<T>`](crate::streaming::sender::StreamSender) for pushing typed frames.
-    ///
-    /// The StreamSender writes to the entry's `frame_tx` so items flow directly
-    /// to the [`StreamAnchor<T>`] consumer. The transport connection is used for
-    /// cross-worker flows.
+    /// A handle whose anchor lives on another worker attaches over the
+    /// network: this node asks the anchor's node with an `_anchor_attach`
+    /// message, and the stream rides the transport the two agree on. A handle
+    /// whose anchor lives on this node attaches locally: the anchor must exist
+    /// and have no sender, and it is marked attached at once. Items from a
+    /// local sender go straight to the [`StreamAnchor<T>`], with no transport.
     ///
     /// # Errors
-    /// - [`AttachError::AnchorNotFound`] if the handle is not in the registry (local path)
+    /// - [`AttachError::AnchorNotFound`] if this node holds no anchor for the
+    ///   handle (local path)
     /// - [`AttachError::AlreadyAttached`] if another sender is already connected, which
     ///   includes a pre-bound slot an `OpenSlot` has already claimed (local path)
     /// - [`AttachError::TransportError`] for all remote path errors (messenger unavailable,
@@ -1446,7 +1443,7 @@ impl Velo {
     /// `MuxConfig::enabled` the complete rollback for this path too, and why
     /// that `None` alone is silent.
     ///
-    /// `None` is also the answer for a handle this manager cannot pre-bind: one
+    /// `None` is also the answer for a handle this node cannot pre-bind: one
     /// belonging to another worker, an MPSC anchor, an anchor already attached
     /// or already pre-bound, or one that has since been removed. Those are
     /// logged at debug and recorded as `outcome="error"` under
