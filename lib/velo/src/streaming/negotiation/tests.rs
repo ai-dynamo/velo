@@ -226,7 +226,11 @@ async fn a_mux_default_refuses_a_sender_without_the_mux_and_names_the_opt_in() {
         };
         let error = error.to_string();
         assert!(
-            error.contains("does not support the messenger mux"),
+            error.contains("the sender does not offer the messenger mux"),
+            "{error}"
+        );
+        assert!(
+            error.contains("the anchor's node has no per-stream transport"),
             "{error}"
         );
         assert!(error.contains("stream_config"), "{error}");

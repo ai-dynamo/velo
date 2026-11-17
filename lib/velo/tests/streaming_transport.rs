@@ -685,9 +685,14 @@ async fn refuses_peers_that_need_a_stream_listener(receiver: velo::VeloBuilder) 
         legacy.register_peer(mux.peer_info()).unwrap();
         let refused = |error: String| {
             assert!(
-                error.contains("does not support the messenger mux"),
+                error.contains("the sender does not offer the messenger mux"),
                 "{error}"
             );
+            assert!(
+                error.contains("the anchor's node has no per-stream transport"),
+                "{error}"
+            );
+            assert!(!error.contains("this instance"), "{error}");
             assert!(error.contains("stream_config"), "{error}");
             assert!(error.contains("stream_bind_addr"), "{error}");
         };
