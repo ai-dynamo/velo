@@ -57,6 +57,9 @@ cargo build --all-features
 # Run all tests (requires NATS server on localhost:4222 for nats tests, etcd on :2379 for etcd tests)
 cargo test --all-features --all-targets
 
+# Doctests (--all-targets leaves them out; ucx-rs's generated bindings carry C code in doc comments)
+cargo test --all-features --doc -p velo -p velo-ext -p velo-hub -p velo-hub-ext
+
 # Single integration test (test names are <module>_<filename>; e.g., tests/transports/tcp_integration.rs)
 cargo test --features zmq --test transports_zmq
 
