@@ -36,15 +36,19 @@
 //! ## How a deployment reaches it
 //!
 //! On by default: `Velo::builder()` installs `MuxConfig::default()` unless
-//! `.messenger_mux(...)` passes another. That registers the transport beside
-//! the configured per-stream one and lets this node advertise
-//! [`MESSENGER_MUX_KEY`] on its attach requests;
-//! [`crate::streaming::negotiation`] is where an attach then picks between the
-//! two, and picks the mux only when both peers named it. Setting
-//! `enabled` back to `false` stops the advertisement, and on the node that
-//! mints zero-RTT tickets that is the whole rollback; a producer rolled back
-//! alone is refused by a consumer that still pre-binds for it, so the minting
-//! side goes first or both go together — see [`MuxConfig::enabled`].
+//! `.messenger_mux(...)` passes another. On a default node the mux is the
+//! only stream transport. A node built with `stream_config` or
+//! `stream_bind_addr` registers it beside that per-stream transport. Either
+//! way the node advertises [`MESSENGER_MUX_KEY`] on its attach requests;
+//! [`crate::streaming::negotiation`] is where an attach then picks a
+//! transport, and picks the mux only when both peers named it.
+//!
+//! Setting `enabled` to `false` stops the advertisement. Only a node with a
+//! per-stream transport can do that: a default node would have no stream
+//! transport left, so its build fails. The peers need the same per-stream
+//! transport. A producer rolled back alone is refused by a consumer that
+//! still pre-binds zero-RTT tickets for it, so the minting side goes first
+//! or both go together — see [`MuxConfig::enabled`].
 //!
 //! ## The producer's contract under the mux
 //!

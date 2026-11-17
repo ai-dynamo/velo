@@ -342,9 +342,11 @@ async fn an_explicit_stream_config_installs_the_per_stream_transport() {
 }
 
 /// With the mux off and no stream config a node would have no remote stream
-/// transport at all. `build` refuses it before it starts a transport, and
-/// the error names the two calls that opt in to the per-stream path, so the
-/// fix is in the message.
+/// transport at all. `build` refuses it, and the error names the two calls
+/// that opt in to the per-stream path, so the fix is in the message. That the
+/// refusal comes before any transport starts is pinned by
+/// `a_disabled_mux_without_a_stream_config_fails_before_a_transport_starts`
+/// in the lib tests, which can see a mock transport's state.
 #[tokio::test]
 async fn a_disabled_mux_without_a_stream_config_fails_the_build() {
     let error = match velo::Velo::builder()
