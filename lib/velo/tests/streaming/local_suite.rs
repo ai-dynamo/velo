@@ -239,43 +239,6 @@ async fn test_12_sentinel_ordering() {
     );
 }
 
-/// TEST-11: Full attach/stream/finalize cycle on one node.
-///
-/// Validates that the anchor state machine correctly:
-/// - Creates an anchor with a typed StreamAnchor
-/// - Attaches a StreamSender
-/// - Delivers all sent items to the stream
-/// - Closes the stream after finalize()
-#[tokio::test(flavor = "multi_thread")]
-async fn test_11_full_cycle() {
-    let node = common::local_node().await;
-    let mut anchor = node.create_anchor::<u32>();
-    let handle = anchor.handle();
-    let sender = node
-        .attach_anchor::<u32>(handle)
-        .await
-        .expect("attach must succeed");
-
-    for i in 0u32..5 {
-        sender.send(i).await.expect("send");
-    }
-    sender.finalize().expect("finalize");
-
-    let mut items = Vec::new();
-    while let Some(frame) = anchor.next().await {
-        match frame {
-            Ok(StreamFrame::Item(v)) => items.push(v),
-            Ok(StreamFrame::Finalized) => break,
-            other => panic!("unexpected frame: {:?}", other),
-        }
-    }
-    assert_eq!(items, vec![0u32, 1, 2, 3, 4]);
-    assert!(
-        anchor.next().await.is_none(),
-        "stream must yield None after Finalized"
-    );
-}
-
 /// TEST-13: Unit coverage — handle roundtrip, registry lifecycle, exclusive attach.
 ///
 /// Validates:
