@@ -114,10 +114,96 @@ use tokio::time::Instant;
 use super::super::FlushPolicy;
 use crate::observability::MuxMetricsHandle;
 
+/// The clock the gate reads, and the batcher's linger waits on.
+///
+/// In a normal build it is `Instant::now()` and a tokio sleep, and it has no
+/// size. A test build can give it a [`ManualClock`], so a test decides when a
+/// window ends. On the real clock, a host that stalls the test for longer
+/// than the window ends the window in the middle of a check.
+#[derive(Clone, Default)]
+pub(super) struct GateClock {
+    #[cfg(test)]
+    manual: Option<std::sync::Arc<ManualClock>>,
+}
+
+impl GateClock {
+    #[cfg(test)]
+    pub(super) fn manual(clock: std::sync::Arc<ManualClock>) -> Self {
+        Self {
+            manual: Some(clock),
+        }
+    }
+
+    #[inline]
+    fn now(&self) -> Instant {
+        #[cfg(test)]
+        if let Some(clock) = &self.manual {
+            return clock.now();
+        }
+        Instant::now()
+    }
+
+    /// Park until `deadline`, or forever when there is none.
+    ///
+    /// The `None` arm is [`std::future::pending`] rather than a far-future
+    /// sleep so a batcher under a policy with no window registers no timer.
+    pub(super) async fn linger_until(&self, deadline: Option<Instant>) {
+        let Some(deadline) = deadline else {
+            return std::future::pending().await;
+        };
+        #[cfg(test)]
+        if let Some(clock) = &self.manual {
+            return clock.sleep_until(deadline).await;
+        }
+        tokio::time::sleep_until(deadline).await;
+    }
+}
+
+/// A clock that moves only when a test moves it.
+#[cfg(test)]
+pub(crate) struct ManualClock {
+    now: parking_lot::Mutex<Instant>,
+    moved: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl ManualClock {
+    /// A clock stopped at the current instant.
+    pub(crate) fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            now: parking_lot::Mutex::new(Instant::now()),
+            moved: tokio::sync::Notify::new(),
+        })
+    }
+
+    pub(crate) fn now(&self) -> Instant {
+        *self.now.lock()
+    }
+
+    /// Move the clock forward by `by`, and wake every wait it ends.
+    pub(crate) fn advance(&self, by: Duration) {
+        *self.now.lock() += by;
+        self.moved.notify_waiters();
+    }
+
+    async fn sleep_until(&self, deadline: Instant) {
+        loop {
+            // Made before the check, so an `advance` between the two still
+            // wakes it (see `test_hooks::barrier`).
+            let moved = self.moved.notified();
+            if self.now() >= deadline {
+                return;
+            }
+            moved.await;
+        }
+    }
+}
+
 /// The flush decision for one peer batcher.
 pub(super) struct FlushGate {
     policy: FlushPolicy,
     metrics: Option<MuxMetricsHandle>,
+    clock: GateClock,
     /// Records in the batch the writer has open.
     staged: usize,
     /// One of those records must move regardless of policy.
@@ -185,6 +271,7 @@ impl FlushGate {
         Self {
             policy,
             metrics,
+            clock: GateClock::default(),
             staged: 0,
             urgent: false,
             kicked: false,
@@ -256,14 +343,14 @@ impl FlushGate {
             return;
         }
         if self.replies_since.is_none() {
-            self.replies_since = Some(Instant::now());
+            self.replies_since = Some(self.clock.now());
         }
         self.stage_records(count);
     }
 
     fn stage_records(&mut self, count: usize) {
         if self.staged == 0 && self.linger_window().is_some() {
-            self.since = Some(Instant::now());
+            self.since = Some(self.clock.now());
         }
         self.staged += count;
         if let Some(metrics) = &self.metrics {
@@ -302,7 +389,9 @@ impl FlushGate {
                 .policy
                 .at_bytes()
                 .is_some_and(|bytes| self.staged > 0 && ctx.batch_bytes >= bytes)
-            || self.deadline(ctx).is_some_and(|due| due <= Instant::now())
+            || self
+                .deadline(ctx)
+                .is_some_and(|due| due <= self.clock.now())
     }
 
     /// When the open batch is due, for the batcher's select to park on.
@@ -368,7 +457,7 @@ impl FlushGate {
     /// failures this avoids.
     pub(super) fn cleared(&mut self) {
         if self.slots_in_batch > 0 && self.policy.on_complete() && self.linger_window().is_some() {
-            self.last_write = Some(Instant::now());
+            self.last_write = Some(self.clock.now());
         }
         self.forget_staged();
     }
@@ -405,19 +494,19 @@ impl FlushGate {
         self.batch_gen = self.batch_gen.wrapping_add(1);
     }
 
+    /// The clock the batcher's linger waits on: the one this gate reads.
+    pub(super) fn clock(&self) -> GateClock {
+        self.clock.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn with_clock(mut self, clock: GateClock) -> Self {
+        self.clock = clock;
+        self
+    }
+
     const fn linger_window(&self) -> Option<Duration> {
         self.policy.max_linger()
-    }
-}
-
-/// Park until `deadline`, or forever when there is none.
-///
-/// The `None` arm is [`std::future::pending`] rather than a far-future sleep so
-/// a batcher under a policy with no window registers no timer at all.
-pub(super) async fn linger_until(deadline: Option<Instant>) {
-    match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline).await,
-        None => std::future::pending().await,
     }
 }
 

@@ -856,11 +856,9 @@ async fn a_stream_round_trips_and_ends_on_its_terminal() {
     }
     assert_eq!(rx.recv().await, *cached_finalized());
     eventually(|| rx.is_disconnected()).await;
-    assert_eq!(
-        pair.live_slots(),
-        0.0,
-        "both sides free the slot once the terminal has landed"
-    );
+    // The consumer counts its slot closed after it hands the terminal to the
+    // reader, so the gauge can trail the end the reader saw.
+    eventually(|| pair.live_slots() == 0.0).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
