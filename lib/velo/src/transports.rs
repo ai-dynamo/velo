@@ -424,6 +424,7 @@ impl VeloBackend {
         feature = "test-helpers",
         all(target_os = "linux", feature = "ucx")
     ))]
+    #[doc(hidden)]
     pub fn primary_transport_key(&self, target: InstanceId) -> Option<TransportKey> {
         self.primary_transport
             .get(&target)

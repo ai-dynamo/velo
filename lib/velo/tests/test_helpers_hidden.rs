@@ -30,46 +30,66 @@ fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
 /// The public items gated on `test-helpers` that have no `#[doc(hidden)]`,
 /// as `file:line: item`.
 ///
-/// An item counts when a `#[cfg(...)]` naming `test-helpers` (and not under
-/// `not(...)`) sits in the attribute block right above a `pub` item. A
-/// `pub(crate)` item is not public, so it does not count.
+/// The scan reads each block of outer attributes above an item, joining an
+/// attribute that spans several lines. An item counts when a `#[cfg(...)]`
+/// in its block names `test-helpers` (and not under `not(...)`), and the item
+/// is `pub`. It is hidden by `#[doc(hidden)]`, or by a `#[cfg_attr(...)]`
+/// that names `test-helpers` and `doc(hidden)`, which holds whenever the
+/// gated item exists. A `pub(crate)` item is not public, so it does not
+/// count.
 fn unhidden(source: &str, file: &str) -> Vec<String> {
     let lines: Vec<&str> = source.lines().collect();
     let mut found = Vec::new();
-    for (index, line) in lines.iter().enumerate() {
-        let line = line.trim_start();
-        if !(line.starts_with("#[cfg(") && line.contains("\"test-helpers\""))
-            || line.contains("not(")
-        {
-            continue;
-        }
-        let mut hidden = false;
-        // Look back and forward through the attribute block.
-        for above in lines[..index].iter().rev() {
-            let above = above.trim_start();
-            if !(above.starts_with("#[") || above.starts_with("///")) {
-                break;
+    // Each attribute as one string, with the line it starts on.
+    let mut block: Vec<(usize, String)> = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index].trim_start();
+        if line.starts_with("#[") {
+            let start = index;
+            let mut attribute = String::from(line);
+            let mut depth = bracket_depth(line);
+            while depth > 0 && index + 1 < lines.len() {
+                index += 1;
+                let next = lines[index].trim();
+                attribute.push_str(next);
+                depth += bracket_depth(next);
             }
-            hidden |= above.starts_with("#[doc(hidden)]");
-        }
-        let mut item = None;
-        for below in &lines[index + 1..] {
-            let below = below.trim_start();
-            if below.starts_with("#[") {
-                hidden |= below.starts_with("#[doc(hidden)]");
-                continue;
+            block.push((start, attribute));
+        } else if line.starts_with("///") || line.starts_with("//") {
+            // Doc and plain comments sit inside an attribute block.
+        } else {
+            let gate = block.iter().find(|(_, attribute)| {
+                attribute.starts_with("#[cfg(")
+                    && attribute.contains("\"test-helpers\"")
+                    && !attribute.contains("not(")
+            });
+            let hidden = block.iter().any(|(_, attribute)| {
+                attribute.starts_with("#[doc(hidden)]")
+                    || (attribute.starts_with("#[cfg_attr(")
+                        && attribute.contains("\"test-helpers\"")
+                        && attribute.contains("doc(hidden)"))
+            });
+            if let Some((start, _)) = gate
+                && line.starts_with("pub ")
+                && !hidden
+            {
+                found.push(format!("{file}:{}: {line}", start + 1));
             }
-            item = Some(below);
-            break;
+            block.clear();
         }
-        if let Some(item) = item
-            && item.starts_with("pub ")
-            && !hidden
-        {
-            found.push(format!("{file}:{}: {item}", index + 1));
-        }
+        index += 1;
     }
     found
+}
+
+/// How far `text` opens square brackets: `[` adds one, `]` takes one.
+fn bracket_depth(text: &str) -> i32 {
+    text.chars().fold(0, |depth, c| match c {
+        '[' => depth + 1,
+        ']' => depth - 1,
+        _ => depth,
+    })
 }
 
 #[test]
@@ -123,4 +143,55 @@ pub fn not_gated() {}
     let found = unhidden(source, "x.rs");
     assert_eq!(found.len(), 1, "{found:?}");
     assert!(found[0].contains("flagged"), "{found:?}");
+}
+
+#[test]
+fn the_scan_reads_a_multiline_cfg() {
+    let source = r#"
+#[cfg(all(
+    target_os = "linux",
+    feature = "ucx",
+    feature = "test-helpers",
+    feature = "distributed-tracing"
+))]
+pub struct Exposed;
+"#;
+    let found = unhidden(source, "x.rs");
+    assert_eq!(
+        found.len(),
+        1,
+        "a public test helper escaped the scan: {found:?}"
+    );
+}
+
+#[test]
+fn the_scan_accepts_a_conditionally_hidden_item() {
+    let source = r#"
+#[cfg(feature = "test-helpers")]
+#[cfg_attr(feature = "test-helpers", doc(hidden))]
+pub struct Hidden;
+"#;
+    let found = unhidden(source, "x.rs");
+    assert!(
+        found.is_empty(),
+        "the helper is hidden whenever it exists: {found:?}"
+    );
+}
+
+#[test]
+fn the_scan_checks_public_types_and_reexports() {
+    let source = r#"
+#[cfg(feature = "test-helpers")]
+pub struct Helper;
+
+#[cfg(feature = "test-helpers")]
+pub use std::time::Duration as HelperDuration;
+"#;
+    let found = unhidden(source, "x.rs");
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(found[0].contains("pub struct Helper"), "{found:?}");
+    assert!(
+        found[1].contains("pub use std::time::Duration"),
+        "{found:?}"
+    );
 }

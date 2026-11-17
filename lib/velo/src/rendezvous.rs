@@ -1002,6 +1002,7 @@ impl RendezvousManager {
         feature = "test-helpers",
         all(target_os = "linux", feature = "ucx")
     ))]
+    #[doc(hidden)]
     pub fn data_store(&self) -> &Arc<store::DataStore> {
         &self.store
     }
