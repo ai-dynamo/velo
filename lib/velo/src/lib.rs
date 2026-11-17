@@ -163,20 +163,18 @@ impl Default for GrpcConfig {
 ///
 /// # Variants
 ///
-/// - [`StreamConfig::Tcp`]: TCP-based streaming via
-///   [`TcpFrameTransport`](crate::streaming::TcpFrameTransport). Pass `None`
-///   to bind on `0.0.0.0:0`, or provide a [`TcpConfig`] for an explicit
-///   single-interface bind.
+/// - [`StreamConfig::Tcp`]: TCP-based streaming, under the `tcp-stream` key.
+///   Pass `None` to bind on `0.0.0.0:0`, or provide a [`TcpConfig`] for an
+///   explicit single-interface bind.
 ///
-/// - [`StreamConfig::Grpc`]: gRPC-based streaming via
-///   [`GrpcFrameTransport`](crate::streaming::GrpcFrameTransport). Only
-///   available when the `grpc` feature is enabled. Same advertise-and-select
-///   semantics as `Tcp`.
+/// - [`StreamConfig::Grpc`]: gRPC-based streaming, under the `grpc-stream`
+///   key. Only available when the `grpc` feature is enabled. Same
+///   advertise-and-select semantics as `Tcp`.
 #[derive(Debug, Clone)]
 pub enum StreamConfig {
-    /// TCP-based streaming transport (TcpFrameTransport).
+    /// TCP-based streaming transport, under the `tcp-stream` key.
     Tcp(Option<TcpConfig>),
-    /// gRPC-based streaming transport (GrpcFrameTransport).
+    /// gRPC-based streaming transport, under the `grpc-stream` key.
     #[cfg(feature = "grpc")]
     Grpc(Option<GrpcConfig>),
 }

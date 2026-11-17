@@ -8,10 +8,12 @@
 //! - [`frame::StreamFrame`]: seven-variant enum representing all frame types on the wire
 //!
 //! Transports: a stream rides the messenger mux by default. A node that asks
-//! for it also runs a per-stream transport ([`TcpFrameTransport`] or
-//! `GrpcFrameTransport`). Both implement a crate-private frame transport
-//! trait; a new transport implements the messenger
-//! [`Transport`](crate::Transport) instead.
+//! for it with [`StreamConfig`](crate::StreamConfig) also runs a per-stream
+//! TCP or gRPC transport, which answers to [`tcp_transport::TCP_STREAM_KEY`]
+//! or `grpc_transport::GRPC_STREAM_KEY`. Both transports, and the frame
+//! transport trait they implement, are private to this crate; a new
+//! transport implements the messenger [`Transport`](crate::Transport)
+//! instead.
 //!
 //! Anchors:
 //! - [`anchor::StreamAnchor`]: typed receive stream for anchor consumers
@@ -57,13 +59,13 @@ pub use anchor::{
 pub(crate) use anchor::{AnchorManager, AnchorManagerBuilder};
 pub use frame::{ByteItemBuilder, ByteItemFrame, SendError, StreamError, StreamFrame};
 #[cfg(feature = "grpc")]
-pub use grpc_transport::GrpcFrameTransport;
+pub(crate) use grpc_transport::GrpcFrameTransport;
 pub use handle::{AnchorKind, StreamAnchorHandle};
 pub use messenger_mux::{AutoFlush, FlushPolicy, MESSENGER_MUX_KEY, MuxConfig};
 pub use mpsc::{
     MpscAnchorConfig, MpscFrame, MpscStreamAnchor, MpscStreamController, MpscStreamSender, SenderId,
 };
 pub use sender::{Retired, Retirement, StreamSender};
-pub use tcp_transport::TcpFrameTransport;
+pub(crate) use tcp_transport::TcpFrameTransport;
 pub(crate) use transport::FrameTransport;
 pub use transport::MAX_ITEM_BYTES;

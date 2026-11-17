@@ -249,7 +249,7 @@ fn read_u64_meta<T>(request: &Request<T>, name: &str) -> Result<u64, Box<Status>
 
 /// gRPC-based [`FrameTransport`] providing per-(anchor, session) routing via
 /// a shared tonic server.
-pub struct GrpcFrameTransport {
+pub(crate) struct GrpcFrameTransport {
     key: TransportKey,
     bind_addr: SocketAddr,
     local_address: WorkerAddress,
@@ -371,11 +371,14 @@ impl GrpcFrameTransport {
     }
 
     /// Convenience: bind on `0.0.0.0:0`.
-    pub async fn default_new() -> Result<Arc<Self>> {
+    #[cfg(test)]
+    pub(crate) async fn default_new() -> Result<Arc<Self>> {
         Self::new("0.0.0.0:0".parse().unwrap()).await
     }
 
-    pub fn bound_addr(&self) -> SocketAddr {
+    /// The bound listener address, for tests that dial it directly.
+    #[cfg(test)]
+    pub(crate) fn bound_addr(&self) -> SocketAddr {
         self.bind_addr
     }
 
