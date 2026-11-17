@@ -14,7 +14,7 @@ instead of it.
 
 **When.** Over the messenger mux, for an item larger than the eager budget:
 the smaller of the transport's frame limit and the stager's threshold
-(`RendezvousStager::with_threshold`, 256 KiB by default), less the message
+(`Velo::staging_threshold()`, 256 KiB), less the message
 envelope.
 
 **Why.** Such an item leaves the producer as a handle. Its bytes stay staged
