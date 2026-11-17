@@ -214,6 +214,17 @@ async fn a_flush_with_nothing_staged_writes_nothing() {
 // What no policy may hold back
 // ---------------------------------------------------------------------------
 
+/// Wakes of the batcher on a linger timer: the reply window's, here.
+///
+/// Counted when the batcher wakes, before it writes, so it is in place once
+/// the batch has arrived.
+fn linger_wakes(harness: &Harness) -> f64 {
+    harness.snapshot().counter(
+        "velo_streaming_mux_batcher_wakes_total",
+        &[("source", "linger")],
+    )
+}
+
 /// A `CreditUpdate` owed to a peer goes within the reply window, without
 /// waiting for a flush.
 ///
@@ -221,10 +232,14 @@ async fn a_flush_with_nothing_staged_writes_nothing() {
 /// polish: the peer's sender is parked waiting for this window, and no
 /// application on *this* side knows it owes that peer anything. If credit
 /// could wait for `flush_batch`, a node with a quiet producer would starve a
-/// busy one. Bounded by an explicit short `reply_linger` rather than
-/// `RECV_TIMEOUT`, so this discriminates a held reply from one that moved —
-/// the assertion held at any `reply_linger` under five seconds before
-/// `flush_gate` bounded a reply's window to records joining it either way.
+/// busy one.
+///
+/// The test counts what moved the batch, not how long it took. Under `Manual`
+/// nothing else in this harness moves a batch: the test never kicks, opens no
+/// slot to probe, and runs no sweep. So a reply that waits for a flush never
+/// arrives, and one that arrives came out on its window's timer. The wait
+/// used to be four windows (200 ms), and on a loaded host the write took
+/// longer than that with nothing wrong.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_credit_reply_moves_under_manual() {
     let window = Duration::from_millis(50);
@@ -242,9 +257,13 @@ async fn a_credit_reply_moves_under_manual() {
             delta: 32,
         }]);
 
-    let batch = tokio::time::timeout(window * 4, harness.next_batch())
+    let batch = tokio::time::timeout(RECV_TIMEOUT, harness.next_batch())
         .await
         .expect("a credit reply must not wait past its own window");
+    assert!(
+        linger_wakes(&harness) >= 1.0,
+        "the batch must have gone out on the reply window's timer"
+    );
     assert_eq!(batch.records.len(), 1);
     assert_eq!(batch.records[0].kind, RecordType::CreditUpdate);
     assert_eq!(batch.records[0].slot, peer_slot);
@@ -259,7 +278,9 @@ async fn a_credit_reply_moves_under_manual() {
 /// the reply's window never started and nothing under `Manual` — no policy, no
 /// timer — ever rescued it. `await_staged(1)` is the positive fact that the
 /// data record reached the gate before the reply is sent, which is what makes
-/// this Family A rather than a reply-alone case.
+/// this Family A rather than a reply-alone case. Timed like
+/// `a_credit_reply_moves_under_manual`: the slot's probe wakes count as
+/// linger wakes too, but under `Manual` they write nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_credit_reply_moves_under_manual_behind_a_staged_record() {
     let window = Duration::from_millis(50);
@@ -281,9 +302,13 @@ async fn a_credit_reply_moves_under_manual_behind_a_staged_record() {
             delta: 32,
         }]);
 
-    let batch = tokio::time::timeout(window * 4, harness.next_batch())
+    let batch = tokio::time::timeout(RECV_TIMEOUT, harness.next_batch())
         .await
         .expect("a reply joining an already-staged batch keeps its own window under Manual");
+    assert!(
+        linger_wakes(&harness) >= 1.0,
+        "the batch must have gone out on the reply window's timer"
+    );
     let kinds: Vec<RecordType> = batch.records.iter().map(|r| r.kind).collect();
     assert_eq!(
         kinds,
