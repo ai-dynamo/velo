@@ -453,8 +453,9 @@ impl VeloBuilder {
     ///
     /// A node with no stream config has no per-stream transport to fall back
     /// to, so turning its mux off, by either form, makes
-    /// [`build`](Self::build) fail with an error that names `stream_config`
-    /// and `stream_bind_addr`. So does `mux_only()`.
+    /// [`build`](Self::build) fail. On a default node the error names
+    /// `stream_config` and `stream_bind_addr`; on a `mux_only()` node it
+    /// names `mux_only`.
     ///
     /// Only one mux may be installed per instance: its `_stream_batch` handler
     /// is registered on the messenger for its lifetime. The messenger would
@@ -2490,12 +2491,13 @@ mod tests {
     /// A worker registers each frontend it serves, and a restarted frontend
     /// comes back with a new instance id. Unless the worker forgets the old
     /// one, it stays in the backend routes, the handler cache, the transport's
-    /// peer and connection maps, and, in default mode, the stream transport's
-    /// address cache. After `unregister_peer` none of them holds the peer, a
-    /// unary to it fails as one to a peer never registered, a unary to another
-    /// peer still works, and registering the peer again handshakes and dials
-    /// afresh. Both modes run, because only default mode has a stream
-    /// transport that caches peers.
+    /// peer and connection maps, and, on a node with a per-stream listener,
+    /// the stream transport's address cache. After `unregister_peer` none of
+    /// them holds the peer, a unary to it fails as one to a peer never
+    /// registered, a unary to another peer still works, and registering the
+    /// peer again handshakes and dials afresh. A per-stream node and a
+    /// `mux_only()` node both run, because only the per-stream transport
+    /// caches peers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unregister_peer_forgets_the_peer_and_leaves_others_alone() {
         use crate::transports::tcp::{TcpTransport, TcpTransportBuilder};

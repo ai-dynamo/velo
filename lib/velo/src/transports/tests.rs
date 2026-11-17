@@ -1051,6 +1051,32 @@ async fn failed_build_with_a_panicking_hook_returns_without_closing() {
     assert!(started.shut_down.load(Ordering::Relaxed));
 }
 
+/// A node with the mux off and no stream config has no remote stream
+/// transport, so `build` refuses it. It must refuse before it starts a
+/// transport: a started transport has bound its listener and spawned its
+/// tasks, and a failed build would have to tear them down again.
+#[tokio::test]
+async fn a_disabled_mux_without_a_stream_config_fails_before_a_transport_starts() {
+    let transport = MockTransport::new("mock", true);
+    let result = crate::Velo::builder()
+        .add_transport(transport.clone())
+        .messenger_mux(crate::streaming::MuxConfig {
+            enabled: false,
+            ..Default::default()
+        })
+        .unwrap()
+        .build()
+        .await;
+    let error = result
+        .err()
+        .expect("a node with no stream transport was built");
+    assert!(error.to_string().contains("stream_config"), "{error}");
+    assert!(
+        !transport.started.load(Ordering::Relaxed),
+        "the build started a transport before it refused the mode"
+    );
+}
+
 /// A retry after a failed teardown must fail at once. Teardown ran once and
 /// failed for good, so running the drain and the RDMA sweep again only spends
 /// their budget (30 s by default for the sweep) before the same panic.
