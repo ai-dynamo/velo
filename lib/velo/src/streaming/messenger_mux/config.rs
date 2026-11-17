@@ -190,10 +190,12 @@ impl FlushPolicy {
 ///
 /// The `Velo` builder installs `MuxConfig::default()` unless
 /// `.messenger_mux(...)` passes another. Tune it with
-/// `.messenger_mux(MuxConfig { max_batch_bytes: ..., ..Default::default() })`,
-/// and turn it off with `.messenger_mux(MuxConfig { enabled: false,
-/// ..Default::default() })`. Defaults are chosen so that most deployments
-/// change nothing.
+/// `.messenger_mux(MuxConfig { max_batch_bytes: ..., ..Default::default() })`.
+/// Turn it off with `.messenger_mux(MuxConfig { enabled: false,
+/// ..Default::default() })` only on a node built with `stream_config` or
+/// `stream_bind_addr`: without a per-stream transport the node would have no
+/// stream transport at all, and `build` fails. Defaults are chosen so that
+/// most deployments change nothing.
 #[derive(Debug, Clone)]
 pub struct MuxConfig {
     /// Whether to install the mux at all.

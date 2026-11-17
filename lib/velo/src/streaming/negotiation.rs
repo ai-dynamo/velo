@@ -148,13 +148,14 @@ pub(crate) fn select(
             target: Target::Mux(Arc::clone(mux), lane),
         });
     }
-    // The message reaches the sender as its attach error; it names the
-    // receiver's fix, because the sender cannot make one.
+    // Built here on the receiver but read on the sender, as its attach
+    // error, so it names each node by its role rather than "this" or "peer".
+    // The fix is on the receiver: the sender cannot make one.
     anyhow::ensure!(
         default_transport.key().as_str() != MESSENGER_MUX_KEY,
-        "peer does not support the messenger mux, and this instance has no per-stream \
-         transport to serve it on: build this instance with stream_config or \
-         stream_bind_addr to accept streams from peers without the mux"
+        "the sender does not offer the messenger mux, and the anchor's node has no \
+         per-stream transport: build that node with stream_config or stream_bind_addr \
+         to accept streams from senders without the mux"
     );
     anyhow::ensure!(
         offered.is_empty() || offered.contains(&default_transport.key()),

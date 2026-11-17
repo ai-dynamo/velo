@@ -67,9 +67,7 @@ async fn uds_rejected_when_path_missing_promotes_tcp() {
     let our_uds = dir.join("self.sock");
     let (backend, _streams) = build_backend(our_uds).await;
 
-    backend
-        .set_transport_priority(vec![TransportKey::from("uds"), TransportKey::from("tcp")])
-        .unwrap();
+    backend.set_transport_priority(vec![TransportKey::from("uds"), TransportKey::from("tcp")]);
 
     let bogus_uds = dir.join(format!("missing-{}.sock", InstanceId::new_v4()));
     assert!(!bogus_uds.exists());
@@ -100,9 +98,7 @@ async fn uds_selected_when_socket_visible() {
     let our_uds = dir.join("self.sock");
     let (backend, _streams) = build_backend(our_uds).await;
 
-    backend
-        .set_transport_priority(vec![TransportKey::from("uds"), TransportKey::from("tcp")])
-        .unwrap();
+    backend.set_transport_priority(vec![TransportKey::from("uds"), TransportKey::from("tcp")]);
 
     // Bind a UDS listener so the peer's socket exists on our fs.
     let peer_uds = dir.join("peer.sock");
@@ -128,9 +124,7 @@ async fn uds_rejected_when_path_is_not_a_socket() {
     let our_uds = dir.join("self.sock");
     let (backend, _streams) = build_backend(our_uds).await;
 
-    backend
-        .set_transport_priority(vec![TransportKey::from("uds"), TransportKey::from("tcp")])
-        .unwrap();
+    backend.set_transport_priority(vec![TransportKey::from("uds"), TransportKey::from("tcp")]);
 
     let regular_file = dir.join("not-a-socket");
     std::fs::write(&regular_file, b"regular file").unwrap();

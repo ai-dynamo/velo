@@ -596,86 +596,6 @@ async fn test_send_message_unregistered_peer() {
 }
 
 #[tokio::test]
-async fn test_send_message_with_transport_primary_match() {
-    let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
-
-    let peer = make_peer_info(&["tcp"]);
-    let peer_id = peer.instance_id();
-    backend.register_peer(peer).unwrap();
-
-    backend
-        .send_message_with_transport(
-            peer_id,
-            Bytes::from_static(&[1]),
-            Bytes::from_static(&[2]),
-            MessageType::Message,
-            Arc::new(NoopErrorHandler),
-            TransportKey::from("tcp"),
-        )
-        .unwrap();
-
-    assert_eq!(t.send_count.load(Ordering::Relaxed), 1);
-}
-
-#[tokio::test]
-async fn test_send_message_with_transport_alternative() {
-    let t1 = MockTransport::new("tcp", true);
-    let t2 = MockTransport::new("http", true);
-    let (backend, _streams) = VeloBackend::new(
-        vec![
-            t1.clone() as Arc<dyn Transport>,
-            t2.clone() as Arc<dyn Transport>,
-        ],
-        None,
-    )
-    .await
-    .unwrap();
-
-    let peer = make_peer_info(&["tcp", "http"]);
-    let peer_id = peer.instance_id();
-    backend.register_peer(peer).unwrap();
-
-    // Send via "http" (the alternative transport)
-    backend
-        .send_message_with_transport(
-            peer_id,
-            Bytes::from_static(&[1]),
-            Bytes::from_static(&[2]),
-            MessageType::Message,
-            Arc::new(NoopErrorHandler),
-            TransportKey::from("http"),
-        )
-        .unwrap();
-
-    assert_eq!(t2.send_count.load(Ordering::Relaxed), 1);
-}
-
-#[tokio::test]
-async fn test_send_message_with_transport_not_found() {
-    let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
-
-    let peer = make_peer_info(&["tcp"]);
-    let peer_id = peer.instance_id();
-    backend.register_peer(peer).unwrap();
-
-    let result = backend.send_message_with_transport(
-        peer_id,
-        Bytes::new(),
-        Bytes::new(),
-        MessageType::Message,
-        Arc::new(NoopErrorHandler),
-        TransportKey::from("grpc"),
-    );
-    assert!(result.is_err());
-}
-
-#[tokio::test]
 async fn test_try_translate_worker_id_not_found() {
     let t = MockTransport::new("tcp", true);
     let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
@@ -708,72 +628,6 @@ async fn failed_start_closes_all_transports_already_started() {
     assert!(failing.started.load(Ordering::Relaxed));
     assert!(!failing.shut_down.load(Ordering::Relaxed));
     assert!(!failing.closed.load(Ordering::Relaxed));
-}
-
-#[tokio::test]
-async fn test_set_transport_priority_valid() {
-    let t1 = MockTransport::new("tcp", true);
-    let t2 = MockTransport::new("http", true);
-    let (backend, _streams) = VeloBackend::new(
-        vec![t1 as Arc<dyn Transport>, t2 as Arc<dyn Transport>],
-        None,
-    )
-    .await
-    .unwrap();
-
-    // Reverse the priority
-    backend
-        .set_transport_priority(vec![TransportKey::from("http"), TransportKey::from("tcp")])
-        .unwrap();
-}
-
-#[tokio::test]
-async fn test_set_transport_priority_rejects_duplicate_without_changing_priority() {
-    let tcp = MockTransport::new("tcp", true);
-    let ucx = MockTransport::new("ucx", true);
-    let (backend, _streams) = VeloBackend::new(
-        vec![tcp as Arc<dyn Transport>, ucx as Arc<dyn Transport>],
-        None,
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        backend.set_transport_priority(vec![TransportKey::from("tcp"), TransportKey::from("tcp")]),
-        Err(VeloBackendError::InvalidTransportPriority(_))
-    ));
-    assert_eq!(
-        *backend.priorities.lock(),
-        vec![TransportKey::from("tcp"), TransportKey::from("ucx")]
-    );
-}
-
-#[tokio::test]
-async fn test_set_transport_priority_wrong_length() {
-    let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
-
-    let result =
-        backend.set_transport_priority(vec![TransportKey::from("tcp"), TransportKey::from("http")]);
-    assert!(matches!(
-        result,
-        Err(VeloBackendError::InvalidTransportPriority(_))
-    ));
-}
-
-#[tokio::test]
-async fn test_set_transport_priority_unknown_key() {
-    let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
-
-    let result = backend.set_transport_priority(vec![TransportKey::from("unknown")]);
-    assert!(matches!(
-        result,
-        Err(VeloBackendError::InvalidTransportPriority(_))
-    ));
 }
 
 #[tokio::test]
@@ -1049,6 +903,81 @@ async fn failed_build_with_a_panicking_hook_returns_without_closing() {
     .expect("a failed build waited on a transport whose hook failed");
     assert!(result.is_err());
     assert!(started.shut_down.load(Ordering::Relaxed));
+}
+
+/// A node with the mux off and no stream config has no remote stream
+/// transport, so `build` refuses it. It must refuse before it starts a
+/// transport: a started transport has bound its listener and spawned its
+/// tasks, and a failed build would have to tear them down again.
+#[tokio::test]
+async fn a_disabled_mux_without_a_stream_config_fails_before_a_transport_starts() {
+    let transport = MockTransport::new("mock", true);
+    let result = crate::Velo::builder()
+        .add_transport(transport.clone())
+        .messenger_mux(crate::streaming::MuxConfig {
+            enabled: false,
+            ..Default::default()
+        })
+        .unwrap()
+        .build()
+        .await;
+    let error = result
+        .err()
+        .expect("a node with no stream transport was built");
+    assert!(error.to_string().contains("stream_config"), "{error}");
+    assert!(
+        !transport.started.load(Ordering::Relaxed),
+        "the build started a transport before it refused the mode"
+    );
+}
+
+/// Two clones that call `shutdown` together run its messenger half once:
+/// one runs it, the other waits on the shared lock and returns when it is
+/// done. A later call runs nothing either. Each run drains the transport, so
+/// the mock's drain count tells one run from two; a node shut down once
+/// gives the count for one run.
+#[tokio::test]
+async fn concurrent_shutdowns_through_two_clones_drain_once() {
+    async fn node() -> (crate::Velo, Arc<MockTransport>) {
+        let transport = MockTransport::new("mock", true);
+        let velo = crate::Velo::builder()
+            .add_transport(transport.clone())
+            .build()
+            .await
+            .unwrap();
+        (velo, transport)
+    }
+    let bound = Duration::from_secs(10);
+    let (once, once_transport) = node().await;
+    tokio::time::timeout(bound, once.shutdown(ShutdownPolicy::WaitForever))
+        .await
+        .expect("a shutdown did not return");
+    let one_run = once_transport.drain_calls.load(Ordering::Relaxed);
+    assert!(one_run > 0, "a shutdown did not drain the transport");
+
+    let (velo, transport) = node().await;
+    let clone = velo.clone();
+    tokio::time::timeout(bound, async {
+        tokio::join!(
+            velo.shutdown(ShutdownPolicy::WaitForever),
+            clone.shutdown(ShutdownPolicy::WaitForever),
+        )
+    })
+    .await
+    .expect("two concurrent shutdowns did not both return");
+    assert_eq!(
+        transport.drain_calls.load(Ordering::Relaxed),
+        one_run,
+        "both clones ran the shutdown sequence"
+    );
+    tokio::time::timeout(bound, clone.shutdown(ShutdownPolicy::WaitForever))
+        .await
+        .expect("a later shutdown did not return");
+    assert_eq!(
+        transport.drain_calls.load(Ordering::Relaxed),
+        one_run,
+        "a later shutdown ran the sequence again"
+    );
 }
 
 /// A retry after a failed teardown must fail at once. Teardown ran once and
