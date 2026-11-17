@@ -931,6 +931,55 @@ async fn a_disabled_mux_without_a_stream_config_fails_before_a_transport_starts(
     );
 }
 
+/// Two clones that call `shutdown` together run its messenger half once:
+/// one runs it, the other waits on the shared lock and returns when it is
+/// done. A later call runs nothing either. Each run drains the transport, so
+/// the mock's drain count tells one run from two; a node shut down once
+/// gives the count for one run.
+#[tokio::test]
+async fn concurrent_shutdowns_through_two_clones_drain_once() {
+    async fn node() -> (crate::Velo, Arc<MockTransport>) {
+        let transport = MockTransport::new("mock", true);
+        let velo = crate::Velo::builder()
+            .add_transport(transport.clone())
+            .build()
+            .await
+            .unwrap();
+        (velo, transport)
+    }
+    let bound = Duration::from_secs(10);
+    let (once, once_transport) = node().await;
+    tokio::time::timeout(bound, once.shutdown(ShutdownPolicy::WaitForever))
+        .await
+        .expect("a shutdown did not return");
+    let one_run = once_transport.drain_calls.load(Ordering::Relaxed);
+    assert!(one_run > 0, "a shutdown did not drain the transport");
+
+    let (velo, transport) = node().await;
+    let clone = velo.clone();
+    tokio::time::timeout(bound, async {
+        tokio::join!(
+            velo.shutdown(ShutdownPolicy::WaitForever),
+            clone.shutdown(ShutdownPolicy::WaitForever),
+        )
+    })
+    .await
+    .expect("two concurrent shutdowns did not both return");
+    assert_eq!(
+        transport.drain_calls.load(Ordering::Relaxed),
+        one_run,
+        "both clones ran the shutdown sequence"
+    );
+    tokio::time::timeout(bound, clone.shutdown(ShutdownPolicy::WaitForever))
+        .await
+        .expect("a later shutdown did not return");
+    assert_eq!(
+        transport.drain_calls.load(Ordering::Relaxed),
+        one_run,
+        "a later shutdown ran the sequence again"
+    );
+}
+
 /// A retry after a failed teardown must fail at once. Teardown ran once and
 /// failed for good, so running the drain and the RDMA sweep again only spends
 /// their budget (30 s by default for the sweep) before the same panic.

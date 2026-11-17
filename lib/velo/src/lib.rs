@@ -262,10 +262,6 @@ struct VeloInner {
 struct ShutdownOnce {
     lock: tokio::sync::Mutex<()>,
     done: std::sync::atomic::AtomicBool,
-    /// How many times the messenger half ran. A second run over a TCP-only
-    /// node is idempotent, so without this a test cannot tell one from two.
-    #[cfg(test)]
-    runs: std::sync::atomic::AtomicUsize,
 }
 
 /// Concrete handles let shutdown join listeners without changing `FrameTransport`.
@@ -768,8 +764,6 @@ impl VeloBuilder {
                 shutdown: ShutdownOnce {
                     lock: tokio::sync::Mutex::new(()),
                     done: std::sync::atomic::AtomicBool::new(false),
-                    #[cfg(test)]
-                    runs: std::sync::atomic::AtomicUsize::new(0),
                 },
             }),
         })
@@ -923,11 +917,6 @@ impl Velo {
         {
             return;
         }
-        #[cfg(test)]
-        self.inner
-            .shutdown
-            .runs
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // A failed teardown is final. Running the RDMA sweep again would spend
         // its budget against torn-down transports, then panic anyway. (The
         // backend refuses to drain again on its own.)
@@ -2124,7 +2113,8 @@ mod tests {
     /// Shutdown through one clone is shutdown of the instance: the other clone
     /// sees it as done, and a repeat call through the other clone returns.
     ///
-    /// `concurrent_shutdowns_through_two_clones_run_once` counts the runs, and
+    /// `transports::tests::concurrent_shutdowns_through_two_clones_drain_once`
+    /// counts the runs, and
     /// `rendezvous::rdma::tests::concurrent_shutdowns_are_serialised` counts
     /// one RDMA sweep across eight clones.
     #[tokio::test]
@@ -2149,35 +2139,6 @@ mod tests {
         )
         .await
         .expect("a second shutdown through another clone did not return");
-    }
-
-    /// Two clones that call `shutdown` together run its messenger half once:
-    /// one runs it, the other waits on the shared lock and returns when it is
-    /// done. A later call runs nothing either.
-    #[tokio::test]
-    async fn concurrent_shutdowns_through_two_clones_run_once() {
-        let velo = tcp_stream_node(None).await;
-        let clone = velo.clone();
-        let runs = || {
-            velo.inner
-                .shutdown
-                .runs
-                .load(std::sync::atomic::Ordering::Relaxed)
-        };
-
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::join!(
-                velo.shutdown(ShutdownPolicy::WaitForever),
-                clone.shutdown(ShutdownPolicy::WaitForever),
-            )
-        })
-        .await
-        .expect("two concurrent shutdowns did not both return");
-        assert_eq!(runs(), 1, "both clones ran the shutdown sequence");
-        assert!(velo.messenger().backend().teardown_requested());
-
-        clone.shutdown(ShutdownPolicy::WaitForever).await;
-        assert_eq!(runs(), 1, "a later shutdown ran the sequence again");
     }
 
     /// Every clone contends on one shutdown lock, so a second caller waits for
