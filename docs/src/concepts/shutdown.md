@@ -47,7 +47,7 @@ To let open streams finish, call `begin_drain`, wait until your streams end, and
 
 ## Close an instance while Tokio keeps running
 
-Use `Velo::shutdown(policy)` when an application removes a Velo instance but keeps its Tokio runtime. It first runs `graceful_shutdown`, then cancels live anchors and senders, stops the builder-owned per-stream listener, and joins the messenger receive loops and streaming tasks. Pending remote event waits fail at teardown, and their subscription tasks stop. Local event completion remains available. Custom frame transports remain the caller's responsibility.
+Use `Velo::shutdown(policy)` when an application removes a Velo instance but keeps its Tokio runtime. It first runs `graceful_shutdown`, then cancels live anchors and senders, stops the per-stream listener if the builder started one, and joins the messenger receive loops and streaming tasks. Pending remote event waits fail at teardown, and their subscription tasks stop. Local event completion remains available. Custom frame transports remain the caller's responsibility.
 
 If the sender of a stream is on the same instance, shutdown cancels that sender. The `cancellation_token` of the sender fires, and later sends fail. The reader of the stream ends when the application drops or finalizes the sender. Shutdown does not end the reader itself. That needs a check on every read.
 

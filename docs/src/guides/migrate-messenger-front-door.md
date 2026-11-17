@@ -36,7 +36,7 @@ velo.register_peer(peer_info)?;
 velo.shutdown(policy).await;
 ```
 
-`VeloBuilder` has the same `add_transport`, `discovery`, and `metrics` methods. Where code needs the `Arc<Messenger>`, call `velo.messenger()`. A `Velo` that opens no stream listener is built with `.mux_only()` (see [Services and mux-only mode](migrate-services.md)).
+`VeloBuilder` has the same `add_transport`, `discovery`, and `metrics` methods. Where code needs the `Arc<Messenger>`, call `velo.messenger()`. A `Velo` opens no stream listener unless the builder calls `stream_config` or `stream_bind_addr` (see [Services and stream transports](migrate-services.md)).
 
 ## What moves in the known consumers
 
