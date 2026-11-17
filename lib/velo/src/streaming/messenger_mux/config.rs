@@ -212,8 +212,9 @@ pub struct MuxConfig {
     /// time, for an application that does not expose this field; it wins over
     /// `enabled: true` set in code. A node with no stream config has no
     /// per-stream path, so either form makes its `build` fail. Its peers need
-    /// a per-stream transport too: a peer on the default build has only the
-    /// mux, and an attach between the two finds no transport in common.
+    /// the same per-stream transport: with the mux off, each side offers and
+    /// accepts only its own per-stream key (`tcp-stream` or `grpc-stream`),
+    /// and a peer on the default build has only the mux.
     ///
     /// Complete on the node that mints zero-RTT tickets — with no mux there is
     /// no ticket, and every stream attaches the ordinary way — but not
