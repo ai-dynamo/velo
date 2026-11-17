@@ -65,7 +65,7 @@ pub const DEFAULT_CHUNK_SIZE: u32 = 512 * 1024;
 /// Reporting only. Derived from [`SlotBody`] on every query rather than stored
 /// beside it, so the two cannot drift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StageMode {
+pub(crate) enum StageMode {
     /// Plain heap bytes, served via chunked pull.
     InMemory,
     /// RDMA-registered memory: served by an RDMA GET to a consumer that can do

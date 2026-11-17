@@ -93,7 +93,7 @@ pub use crate::streaming::sender::StreamSender;
 // Rendezvous
 pub use crate::rendezvous::handle::DataHandle;
 pub use crate::rendezvous::protocol::DataMetadata;
-pub use crate::rendezvous::store::{RegisterOptions, StageMode};
+pub use crate::rendezvous::store::RegisterOptions;
 pub use crate::rendezvous::write::RendezvousWrite;
 
 #[cfg(all(target_os = "linux", feature = "ucx"))]
