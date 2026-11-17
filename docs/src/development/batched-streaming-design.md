@@ -124,7 +124,7 @@ The first version killed the slot at the budget instead of pausing. That killed 
 The ingress gets each batch as one `Bytes`, and each record knows its range in it. It still copies every record body into its own `Vec` for the slot buffer. Handing the consumer `payload.slice(range)` instead would remove that copy, and with [byte items](../concepts/streaming.md#byte-items) the consumer would then copy nothing. It is not done, for two reasons:
 
 - **The byte budgets would stop bounding memory.** A slice keeps its whole batch in memory. A batch holds records of many streams, so a consumer that keeps one 100 B token keeps up to the batch size, and many slow consumers keep many batches. The slot and peer budgets count record bytes, so they would no longer bound what the node holds. Slicing only a record that fills most of its batch would bound this, but it is a second policy to keep correct.
-- **`velo-ext` fixes the slot buffer type.** The mux implements `FrameTransport::bind`, which returns `flume::Receiver<Vec<u8>>`. A slot buffer of `Bytes` needs the trait path to keep its own `Vec` channel, and it ripples through the attach and pre-bind paths, the direct feed, the MPSC pump and the anchor.
+- **The frame transport trait fixes the slot buffer type.** The mux implements `FrameTransport::bind`, which returns `flume::Receiver<Vec<u8>>`. A slot buffer of `Bytes` needs the trait path to keep its own `Vec` channel, and it ripples through the attach and pre-bind paths, the direct feed, the MPSC pump and the anchor.
 
 The producer side has the same limit. Its frame goes through the slot inlet, the `flume::Sender<Vec<u8>>` that `FrameTransport::connect` returns, so it is built once and copied into the batch once. Writing it straight into the batch needs another inlet type for the mux and a `StreamSender` that knows which transport it has.
 
@@ -231,7 +231,7 @@ The mux is a user of the Messenger send path, not something a transport implemen
 
 The additions this work made to `velo-ext` were shaped to last. `Transport::max_message_size(target) -> Option<usize>` has a default, and `None` means unknown, which costs the caller a conservative budget. `SendOutcome::Pending(SendAdmission)` changed a published enum, so it shipped once, as a coordinated `velo-ext` and `velo` release. The egress recorders on `TransportObservability` have no-op defaults.
 
-The cost of deferral is bounded. Out-of-tree `FrameTransport`s get no multiplexing, and nothing else breaks. A receiver offers `messenger-mux-v2` only when the mux is installed and enabled, so a deployment without the mux degrades correctly.
+The cost of deferral is bounded. The per-stream transports get no multiplexing, and nothing else breaks. A receiver offers `messenger-mux-v2` only when the mux is installed and enabled, so a deployment without the mux degrades correctly.
 
 Methods that the mux needs outside the trait (`advertised_limits`, `connect_negotiated`, `take_drain_signal`, `prebind`, `release_bind`, `close_claimed_slot`) are inherent on the concrete `MessengerMuxTransport`. `AnchorManager` already holds the concrete type, so none of them needs a trait change.
 

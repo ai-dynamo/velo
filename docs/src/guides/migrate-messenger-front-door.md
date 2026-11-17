@@ -40,7 +40,7 @@ velo.shutdown(policy).await;
 
 ## 0.23.0: the deprecated items are gone
 
-Every item in the table above is removed. There is no forwarding method and no alias, so a call to one fails to compile. Also:
+Every item in the table above is removed. There is no forwarding method and no alias, so a call to one fails to compile. 0.23.0 also opens no per-stream listener by default (see [Services and stream transports](migrate-services.md#0230-the-per-stream-listener-is-opt-in)), and gives each public item one path (see [Move to the public paths of 0.23.0](migrate-public-paths.md)). Also:
 
 - `Velo::shutdown` is the one shutdown. It keeps everything `graceful_shutdown` did: the RDMA sweep before transport teardown, the join of the mux senders, and one run across clones.
 - `velo::transports::VeloBackend` is no longer public. Code that built one with `VeloBackend::new` has no replacement: build a `Velo`. `VeloBackendError` stays public, because a failed send can carry it.
@@ -56,7 +56,7 @@ velo.register_peer(peer_info)?;
 let messenger = Arc::clone(velo.messenger());
 ```
 
-A `Velo` registers its own anchor, rendezvous, and mux handlers on its `Messenger`. A test that builds its own `AnchorManager` or `RendezvousManager` over that `Messenger` replaces the `Velo`'s handlers of the same name.
+A `Velo` registers its own anchor, rendezvous, and mux handlers on its `Messenger`. A handler that you register on `velo.messenger()` with `register_streaming_handler` under one of those names replaces the `Velo`'s own. Streams and staged payloads go through the methods on `Velo`: the anchor and rendezvous managers are not public in 0.23.0.
 
 ## What moves in the known consumers
 
