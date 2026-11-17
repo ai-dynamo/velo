@@ -84,9 +84,9 @@ async fn remote_sender_cancel_preserves_an_unrelated_local_sender() {
         .attach_mpsc_anchor::<u32>(remote_anchor.handle())
         .await
         .unwrap();
-    // Sender IDs belong to workers, so both first senders have the same
-    // registry key, each in its own worker's registry.
-    assert_eq!(local_sender.sender_id(), remote_sender.sender_id());
+    // Each sender sits in the registry of the node it attached through.
+    assert_eq!(node_a.stream_senders_in_use(), 1);
+    assert_eq!(node_b.stream_senders_in_use(), 1);
 
     remote_anchor.cancel();
     tokio::time::timeout(
