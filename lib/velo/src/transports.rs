@@ -12,8 +12,9 @@
 //!
 //! # Architecture
 //!
-//! [`VeloBackend`] is the central orchestrator. It holds a set of transports,
-//! each identified by a [`TransportKey`]. When a peer registers, the backend
+//! The backend inside each [`Messenger`](crate::Messenger) is the central
+//! orchestrator. It holds a set of transports, each identified by a
+//! [`TransportKey`]. When a peer registers, the backend
 //! selects a *primary* transport (highest-priority compatible transport) and
 //! records any alternatives. Outbound messages are routed through the primary
 //! transport by default, or through an explicit alternative.
@@ -100,28 +101,21 @@ pub use transport::{
     make_channels,
 };
 
-/// Errors returned by [`VeloBackend`] operations.
+/// Errors from the transport backend that routes a messenger's sends. A send
+/// that fails for one of these reasons carries it in its `anyhow::Error`.
 #[derive(Debug, thiserror::Error)]
 pub enum VeloBackendError {
     /// No transport could accept the peer's address.
     #[error("No compatible transports found")]
     NoCompatibleTransports,
 
-    /// The target instance was never registered via [`VeloBackend::register_peer`].
+    /// The target instance was never registered, or was unregistered.
     #[error("Transport not found for instance: {0}")]
     InstanceNotRegistered(InstanceId),
 
     /// The worker ID is not in the fast-path cache.
     #[error("Worker not found: {0}")]
     WorkerNotRegistered(WorkerId),
-
-    /// The requested [`TransportKey`] does not match any loaded transport.
-    #[error("Transport not found: {0}")]
-    TransportNotFound(TransportKey),
-
-    /// The priority list does not match the set of available transports.
-    #[error("Invalid transport priority: {0}")]
-    InvalidTransportPriority(String),
 }
 
 /// Central orchestrator that aggregates multiple transports and routes messages
@@ -130,7 +124,10 @@ pub enum VeloBackendError {
 /// Each peer is registered with all compatible transports; the highest-priority
 /// compatible transport becomes the *primary* for that peer. Worker IDs are
 /// cached for fast-path routing without discovery lookups.
-pub struct VeloBackend {
+///
+/// Crate-private: a [`Messenger`](crate::Messenger) owns one, and applications
+/// reach it through `Velo`.
+pub(crate) struct VeloBackend {
     instance_id: InstanceId,
     address: WorkerAddress,
     priorities: Mutex<Vec<TransportKey>>,
@@ -419,19 +416,14 @@ impl VeloBackend {
             .ok_or(VeloBackendError::WorkerNotRegistered(worker_id))
     }
 
-    /// Deprecated: Use `try_translate_worker_id()` for explicit fast-path semantics.
-    #[deprecated(since = "0.7.0", note = "Use try_translate_worker_id() instead")]
-    pub fn translate_worker_id(&self, worker_id: WorkerId) -> Result<InstanceId, VeloBackendError> {
-        self.try_translate_worker_id(worker_id)
-    }
-
-    /// Check if an instance_id is registered.
-    pub fn has_instance(&self, instance_id: InstanceId) -> bool {
-        self.primary_transport.contains_key(&instance_id)
-    }
-
     /// Returns the [`TransportKey`] of the primary transport selected for `target`,
-    /// or `None` if the peer has not been registered.
+    /// or `None` if the peer has not been registered. For the RDMA path's
+    /// eligibility check, and for tests.
+    #[cfg(any(
+        test,
+        feature = "test-helpers",
+        all(target_os = "linux", feature = "ucx")
+    ))]
     pub fn primary_transport_key(&self, target: InstanceId) -> Option<TransportKey> {
         self.primary_transport
             .get(&target)
@@ -461,10 +453,9 @@ impl VeloBackend {
     /// capacity to plan against and the caller falls back to its own
     /// conservative budget.
     ///
-    /// Reported for the *primary* transport only. An alternative reached
-    /// through [`send_message_with_transport`](Self::send_message_with_transport)
-    /// can have a different limit; sizing a send against this number and then
-    /// routing it elsewhere is the caller's business to avoid.
+    /// Reported for the *primary* transport only, the one every send in the
+    /// library goes through. An alternative transport can have a different
+    /// limit.
     pub(crate) fn max_message_size(&self, target: InstanceId) -> Option<usize> {
         self.primary_transport
             .get(&target)
@@ -473,6 +464,7 @@ impl VeloBackend {
 
     /// Returns the ordered list of alternative [`TransportKey`]s for `target`,
     /// or `None` if the peer has not been registered.
+    #[cfg(any(test, all(target_os = "linux", feature = "ucx")))]
     pub fn alternative_transport_keys(&self, target: InstanceId) -> Option<Vec<TransportKey>> {
         self.alternative_transports
             .get(&target)
@@ -596,79 +588,6 @@ impl VeloBackend {
         );
 
         Ok(finalize_send_outcome(outcome, report))
-    }
-
-    /// Send a message to a registered peer via a specific transport.
-    ///
-    /// If `transport_key` matches the peer's primary transport, the message is
-    /// sent directly. Otherwise, the alternative transports are searched.
-    /// Returns [`VeloBackendError::NoCompatibleTransports`] if the requested
-    /// transport is not available for this peer.
-    pub fn send_message_with_transport(
-        &self,
-        target: InstanceId,
-        header: Bytes,
-        payload: Bytes,
-        message_type: MessageType,
-        on_error: Arc<dyn TransportErrorHandler>,
-        transport_key: TransportKey,
-    ) -> anyhow::Result<SendOutcome> {
-        let transport = self
-            .primary_transport
-            .get(&target)
-            .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
-
-        if transport.value().key() == transport_key {
-            let metrics = self.transport_metrics.get(&transport_key);
-
-            let error_handler = instrument_transport_error_handler(metrics.cloned(), on_error);
-            let report = SendReport {
-                metrics: metrics.cloned(),
-                on_error: error_handler.clone(),
-                message_type,
-                header: header.clone(),
-                payload: payload.clone(),
-            };
-            let outcome =
-                transport.send_message(target, header, payload, message_type, error_handler);
-
-            return Ok(finalize_send_outcome(outcome, report));
-        } else {
-            // if we got here, we can unwrap because there is an entry in the alternative_transports map
-            let alternative_transports = self
-                .alternative_transports
-                .get(&target)
-                .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
-
-            for alternative_transport in alternative_transports.iter() {
-                if *alternative_transport == transport_key
-                    && let Some(transport) = self.transports.get(alternative_transport)
-                {
-                    let metrics = self.transport_metrics.get(alternative_transport);
-
-                    let error_handler =
-                        instrument_transport_error_handler(metrics.cloned(), on_error);
-                    let report = SendReport {
-                        metrics: metrics.cloned(),
-                        on_error: error_handler.clone(),
-                        message_type,
-                        header: header.clone(),
-                        payload: payload.clone(),
-                    };
-                    let outcome = transport.send_message(
-                        target,
-                        header,
-                        payload,
-                        message_type,
-                        error_handler,
-                    );
-
-                    return Ok(finalize_send_outcome(outcome, report));
-                }
-            }
-        }
-
-        Err(VeloBackendError::NoCompatibleTransports)?
     }
 
     /// Send message to a worker (fast-path only).
@@ -798,42 +717,26 @@ impl VeloBackend {
     }
 
     /// Get the available transports.
+    #[cfg(test)]
     pub fn available_transports(&self) -> Vec<TransportKey> {
         self.transports.keys().cloned().collect()
     }
 
-    /// Set the priority of the transports.
+    /// Set the order in which `register_peer` picks a peer's primary
+    /// transport. Every available transport must occur exactly once.
     ///
-    /// Every available transport must occur exactly once.
-    pub fn set_transport_priority(
-        &self,
-        priorities: Vec<TransportKey>,
-    ) -> Result<(), VeloBackendError> {
-        let required_transports = self.available_transports();
-        if required_transports.len() != priorities.len() {
-            return Err(VeloBackendError::InvalidTransportPriority(format!(
-                "Required transports: {:?}, provided priorities: {:?}",
-                required_transports, priorities
-            )));
-        }
-
-        for (index, priority) in priorities.iter().enumerate() {
-            if !required_transports.contains(priority) {
-                return Err(VeloBackendError::InvalidTransportPriority(format!(
-                    "Priority transport not found: {:?}",
-                    priority
-                )));
-            }
-            if priorities[..index].contains(priority) {
-                return Err(VeloBackendError::InvalidTransportPriority(format!(
-                    "Duplicate priority transport: {priority}"
-                )));
-            }
-        }
-
-        let mut guard = self.priorities.lock();
-        *guard = priorities;
-        Ok(())
+    /// Test-only: the library keeps the order the transports were added in.
+    #[cfg(test)]
+    pub(crate) fn set_transport_priority(&self, priorities: Vec<TransportKey>) {
+        let mut available = self.available_transports();
+        let mut given = priorities.clone();
+        available.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        given.sort_by(|a, b| a.as_str().cmp(b.as_str()));
+        assert_eq!(
+            given, available,
+            "a priority list names each available transport once"
+        );
+        *self.priorities.lock() = priorities;
     }
 
     /// Get the shared shutdown state.
@@ -846,9 +749,9 @@ impl VeloBackend {
     ///
     /// Listeners then reject new `Message` frames with ShuttingDown
     /// correlation replies while responses, acks, and events keep flowing.
-    /// Idempotent. Phases 2–3 are [`graceful_shutdown`](Self::graceful_shutdown)'s
-    /// job; calling this alone leaves the instance serving in-flight work
-    /// indefinitely.
+    /// Idempotent. Phase 2 is [`drain`](Self::drain)'s job, and phases 3–4
+    /// are [`finish_shutdown`](Self::finish_shutdown)'s; calling this alone
+    /// leaves the instance serving in-flight work indefinitely.
     pub fn begin_drain(&self) {
         self.shutdown_state.begin_drain();
         for transport in self.transports.values() {
@@ -906,6 +809,10 @@ impl VeloBackend {
     /// Panics if a transport's shutdown hook panicked. The other hooks still
     /// ran, but shutdown cannot report the instance as stopped. A later call
     /// panics at once, without draining again.
+    ///
+    /// Test-only: `Velo::shutdown` runs these phases itself, to join the mux
+    /// senders between drain and teardown.
+    #[cfg(test)]
     pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
         // A failed teardown is final: draining again would only spend the
         // caller's budget against torn-down transports.

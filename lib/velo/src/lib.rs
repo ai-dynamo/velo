@@ -50,13 +50,12 @@ pub use velo_ext::{
 pub use velo_ext as ext;
 
 // Messenger surface
-#[allow(deprecated)] // re-exported until 0.23.0 removes `MessengerBuilder`
 pub use crate::messenger::{
     Admitted, AmHandlerBuilder, AmSendBuilder, AmSyncBuilder, AsyncExecutor, Context, FireResult,
-    Handler, HandlerExecutor, Messenger, MessengerBuilder, OrderedConfig, OrderingKey,
-    OverflowPolicy, PeerDiscovery, RequestTimeout, SyncExecutor, SyncResult, TypedContext,
-    TypedUnaryBuilder, TypedUnaryHandlerBuilder, TypedUnaryResult, UnaryBuilder,
-    UnaryHandlerBuilder, UnaryResult, UnifiedResponse,
+    Handler, HandlerExecutor, Messenger, OrderedConfig, OrderingKey, OverflowPolicy, PeerDiscovery,
+    RequestTimeout, SyncExecutor, SyncResult, TypedContext, TypedUnaryBuilder,
+    TypedUnaryHandlerBuilder, TypedUnaryResult, UnaryBuilder, UnaryHandlerBuilder, UnaryResult,
+    UnifiedResponse,
 };
 
 // Events
@@ -247,7 +246,7 @@ struct VeloInner {
     /// through [`VeloBuilder::add_ucx_transport`].
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     rdma: Option<Arc<crate::rendezvous::rdma::RdmaRegistry>>,
-    /// Serialises [`graceful_shutdown`](Velo::graceful_shutdown).
+    /// Serialises the messenger half of [`shutdown`](Velo::shutdown).
     ///
     /// [`Velo`] is `Clone`, so two clones can call it at once. Without this the
     /// second caller finds the transport's join handle already taken, skips the
@@ -258,8 +257,8 @@ struct VeloInner {
     shutdown: ShutdownOnce,
 }
 
-/// Makes [`Velo::graceful_shutdown`] run exactly once, and makes concurrent
-/// callers wait for the run rather than start their own.
+/// Makes the messenger half of [`Velo::shutdown`] run exactly once, and makes
+/// concurrent callers wait for the run rather than start their own.
 struct ShutdownOnce {
     lock: tokio::sync::Mutex<()>,
     done: std::sync::atomic::AtomicBool,
@@ -702,7 +701,7 @@ impl VeloBuilder {
             Some(limit) => resolver.with_limit(limit),
             None => resolver,
         });
-        messenger.set_large_payload_support_inner(stager, resolver);
+        messenger.set_large_payload_support(stager, resolver);
 
         // Build the RDMA registration layer, if a UCX transport was
         // added through `add_ucx_transport`.
@@ -888,106 +887,22 @@ impl Velo {
 
     /// Begin Phase 1 (Gate) of graceful shutdown: reject new inbound requests
     /// while responses, acks, events, and the messages of streams already open
-    /// keep flowing. See
-    /// [`Messenger::begin_drain`].
+    /// keep flowing.
+    ///
+    /// Transport listeners answer each rejected request with a ShuttingDown
+    /// correlation reply, so remote senders fail fast ("peer is shutting
+    /// down") instead of hanging until their response timeout. Handlers
+    /// already running continue to completion. Call [`shutdown`](Self::shutdown)
+    /// to also wait for them and tear down. To let open streams finish first,
+    /// call this, wait for them, then call `shutdown`. Idempotent.
     pub fn begin_drain(&self) {
-        self.inner.messenger.begin_drain_inner();
+        self.inner.messenger.begin_drain();
     }
 
-    /// Perform a graceful shutdown of the messenger transports: gate inbound
-    /// requests, wait for in-flight handler invocations per `policy`, tear
-    /// down, then wait for each transport's close. See
-    /// [`Messenger::graceful_shutdown`].
-    ///
-    /// Streams opened before the drain keep flowing through it: the gate lets
-    /// their messages through. The drain counts each such message only while
-    /// its handler runs, not the stream, so an open stream, busy or quiet, does
-    /// not hold this call open. Teardown then ends the streams that ride the
-    /// messenger mux. To let streams
-    /// finish, call [`begin_drain`](Self::begin_drain), wait for them, then
-    /// call this. The per-stream transports have their own teardown, which
-    /// this call does not cover.
-    ///
-    /// # RDMA registrations go first, and are declared released last
-    ///
-    /// When an RDMA registration layer is installed, shutdown has four
-    /// steps:
-    ///
-    /// 1. [`begin_drain`](Self::begin_drain) — idempotent, and repeated by the
-    ///    messenger shutdown below. Closing the inbound gate first means no new
-    ///    request can start while registrations are being torn down. The pull
-    ///    of a payload staged before the drain still passes the gate, but a
-    ///    draining owner answers it chunked, never with an RDMA descriptor.
-    /// 2. The registry sweep: registrations refused,
-    ///    in-flight transfers drained, every region and arena unmapped.
-    /// 3. Messenger gate, drain, teardown and close, unchanged.
-    /// 4. Every registration that survived step 2 is declared released.
-    ///
-    /// Step 1 to 2 is load-bearing, not tidiness. An RDMA GET is issued by the
-    /// *peer's* NIC, so it never appears in this instance's in-flight counts;
-    /// tearing the transport down first and unmapping afterwards would
-    /// deregister memory a peer is still reading.
-    ///
-    /// Step 4 is what makes [`RegionGuard::deregistered`] a signal worth
-    /// waiting on. A region whose unmap could not be confirmed in step 2 — a
-    /// wedged backend, a transport already going down — is nonetheless
-    /// genuinely unmapped once step 3 returns, because transport teardown
-    /// force-unmaps everything the progress thread still holds. Without step 4
-    /// those latches would stay pending forever and a caller waiting on one
-    /// would hold its memory for the life of the process.
-    ///
-    /// Step 2 begins by moving anything staged in registered memory onto the
-    /// heap. That releases what the sweep's own drains wait on, and it costs
-    /// one transient copy of everything staged — the price of letting a
-    /// chunked transfer that was already admitted finish rather than fail
-    /// halfway through.
-    ///
-    /// Step 4 is itself conditional: it checks with the backend that nothing is
-    /// still registered, and declines to declare anything released if the
-    /// answer is not "none". After an abnormal teardown — a panicking progress
-    /// thread — the latches therefore stay pending and that memory is leaked on
-    /// purpose. Velo will not tell a caller to free pages it cannot establish
-    /// were released.
-    ///
-    /// # Called once, even from clones
-    ///
-    /// [`Velo`] is `Clone`, so concurrent callers are possible. They are
-    /// serialised: the first runs the sequence, the rest wait and return as
-    /// soon as it finishes. Only one caller can take the transport's join
-    /// handle, and step 4's claim rests on that join having completed — a
-    /// second caller running the tail concurrently would be declaring memory
-    /// released while the progress thread was still alive.
-    ///
-    /// # One deadline, not one per phase
-    ///
-    /// [`ShutdownPolicy::Timeout`] bounds the sweep and messenger drain
-    /// together, rather than giving each phase the full duration. Joining mux
-    /// tasks comes after the drain and needs the owning runtime to make
-    /// progress. The transports' close step also comes on top: it is bounded by each
-    /// transport's own [`Transport::closed`] (QUIC: 2.5 s; TCP and UDS: their
-    /// teardown grace, 1 s unless the builder set it, plus 1.5 s), not by the policy,
-    /// because cutting it short would discard frames already written.
-    /// Under [`ShutdownPolicy::WaitForever`] the sweep still takes
-    /// [`RdmaConfig::shutdown_timeout`], because a peer that crashed
-    /// mid-transfer must not wedge shutdown forever even when the caller is
-    /// willing to wait on local work.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a transport's shutdown hook panicked. The other hooks still
-    /// ran, but shutdown cannot report the instance, or its RDMA memory, as
-    /// released. A later call panics at once, without draining again.
-    #[deprecated(
-        since = "0.22.1",
-        note = "Use `Velo::shutdown`. 0.23.0 folds `graceful_shutdown` into `shutdown`"
-    )]
-    pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
-        self.graceful_shutdown_inner(policy).await;
-    }
-
-    /// The messenger half of [`shutdown`](Self::shutdown), and what
-    /// [`graceful_shutdown`](Self::graceful_shutdown) runs.
-    pub(crate) async fn graceful_shutdown_inner(&self, policy: ShutdownPolicy) {
+    /// The messenger half of [`shutdown`](Self::shutdown): the RDMA sweep,
+    /// then gate, drain, mux-send join, teardown and close. It runs once per
+    /// instance, under the lock every clone shares.
+    async fn shutdown_messenger(&self, policy: ShutdownPolicy) {
         // Serialised, and run once. `Velo` is `Clone`, so two clones can arrive
         // here together; the sequence below takes a transport join handle and
         // then declares memory released on the strength of that join having
@@ -1071,18 +986,132 @@ impl Velo {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Drain messenger work and stop this instance's streaming services.
+    /// Shut this instance down: drain messenger work, tear down its
+    /// transports, and stop its streaming services.
     ///
-    /// This also cancels live streams, and joins the receive loops and the
-    /// streaming transport tasks owned by the builder. Stream reader pumps are
-    /// cancelled, not joined. Custom frame transports
-    /// remain the caller's responsibility. Stream watchdogs and heartbeats are
-    /// cancelled; application handlers that exceed `policy` can still be running.
-    /// If the sender of a stream is on this instance, shutdown cancels that
-    /// sender: its `cancellation_token` fires, and later sends fail. The reader
-    /// ends when the application drops or finalizes the sender.
-    /// Use this when an instance is removed while its Tokio runtime stays alive.
-    /// It closes resources. Drop the instance and its handles to release their memory.
+    /// The messenger transports go through four phases:
+    ///
+    /// 1. **Gate** — new inbound requests are rejected (see
+    ///    [`begin_drain`](Self::begin_drain)).
+    /// 2. **Drain** — wait, per `policy`, for accepted work to finish: both
+    ///    handlers that are running and requests still on the inbound queue,
+    ///    which are counted from the moment a transport admits them. Their
+    ///    responses still flow out through the gate.
+    /// 3. **Teardown** — cancel listeners, connections, and transports.
+    /// 4. **Close** — wait for each transport's [`Transport::closed`], so what
+    ///    it wrote is on the wire (bounded by the transport, not by `policy`).
+    ///
+    /// Then the streaming services stop. Live streams are cancelled, and the
+    /// receive loops and the streaming transport tasks owned by the builder
+    /// are joined. Stream reader pumps are cancelled, not joined. Custom frame
+    /// transports remain the caller's responsibility. Stream watchdogs and
+    /// heartbeats are cancelled. If the sender of a stream is on this
+    /// instance, shutdown cancels that sender: its `cancellation_token` fires,
+    /// and later sends fail. The reader ends when the application drops or
+    /// finalizes the sender.
+    ///
+    /// After this returns the instance can no longer send or receive, and no
+    /// further handler is dispatched. Use it when an instance is removed while
+    /// its Tokio runtime stays alive. It closes resources; drop the instance
+    /// and its handles to release their memory.
+    ///
+    /// # Open streams and the drain
+    ///
+    /// Streams opened before the drain keep flowing through it: the gate lets
+    /// their messages through. The drain counts each such message only while
+    /// its handler runs, not the stream, so an open stream, busy or quiet, does
+    /// not hold this call open. Teardown then ends the streams that ride the
+    /// messenger mux. To let streams finish, call
+    /// [`begin_drain`](Self::begin_drain), wait for them, then call this.
+    ///
+    /// # What a timeout leaves behind
+    ///
+    /// Under [`ShutdownPolicy::WaitForever`] the drain costs nothing: it
+    /// completes only once the queue is empty *and* every accepted handler has
+    /// finished, so every admitted request ran to completion. Under
+    /// [`ShutdownPolicy::Timeout`] two things outlive the return.
+    ///
+    /// Work still queued when teardown starts is abandoned rather than
+    /// dispatched: the message handler drops the backlog at teardown.
+    /// Teardown starts after the drain timeout and after the mux's send tasks
+    /// are joined, so work queued in that gap can still be dispatched. Its
+    /// senders were admitted, so they get no `ShuttingDown` correlation and
+    /// wait out their own response timeout. (The in-flight guards riding with
+    /// those messages *are* released as they are dropped. Left parked in the
+    /// channel buffer, they would pin the in-flight count above zero for good
+    /// and wedge every later drain wait.)
+    ///
+    /// A handler already *running* when the timeout expires is not cancelled
+    /// either: teardown stops dispatch, it does not abort tasks. It finishes in
+    /// the background after this call has returned. Sequence anything a
+    /// handler touches accordingly. Both are the price of bounding shutdown.
+    ///
+    /// # RDMA registrations go first, and are declared released last
+    ///
+    /// When an RDMA registration layer is installed, shutdown has four
+    /// steps:
+    ///
+    /// 1. [`begin_drain`](Self::begin_drain) — idempotent, and repeated by the
+    ///    messenger shutdown below. Closing the inbound gate first means no new
+    ///    request can start while registrations are being torn down. The pull
+    ///    of a payload staged before the drain still passes the gate, but a
+    ///    draining owner answers it chunked, never with an RDMA descriptor.
+    /// 2. The registry sweep: registrations refused,
+    ///    in-flight transfers drained, every region and arena unmapped.
+    /// 3. Messenger gate, drain, teardown and close, unchanged.
+    /// 4. Every registration that survived step 2 is declared released.
+    ///
+    /// Step 1 to 2 is load-bearing, not tidiness. An RDMA GET is issued by the
+    /// *peer's* NIC, so it never appears in this instance's in-flight counts;
+    /// tearing the transport down first and unmapping afterwards would
+    /// deregister memory a peer is still reading.
+    ///
+    /// Step 4 is what makes [`RegionGuard::deregistered`] a signal worth
+    /// waiting on. A region whose unmap could not be confirmed in step 2 — a
+    /// wedged backend, a transport already going down — is nonetheless
+    /// genuinely unmapped once step 3 returns, because transport teardown
+    /// force-unmaps everything the progress thread still holds. Without step 4
+    /// those latches would stay pending forever and a caller waiting on one
+    /// would hold its memory for the life of the process.
+    ///
+    /// Step 2 begins by moving anything staged in registered memory onto the
+    /// heap. That releases what the sweep's own drains wait on, and it costs
+    /// one transient copy of everything staged — the price of letting a
+    /// chunked transfer that was already admitted finish rather than fail
+    /// halfway through.
+    ///
+    /// Step 4 is itself conditional: it checks with the backend that nothing is
+    /// still registered, and declines to declare anything released if the
+    /// answer is not "none". After an abnormal teardown — a panicking progress
+    /// thread — the latches therefore stay pending and that memory is leaked on
+    /// purpose. Velo will not tell a caller to free pages it cannot establish
+    /// were released.
+    ///
+    /// # Called once, even from clones
+    ///
+    /// [`Velo`] is `Clone`, so concurrent callers are possible. They are
+    /// serialised: the first runs the four steps above, and the rest wait for
+    /// it and skip them. Every caller then runs the streaming step and waits
+    /// for the transports to close, so each returns once both are done.
+    ///
+    /// Only one caller can take the transport's join handle, and step 4's
+    /// claim rests on that join having completed — a second caller running
+    /// the tail concurrently would be declaring memory released while the
+    /// progress thread was still alive.
+    ///
+    /// # One deadline, not one per phase
+    ///
+    /// [`ShutdownPolicy::Timeout`] bounds the sweep and messenger drain
+    /// together, rather than giving each phase the full duration. Joining mux
+    /// tasks comes after the drain and needs the owning runtime to make
+    /// progress. The transports' close step also comes on top: it is bounded by each
+    /// transport's own [`Transport::closed`] (QUIC: 2.5 s; TCP and UDS: their
+    /// teardown grace, 1 s unless the builder set it, plus 1.5 s), not by the policy,
+    /// because cutting it short would discard frames already written.
+    /// Under [`ShutdownPolicy::WaitForever`] the sweep still takes
+    /// [`RdmaConfig::shutdown_timeout`], because a peer that crashed
+    /// mid-transfer must not wedge shutdown forever even when the caller is
+    /// willing to wait on local work.
     ///
     /// # Panics
     ///
@@ -1090,7 +1119,7 @@ impl Velo {
     /// ran, but shutdown cannot report the instance, or its RDMA memory, as
     /// released. A later call panics at once, without draining again.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
-        self.graceful_shutdown_inner(policy).await;
+        self.shutdown_messenger(policy).await;
         self.inner.anchor_manager.shutdown().await;
         if let Some(transport) = &self.inner.stream_owner.transport {
             transport.shutdown().await;
@@ -1204,10 +1233,9 @@ impl Velo {
     /// fails as one to a peer never registered.
     ///
     /// A peer learned any other way reaches the streaming transport too: by
-    /// its `_hello`, by discovery when a send names its worker, or by the
-    /// messenger's own `register_peer`.
+    /// its `_hello`, or by discovery when a send names its worker.
     pub fn register_peer(&self, peer_info: PeerInfo) -> Result<()> {
-        self.inner.messenger.register_peer_inner(peer_info)
+        self.inner.messenger.register_peer(peer_info)
     }
 
     /// Forget a peer that [`register_peer`](Self::register_peer) added.
@@ -1227,7 +1255,7 @@ impl Velo {
     /// from the peer registers it again too. The messenger mux keeps small
     /// per-peer receive tables that this does not drop.
     pub fn unregister_peer(&self, instance_id: InstanceId) {
-        self.inner.messenger.unregister_peer_inner(instance_id);
+        self.inner.messenger.unregister_peer(instance_id);
     }
 
     /// Discover a peer by instance_id and register it for communication.
@@ -1707,7 +1735,7 @@ impl Velo {
     ///
     /// The registration lasts until [`RegionGuard::deregistered`] resolves —
     /// which happens on a confirmed unmap, or at the end of
-    /// [`graceful_shutdown`](Self::graceful_shutdown), whichever comes first.
+    /// [`shutdown`](Self::shutdown), whichever comes first.
     /// It does **not** end when the guard is dropped, and it does not end when
     /// an `unregister` returns `Err`. For that whole time, all of the following
     /// must hold.
@@ -2090,10 +2118,10 @@ mod tests {
     /// Shutdown through one clone is shutdown of the instance: the other clone
     /// sees it as done, and a repeat call through the other clone returns.
     ///
-    /// This test cannot tell one teardown from two, because a second pass over
-    /// a TCP-only node is idempotent. The once-only guarantee is proven by
-    /// `rendezvous::rdma::tests::concurrent_graceful_shutdowns_are_serialised`,
-    /// which counts one RDMA sweep across eight clones.
+    /// `transports::tests::concurrent_shutdowns_through_two_clones_drain_once`
+    /// counts the runs, and
+    /// `rendezvous::rdma::tests::concurrent_shutdowns_are_serialised` counts
+    /// one RDMA sweep across eight clones.
     #[tokio::test]
     async fn shutdown_through_one_clone_is_seen_by_the_other() {
         let velo = tcp_stream_node(None).await;
@@ -2122,13 +2150,12 @@ mod tests {
     /// the first rather than starting a teardown of its own. Holding the lock
     /// stands in for a first caller that is mid-sequence.
     #[tokio::test]
-    #[allow(deprecated)] // tests the lock of the deprecated `Velo::graceful_shutdown`
-    async fn clones_serialise_graceful_shutdown_on_one_lock() {
+    async fn clones_serialise_shutdown_on_one_lock() {
         let velo = tcp_stream_node(None).await;
         let clone = velo.clone();
 
         let guard = velo.inner.shutdown.lock.lock().await;
-        let blocked = clone.graceful_shutdown(ShutdownPolicy::WaitForever);
+        let blocked = clone.shutdown(ShutdownPolicy::WaitForever);
         futures::pin_mut!(blocked);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), blocked.as_mut())
@@ -3171,7 +3198,7 @@ mod tests {
             .unwrap();
         let peer_instance = crate::InstanceId::new_v4();
         messenger
-            .register_peer_inner(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
+            .register_peer(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
             .unwrap();
         (messenger, peer_instance, sends)
     }
@@ -3437,7 +3464,7 @@ mod tests {
             .unwrap();
         let resolver = Arc::new(NeverResolves::default());
         let resolver_alive = Arc::downgrade(&resolver);
-        messenger.set_large_payload_support_inner(resolver.clone(), resolver);
+        messenger.set_large_payload_support(resolver.clone(), resolver);
         let backend = Arc::clone(messenger.backend());
         let headers = std::collections::HashMap::from([(
             crate::messenger::large_payload::RV_HEADER_KEY.to_string(),

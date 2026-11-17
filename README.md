@@ -25,6 +25,8 @@ Velo 0.22.1 deprecates `Velo::anchor_manager()` and `Velo::rendezvous_manager()`
 
 Velo 0.23 opens no per-stream listener by default: the messenger mux carries every remote stream. Call `stream_config` or `stream_bind_addr` to serve peers without the mux, or to turn the mux off. See [0.23.0: the per-stream listener is opt-in](docs/src/guides/migrate-services.md#0230-the-per-stream-listener-is-opt-in).
 
+Velo 0.23.0 removes the `Messenger` front door that 0.22.1 deprecated: `Messenger::builder`, `MessengerBuilder`, the peer, drain and shutdown methods of `Messenger`, and `Velo::graceful_shutdown`. Build and manage an instance through `Velo`. `Velo::shutdown` is the one shutdown. See [Move off the Messenger front door](docs/src/guides/migrate-messenger-front-door.md).
+
 Use `Velo::shutdown(policy)` to close resources and join owned tasks while Tokio keeps running. The instance and its handles stay valid after shutdown, and shutdown does not release them from memory. Accepted requests remain counted until their replies are submitted, including error replies. See [Shutdown and drain](docs/src/concepts/shutdown.md).
 
 Call `Velo::unregister_peer` when a peer leaves. A restarted peer has a new instance id, so without the call a long-lived node keeps state and connections for every peer it ever served. See [Forget a peer](docs/src/concepts/discovery.md#forget-a-peer).

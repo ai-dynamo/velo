@@ -209,7 +209,6 @@ async fn a_consumer_that_leaves_retires_the_stream_as_discarded() {
 /// A producer that shuts down while it still withholds a stream's output
 /// throws that output away, and `retired()` says so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[allow(deprecated)] // tests what `graceful_shutdown` does to a stream, which `Velo::shutdown` would end first
 async fn producer_shutdown_discards_withheld_output() {
     let (producer, consumer) = pair(window(SMALL_WINDOW)).await;
     let (_anchor, sender) = stream_of_items(&producer, &consumer).await;
@@ -217,7 +216,7 @@ async fn producer_shutdown_discards_withheld_output() {
     sender.finalize().expect("finalize");
     producer
         .velo
-        .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_secs(1)))
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(1)))
         .await;
     assert_eq!(
         tokio::time::timeout(PATIENCE, retired).await,
@@ -238,7 +237,6 @@ async fn producer_shutdown_discards_withheld_output() {
 /// write. Each trial builds its own two nodes, since the shutdown ends one; a
 /// trial takes a few milliseconds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[allow(deprecated)] // tests what `graceful_shutdown` does to a stream, which `Velo::shutdown` would end first
 async fn shutting_down_after_sent_keeps_the_tail() {
     const TRIALS: usize = 10;
 
@@ -271,7 +269,7 @@ async fn shutting_down_after_sent_keeps_the_tail() {
         sender.finalize().expect("finalize");
         producer
             .velo
-            .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_millis(100)))
+            .shutdown(ShutdownPolicy::Timeout(Duration::from_millis(100)))
             .await;
         drop(producer);
         let mut items = 0;
@@ -304,7 +302,7 @@ async fn shutting_down_after_sent_keeps_the_tail() {
         );
         producer
             .velo
-            .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_millis(100)))
+            .shutdown(ShutdownPolicy::Timeout(Duration::from_millis(100)))
             .await;
         drop(producer);
         tokio::time::timeout(PATIENCE, reader)

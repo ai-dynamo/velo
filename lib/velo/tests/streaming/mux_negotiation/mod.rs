@@ -816,7 +816,9 @@ enum PreNegotiationMpscAttachResponse {
 /// the only way to reach the branch where the *absent credit fields* are what
 /// decides.
 struct LegacyReceiver {
-    messenger: Arc<velo::messenger::Messenger>,
+    /// A mux-only node whose `_mpsc_anchor_attach` handler the legacy one
+    /// replaces. Mux-only, so its `PeerInfo` carries no `tcp-stream` entry.
+    node: Velo,
     /// Carries only the `tcp-stream` entry, for the producer's frame transport.
     stream_peer: velo_ext::PeerInfo,
     /// Frames the bound legacy transport delivered.
@@ -824,17 +826,17 @@ struct LegacyReceiver {
     _stream: Arc<velo::streaming::TcpFrameTransport>,
 }
 
-#[allow(deprecated)] // a legacy peer: a bare `Messenger` with no `Velo` around it
 async fn legacy_mpsc_receiver(answers_with: &str) -> LegacyReceiver {
-    let messenger = velo::messenger::Messenger::builder()
+    let node = Velo::builder()
         .add_transport(tcp_transport())
+        .mux_only()
         .build()
         .await
-        .expect("legacy receiver messenger");
+        .expect("legacy receiver node");
     let stream = velo::streaming::TcpFrameTransport::new(std::net::Ipv4Addr::LOCALHOST.into())
         .await
         .expect("legacy streaming listener");
-    let stream_peer = velo_ext::PeerInfo::new(messenger.instance_id(), stream.address());
+    let stream_peer = velo_ext::PeerInfo::new(node.instance_id(), stream.address());
 
     let (frame_tx, frames) = flume::unbounded::<Vec<u8>>();
     let bind_stream = Arc::clone(&stream);
@@ -868,13 +870,13 @@ async fn legacy_mpsc_receiver(answers_with: &str) -> LegacyReceiver {
     .spawn()
     .build();
     // The same door the real control plane uses: `register_handler` refuses
-    // names beginning with `_`.
-    messenger
+    // names beginning with `_`. It replaces the node's own handler.
+    node.messenger()
         .register_streaming_handler(handler)
         .expect("register legacy attach handler");
 
     LegacyReceiver {
-        messenger,
+        node,
         stream_peer,
         frames,
         _stream: stream,
@@ -885,16 +887,15 @@ async fn legacy_mpsc_receiver(answers_with: &str) -> LegacyReceiver {
 ///
 /// The control plane both ways, then the producer's frame transport is told
 /// where the receiver's streaming listener is. `Velo::register_peer` does both
-/// at once for a `Velo` peer; this peer is not one, and its messenger
-/// `PeerInfo` carries no `tcp-stream` entry to fan out.
-#[allow(deprecated)] // a legacy peer: a bare `Messenger` with no `Velo` around it
+/// at once for a peer with a per-stream listener; this peer is mux-only, and
+/// its `PeerInfo` carries no `tcp-stream` entry to fan out.
 async fn wire_up(producer: &Node, receiver: &LegacyReceiver) {
     producer
         .velo
-        .register_peer(receiver.messenger.peer_info())
+        .register_peer(receiver.node.peer_info())
         .expect("register receiver on producer");
     receiver
-        .messenger
+        .node
         .register_peer(producer.velo.peer_info())
         .expect("register producer on receiver");
     // The transport registry has no `Velo` form.
@@ -907,12 +908,7 @@ async fn wire_up(producer: &Node, receiver: &LegacyReceiver) {
         .expect("the producer runs the legacy transport too")
         .register(&receiver.stream_peer)
         .expect("register the receiver's streaming endpoint");
-    ready(
-        producer,
-        receiver.messenger.instance_id(),
-        "_mpsc_anchor_attach",
-    )
-    .await;
+    ready(producer, receiver.node.instance_id(), "_mpsc_anchor_attach").await;
 }
 
 /// (d) A response that genuinely omits the credit fields keeps a mux sender on
@@ -933,7 +929,7 @@ async fn a_response_from_before_negotiation_keeps_an_mpsc_sender_on_the_legacy_p
     wire_up(&producer, &receiver).await;
 
     let handle = StreamAnchorHandle::pack_mpsc(
-        receiver.messenger.instance_id().worker_id(),
+        receiver.node.instance_id().worker_id(),
         7, // any id: the stand-in receiver keeps no anchor registry
     );
     let sender = producer
@@ -994,7 +990,7 @@ async fn a_mux_key_answered_without_a_window_fails_the_attach() {
     let receiver = legacy_mpsc_receiver(MUX_KEY).await;
     wire_up(&producer, &receiver).await;
 
-    let handle = StreamAnchorHandle::pack_mpsc(receiver.messenger.instance_id().worker_id(), 7);
+    let handle = StreamAnchorHandle::pack_mpsc(receiver.node.instance_id().worker_id(), 7);
     let Err(error) = producer.velo.attach_mpsc_anchor::<u32>(handle).await else {
         panic!("an attach naming the mux with no window must fail");
     };

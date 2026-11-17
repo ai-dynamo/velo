@@ -150,7 +150,7 @@ The warm-pair table came from a measurement harness, `rv_sweep`. It is not a shi
 2. Record `metadata(handle).pinned` for each slot, and print `rdma_registered_bytes()`.
 3. Write `owner.json`: the owner's `PeerInfo` and a list of `(size, handle as u128 decimal, pinned)`.
 4. Wait for `consumer.json`, register the consumer as a peer, and wait for a `done` file.
-5. Call `graceful_shutdown(ShutdownPolicy::Timeout(30 s))`.
+5. Call `shutdown(ShutdownPolicy::Timeout(30 s))`.
 
 **Consumer.**
 
