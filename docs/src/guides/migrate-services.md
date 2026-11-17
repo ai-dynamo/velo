@@ -91,7 +91,7 @@ These nodes need no change:
 
 Add `stream_config` or `stream_bind_addr` to a default node in these cases:
 
-- A peer turns the mux off, or runs a velo without the mux, and attaches to this node. Without a listener, the attach fails with `peer does not support the messenger mux, and this instance has no per-stream transport to serve it on`. The message names `stream_config` and `stream_bind_addr`.
+- A peer turns the mux off, or runs a velo without the mux, and attaches to this node. Without a listener, the attach fails on the peer with `the sender does not offer the messenger mux, and the anchor's node has no per-stream transport`. The message names `stream_config` and `stream_bind_addr`.
 - This node attaches to a peer that has the mux off. The peer answers with `no common streaming transport`. That error comes from the peer, so it does not name the fix.
 - This node must be able to turn the mux off. With the mux off by `MuxConfig { enabled: false, .. }` or `VELO_MESSENGER_MUX_DISABLE=1`, and no stream config, `build()` fails. The error names `stream_config` and `stream_bind_addr`.
 

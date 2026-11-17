@@ -170,20 +170,18 @@ impl Default for GrpcConfig {
 ///
 /// # Variants
 ///
-/// - [`StreamConfig::Tcp`]: TCP-based streaming via
-///   [`TcpFrameTransport`](crate::streaming::TcpFrameTransport). Pass `None`
-///   to bind on `0.0.0.0:0`, or provide a [`TcpConfig`] for an explicit
-///   single-interface bind.
+/// - [`StreamConfig::Tcp`]: TCP-based streaming, under the `tcp-stream` key.
+///   Pass `None` to bind on `0.0.0.0:0`, or provide a [`TcpConfig`] for an
+///   explicit single-interface bind.
 ///
-/// - [`StreamConfig::Grpc`]: gRPC-based streaming via
-///   [`GrpcFrameTransport`](crate::streaming::GrpcFrameTransport). Only
-///   available when the `grpc` feature is enabled. Same advertise-and-select
-///   semantics as `Tcp`.
+/// - [`StreamConfig::Grpc`]: gRPC-based streaming, under the `grpc-stream`
+///   key. Only available when the `grpc` feature is enabled. Same
+///   advertise-and-select semantics as `Tcp`.
 #[derive(Debug, Clone)]
 pub enum StreamConfig {
-    /// TCP-based streaming transport (TcpFrameTransport).
+    /// TCP-based streaming transport, under the `tcp-stream` key.
     Tcp(Option<TcpConfig>),
-    /// gRPC-based streaming transport (GrpcFrameTransport).
+    /// gRPC-based streaming transport, under the `grpc-stream` key.
     #[cfg(feature = "grpc")]
     Grpc(Option<GrpcConfig>),
 }
@@ -269,10 +267,6 @@ struct VeloInner {
 struct ShutdownOnce {
     lock: tokio::sync::Mutex<()>,
     done: std::sync::atomic::AtomicBool,
-    /// How many times the messenger half ran. A second run over a TCP-only
-    /// node is idempotent, so without this a test cannot tell one from two.
-    #[cfg(test)]
-    runs: std::sync::atomic::AtomicUsize,
 }
 
 /// Concrete handles let shutdown join listeners without changing `FrameTransport`.
@@ -460,8 +454,9 @@ impl VeloBuilder {
     ///
     /// A node with no stream config has no per-stream transport to fall back
     /// to, so turning its mux off, by either form, makes
-    /// [`build`](Self::build) fail with an error that names `stream_config`
-    /// and `stream_bind_addr`. So does `mux_only()`.
+    /// [`build`](Self::build) fail. On a default node the error names
+    /// `stream_config` and `stream_bind_addr`; on a `mux_only()` node it
+    /// names `mux_only`.
     ///
     /// Only one mux may be installed per instance: its `_stream_batch` handler
     /// is registered on the messenger for its lifetime. The messenger would
@@ -773,8 +768,6 @@ impl VeloBuilder {
                 shutdown: ShutdownOnce {
                     lock: tokio::sync::Mutex::new(()),
                     done: std::sync::atomic::AtomicBool::new(false),
-                    #[cfg(test)]
-                    runs: std::sync::atomic::AtomicUsize::new(0),
                 },
             }),
         })
@@ -928,11 +921,6 @@ impl Velo {
         {
             return;
         }
-        #[cfg(test)]
-        self.inner
-            .shutdown
-            .runs
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // A failed teardown is final. Running the RDMA sweep again would spend
         // its budget against torn-down transports, then panic anyway. (The
         // backend refuses to drain again on its own.)
@@ -1047,8 +1035,10 @@ impl Velo {
     /// finished, so every admitted request ran to completion. Under
     /// [`ShutdownPolicy::Timeout`] two things outlive the return.
     ///
-    /// Work still queued when the timeout expires is abandoned rather than
-    /// dispatched: the message handler drops the backlog at teardown. Its
+    /// Work still queued when teardown starts is abandoned rather than
+    /// dispatched: the message handler drops the backlog at teardown.
+    /// Teardown starts after the drain timeout and after the mux's send tasks
+    /// are joined, so work queued in that gap can still be dispatched. Its
     /// senders were admitted, so they get no `ShuttingDown` correlation and
     /// wait out their own response timeout. (The in-flight guards riding with
     /// those messages *are* released as they are dropped. Left parked in the
@@ -1104,11 +1094,14 @@ impl Velo {
     /// # Called once, even from clones
     ///
     /// [`Velo`] is `Clone`, so concurrent callers are possible. They are
-    /// serialised: the first runs the sequence, the rest wait and return as
-    /// soon as it finishes. Only one caller can take the transport's join
-    /// handle, and step 4's claim rests on that join having completed — a
-    /// second caller running the tail concurrently would be declaring memory
-    /// released while the progress thread was still alive.
+    /// serialised: the first runs the four steps above, and the rest wait for
+    /// it and skip them. Every caller then runs the streaming step and waits
+    /// for the transports to close, so each returns once both are done.
+    ///
+    /// Only one caller can take the transport's join handle, and step 4's
+    /// claim rests on that join having completed — a second caller running
+    /// the tail concurrently would be declaring memory released while the
+    /// progress thread was still alive.
     ///
     /// # One deadline, not one per phase
     ///
@@ -2364,7 +2357,8 @@ mod tests {
     /// Shutdown through one clone is shutdown of the instance: the other clone
     /// sees it as done, and a repeat call through the other clone returns.
     ///
-    /// `concurrent_shutdowns_through_two_clones_run_once` counts the runs, and
+    /// `transports::tests::concurrent_shutdowns_through_two_clones_drain_once`
+    /// counts the runs, and
     /// `rendezvous::rdma::tests::concurrent_shutdowns_are_serialised` counts
     /// one RDMA sweep across eight clones.
     #[tokio::test]
@@ -2389,35 +2383,6 @@ mod tests {
         )
         .await
         .expect("a second shutdown through another clone did not return");
-    }
-
-    /// Two clones that call `shutdown` together run its messenger half once:
-    /// one runs it, the other waits on the shared lock and returns when it is
-    /// done. A later call runs nothing either.
-    #[tokio::test]
-    async fn concurrent_shutdowns_through_two_clones_run_once() {
-        let velo = tcp_stream_node(None).await;
-        let clone = velo.clone();
-        let runs = || {
-            velo.inner
-                .shutdown
-                .runs
-                .load(std::sync::atomic::Ordering::Relaxed)
-        };
-
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::join!(
-                velo.shutdown(ShutdownPolicy::WaitForever),
-                clone.shutdown(ShutdownPolicy::WaitForever),
-            )
-        })
-        .await
-        .expect("two concurrent shutdowns did not both return");
-        assert_eq!(runs(), 1, "both clones ran the shutdown sequence");
-        assert!(velo.messenger().backend().teardown_requested());
-
-        clone.shutdown(ShutdownPolicy::WaitForever).await;
-        assert_eq!(runs(), 1, "a later shutdown ran the sequence again");
     }
 
     /// Every clone contends on one shutdown lock, so a second caller waits for
@@ -2728,12 +2693,13 @@ mod tests {
     /// A worker registers each frontend it serves, and a restarted frontend
     /// comes back with a new instance id. Unless the worker forgets the old
     /// one, it stays in the backend routes, the handler cache, the transport's
-    /// peer and connection maps, and, in default mode, the stream transport's
-    /// address cache. After `unregister_peer` none of them holds the peer, a
-    /// unary to it fails as one to a peer never registered, a unary to another
-    /// peer still works, and registering the peer again handshakes and dials
-    /// afresh. Both modes run, because only default mode has a stream
-    /// transport that caches peers.
+    /// peer and connection maps, and, on a node with a per-stream listener,
+    /// the stream transport's address cache. After `unregister_peer` none of
+    /// them holds the peer, a unary to it fails as one to a peer never
+    /// registered, a unary to another peer still works, and registering the
+    /// peer again handshakes and dials afresh. A per-stream node and a
+    /// `mux_only()` node both run, because only the per-stream transport
+    /// caches peers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unregister_peer_forgets_the_peer_and_leaves_others_alone() {
         use crate::transports::tcp::{TcpTransport, TcpTransportBuilder};
