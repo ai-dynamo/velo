@@ -15,7 +15,7 @@ Two other 0.23.0 changes have their own guides: the `Messenger` front door is re
 
 ## The path map
 
-Where an item had several paths, the path that consumers use stays. The others are removed.
+Where an item had several paths, the path that consumers use stays. The others are removed. A path marked "(new)" did not exist in 0.22.1: the item had only the paths in the last column.
 
 ### Streams
 
@@ -25,10 +25,10 @@ Where an item had several paths, the path that consumers use stays. The others a
 | `StreamOpenTicket` | `velo::StreamOpenTicket` | `velo::streaming::control::StreamOpenTicket` |
 | `AnchorConfig`, `AnchorReservation`, `ReservationConfig`, `ByteItemBuilder`, `ByteItemFrame`, `AnchorKind`, `Retired`, `Retirement` | `velo::streaming::X` | `velo::streaming::{anchor, frame, handle, sender}::X` |
 | `MpscAnchorConfig`, `MpscFrame`, `MpscStreamAnchor`, `MpscStreamController`, `MpscStreamSender`, `SenderId` | `velo::streaming::X` | `velo::streaming::mpsc::X` and its submodules |
-| `TcpFrameTransport`, `GrpcFrameTransport` | `velo::streaming::X` | `velo::streaming::{tcp_transport, grpc_transport}::X` |
-| `TCP_STREAM_KEY`, `GRPC_STREAM_KEY` | `velo::streaming::X` | `velo::streaming::{tcp_transport, grpc_transport}::X` |
+| `TCP_STREAM_KEY`, `GRPC_STREAM_KEY` | `velo::streaming::X` (new) | `velo::streaming::{tcp_transport, grpc_transport}::X` |
+| `MAX_ITEM_BYTES` | `velo::streaming::MAX_ITEM_BYTES` | `velo::streaming::transport::MAX_ITEM_BYTES` |
 
-`AutoFlush`, `FlushPolicy`, `MuxConfig`, `MESSENGER_MUX_KEY` and `MAX_ITEM_BYTES` keep `velo::streaming::X`, their one path.
+`AutoFlush`, `FlushPolicy`, `MuxConfig` and `MESSENGER_MUX_KEY` keep `velo::streaming::X`, their one path.
 
 ### Messaging, events and discovery
 
@@ -41,21 +41,22 @@ Where an item had several paths, the path that consumers use stays. The others a
 | `PeerDiscovery` | `velo::discovery::PeerDiscovery` | `velo::PeerDiscovery`, `velo::messenger::PeerDiscovery`, `velo::messenger::discovery::PeerDiscovery` |
 | `FilesystemPeerDiscovery` and the other filesystem discovery types | `velo::discovery::X` | `velo::discovery::{filesystem, filesystem_service}::X` |
 
-`Messenger` is not in this map. `MessengerBuilder` is removed in 0.23.0; the [Messenger front door guide](migrate-messenger-front-door.md) covers it.
+`Messenger` keeps `velo::Messenger`; `velo::messenger::Messenger` is removed. `MessageId` keeps `velo::messenger::MessageId`, the one item left in `velo::messenger`. `MessengerBuilder` is removed in 0.23.0; the [Messenger front door guide](migrate-messenger-front-door.md) covers it.
 
 ### Rendezvous, transports and metrics
 
 | Item | Path that stays | Paths removed |
 |---|---|---|
-| `DataHandle`, `DataMetadata`, `RegisterOptions`, `StageMode`, `RendezvousWrite` | `velo::X` | `velo::rendezvous::X`, and `velo::rendezvous::{handle, protocol, store, write}::X` |
+| `DataHandle`, `DataMetadata`, `RegisterOptions`, `RendezvousWrite` | `velo::X` | `velo::rendezvous::X`, and `velo::rendezvous::{handle, protocol, store, write}::X` |
 | `PinnedWriter`, `RdmaDestination` | `velo::X` | `velo::rendezvous::write::X` |
 | `RegionGuard`, `RegionWatch`, `Deregistered`, `PinnedBuf`, `RdmaConfig`, `RdmaError`, `RdmaPoolConfig`, `RdmaRendezvousConfig`, `RegisterOwnedError` | `velo::rendezvous::rdma::X` | `velo::X` |
 | `VeloMetrics` | `velo::observability::VeloMetrics` | `velo::VeloMetrics` |
 | `Transport`, `ShutdownPolicy`, `AdmissionState` | `velo::X` | `velo::transports::X` |
 | `InterfaceEndpoint`, `InterfaceFilter`, `parse_endpoints` and the other interface helpers | `velo::transports::utils::interfaces::X` | `velo::transports::X`, `velo::transports::utils::X` |
 | The queue types (`NextOptions`, `WorkQueueBackend`, `WorkQueueError`, ...) | `velo::queue::X` | `velo::queue::{backend, error, options, receiver, sender}::X` |
-| `ReceiverFuture`, `SenderFuture` | `velo::queue::X` | `velo::queue::backend::X` |
-| The simulation types, and `Transfer` | `velo::simulation::X` | `velo::simulation::{discovery, fabric, network, transport}::X` |
+| `ReceiverFuture`, `SenderFuture` | `velo::queue::X` (new) | `velo::queue::backend::X` |
+| The simulation types | `velo::simulation::X` | `velo::simulation::{discovery, fabric, network, transport}::X` |
+| `Transfer` | `velo::simulation::Transfer` (new) | `velo::simulation::fabric::Transfer` |
 
 `velo::ext` is the velo-ext crate itself. A velo-ext item keeps its path under it, beside the one velo path in the map.
 
@@ -66,16 +67,18 @@ Where an item had several paths, the path that consumers use stays. The others a
 | `AnchorManager`, `AnchorManagerBuilder`, `Velo::anchor_manager()` | The anchor methods on `Velo`. See [Move off the manager accessors](migrate-manager-accessors.md). |
 | `RendezvousManager`, `Velo::rendezvous_manager()`, `rendezvous::store::DataStore` | The rendezvous methods on `Velo`, such as `unregister_data` and `register_data_in_region`. |
 | `rendezvous::transparent::DEFAULT_THRESHOLD` | `Velo::staging_threshold()` |
+| `StageMode` | `DataMetadata::pinned`. Nothing public took or returned `StageMode`. |
+| `TcpFrameTransport`, `GrpcFrameTransport` | `StreamConfig` with `VeloBuilder::stream_config`, or `VeloBuilder::stream_bind_addr`. Nothing public took either type. |
 | `RendezvousStager`, `RendezvousResolver` | Nothing. `Velo::builder` installs large payload support. |
 | The control-plane wire messages: `AnchorAttachRequest`, `AnchorAttachResponse`, the detach, finalize and cancel requests, `StreamCancelHandle`, `StreamCancelRequest`, the MPSC attach, detach and cancel messages, and the `rendezvous::protocol` requests | Nothing. velo's own tests reach a few of them through `velo::test_helpers`, behind the `test-helpers` feature. That module is not a supported API. |
-| `rendezvous::{handlers, consumer}`, `streaming::control::{SenderRegistry, SenderEntry, SenderClosed, create_stream_cancel_handler, DETECTION_MULTIPLIER}` | Nothing. |
+| `rendezvous::{handlers, consumer}`, `rendezvous::store::{DEFAULT_CHUNK_SIZE, LeaseOutcome}`, `rendezvous::protocol::{AcquireResponse, RdmaOffer, RvHandleWire, RV_LEASE_HEADER_KEY}`, `streaming::control::{SenderRegistry, SenderEntry, SenderClosed, create_stream_cancel_handler, DETECTION_MULTIPLIER}` | Nothing. |
 | `velo::streaming::FrameTransport`, `velo::ext::FrameTransport`, `velo_ext::streaming` | See below. |
 
 ## FrameTransport
 
 velo-ext 0.6.0 has no `streaming` module. A stream rides the messenger mux, so a new transport implements the messenger `Transport` and its streams get the mux. See [Write an out-of-tree transport](out-of-tree-transport.md).
 
-The per-stream transports stay: `TcpFrameTransport`, `GrpcFrameTransport`, `StreamConfig`, `TcpConfig`, `GrpcConfig`, and `VeloBuilder::{stream_config, stream_bind_addr}` keep their signatures.
+The per-stream transports stay. `StreamConfig`, `TcpConfig`, `GrpcConfig`, and `VeloBuilder::{stream_config, stream_bind_addr}` keep their signatures. The transport types, `TcpFrameTransport` and `GrpcFrameTransport`, are no longer public.
 
 ## What each consumer moves
 
