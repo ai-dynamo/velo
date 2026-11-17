@@ -1790,3 +1790,155 @@ async fn teardown_closes_the_connection_before_child_readers_stop_streams() {
         "the listener stopped the stream before it closed the connection: {outcome:?}"
     );
 }
+
+/// A client whose observability handle is the runtime's real Prometheus
+/// handle, bound as `quic`, so a test reads the series an operator reads.
+async fn started_with_metrics(
+    builder: QuicTransportBuilder,
+) -> (QuicTransport, DataStreams, prometheus::Registry) {
+    let registry = prometheus::Registry::new();
+    let metrics = crate::observability::VeloMetrics::register(&registry).unwrap();
+    let transport = builder
+        .bind_addr("127.0.0.1:0".parse().unwrap())
+        .build()
+        .unwrap();
+    transport.set_observability(Arc::new(metrics.bind_transport("quic")));
+    let (adapter, streams) = make_channels();
+    transport
+        .start(
+            InstanceId::new_v4(),
+            adapter,
+            tokio::runtime::Handle::current(),
+        )
+        .await
+        .unwrap();
+    (transport, streams, registry)
+}
+
+fn unacknowledged_closes(registry: &prometheus::Registry) -> f64 {
+    crate::observability::test_helpers::MetricSnapshot::from_registry(registry).counter(
+        "velo_transport_unacknowledged_closes_total",
+        &[("transport", "quic")],
+    )
+}
+
+/// A close that runs out the acknowledgement wait is counted in
+/// `velo_transport_unacknowledged_closes_total`, once per connection, beside
+/// the "can be lost" warning. Before the counter, only the log said so.
+///
+/// The peer accepts the stream and never reads it, so the frames beyond its
+/// 1 MiB window cannot be sent, and the stream end is never acknowledged.
+/// The close grace is 1 ms, so the writer gives up at once. With a 1 ms grace
+/// and a peer that reads everything, the wait also runs out (quinn delays an
+/// acknowledgement by up to 25 ms), but not on every run; this peer makes it
+/// certain.
+///
+/// The count is read until a deadline, not once: `closed()` can return while
+/// a writer is still on its way out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_close_the_peer_did_not_acknowledge_is_counted() {
+    const FRAMES: usize = 64;
+    let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
+    let (peer, peer_id) = raw_server(
+        1 << 20,
+        Duration::from_secs(30),
+        move |connection| async move {
+            let _stream = connection.accept_bi().await.unwrap();
+            let _ = accepted_tx.send(());
+            std::future::pending::<()>().await;
+        },
+    );
+    let (client, _client_streams, registry) =
+        started_with_metrics(QuicTransportBuilder::new().close_grace(Duration::from_millis(1)))
+            .await;
+    client.register(peer).unwrap();
+    let errors = Arc::new(Errors::default());
+    for i in 0..FRAMES {
+        let _ = client.send_message(
+            peer_id,
+            Bytes::from((i as u32).to_be_bytes().to_vec()),
+            Bytes::from(vec![0u8; 64 * 1024]),
+            MessageType::Response,
+            errors.clone(),
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(5), accepted_rx)
+        .await
+        .expect("the writer never reached the peer")
+        .unwrap();
+    assert_eq!(
+        unacknowledged_closes(&registry),
+        0.0,
+        "counted before the close"
+    );
+
+    client.shutdown();
+    client.closed().await;
+    let failed = errors.0.lock().unwrap().len();
+    assert!(
+        failed < FRAMES,
+        "control: no frame fit the peer's window, so none was left unacknowledged"
+    );
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while unacknowledged_closes(&registry) < 1.0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        unacknowledged_closes(&registry),
+        1.0,
+        "{} frames were written into a window the peer never read, on one connection",
+        FRAMES - failed
+    );
+}
+
+/// Control for `a_close_the_peer_did_not_acknowledge_is_counted`: a clean
+/// close, where the peer read every frame and acknowledged the stream end,
+/// counts nothing.
+///
+/// The grace is 30 s, not 1 ms: with 1 ms the wait can run out against a peer
+/// that reads everything, because quinn delays acknowledgements. The count is
+/// read only once the client has no connection open, so the writer is past
+/// the point where it would count.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_clean_close_counts_no_unacknowledged_close() {
+    const FRAMES: usize = 64;
+    let (server, server_streams, server_id) = started().await;
+    let server_peer = peer_with_fingerprint(&server, server_id, server.fingerprint());
+    let (client, _client_streams, registry) =
+        started_with_metrics(QuicTransportBuilder::new().close_grace(Duration::from_secs(30)))
+            .await;
+    client.register(server_peer).unwrap();
+    let errors = Arc::new(Errors::default());
+    for i in 0..FRAMES {
+        let _ = client.send_message(
+            server_id,
+            Bytes::from((i as u32).to_be_bytes().to_vec()),
+            Bytes::from(vec![0u8; 4 * 1024]),
+            MessageType::Response,
+            errors.clone(),
+        );
+    }
+    for _ in 0..FRAMES {
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            server_streams.response_stream.recv_async(),
+        )
+        .await
+        .expect("every frame arrives")
+        .unwrap();
+    }
+
+    client.shutdown();
+    client.closed().await;
+    for (lane, endpoint) in client.client_endpoints.get().unwrap().iter().enumerate() {
+        assert_eq!(
+            endpoint.open_connections(),
+            0,
+            "closed() returned with lane {lane}'s connection still open"
+        );
+    }
+    assert!(errors.0.lock().unwrap().is_empty());
+    assert_eq!(unacknowledged_closes(&registry), 0.0);
+    server.shutdown();
+    server.closed().await;
+}
