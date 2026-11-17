@@ -237,6 +237,8 @@ required-features = ["test-helpers"]
 [[test]]
 name = "streaming_mpsc_remote_integration"
 path = "tests/streaming/mpsc_remote_integration.rs"
+# test-helpers: the MPSC wire messages in `velo::test_helpers`, sent by hand.
+required-features = ["test-helpers"]
 
 [[test]]
 name = "streaming_retired"
@@ -253,6 +255,8 @@ name = "streaming_staged_limit"
 # Its own binary: a global allocator that records the consumer's largest
 # allocation.
 path = "tests/streaming/staged_limit.rs"
+# test-helpers: `Velo::staged_payload_len`, to see what the producer still holds.
+required-features = ["test-helpers"]
 
 [[test]]
 name = "streaming_timing"
@@ -287,6 +291,12 @@ path = "tests/rendezvous_rdma.rs"
 # failing GET cannot be produced over `UCX_TLS=tcp`, and the fallbacks they
 # drive are exactly the code that must not rot.
 required-features = ["ucx", "test-helpers"]
+
+[[test]]
+name = "rendezvous_integration"
+path = "tests/rendezvous_integration.rs"
+# test-helpers: the acquire wire messages in `velo::test_helpers`, sent by hand.
+required-features = ["test-helpers"]
 
 [[test]]
 name = "streaming_transport"

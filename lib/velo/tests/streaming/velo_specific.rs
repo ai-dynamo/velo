@@ -10,7 +10,7 @@ mod common;
 use futures::StreamExt;
 use std::sync::Arc;
 use std::time::Duration;
-use velo::streaming::{AttachError, StreamError, StreamFrame};
+use velo::{AttachError, StreamError, StreamFrame};
 
 async fn make_manager() -> Arc<velo::Velo> {
     Arc::new(common::local_node().await)

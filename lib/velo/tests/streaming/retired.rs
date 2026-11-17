@@ -20,9 +20,10 @@ use futures::{FutureExt, StreamExt};
 use prometheus::Registry;
 use velo::observability::VeloMetrics;
 use velo::observability::test_helpers::MetricSnapshot;
-use velo::streaming::{AnchorConfig, MuxConfig, Retirement, StreamAnchor, StreamFrame};
+use velo::streaming::{AnchorConfig, MuxConfig, Retirement};
 use velo::transports::tcp::TcpTransportBuilder;
 use velo::{ShutdownPolicy, Velo};
+use velo::{StreamAnchor, StreamFrame};
 
 const PATIENCE: Duration = Duration::from_secs(5);
 
@@ -110,7 +111,7 @@ async fn pair(mux: MuxConfig) -> (Node, Node) {
 async fn stream_of_items(
     producer: &Node,
     consumer: &Node,
-) -> (StreamAnchor<u32>, velo::streaming::StreamSender<u32>) {
+) -> (StreamAnchor<u32>, velo::StreamSender<u32>) {
     let anchor = consumer.velo.create_anchor::<u32>();
     let ticket = consumer
         .velo
@@ -602,7 +603,7 @@ const UNDER_THE_LIMIT: usize = FRAME_LIMIT - 64;
 /// with it, so a frame the producer lets through is never one the far end
 /// refuses.
 async fn an_item_over_the_limit_fails_at_send(producer: &Node, consumer: &Node) {
-    use velo::streaming::SendError;
+    use velo::SendError;
     let mut anchor = consumer.velo.create_anchor::<Bytes>();
     let sender = producer
         .velo
@@ -658,7 +659,8 @@ async fn an_item_over_the_grpc_limit_fails_at_send() {
 /// way, and keeps sending after it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_mpsc_item_over_the_tcp_limit_fails_at_send() {
-    use velo::streaming::{MpscFrame, SendError};
+    use velo::SendError;
+    use velo::streaming::MpscFrame;
     let (producer, consumer) = pair(MuxConfig {
         enabled: false,
         ..MuxConfig::default()
@@ -703,7 +705,7 @@ async fn a_same_worker_cancel_through_a_controller_leaves_the_terminal_queued() 
         .expect("the cancel reaches the sender");
     assert!(matches!(
         sender.send(2).await,
-        Err(velo::streaming::SendError::ChannelClosed)
+        Err(velo::SendError::ChannelClosed)
     ));
     let _ = sender.finalize();
     assert_eq!(

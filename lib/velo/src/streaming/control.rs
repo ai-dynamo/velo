@@ -3,7 +3,7 @@
 
 //! Control-plane handler constructors for the anchor lifecycle.
 //!
-//! This module builds four [`crate::messenger::Handler`]s, registered by
+//! This module builds four [`crate::Handler`]s, registered by
 //! [`AnchorManager::register_handlers`]. They hold the manager weakly, because
 //! the manager holds the messenger that holds them:
 //! - `_anchor_attach`: validates anchor existence, calls
@@ -123,7 +123,7 @@ impl<'de> Deserialize<'de> for StreamCancelHandle {
 /// Payload for the `_stream_cancel` active message.
 ///
 /// The receiver (sender-side worker) looks up `sender_stream_id` in the
-/// [`SenderRegistry`] to find and cancel the corresponding [`SenderEntry`].
+/// sender registry to find and cancel the corresponding sender.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StreamCancelRequest {
     pub sender_stream_id: u64,
@@ -185,7 +185,7 @@ pub enum AnchorAttachResponse {
     ///
     /// `streaming_transport_key` tells the client which `FrameTransport` it
     /// should call `connect()` on (looked up in the local
-    /// [`crate::streaming::AnchorManager`]'s transport registry). Endpoint
+    /// anchor manager's transport registry). Endpoint
     /// resolution is no longer string-based — the chosen transport extracts
     /// the peer's listener address from the cached WorkerAddress entry it
     /// stored on `register()`.
@@ -301,10 +301,10 @@ pub struct AnchorCancelRequest {
 ///
 /// Returns [`AnchorAttachResponse::Ok`] on success or [`AnchorAttachResponse::Err`] on
 /// any failure (not found, already attached, transport error).
-pub(crate) fn anchor_attach_handler(manager: Weak<AnchorManager>) -> crate::messenger::Handler {
-    crate::messenger::Handler::typed_unary_async(
+pub(crate) fn anchor_attach_handler(manager: Weak<AnchorManager>) -> crate::Handler {
+    crate::Handler::typed_unary_async(
         "_anchor_attach",
-        move |ctx: crate::messenger::TypedContext<AnchorAttachRequest>| {
+        move |ctx: crate::TypedContext<AnchorAttachRequest>| {
             let manager = manager.clone();
             async move {
                 let Some(manager) = manager.upgrade() else {
@@ -651,10 +651,10 @@ pub(crate) fn anchor_attach_handler(manager: Weak<AnchorManager>) -> crate::mess
 /// its terminal record and `CloseSlot`, in order, on the slot itself.
 ///
 /// Idempotent: if the anchor is not found, returns `Ok(())`.
-pub(crate) fn anchor_detach_handler(manager: Weak<AnchorManager>) -> crate::messenger::Handler {
-    crate::messenger::Handler::typed_unary_async(
+pub(crate) fn anchor_detach_handler(manager: Weak<AnchorManager>) -> crate::Handler {
+    crate::Handler::typed_unary_async(
         "_anchor_detach",
-        move |ctx: crate::messenger::TypedContext<AnchorDetachRequest>| {
+        move |ctx: crate::TypedContext<AnchorDetachRequest>| {
             let manager = manager.clone();
             async move {
                 // A manager that is gone holds no anchor: cleanup has succeeded.
@@ -763,12 +763,10 @@ pub(crate) struct AnchorAbortAttachRequest {
 ///
 /// Idempotent: if the anchor, or its manager, is gone, or another sender now
 /// holds the attachment, returns `Ok(())`.
-pub(crate) fn anchor_abort_attach_handler(
-    manager: Weak<AnchorManager>,
-) -> crate::messenger::Handler {
-    crate::messenger::Handler::typed_unary_async(
+pub(crate) fn anchor_abort_attach_handler(manager: Weak<AnchorManager>) -> crate::Handler {
+    crate::Handler::typed_unary_async(
         "_anchor_abort_attach",
-        move |ctx: crate::messenger::TypedContext<AnchorAbortAttachRequest>| {
+        move |ctx: crate::TypedContext<AnchorAbortAttachRequest>| {
             let manager = manager.clone();
             async move {
                 // A manager that is gone holds no anchor: cleanup has succeeded.
@@ -829,10 +827,10 @@ pub(crate) fn anchor_abort_attach_handler(
 /// its terminal record and `CloseSlot`, in order, on the slot itself.
 ///
 /// Idempotent: if the anchor is already absent, returns `Ok(())`.
-pub(crate) fn anchor_finalize_handler(manager: Weak<AnchorManager>) -> crate::messenger::Handler {
-    crate::messenger::Handler::typed_unary_async(
+pub(crate) fn anchor_finalize_handler(manager: Weak<AnchorManager>) -> crate::Handler {
+    crate::Handler::typed_unary_async(
         "_anchor_finalize",
-        move |ctx: crate::messenger::TypedContext<AnchorFinalizeRequest>| {
+        move |ctx: crate::TypedContext<AnchorFinalizeRequest>| {
             let manager = manager.clone();
             async move {
                 // A manager that is gone holds no anchor: cleanup has succeeded.
@@ -876,10 +874,10 @@ pub(crate) fn anchor_finalize_handler(manager: Weak<AnchorManager>) -> crate::me
 /// Used when a sender aborts before or during attachment.
 ///
 /// Idempotent: calling cancel on an already-absent anchor does not panic.
-pub(crate) fn anchor_cancel_handler(manager: Weak<AnchorManager>) -> crate::messenger::Handler {
-    crate::messenger::Handler::typed_unary_async(
+pub(crate) fn anchor_cancel_handler(manager: Weak<AnchorManager>) -> crate::Handler {
+    crate::Handler::typed_unary_async(
         "_anchor_cancel",
-        move |ctx: crate::messenger::TypedContext<AnchorCancelRequest>| {
+        move |ctx: crate::TypedContext<AnchorCancelRequest>| {
             let manager = manager.clone();
             async move {
                 // A manager that is gone holds no anchor: cleanup has succeeded.

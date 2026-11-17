@@ -29,9 +29,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::StreamExt;
-use velo::streaming::{StreamAnchor, StreamError, StreamFrame};
 use velo::transports::tcp::TcpTransportBuilder;
 use velo::{Handler, Velo};
+use velo::{StreamAnchor, StreamError, StreamFrame};
 
 struct Counting;
 
@@ -175,15 +175,14 @@ impl Pair {
     /// Whether the producer still holds a staged payload of at least `len`
     /// bytes. Slot ids are handed out in order, so a probe registered now has
     /// an id past every earlier one.
-    // Reads the producer's store directly. The store has no `Velo` form.
-    #[allow(deprecated)]
     fn producer_holds(&self, len: usize) -> bool {
-        let manager = self.producer.rendezvous_manager();
-        let (_, probe) = manager.register_data(Bytes::from_static(b"probe")).unpack();
-        let store = manager.data_store();
+        let (_, probe) = self
+            .producer
+            .register_data(Bytes::from_static(b"probe"))
+            .unpack();
         (0..probe)
-            .filter_map(|id| store.metadata(id))
-            .any(|meta| meta.total_len >= len as u64)
+            .filter_map(|id| self.producer.staged_payload_len(id))
+            .any(|total_len| total_len >= len as u64)
     }
 }
 

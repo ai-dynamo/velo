@@ -127,11 +127,12 @@ use self::flow_control::NegotiatedLimits;
 use self::ingress::IngressRegistry;
 use self::lane_choice::LaneLoad;
 use self::peer_batcher::{BatcherHandle, BatcherMap, OpenRejected, OpenSlotRequest};
+use crate::messenger::Messenger;
 use crate::messenger::large_payload::RefusedPayload;
-use crate::messenger::{Context, Handler, Messenger};
 use crate::observability::{MuxMetricsHandle, VeloMetrics};
 use crate::streaming::deadline::DeadlineQueue;
 use crate::streaming::transport::FrameTransport;
+use crate::{Context, Handler};
 
 pub use self::config::{AutoFlush, FlushPolicy, MuxConfig};
 pub(crate) use self::lane::{LaneIndex, PeerLane, is_batch_handler};
@@ -144,7 +145,7 @@ pub(crate) use self::lane_choice::LaneReservation;
 /// versions simply never pair up.
 ///
 /// Public because it is what
-/// [`StreamSender::negotiated_transport`](crate::streaming::StreamSender::negotiated_transport)
+/// [`StreamSender::negotiated_transport`](crate::StreamSender::negotiated_transport)
 /// is compared against — a caller that had to spell the string itself would be
 /// re-deriving the one value negotiation is keyed on.
 pub const MESSENGER_MUX_KEY: &str = "messenger-mux-v2";
@@ -635,9 +636,7 @@ impl MuxCore {
             return;
         };
         let why = format!("refused a staged stream item: {}", refused.too_large);
-        let Ok(frame) =
-            rmp_serde::to_vec(&crate::streaming::StreamFrame::<()>::TransportError(why))
-        else {
+        let Ok(frame) = rmp_serde::to_vec(&crate::StreamFrame::<()>::TransportError(why)) else {
             return;
         };
         let Some(reply) = self.ingress.refuse_record(

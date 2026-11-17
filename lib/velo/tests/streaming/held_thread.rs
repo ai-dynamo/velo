@@ -35,8 +35,9 @@ use tokio::sync::Notify;
 
 use futures::StreamExt;
 use velo::Velo;
-use velo::streaming::{AnchorConfig, StreamAnchor, StreamFrame};
+use velo::streaming::AnchorConfig;
 use velo::transports::tcp::TcpTransportBuilder;
+use velo::{StreamAnchor, StreamFrame};
 
 const PATIENCE: Duration = Duration::from_secs(5);
 const HEARTBEAT: Duration = Duration::from_millis(50);

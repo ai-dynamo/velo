@@ -1215,7 +1215,7 @@ mod tests {
     }
 
     struct PendingDiscovery(tokio::sync::Notify);
-    impl crate::PeerDiscovery for PendingDiscovery {
+    impl crate::discovery::PeerDiscovery for PendingDiscovery {
         fn discover_by_worker_id(
             &self,
             _: velo_ext::WorkerId,

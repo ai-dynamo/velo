@@ -247,7 +247,7 @@ fn read_u64_meta<T>(request: &Request<T>, name: &str) -> Result<u64, Box<Status>
 // GrpcFrameTransport (public API)
 // ---------------------------------------------------------------------------
 
-/// gRPC-based [`FrameTransport`] providing per-(anchor, session) routing via
+/// The per-stream gRPC transport, providing per-(anchor, session) routing via
 /// a shared tonic server.
 pub struct GrpcFrameTransport {
     key: TransportKey,

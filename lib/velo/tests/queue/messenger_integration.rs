@@ -13,9 +13,9 @@ use velo::Velo;
 use velo::messenger::Messenger;
 use velo::transports::uds::UdsTransportBuilder;
 
+use velo::queue::NextOptions;
 use velo::queue::WorkQueueBackend;
 use velo::queue::backends::messenger::{MessengerQueueBackend, MessengerQueueConfig};
-use velo::queue::options::NextOptions;
 
 /// Set up two mux-only `Velo`s connected via UDS, and return their
 /// messengers, which the queue backend runs over. The caller keeps the

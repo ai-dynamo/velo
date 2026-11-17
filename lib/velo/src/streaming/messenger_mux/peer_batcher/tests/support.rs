@@ -14,7 +14,6 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::super::*;
-use crate::messenger::{Context, Handler};
 use crate::observability::VeloMetrics;
 use crate::streaming::messenger_mux::LaneIndex;
 use crate::streaming::messenger_mux::flow_control::SlotCredit;
@@ -23,6 +22,7 @@ use crate::streaming::messenger_mux::protocol::{
 };
 use crate::streaming::messenger_mux::test_support::{StallingTransport, stalling_address};
 use crate::transports::tcp::TcpTransportBuilder;
+use crate::{Context, Handler};
 
 pub(super) const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
