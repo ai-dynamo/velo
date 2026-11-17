@@ -9,9 +9,10 @@
 //! change hid by mistake. This file names each path a consumer uses, so such
 //! a change fails here first. The consumers: dynamo (`velo::streaming` and the
 //! root stream types), dynamo-gdl (`velo::StreamOpenTicket` and its fields,
-//! `Velo::staging_threshold`), rhino and kvbm (`velo::discovery`), and
-//! deepseek-ultrafast (the RDMA staging surface). The 0.23.0 section of the
-//! migration guide lists the paths each consumer moves to.
+//! `Velo::staging_threshold`, and `parse_endpoints` in its hub), rhino and
+//! kvbm (`velo::discovery`), and deepseek-ultrafast (the RDMA staging
+//! surface). The 0.23.0 section of the migration guide lists the paths each
+//! consumer moves to.
 //!
 //! The test only has to compile; its body checks a few values so it is not
 //! empty.
@@ -40,6 +41,9 @@ use velo::{DataHandle, RdmaDestination, RendezvousWrite};
 
 // Metrics, at its one path.
 use velo::observability::VeloMetrics;
+
+// dynamo-gdl's hub: the interface helper it parses advertised endpoints with.
+use velo::transports::utils::interfaces::parse_endpoints;
 
 /// `StreamOpenTicket` keeps its public fields: a consumer carries the ticket
 /// in its own envelope and reads them.
