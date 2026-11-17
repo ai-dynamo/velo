@@ -1031,8 +1031,10 @@ impl Velo {
     /// finished, so every admitted request ran to completion. Under
     /// [`ShutdownPolicy::Timeout`] two things outlive the return.
     ///
-    /// Work still queued when the timeout expires is abandoned rather than
-    /// dispatched: the message handler drops the backlog at teardown. Its
+    /// Work still queued when teardown starts is abandoned rather than
+    /// dispatched: the message handler drops the backlog at teardown.
+    /// Teardown starts after the drain timeout and after the mux's send tasks
+    /// are joined, so work queued in that gap can still be dispatched. Its
     /// senders were admitted, so they get no `ShuttingDown` correlation and
     /// wait out their own response timeout. (The in-flight guards riding with
     /// those messages *are* released as they are dropped. Left parked in the
@@ -1088,11 +1090,14 @@ impl Velo {
     /// # Called once, even from clones
     ///
     /// [`Velo`] is `Clone`, so concurrent callers are possible. They are
-    /// serialised: the first runs the sequence, the rest wait and return as
-    /// soon as it finishes. Only one caller can take the transport's join
-    /// handle, and step 4's claim rests on that join having completed — a
-    /// second caller running the tail concurrently would be declaring memory
-    /// released while the progress thread was still alive.
+    /// serialised: the first runs the four steps above, and the rest wait for
+    /// it and skip them. Every caller then runs the streaming step and waits
+    /// for the transports to close, so each returns once both are done.
+    ///
+    /// Only one caller can take the transport's join handle, and step 4's
+    /// claim rests on that join having completed — a second caller running
+    /// the tail concurrently would be declaring memory released while the
+    /// progress thread was still alive.
     ///
     /// # One deadline, not one per phase
     ///

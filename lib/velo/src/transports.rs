@@ -749,9 +749,9 @@ impl VeloBackend {
     ///
     /// Listeners then reject new `Message` frames with ShuttingDown
     /// correlation replies while responses, acks, and events keep flowing.
-    /// Idempotent. Phases 2–3 are [`graceful_shutdown`](Self::graceful_shutdown)'s
-    /// job; calling this alone leaves the instance serving in-flight work
-    /// indefinitely.
+    /// Idempotent. Phase 2 is [`drain`](Self::drain)'s job, and phases 3–4
+    /// are [`finish_shutdown`](Self::finish_shutdown)'s; calling this alone
+    /// leaves the instance serving in-flight work indefinitely.
     pub fn begin_drain(&self) {
         self.shutdown_state.begin_drain();
         for transport in self.transports.values() {
