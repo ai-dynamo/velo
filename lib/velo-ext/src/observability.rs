@@ -92,12 +92,14 @@ impl TransportRejection {
 ///
 /// The frame, rejection, gauge and backpressure methods carry no default: each
 /// names a signal any real implementation would care about, and a transport
-/// that reported none of them would be invisible. The three egress methods do
-/// carry defaults, for two reasons. A transport whose `send_message` hands the
-/// frame straight to the wire has no queue in front of a writer and nothing to
-/// report; and adding a bare method to this trait would break every
-/// out-of-tree implementation, which is a major bump and a coordinated `velo`
-/// release (see `CONTRIBUTING.md`, *velo-ext API stability*).
+/// that reported none of them would be invisible. The three egress methods and
+/// [`record_unacknowledged_close`](Self::record_unacknowledged_close) do carry
+/// defaults, for two reasons. A transport whose `send_message` hands the frame
+/// straight to the wire has no queue in front of a writer, and a transport
+/// with no acknowledgement wait at close has no such close, so neither has
+/// anything to report; and adding a bare method to this trait would break
+/// every out-of-tree implementation, which is a major bump and a coordinated
+/// `velo` release (see `CONTRIBUTING.md`, *velo-ext API stability*).
 pub trait TransportObservability: Send + Sync {
     /// Record an accepted frame.
     ///
@@ -173,4 +175,15 @@ pub trait TransportObservability: Send + Sync {
     /// [`record_egress_queue_wait`](Self::record_egress_queue_wait) means the
     /// writer is starved of runtime time, or the queue is simply long.
     fn record_egress_write_duration(&self, _duration: Duration) {}
+
+    /// Record one connection or stream that a writer closed before the peer
+    /// had acknowledged everything the writer handed to it, so frames written
+    /// on it can be lost.
+    ///
+    /// This counts closes, not frames. A transport whose protocol stack does
+    /// not say how much of a stream the peer acknowledged (quinn does not)
+    /// cannot count the frames honestly: counting every frame written on the
+    /// connection would count frames that did arrive. Call it where the
+    /// transport warns that frames can be lost, once per close.
+    fn record_unacknowledged_close(&self) {}
 }

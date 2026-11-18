@@ -21,8 +21,9 @@ use prometheus::Registry;
 use staged_fetch::{Stall, stall_fetches};
 use velo::observability::VeloMetrics;
 use velo::observability::test_helpers::MetricSnapshot;
-use velo::streaming::{MuxConfig, StreamAnchor, StreamAnchorHandle, StreamFrame};
+use velo::streaming::MuxConfig;
 use velo::transports::tcp::TcpTransportBuilder;
+use velo::{StreamAnchor, StreamAnchorHandle, StreamFrame};
 use velo::{Velo, VeloBuilder};
 
 const PATIENCE: Duration = Duration::from_secs(10);

@@ -257,8 +257,15 @@ running at once, about 1 run in 80 read 0. Run alone, it passed 60 runs of
 reads. Run the test in a loop with many copies at once, for example 24. One
 copy on a quiet host hides the race.
 
-Test: `streaming::messenger_mux::peer_batcher::tests::instruments::singleton_records_are_counted_by_type`
-(`lib/velo/src/streaming/messenger_mux/peer_batcher/tests/instruments.rs`).
+The consumer side of the mux does the same with `velo_streaming_mux_live_slots`.
+It hands the terminal to the reader, and only then counts the slot closed. A
+test that read the gauge once, right after the reader's channel closed, read
+1 when the count came 100 ms late (10 runs of 10).
+
+Tests: `streaming::messenger_mux::peer_batcher::tests::instruments::singleton_records_are_counted_by_type`
+(`lib/velo/src/streaming/messenger_mux/peer_batcher/tests/instruments.rs`) and
+`streaming::messenger_mux::tests::a_stream_round_trips_and_ends_on_its_terminal`
+(`lib/velo/src/streaming/messenger_mux/tests.rs`).
 
 ## Hold a state open with a gate, not with a slow operation
 
@@ -295,13 +302,30 @@ is lost on every flight. With 12 copies of the lib suite running at once,
 they took 2.1 s to 9.7 s and failed in 45 of 72 copies, with no packet lost.
 They now read quinn's `lost_packets` through the `record_dialed` test seam.
 
+Two mux tests checked speed the same way. `a_credit_reply_moves_under_manual`
+waited 200 ms for a reply with a 50 ms window, and
+`a_singleton_at_the_eager_frame_limit_reaches_its_peer` waited 2 s for a
+16 MiB record. A host that stopped the test process for longer failed them
+with the record on its way. With random stops of up to 2.5 s, 12 of 640
+replies took more than 200 ms, and all of them arrived. Under `Manual`
+nothing else in the reply tests moves a batch, so a reply that waits for a
+flush never arrives, and the long wait still catches it. Do not count which
+wake wrote the batch: after a stall, the reply window can be over at the
+wake that staged the reply, and that wake writes it.
+
 **Test.** Run the test with many copies of the suite at once. Then break the
 code on purpose, for example make `clamp_to_gso_batch` return its input, and
 check that the count catches it: the jumbo test then counts about 2,500 lost
-packets.
+packets. To make a stall certain, stop the process yourself: start a thread
+that runs `kill -STOP` on the process 10 ms after the send, and a child
+process that sends `SIGCONT` 2.5 s later. The old mux tests then fail, and
+the new ones pass. Without the start of the reply window in `stage_reply`,
+the new reply tests fail.
 
-Test: `transports::quic::transport::tests::large_frames_round_trip_at_a_jumbo_mtu`
-(`lib/velo/src/transports/quic/tests.rs`).
+Tests: `transports::quic::transport::tests::large_frames_round_trip_at_a_jumbo_mtu`
+(`lib/velo/src/transports/quic/tests.rs`) and
+`streaming::messenger_mux::peer_batcher::tests::flush_policy::a_credit_reply_moves_under_manual`
+(`lib/velo/src/streaming/messenger_mux/peer_batcher/tests/flush_policy.rs`).
 
 ## A timeout in the code under test is part of the test's clock
 
@@ -322,6 +346,14 @@ not for a fixed time or a quiet spell, so a passing run stays short.
 - The TCP stream pump test took over 30 s to encode its frames, and the
   socket's `TCP_USER_TIMEOUT` aborted the connection to a peer that never
   reads.
+- A QUIC writer waits 1 s for the peer to acknowledge its last frames. With
+  48 copies of a delivery-count test on one CPU, and the process paused at
+  random points, that wait ran out in 190 runs of 240. The writer then closed
+  the connection and warned that frames can be lost, as the shutdown chapter
+  says it does, and up to 13 frames of 256 were neither delivered nor failed.
+  With a 30 s grace, 0 runs of 240 failed. The count also waited for a quiet
+  spell of 3 s, which a stall can make too. It now waits until every frame is
+  delivered or failed.
 
 **Test.** Make the stall happen. Block the thread at the point you suspect,
 with `std::thread::sleep` in a scratch build, or pause the whole test process
@@ -331,7 +363,40 @@ Check that the old test fails and the new one passes. Then remove the
 behavior the test checks, for example skip the close, and check that the new
 test still fails.
 
-Test: `transports::quic::transport::tests::the_senders_exit_closes_its_connection`
+Tests: `transports::quic::transport::tests::the_senders_exit_closes_its_connection`
+and `transports::quic::transport::tests::frames_survive_the_runtime_ending_right_after_close`
+(`lib/velo/src/transports/quic/tests.rs`).
+
+## A test that checks a log line runs in its own process
+
+**Rule.** Do not check a log line with `tracing::subscriber::set_default` in
+the shared test process. Run the test again in a child process, alone, with a
+global subscriber.
+
+`tracing` decides once per call site, for the whole process, whether a
+subscriber wants that site. A `set_default` subscriber is seen only on its own
+thread. While it is the only subscriber alive, a call site first reached on
+another thread asks only that thread's subscriber, which is none. The site is
+then marked unwanted on every thread, and the test's own line from it is
+dropped. In a check that a line is absent, the same miss makes the test pass
+without checking anything.
+
+**Failure.** `a_forced_close_warns_of_frames_the_peer_did_not_read` failed 1
+time in 30 full `--lib` runs (6 at once on 4 CPUs, with random pauses), with
+"nothing warned". The writer had reached its `warn!`: a print just before it
+showed in the output. Another QUIC test had reached the same `warn!` first.
+Run alone, the test passed 240 runs of 240.
+
+**Test.** Hold the `set_default` subscriber. Then make a thread with no
+subscriber reach the same call site first, and then run the scenario. The old
+test then fails every time (10 runs of 10, each in a new process). If the other
+thread reaches the site before `set_default`, it passes every time. The fixed
+tests call `logs_in_child`, which runs the test again with `--exact` in a
+child process. In the child, the subscriber is global. To check that the
+fixed test is not empty, change the text of the warning: it must fail.
+
+Tests: `transports::quic::transport::tests::a_forced_close_warns_of_frames_the_peer_did_not_read`
+and `transports::quic::transport::tests::a_dialer_does_not_count_the_servers_shutdown_as_a_decode_error`
 (`lib/velo/src/transports/quic/tests.rs`).
 
 ## Test timer logic on a paused clock
@@ -520,8 +585,20 @@ records any reap of an endpoint whose peer sent a frame within the timeout.
 A correct reaper never adds to it, at any load. To show a test is not empty,
 remove the inbound stamp: the count must rise.
 
-Test: `transports::ucx::transport::tests::a_peer_that_keeps_sending_responses_keeps_its_endpoint`
-(`lib/velo/src/transports/ucx/tests.rs`).
+The mux batcher's flush windows had the same fault. Five tests checked that
+nothing was written for 200 ms inside a 1 s window, or that a reply moved
+within 200 ms. A stall of over 800 ms ended the window inside the check, and
+the batch went for a reason the test did not expect. With 8 copies of the mux
+tests on two CPUs and random pauses, 3 runs of 80 failed this way. `FlushGate`
+now reads a `GateClock`. Outside test builds it has no fields and reads
+`Instant::now()`. A test that uses `harness_with_clock` stops it, and moves it
+with `ManualClock::advance`. A stall of 900 ms inside the check failed the old
+form 10 runs of 10, and the new form passes it 10 of 10.
+
+Tests: `transports::ucx::transport::tests::a_peer_that_keeps_sending_responses_keeps_its_endpoint`
+(`lib/velo/src/transports/ucx/tests.rs`) and
+`streaming::messenger_mux::peer_batcher::tests::flush_policy::on_complete_waits_for_every_live_slot`
+(`lib/velo/src/streaming/messenger_mux/peer_batcher/tests/flush_policy.rs`).
 
 ## Wait for facts that stay true, and keep the test's own steps out of the state it checks
 
@@ -530,6 +607,8 @@ Wait for a fact that stays true once it holds: a counter that only grows, a
 `OnceLock` that is set, a channel that has closed. Also check that the test's
 own steps do not change what it checks. A read can return credit, and a
 send can fail because the event under test has already happened.
+When a watchdog can end the state while the test sets it up, hold the
+watchdog with a gate until the setup is done.
 
 **Failure.** Two mux watchdog tests failed under load. The watchdog ends a
 stream when its sender holds credit and sends nothing for three heartbeat
@@ -539,13 +618,24 @@ and the send failed. `the_watchdog_does_not_fire_while_its_sender_is_parked`
 read the records of a parked sender. The first reads gave credit back, so the
 watchdog correctly fired before the last read.
 
+`a_silent_sender_with_credit_is_reaped_while_records_wait_unread` and
+`a_sender_starved_by_the_byte_budget_is_not_reaped` let the watchdog run from
+the attach. A sender that stalled for three windows before its last send held
+credit and sent nothing, so the watchdog fired, and the test failed on a send
+or on a wait for the records.
+
 **Test.** Force the delay that load causes: wait 300 ms before the sends, or
 four windows after the first read. The old tests then fail every time. The
 fixed tests wait for the anchor to go, the sender's channel to close, and no
 live slot. They hold credit back until the test returns it with one sweep.
+The other two hold the watchdog (`DrainSignal::hold_watchdog`, in test builds)
+until the records have arrived. To show that a watchdog did not fire, they
+wait for it to judge more windows than a firing needs (`watchdog_windows`),
+not for a fixed time.
 
-Tests: `streaming::messenger_mux::tests::a_watchdog_firing_closes_its_slot`
-and `streaming::messenger_mux::tests::the_watchdog_does_not_fire_while_its_sender_is_parked`
+Tests: `streaming::messenger_mux::tests::a_watchdog_firing_closes_its_slot`,
+`streaming::messenger_mux::tests::the_watchdog_does_not_fire_while_its_sender_is_parked`,
+and `streaming::messenger_mux::tests::a_sender_starved_by_the_byte_budget_is_not_reaped`
 (`lib/velo/src/streaming/messenger_mux/tests.rs`).
 
 ## A connection is not idle until both ends have set it up
@@ -582,3 +672,124 @@ and `transports::ucx::transport::tests::an_endpoint_whose_peer_never_sends_is_re
 **Test.** Make the store's next remove report the fence and fail in one call, then stop the hub, and check that the stop reports Ok. As a control, make a remove fail with no fence, and check that the stop reports it.
 
 Test: `a_stop_that_finds_the_store_fenced_by_its_own_remove_reports_ok` (`lib/velo-hub/tests/lifecycle.rs`), with `FaultStore::fence_next_remove`.
+
+## A barrier proves an event was handled only if that event reaches it
+
+**Rule.** When a test holds a loop at a barrier to check the effect of an
+event, the event itself must bring the loop to the barrier. If the code can
+drop the event early, or handle it in a wake that has already passed the
+barrier, the loop stops there only at some later, unrelated wake. Wait for a
+count that the code moves once it has handled the event instead.
+
+**Failure.** `a_delayed_payload_refusal_reply_spares_a_reused_slot` posts a
+reply that names a session that has ended. The control inbox drops it at
+once. The batcher wakes, finds nothing to apply, and goes back to its select
+without passing the barrier. Only the probe tick, every 5 s while a slot is
+live, brought it there: 0.8 s to 4.9 s after the reply in 48 runs. The test
+waited 5 s, so a probe tick that load delayed failed it: 9 runs of 160 with
+8 copies on two CPUs and random pauses.
+
+**Test.** Print which work brought the loop to the barrier: here it was
+always the probe. The fixed test waits until nothing is pending and the
+batcher has applied every control drain it took
+(`BatcherHandle::control_settled`). To check that it still sees the defect,
+remove both session checks, in `ControlInbox::peer_stopped` and in
+`on_owned_control`: the test fails. With only one removed, the other one
+still stops the reply.
+
+Test: `streaming::messenger_mux::peer_batcher::tests::egress::a_delayed_payload_refusal_reply_spares_a_reused_slot`
+(`lib/velo/src/streaming/messenger_mux/peer_batcher/tests/egress.rs`).
+
+## Before a test moves its clock, wait for the work that reads it
+
+**Rule.** When a test moves a clock by hand, first wait for the work in
+flight that reads that clock, such as a completion callback that stamps a
+time. Wait for a count that the work moves, then for the pass that runs it to
+end. Work that runs after the move reads the moved time, so the state the
+test checks starts later than the test thinks.
+
+**Failure.** `an_endpoint_whose_peer_never_sends_is_reaped_after_the_setup_bound`
+froze A's reaper clock and sent one Message from A to B. Then it moved the
+clock to the 5 s setup bound and one timeout past it, and expected a reap. On
+a new endpoint over the tcp lane, A's send can complete after B has the
+frame. In 2 of 320 runs (16 copies on two busy CPUs), A ran the completion
+after the first move and stamped the endpoint as used at 5 s. At 5.5 s the
+endpoint had been idle for exactly the timeout, not more, so the reaper kept
+it, as it should.
+
+**Test.** Make the completion late: in a scratch build, sleep 300 ms at the
+start of `send_trampoline`. The old test then fails 10 runs of 10. The new
+test waits for `inflight_ops` to reach 0 and then for two more passes
+(`sends_completed`), and passes 10 of 10.
+
+Test: `transports::ucx::transport::tests::an_endpoint_whose_peer_never_sends_is_reaped_after_the_setup_bound`
+(`lib/velo/src/transports/ucx/tests.rs`).
+
+## A test that pauses a worker thread must wait in `block_in_place`
+
+**Rule.** When a test pauses code on a tokio worker thread with a blocking
+wait, such as a condvar, put the wait in `tokio::task::block_in_place`. A
+task that the paused code woke just before can be in that worker's LIFO
+slot, and no other worker takes it from there. It then waits for the pause
+to end. The limitation "A task that holds its worker thread stalls velo's
+tasks" in [Limitations](../appendix/limitations.md) gives the details.
+
+**Failure.** `a_peer_close_preserves_acknowledged_frames` pauses a QUIC
+stream reader in `record_frame` with a condvar wait, on a runtime with two
+workers. In the stress runs of the full lib binary it failed once: the
+sender's `stopped()` waited 5 s for the acknowledgement of its frames, which
+never came. It did not fail in 640 runs of the test alone on two busy CPUs.
+
+**Test.** Run the test on one worker thread. With the plain wait it hangs
+every time, and with `block_in_place` it passes. The test keeps two workers,
+so a plain wait fails a run instead of hanging the test runner.
+
+Test: `transports::quic::listener::tests::a_peer_close_preserves_acknowledged_frames`
+(`lib/velo/src/transports/quic/listener.rs`).
+
+## A bare SIGSEGV from a test binary is not a stack overflow
+
+**Rule.** When a Rust test binary dies with `signal: 11, SIGSEGV` and prints
+nothing else, do not look for a stack overflow. Rust reports an overflow on
+any thread it starts as SIGABRT, with `thread '<name>' has overflowed its
+stack`. Look at native code, at `unsafe`, and at the host.
+
+Two things make this hold. Rust installs a SIGSEGV handler that knows the
+guard page of each thread it starts: test threads, `std::thread`s, and tokio
+workers. Stack probes make each large frame touch that guard page, so a
+frame of 256 KiB cannot jump over it. Both hold in the debug build and in
+the `-C instrument-coverage` build of the Coverage job. The rule breaks in
+one case: if SIGSEGV already has a handler when Rust starts, or is ignored,
+Rust does not install its own handler. An overflow then gives a bare SIGSEGV.
+
+**Failure.** One CI Coverage run of the `velo` unit-test binary died with a
+bare SIGSEGV in the mux tests, 6 s after it started. A stack overflow in the
+instrumented build was the first suspect. In local runs, no UCX thread was
+alive at that point: the `rendezvous::rdma` tests had ended, and the
+`transports::ucx` tests had not started. With `RUST_MIN_STACK` at 64 KiB or 128 KiB, the binary stopped
+every time with SIGABRT and the overflow message. Under a memory limit it
+was killed with SIGKILL (exit 137). In 173 full runs, and 320 runs of the
+mux tests alone, with 4 to 12 copies at a time, it never gave a SIGSEGV. In
+the same ten minutes, three other Coverage jobs on the same runner pool were
+killed with exit 137 before their tests started.
+
+**Test.** Run the binary again from a test, overflow a 64 KiB stack in the
+child, and check that the child ends with SIGABRT and the message. Run it
+once with SIGSEGV ignored (`trap '' SEGV` in the shell that starts it). The
+test must then fail, with a bare SIGSEGV.
+
+Test: `crash_report_tests::a_stack_overflow_aborts_with_a_message_not_a_bare_sigsegv`
+(`lib/velo/src/crash_report_tests.rs`).
+
+## A per-thread log capture misses events in a shared test binary
+
+**Rule.** To assert on what velo logs, give the test a binary of its own, install the capture with `tracing::subscriber::set_global_default`, and assert one line that must appear before you assert that a line is absent. Do not capture with `tracing::subscriber::set_default` in a binary whose other tests log at the same time.
+
+`tracing` keeps its per-callsite filter state for the whole process, and every test thread that logs shares it. A per-thread subscriber is one input to that state among the threads that log beside it.
+
+**Failure.** A test that set a per-thread subscriber and then built two nodes captured nothing at all, not even the transports' start-up lines, in 4 of 5 runs of its module beside the other tests. Run alone, it passed. Its "no warning" check would have passed for nothing. Only the check that a debug line appears caught it.
+
+**Test.** Run the capture test with the rest of its binary, 50 times. A check that a line is absent proves nothing until a check in the same capture shows that a line is present.
+
+Test: `a_default_node_learns_peers_without_a_per_stream_transport`
+(`lib/velo/tests/streaming/default_node_peers.rs`).

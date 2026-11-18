@@ -53,7 +53,8 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use velo::{InstanceId, PeerDiscovery, ShutdownPolicy, Velo, VeloBuilder};
+use velo::discovery::PeerDiscovery;
+use velo::{InstanceId, ShutdownPolicy, Velo, VeloBuilder};
 
 pub use authority::{Authority, AuthorityError, Lease};
 pub use config::{
