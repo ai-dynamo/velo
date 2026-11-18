@@ -18,7 +18,8 @@ impl std::fmt::Display for SenderId {
     }
 }
 
-/// Per-anchor configuration overrides for [`crate::AnchorManager::create_mpsc_anchor_with_config`].
+/// Per-anchor configuration overrides for
+/// [`Velo::create_mpsc_anchor_with_config`](crate::Velo::create_mpsc_anchor_with_config).
 ///
 /// `None` on `heartbeat_interval` inherits the manager-level default.
 /// `None` on `unattached_timeout` means no timeout: the manager's

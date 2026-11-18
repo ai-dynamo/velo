@@ -20,8 +20,7 @@
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::{Notify, Semaphore};
-use velo::rendezvous::handlers::acquire_lease;
-use velo::rendezvous::protocol::RvAcquireRequest;
+use velo::test_helpers::RvAcquireRequest;
 use velo::{Handler, TypedContext, Velo};
 
 /// What a stalled owner saw, and the gate that holds it.
@@ -51,10 +50,10 @@ impl Stall {
 
 /// Stall every fetch of a payload that `owner` staged until `stall.gate`
 /// lets it through, then answer as the real handler does.
-// Reads the owner's store directly. The store has no `Velo` form.
-#[allow(deprecated)]
 pub fn stall_fetches(owner: &Velo, stall: &Stall) {
-    let store = Arc::clone(owner.rendezvous_manager().data_store());
+    // Weak: the handler lives on the owner's messenger, and a strong handle
+    // there would keep the owner alive past its last user.
+    let node = owner.downgrade();
     let stall = stall.clone();
     owner
         .messenger()
@@ -62,14 +61,17 @@ pub fn stall_fetches(owner: &Velo, stall: &Stall) {
             Handler::typed_unary_async(
                 "_rv_acquire",
                 move |ctx: TypedContext<RvAcquireRequest>| {
-                    let store = Arc::clone(&store);
+                    let node = node.clone();
                     let stall = stall.clone();
                     async move {
                         let (_, local_id) = ctx.input.handle.to_handle().unpack();
                         stall.asked.lock().unwrap().push(local_id);
                         stall.entered.notify_one();
                         stall.gate.acquire().await?.forget();
-                        acquire_lease(&store, &ctx.input, ctx.headers.as_ref())
+                        let node = node
+                            .upgrade()
+                            .ok_or_else(|| anyhow::anyhow!("owner dropped"))?;
+                        node.serve_rv_acquire(&ctx.input, ctx.headers.as_ref())
                     }
                 },
             )
@@ -79,14 +81,8 @@ pub fn stall_fetches(owner: &Velo, stall: &Stall) {
 }
 
 /// Whether `owner` still holds the staged payload `local_id`.
-// Reads the owner's store directly. The store has no `Velo` form.
-#[allow(deprecated)]
 pub fn still_staged(owner: &Velo, local_id: u64) -> bool {
-    owner
-        .rendezvous_manager()
-        .data_store()
-        .get_total_len(local_id)
-        .is_some()
+    owner.staged_payload_len(local_id).is_some()
 }
 
 /// Whether `owner` lets go of the staged payload `local_id` within `within`.

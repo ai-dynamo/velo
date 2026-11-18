@@ -23,7 +23,7 @@ use crate::streaming::sender::Retirement;
 ///
 /// It is also where the stream's retirement is recorded: the sender and its
 /// transport slot already share this allocation, so
-/// [`StreamSender::retired`](crate::streaming::StreamSender::retired) costs a
+/// [`StreamSender::retired`](crate::StreamSender::retired) costs a
 /// stream nothing until the stream ends.
 #[derive(Clone, Debug, Default)]
 pub struct SenderClosed(Arc<SenderState>);
@@ -298,17 +298,12 @@ pub(crate) fn request_sender_cancel(
 /// 2. Removes the entry and cancels its token.
 ///
 /// Idempotent: if the entry is absent the handler returns `Ok(())` silently.
-pub fn create_stream_cancel_handler(
-    sender_registry: Arc<SenderRegistry>,
-) -> crate::messenger::Handler {
-    crate::messenger::Handler::am_handler(
-        "_stream_cancel",
-        move |ctx: crate::messenger::Context| {
-            let req = serde_json::from_slice::<StreamCancelRequest>(&ctx.payload)?;
-            sender_registry.cancel(req.sender_stream_id);
-            Ok(())
-        },
-    )
+pub fn create_stream_cancel_handler(sender_registry: Arc<SenderRegistry>) -> crate::Handler {
+    crate::Handler::am_handler("_stream_cancel", move |ctx: crate::Context| {
+        let req = serde_json::from_slice::<StreamCancelRequest>(&ctx.payload)?;
+        sender_registry.cancel(req.sender_stream_id);
+        Ok(())
+    })
     .build()
 }
 
@@ -353,10 +348,8 @@ pub(crate) fn request_sender_stop(
     }
 }
 
-pub(crate) fn create_stream_stop_handler(
-    registry: Arc<SenderRegistry>,
-) -> crate::messenger::Handler {
-    crate::messenger::Handler::am_handler("_stream_stop", move |ctx: crate::messenger::Context| {
+pub(crate) fn create_stream_stop_handler(registry: Arc<SenderRegistry>) -> crate::Handler {
+    crate::Handler::am_handler("_stream_stop", move |ctx: crate::Context| {
         let req = serde_json::from_slice::<StreamCancelRequest>(&ctx.payload)?;
         if let Some(entry) = registry.senders.get(&req.sender_stream_id) {
             entry.stop_token.cancel();

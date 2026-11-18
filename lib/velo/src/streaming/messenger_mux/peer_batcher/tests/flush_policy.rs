@@ -221,10 +221,15 @@ async fn a_flush_with_nothing_staged_writes_nothing() {
 /// polish: the peer's sender is parked waiting for this window, and no
 /// application on *this* side knows it owes that peer anything. If credit
 /// could wait for `flush_batch`, a node with a quiet producer would starve a
-/// busy one. Bounded by an explicit short `reply_linger` rather than
-/// `RECV_TIMEOUT`, so this discriminates a held reply from one that moved —
-/// the assertion held at any `reply_linger` under five seconds before
-/// `flush_gate` bounded a reply's window to records joining it either way.
+/// busy one.
+///
+/// Under `Manual` nothing else in this harness moves a batch: the test never
+/// kicks, opens no slot to probe, and runs no sweep. So a reply that waits for
+/// a flush never arrives, and a long wait still catches it. The wait used to
+/// be four windows (200 ms), and on a loaded host the write took longer than
+/// that with nothing wrong. Do not check which wake wrote the batch: after a
+/// stall the window can already be over at the wake that staged the reply,
+/// and that wake writes it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_credit_reply_moves_under_manual() {
     let window = Duration::from_millis(50);
@@ -242,7 +247,7 @@ async fn a_credit_reply_moves_under_manual() {
             delta: 32,
         }]);
 
-    let batch = tokio::time::timeout(window * 4, harness.next_batch())
+    let batch = tokio::time::timeout(RECV_TIMEOUT, harness.next_batch())
         .await
         .expect("a credit reply must not wait past its own window");
     assert_eq!(batch.records.len(), 1);
@@ -259,7 +264,9 @@ async fn a_credit_reply_moves_under_manual() {
 /// the reply's window never started and nothing under `Manual` — no policy, no
 /// timer — ever rescued it. `await_staged(1)` is the positive fact that the
 /// data record reached the gate before the reply is sent, which is what makes
-/// this Family A rather than a reply-alone case.
+/// this Family A rather than a reply-alone case. Timed like
+/// `a_credit_reply_moves_under_manual`: the slot's probe wakes the batcher
+/// every 5 s, but under `Manual` a probe writes nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_credit_reply_moves_under_manual_behind_a_staged_record() {
     let window = Duration::from_millis(50);
@@ -281,7 +288,7 @@ async fn a_credit_reply_moves_under_manual_behind_a_staged_record() {
             delta: 32,
         }]);
 
-    let batch = tokio::time::timeout(window * 4, harness.next_batch())
+    let batch = tokio::time::timeout(RECV_TIMEOUT, harness.next_batch())
         .await
         .expect("a reply joining an already-staged batch keeps its own window under Manual");
     let kinds: Vec<RecordType> = batch.records.iter().map(|r| r.kind).collect();

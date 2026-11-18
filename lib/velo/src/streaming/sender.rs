@@ -172,17 +172,14 @@ pub enum Retirement {
     /// behind every record before it. Over the messenger mux, the batch that
     /// carries the terminal was admitted by the transport. One exception: an
     /// item larger than the eager budget (the stager's threshold,
-    /// `RendezvousStager::with_threshold`, 256 KiB by default, or less on a
-    /// transport with a smaller frame limit) is staged on
+    /// [`Velo::staging_threshold`](crate::Velo::staging_threshold), 256 KiB by
+    /// default, or less on a transport with a smaller frame limit) is staged on
     /// this node until the consumer pulls it, so `Sent` can resolve while
     /// this node still holds it; the "Known limitations" appendix of the book says
     /// what that means for a shutdown. On the same worker, the terminal is in
     /// the anchor's channel. On a per-stream
-    /// transport of this crate that the `Velo` builder installed, the
-    /// stream's own pump wrote the terminal to the socket (TCP), or the
-    /// server took the whole stream (gRPC); on a frame transport from outside
-    /// velo, or under an `AnchorManager` built by hand, the terminal is in
-    /// the stream's egress channel.
+    /// transport, the stream's own pump wrote the terminal to the socket
+    /// (TCP), or the server took the whole stream (gRPC).
     ///
     /// It says nothing about the consumer: not that it received anything.
     /// Over gRPC, a server from before velo 0.21 ends the call cleanly even
@@ -406,7 +403,7 @@ impl<T: Serialize> StreamSender<T> {
     /// Use in a `tokio::select!` to stop production proactively:
     /// ```no_run
     /// # async fn example() {
-    /// # let mut sender: velo::streaming::StreamSender<u32> = todo!();
+    /// # let mut sender: velo::StreamSender<u32> = todo!();
     /// # async fn produce() -> u32 { 0 }
     /// loop {
     ///     tokio::select! {
@@ -640,7 +637,7 @@ impl StreamSender<Bytes> {
     /// The frame is the one [`send`](Self::send) writes for
     /// `Bytes::copy_from_slice(payload)`, so any `StreamAnchor<Bytes>` reads
     /// it, through `next` or through
-    /// [`next_bytes`](crate::streaming::StreamAnchor::next_bytes). It is
+    /// [`next_bytes`](crate::StreamAnchor::next_bytes). It is
     /// built in one allocation of the exact size, with one copy of the
     /// payload. `send` copies the payload once too, but serde grows the
     /// buffer as it writes it.
