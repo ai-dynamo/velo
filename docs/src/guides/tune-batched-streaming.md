@@ -6,9 +6,11 @@ The mux is on by default, and most deployments change nothing. Keep the defaults
 
 ## The mux is on by default
 
-A `Velo` builder installs the mux with `MuxConfig::default()`. The per-stream transport stays configured beside it, because negotiation needs it to serve peers that do not offer the mux. An attach uses the mux only when both sides advertise `messenger-mux-v2`. Every other pair uses the per-stream path.
+A `Velo` builder installs the mux with `MuxConfig::default()`. With no stream config, the mux is the node's only stream transport, and a peer that does not offer the mux cannot attach. A builder that calls `stream_config` or `stream_bind_addr` also installs a per-stream transport. On that node, an attach uses the mux only when both sides advertise `messenger-mux-v2`. Every other pair uses the per-stream path.
 
 To turn the mux off without a code change, set `VELO_MESSENGER_MUX_DISABLE=1` and restart the process. Only `1`, `true`, `yes` and `on` (any case) count. Velo reads the variable once, when it builds the node. The variable wins over `enabled: true` set in code, so a benchmark that must measure the mux must not inherit it.
+
+The switch needs a stream config. A node with no `stream_config` or `stream_bind_addr` has no per-stream transport to fall back to, so with the mux off, by the variable or by `enabled: false`, its `build()` fails. The error names `stream_config` and `stream_bind_addr`. Add one of them before you rely on the switch.
 
 A node with the mux runs one sweep task, which wakes five times a second, and registers 16 batch handlers (`_stream_batch` for lane 0 and `_stream_batch.1` to `_stream_batch.15`), even if it never streams. A handler costs a map entry until its first batch.
 
@@ -20,7 +22,7 @@ use velo::{StreamConfig, TcpConfig, Velo};
 
 let velo = Velo::builder()
     .add_transport(transport)
-    // The per-stream path stays configured. Negotiation picks per attach.
+    // A disabled mux needs the per-stream path. Negotiation picks per attach.
     .stream_config(StreamConfig::Tcp(Some(TcpConfig::new(bind_addr))))?
     .messenger_mux(MuxConfig {
         enabled: false, // Turn the mux off. Omit this line to keep it on.
@@ -173,13 +175,15 @@ let sender = match envelope.ticket {
 };
 ```
 
-`prebind_anchor` returns a ticket whenever the consumer has the mux and the anchor can be pre-bound, and the mux is on by default. A producer without the mux cannot open that ticket: `open_anchor_stream` fails, and the first `attach_anchor` is refused. The refusal releases the pre-bind, so a retry attaches on the per-stream path. To avoid these failures when you roll the mux out, upgrade the producers before the consumers that mint tickets, or keep the mux off on those consumers until every producer has it.
+`prebind_anchor` returns a ticket whenever the consumer has the mux and the anchor can be pre-bound, and the mux is on by default. A producer without the mux cannot open that ticket: `open_anchor_stream` fails, and the first `attach_anchor` is refused. The refusal releases the pre-bind, so a retry attaches on the per-stream path, but only if the consumer has the same per-stream transport as the producer. A consumer on the default build has only the mux and refuses the retry too. To avoid these failures when you roll the mux out, upgrade the producers before the consumers that mint tickets, or keep the mux off on those consumers until every producer has it.
 
 A ticket sender observes `stop_token()` and `cancellation_token()` through the mux's slot lifecycle. Stop leaves the stream open for final output. Cancel or consumer drop wakes an idle producer and ends delivery; it does not need a later send.
 
 The ticket stays valid for the configured accept window (180 seconds by default). After the window, the consumer reaps the bind and sees `SenderDropped`.
 
 ## Roll back
+
+A rollback needs the same per-stream transport on both ends of every stream. With the mux off, a node offers only its own per-stream key, `tcp-stream` (`StreamConfig::Tcp` or `stream_bind_addr`) or `grpc-stream` (`StreamConfig::Grpc`), and accepts only that key. So a TCP node and a gRPC node that stream over the mux today cannot stream once it is off. A node without `stream_config` or `stream_bind_addr` fails to start with the mux off, and a node on the default build has only the mux, so its attaches to a peer that turned the mux off fail. So first give every node, the producers and the consumers, the same per-stream transport type: TCP on all of them (`StreamConfig::Tcp` or `stream_bind_addr`) or gRPC on all of them (`StreamConfig::Grpc`). Each node keeps its own bind address. Restart them with the mux still on. A node built with `.mux_only()` must drop that call in the same change: `build` refuses `mux_only()` together with either setting. Then:
 
 1. Set `enabled: false`, or set `VELO_MESSENGER_MUX_DISABLE=1`, on the nodes that mint tickets.
 2. Restart those nodes.
@@ -203,4 +207,4 @@ These changes were measured and did not help. Do not try them again without a ne
 
 [Response plane performance](../operations/response-plane-performance.md) has the measurements.
 
-For work that exceeds the initial window, renew held tickets with `AnchorManager::renew_reservations`. Configure lifetimes through `VeloBuilder::reservation_config`; see [reservation renewal](../concepts/streaming.md#reservation-renewal).
+For work that exceeds the initial window, renew held tickets with `Velo::renew_reservations`. Configure lifetimes through `VeloBuilder::reservation_config`; see [reservation renewal](../concepts/streaming.md#reservation-renewal).

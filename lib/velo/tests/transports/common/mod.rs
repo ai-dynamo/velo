@@ -23,10 +23,9 @@ use bytes::Bytes;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::time::timeout;
-use velo::transports::{
-    DataStreams, MessageType, SendOutcome, Transport, TransportErrorHandler,
-    tcp::{TcpTransport, TcpTransportBuilder},
-};
+use velo::Transport;
+use velo::transports::tcp::{TcpTransport, TcpTransportBuilder};
+use velo::transports::{DataStreams, MessageType, SendOutcome, TransportErrorHandler};
 use velo_ext::{InstanceId, PeerInfo};
 
 #[cfg(all(target_os = "linux", feature = "ucx"))]
@@ -662,8 +661,8 @@ impl ShutdownTestClient for TcpShutdownClient {
         header: &[u8],
         payload: &[u8],
     ) -> Self::Stream {
-        use velo::transports::InterfaceEndpoint;
         use velo::transports::tcp::TcpFrameCodec;
+        use velo::transports::utils::interfaces::InterfaceEndpoint;
 
         let addr = {
             let wa = handle.transport.address();

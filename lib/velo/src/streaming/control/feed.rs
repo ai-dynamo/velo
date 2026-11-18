@@ -339,6 +339,16 @@ pub(crate) async fn stream_watchdog(
                 note_timer_fire();
                 sleep.as_mut().reset(tokio::time::Instant::now() + heartbeat_deadline);
                 note_timer_arm();
+                // A test holding the watchdog: the window is not judged, and
+                // counting starts afresh on release.
+                #[cfg(test)]
+                if feed.drain.watchdog_held() {
+                    seen = feed.drain.arrivals();
+                    missed = 0;
+                    continue;
+                }
+                #[cfg(test)]
+                feed.drain.note_watchdog_window();
                 let arrivals = feed.drain.arrivals();
                 if arrivals != seen {
                     seen = arrivals;

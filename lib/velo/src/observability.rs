@@ -572,6 +572,7 @@ pub struct TransportMetricsHandle {
     truncated_frame: Counter,
     drain_reply_build_failed: Counter,
     send_backpressure: Counter,
+    unacknowledged_closes: Counter,
 }
 
 impl TransportMetricsHandle {
@@ -678,6 +679,12 @@ impl TransportMetricsHandle {
     pub fn record_send_backpressure(&self) {
         self.send_backpressure.inc();
     }
+
+    /// Record one close that came before the peer acknowledged everything
+    /// written, so frames written on that connection can be lost.
+    pub fn record_unacknowledged_close(&self) {
+        self.unacknowledged_closes.inc();
+    }
 }
 
 impl velo_ext::TransportObservability for TransportMetricsHandle {
@@ -711,6 +718,10 @@ impl velo_ext::TransportObservability for TransportMetricsHandle {
 
     fn record_egress_write_duration(&self, duration: Duration) {
         TransportMetricsHandle::record_egress_write_duration(self, duration);
+    }
+
+    fn record_unacknowledged_close(&self) {
+        TransportMetricsHandle::record_unacknowledged_close(self);
     }
 }
 
@@ -1134,6 +1145,7 @@ pub struct VeloMetrics {
     transport_write_duration_seconds: HistogramVec,
     transport_rejections_total: CounterVec,
     transport_send_backpressure_total: CounterVec,
+    transport_unacknowledged_closes_total: CounterVec,
     transport_registered_peers: GaugeVec,
     transport_active_connections: GaugeVec,
     messenger_handler_requests_total: CounterVec,
@@ -1310,6 +1322,20 @@ impl VeloMetrics {
                 Opts::new(
                     "velo_transport_send_backpressure_total",
                     "Sends that found the bounded per-target channel full and were queued in that target's admission gate.",
+                ),
+                &["transport"],
+            )?,
+        )?;
+        let transport_unacknowledged_closes_total = register_collector(
+            registry,
+            CounterVec::new(
+                Opts::new(
+                    "velo_transport_unacknowledged_closes_total",
+                    "Connections a writer closed before the peer acknowledged everything written, \
+                     so frames written on them can be lost. QUIC only: the writer's wait for the \
+                     acknowledgement at close ran out, or the connection ended another way than a \
+                     close by the peer. Counts closes, not frames, because quinn does not say how \
+                     much of a stream the peer acknowledged.",
                 ),
                 &["transport"],
             )?,
@@ -2016,6 +2042,7 @@ impl VeloMetrics {
             transport_write_duration_seconds,
             transport_rejections_total,
             transport_send_backpressure_total,
+            transport_unacknowledged_closes_total,
             transport_registered_peers,
             transport_active_connections,
             messenger_handler_requests_total,
@@ -2162,6 +2189,9 @@ impl VeloMetrics {
                 .with_label_values(&[transport_label, "drain_reply_build_failed"]),
             send_backpressure: self
                 .transport_send_backpressure_total
+                .with_label_values(&[transport_label]),
+            unacknowledged_closes: self
+                .transport_unacknowledged_closes_total
                 .with_label_values(&[transport_label]),
         }
     }
@@ -2615,6 +2645,7 @@ pub fn apply_remote_parent(span: &tracing::Span, headers: Option<&HashMap<String
 /// Enable with `velo-observability = { ..., features = ["test-helpers"] }` in
 /// `[dev-dependencies]`.
 #[cfg(any(test, feature = "test-helpers"))]
+#[doc(hidden)]
 pub mod test_helpers {
     use prometheus::Registry;
     use prometheus::proto::MetricFamily;
@@ -2813,6 +2844,49 @@ mod tests {
         assert!(names.contains(&"velo_transport_frames_written_total".to_string()));
         assert!(names.contains(&"velo_transport_egress_queue_wait_seconds".to_string()));
         assert!(names.contains(&"velo_transport_write_duration_seconds".to_string()));
+    }
+
+    /// A close the peer did not acknowledge lands on its own transport's
+    /// series, through the trait object a transport holds, and the series is
+    /// there at zero from bind, so a dashboard reads "no such close" rather
+    /// than "no data".
+    #[test]
+    fn unacknowledged_closes_count_per_transport() {
+        use super::test_helpers::MetricSnapshot;
+
+        let registry = Registry::new();
+        let metrics = VeloMetrics::register(&registry).expect("register metrics");
+        let quic: std::sync::Arc<dyn velo_ext::TransportObservability> =
+            std::sync::Arc::new(metrics.bind_transport("quic"));
+        let _tcp = metrics.bind_transport("tcp");
+
+        let snap = MetricSnapshot::from_registry(&registry);
+        assert_eq!(
+            snap.counter(
+                "velo_transport_unacknowledged_closes_total",
+                &[("transport", "quic")]
+            ),
+            0.0
+        );
+
+        quic.record_unacknowledged_close();
+        quic.record_unacknowledged_close();
+
+        let snap = MetricSnapshot::from_registry(&registry);
+        assert_eq!(
+            snap.counter(
+                "velo_transport_unacknowledged_closes_total",
+                &[("transport", "quic")]
+            ),
+            2.0
+        );
+        assert_eq!(
+            snap.counter(
+                "velo_transport_unacknowledged_closes_total",
+                &[("transport", "tcp")]
+            ),
+            0.0
+        );
     }
 
     /// The egress instruments land on the labels the depth identity subtracts

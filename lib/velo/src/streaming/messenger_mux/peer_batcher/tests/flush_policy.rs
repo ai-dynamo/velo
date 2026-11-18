@@ -262,7 +262,9 @@ async fn a_credit_reply_moves_under_manual() {
 /// the reply's window never started and nothing under `Manual` — no policy, no
 /// timer — ever rescued it. `await_staged(1)` is the positive fact that the
 /// data record reached the gate before the reply is sent, which is what makes
-/// this Family A rather than a reply-alone case.
+/// this Family A rather than a reply-alone case. Timed like
+/// `a_credit_reply_moves_under_manual`: the slot's probe wakes the batcher
+/// every 5 s, but under `Manual` a probe writes nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_credit_reply_moves_under_manual_behind_a_staged_record() {
     let window = Duration::from_millis(50);
@@ -284,7 +286,7 @@ async fn a_credit_reply_moves_under_manual_behind_a_staged_record() {
             delta: 32,
         }]);
 
-    let batch = tokio::time::timeout(window * 4, harness.next_batch())
+    let batch = tokio::time::timeout(RECV_TIMEOUT, harness.next_batch())
         .await
         .expect("a reply joining an already-staged batch keeps its own window under Manual");
     let kinds: Vec<RecordType> = batch.records.iter().map(|r| r.kind).collect();

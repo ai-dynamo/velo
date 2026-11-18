@@ -5,6 +5,7 @@
 ```bash
 cargo build --all-features
 cargo test --all-features --all-targets
+cargo test --all-features --doc -p velo -p velo-ext -p velo-hub -p velo-hub-ext   # --all-targets leaves out doctests
 cargo clippy --all-features --no-deps --all-targets -- -D warnings
 cargo fmt --check
 cargo machete
@@ -57,7 +58,7 @@ CI links with `mold` (`RUSTFLAGS="-C linker=clang -C link-arg=-fuse-ld=mold"`). 
 | Formatting | `cargo fmt --check` |
 | Clippy | clippy with `-D warnings`, then `cargo machete` |
 | Cargo Deny | license and ban checks |
-| Tests | `cargo test --locked --all-features --all-targets`, with NATS and etcd services |
+| Tests | `cargo test --locked --all-features --all-targets`, with NATS and etcd services, then the doctests of every crate but `ucx-rs`, whose generated bindings carry C code in doc comments |
 | Core configuration | TCP and UCX tests with default features disabled |
 | Coverage | `cargo llvm-cov` over the same set |
 | Examples | builds all examples and runs the short ones, including `rendezvous_rdma_two_proc` with `UCX_TLS=tcp` |
