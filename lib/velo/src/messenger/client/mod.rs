@@ -412,7 +412,7 @@ impl ActiveMessageClient {
         // 1. Check if peer is registered
         if !self.is_peer_registered(target) {
             anyhow::bail!(
-                "Peer {} not registered. Call messenger.register_peer() first.",
+                "Peer {} not registered. Call Velo::register_peer first.",
                 target
             );
         }

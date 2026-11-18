@@ -45,15 +45,14 @@
 //! - `AckPolicy` config: `None` (auto-ack) vs `Manual` (explicit acknowledgment)
 //! - Redelivery for nack'd or timed-out items
 
-pub mod backend;
+mod backend;
 pub mod backends;
-pub mod error;
-pub mod options;
-pub mod receiver;
-pub mod sender;
+mod error;
+mod options;
+mod receiver;
+mod sender;
 
-// Re-export primary types at crate root for convenience.
-pub use backend::{ReceiverBackend, SenderBackend, WorkQueueBackend};
+pub use backend::{ReceiverBackend, ReceiverFuture, SenderBackend, SenderFuture, WorkQueueBackend};
 pub use error::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
 pub use options::NextOptions;
 pub use receiver::WorkQueueReceiver;

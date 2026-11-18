@@ -65,7 +65,7 @@ pub const DEFAULT_CHUNK_SIZE: u32 = 512 * 1024;
 /// Reporting only. Derived from [`SlotBody`] on every query rather than stored
 /// beside it, so the two cannot drift.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum StageMode {
+pub(crate) enum StageMode {
     /// Plain heap bytes, served via chunked pull.
     InMemory,
     /// RDMA-registered memory: served by an RDMA GET to a consumer that can do
@@ -242,10 +242,7 @@ type RegisterHook = Box<dyn Fn(&DataStore) + Send + Sync>;
 pub struct RegisterOptions {
     /// Optional time-to-live for the staged data. When it is up, the slot is
     /// freed and every lease on it ended, whether or not a consumer is still
-    /// reading. Enforced by the instance's reaper, which a registration
-    /// through [`RendezvousManager`](crate::RendezvousManager) starts; a
-    /// [`DataStore`] used on its own enforces it only through
-    /// [`DataStore::sweep_expired`].
+    /// reading. Enforced by the instance's reaper.
     pub ttl: Option<Duration>,
 }
 
@@ -389,11 +386,6 @@ impl DataStore {
         }
     }
 
-    /// Register data and return the local slot ID.
-    pub fn register(&self, data: Bytes, opts: Option<RegisterOptions>) -> u64 {
-        self.register_body(SlotBody::InMemory(data), opts)
-    }
-
     /// Register an already-built body and return the local slot ID.
     ///
     /// The staging path — pool, external region, or plain bytes — decides the
@@ -445,6 +437,7 @@ impl DataStore {
     }
 
     /// How a slot is staged, or `None` if it does not exist.
+    #[cfg(any(test, all(target_os = "linux", feature = "ucx")))]
     pub fn stage_mode(&self, local_id: u64) -> Option<StageMode> {
         self.slots.get(&local_id).map(|slot| slot.body.stage_mode())
     }
@@ -621,9 +614,9 @@ impl DataStore {
     /// release, a `LeaseGuard` drop, and the reaper. The free must not depend
     /// on which counter this call took to zero. An owner may drop its
     /// reference while a reader holds a lease, so the reference count is
-    /// already 0 when the last reader leaves. A path that freed only when its
-    /// own `ref_decrement` returned true, or that looked at nothing on a
-    /// detach, left that slot for the life of the process, and an RDMA slot
+    /// already 0 when the last reader leaves. A path that freed only when it
+    /// took the reference count to zero itself, or that looked at nothing on
+    /// a detach, left that slot for the life of the process, and an RDMA slot
     /// kept its region's in-flight guard with it.
     ///
     /// The rule: whichever call takes a count to zero calls
@@ -678,15 +671,6 @@ impl DataStore {
         }
     }
 
-    /// Release a read lock on a slot. Returns true if the slot should be freed
-    /// (refcount == 0 AND read_lock_count == 0).
-    ///
-    /// Uses checked arithmetic: returns `false` if the count is already zero
-    /// instead of underflowing.
-    pub fn release_read_lock(&self, local_id: u64) -> bool {
-        self.take_one(local_id, Count::ReadLocks) == Some((0, 0))
-    }
-
     /// Increment the reference count for a slot.
     pub fn ref_increment(&self, local_id: u64) -> bool {
         if let Some(slot) = self.slots.get(&local_id) {
@@ -727,30 +711,6 @@ impl DataStore {
             Some(_) => true,
             None => false,
         }
-    }
-
-    /// Decrement the reference count. Returns true if the slot should be freed
-    /// (refcount == 0 AND read_lock_count == 0).
-    ///
-    /// Uses checked arithmetic: returns `false` if the count is already zero
-    /// instead of underflowing.
-    pub fn ref_decrement(&self, local_id: u64) -> bool {
-        self.take_one(local_id, Count::References) == Some((0, 0))
-    }
-
-    /// Remove a slot from the registry and return a copy of its data.
-    ///
-    /// A copy, not the staging: a pinned slot's pages belong to the pool or to
-    /// a caller's region, and handing them out under a `Bytes` would make the
-    /// registration's lifetime depend on where that `Bytes` ended up. Removing
-    /// the slot drops the staging, which is the whole point of removing it.
-    pub fn remove(&self, local_id: u64) -> Option<Bytes> {
-        let (_, slot) = self.slots.remove(&local_id)?;
-        if slot.ttl.is_some() {
-            self.expiring.remove(&local_id);
-        }
-        self.note_slot_removed();
-        slot.body.to_bytes()
     }
 
     /// Try to free a slot if both refcount and read_lock_count are zero.
@@ -838,11 +798,6 @@ impl DataStore {
             self.renew_lease(lease_id);
         }
         Some(chunk)
-    }
-
-    /// Remove a completed transfer.
-    pub fn remove_transfer(&self, transfer_id: u64) {
-        self.transfers.remove(&transfer_id);
     }
 
     /// Move every slot out of registered memory and into the heap, releasing
@@ -1109,7 +1064,7 @@ mod tests {
     fn test_register_and_get() {
         let store = DataStore::new();
         let data = Bytes::from(vec![1u8, 2, 3, 4]);
-        let id = store.register(data.clone(), None);
+        let id = store.register_body(SlotBody::InMemory(data.clone()), None);
         assert_eq!(id, 1);
         assert_eq!(store.get_data(id).unwrap(), data);
     }
@@ -1118,7 +1073,7 @@ mod tests {
     fn test_metadata() {
         let store = DataStore::new();
         let data = Bytes::from(vec![0u8; 1024]);
-        let id = store.register(data, None);
+        let id = store.register_body(SlotBody::InMemory(data), None);
         let meta = store.metadata(id).unwrap();
         assert_eq!(meta.total_len, 1024);
         assert_eq!(meta.refcount, 1);
@@ -1129,7 +1084,7 @@ mod tests {
     #[test]
     fn test_ref_counting() {
         let store = DataStore::new();
-        let id = store.register(Bytes::from("hello"), None);
+        let id = store.register_body(SlotBody::InMemory(Bytes::from("hello")), None);
 
         // Initial refcount is 1
         assert_eq!(store.metadata(id).unwrap().refcount, 1);
@@ -1138,40 +1093,45 @@ mod tests {
         assert!(store.ref_increment(id));
         assert_eq!(store.metadata(id).unwrap().refcount, 2);
 
-        // Decrement (not yet free: refcount=1)
-        assert!(!store.ref_decrement(id));
+        // The owner drops its reference once: a repeat changes nothing, so it
+        // cannot take the reference the increment gave a reader.
+        assert!(store.release_owner_reference(id));
+        assert!(!store.release_owner_reference(id));
+        assert_eq!(store.metadata(id).unwrap().refcount, 1);
 
-        // Decrement (free: refcount=0, no read locks)
-        assert!(store.ref_decrement(id));
-
-        // try_free should remove it
-        store.try_free(id);
+        // The reader's release drops the last reference and frees the slot.
+        let lease = store.acquire_read_lock(id).unwrap();
+        assert_eq!(
+            store.end_lease(lease, id, LeaseEnd::Release),
+            LeaseOutcome::Consumed
+        );
         assert!(store.metadata(id).is_none());
     }
 
     #[test]
     fn test_read_lock_prevents_free() {
         let store = DataStore::new();
-        let id = store.register(Bytes::from("data"), None);
+        let id = store.register_body(SlotBody::InMemory(Bytes::from("data")), None);
 
-        // Acquire read lock
-        let _lease = store.acquire_read_lock(id).unwrap();
+        let lease = store.acquire_read_lock(id).unwrap();
 
-        // Decrement refcount to 0
-        let should_free = store.ref_decrement(id);
-        // Should NOT free because read lock is held
-        assert!(!should_free);
+        // The owner's reference goes, but the read lock keeps the slot.
+        assert!(store.release_owner_reference(id));
+        assert_eq!(store.metadata(id).unwrap().refcount, 0);
 
-        // Release read lock — now should free
-        let should_free = store.release_read_lock(id);
-        assert!(should_free);
+        // The reader's detach drops the last read lock and frees it.
+        assert_eq!(
+            store.end_lease(lease, id, LeaseEnd::Detach),
+            LeaseOutcome::Consumed
+        );
+        assert!(store.metadata(id).is_none());
     }
 
     #[test]
     fn test_chunked_transfer() {
         let store = DataStore::new();
         let data = Bytes::from(vec![0xAA; 2000]);
-        let id = store.register(data, None);
+        let id = store.register_body(SlotBody::InMemory(data), None);
         let lease_id = store.acquire_read_lock(id).unwrap();
 
         let (transfer_id, chunk_size, chunk_count) =
@@ -1192,8 +1152,8 @@ mod tests {
         // Chunk 2 doesn't exist
         assert!(store.get_chunk(transfer_id, 2).is_none());
 
-        // Cleanup
-        store.remove_transfer(transfer_id);
+        // Ending the lease's transfers removes this one.
+        store.remove_transfers_by_lease(lease_id);
         assert!(store.transfers.get(&transfer_id).is_none());
     }
 
@@ -1202,7 +1162,7 @@ mod tests {
     #[test]
     fn chunked_leases_never_expire() {
         let store = DataStore::new();
-        let id = store.register(Bytes::from("data"), None);
+        let id = store.register_body(SlotBody::InMemory(Bytes::from("data")), None);
         let lease = store.acquire_read_lock(id).unwrap();
 
         assert_eq!(store.deadline_count(), 0);
@@ -1218,7 +1178,7 @@ mod tests {
     #[test]
     fn a_deadline_expires_and_renewal_pushes_it_out() {
         let store = DataStore::new();
-        let id = store.register(Bytes::from("data"), None);
+        let id = store.register_body(SlotBody::InMemory(Bytes::from("data")), None);
         let lease = store.acquire_read_lock(id).unwrap();
         store.set_lease_deadline(lease, id, Duration::from_secs(3600));
         assert!(
@@ -1247,7 +1207,7 @@ mod tests {
     #[test]
     fn consuming_a_lease_drops_its_deadline() {
         let store = DataStore::new();
-        let id = store.register(Bytes::from("data"), None);
+        let id = store.register_body(SlotBody::InMemory(Bytes::from("data")), None);
         let lease = store.acquire_read_lock(id).unwrap();
         store.set_lease_deadline(lease, id, Duration::from_secs(30));
         assert_eq!(store.deadline_count(), 1);
@@ -1268,8 +1228,8 @@ mod tests {
     #[test]
     fn a_mismatched_lease_is_not_consumed_and_stays_reapable() {
         let store = DataStore::new();
-        let mine = store.register(Bytes::from(vec![0u8; 4096]), None);
-        let theirs = store.register(Bytes::from(vec![1u8; 4096]), None);
+        let mine = store.register_body(SlotBody::InMemory(Bytes::from(vec![0u8; 4096])), None);
+        let theirs = store.register_body(SlotBody::InMemory(Bytes::from(vec![1u8; 4096])), None);
         let lease = store.acquire_read_lock(mine).unwrap();
         store.set_lease_deadline(lease, mine, Duration::from_millis(0));
 
@@ -1307,7 +1267,7 @@ mod tests {
     #[test]
     fn force_release_frees_a_transparent_style_slot() {
         let store = DataStore::new();
-        let id = store.register(Bytes::from(vec![0u8; 4096]), None);
+        let id = store.register_body(SlotBody::InMemory(Bytes::from(vec![0u8; 4096])), None);
         let lease = store.acquire_read_lock(id).unwrap();
         let (transfer_id, _, _) = store.create_transfer(id, lease, 1024).unwrap();
         store.set_lease_deadline(lease, id, Duration::from_millis(0));
@@ -1329,7 +1289,7 @@ mod tests {
     #[test]
     fn a_chunked_lease_deadline_is_renewed_by_pulls_and_reaped_without_them() {
         let store = DataStore::new();
-        let id = store.register(Bytes::from(vec![7u8; 4096]), None);
+        let id = store.register_body(SlotBody::InMemory(Bytes::from(vec![7u8; 4096])), None);
         let lease = store.acquire_read_lock(id).unwrap();
         let (transfer, _, _) = store.create_transfer(id, lease, 1024).unwrap();
         let granted = Instant::now();
@@ -1364,7 +1324,7 @@ mod tests {
     #[test]
     fn a_lease_without_a_deadline_is_never_reaped() {
         let store = DataStore::new();
-        let id = store.register(Bytes::from(vec![7u8; 4096]), None);
+        let id = store.register_body(SlotBody::InMemory(Bytes::from(vec![7u8; 4096])), None);
         let lease = store.acquire_read_lock(id).unwrap();
         let (transfer, _, _) = store.create_transfer(id, lease, 4096).unwrap();
         assert!(store.pull_chunk(transfer, 0).is_some());
@@ -1382,9 +1342,12 @@ mod tests {
     fn a_slot_past_its_time_to_live_is_freed_with_every_lease_on_it() {
         let store = DataStore::new();
         let ttl = RegisterOptions::new().ttl(Duration::from_millis(100));
-        let unread = store.register(Bytes::from(vec![1u8; 4096]), Some(ttl.clone()));
-        let read = store.register(Bytes::from(vec![2u8; 4096]), Some(ttl));
-        let kept = store.register(Bytes::from(vec![3u8; 4096]), None);
+        let unread = store.register_body(
+            SlotBody::InMemory(Bytes::from(vec![1u8; 4096])),
+            Some(ttl.clone()),
+        );
+        let read = store.register_body(SlotBody::InMemory(Bytes::from(vec![2u8; 4096])), Some(ttl));
+        let kept = store.register_body(SlotBody::InMemory(Bytes::from(vec![3u8; 4096])), None);
         let lease = store.acquire_read_lock(read).unwrap();
         let (transfer, _, _) = store.create_transfer(read, lease, 1024).unwrap();
         store.set_lease_deadline(lease, read, Duration::from_secs(3600));
@@ -1408,21 +1371,23 @@ mod tests {
     fn a_slot_released_before_its_time_to_live_leaves_no_expiry_behind() {
         let store = DataStore::new();
         let ttl = RegisterOptions::new().ttl(Duration::from_secs(3600));
-        let id = store.register(Bytes::from(vec![1u8; 4096]), Some(ttl));
+        let id = store.register_body(SlotBody::InMemory(Bytes::from(vec![1u8; 4096])), Some(ttl));
         assert!(store.has_pending_expiry());
         let lease = store.acquire_read_lock(id).unwrap();
-        assert_eq!(store.consume_lease(lease, id), LeaseOutcome::Consumed);
-        store.release_read_lock(id);
-        assert!(store.ref_decrement(id));
-        store.try_free(id);
+        assert!(store.release_owner_reference(id));
+        assert_eq!(
+            store.end_lease(lease, id, LeaseEnd::Detach),
+            LeaseOutcome::Consumed
+        );
         assert!(store.metadata(id).is_none());
         assert!(!store.has_pending_expiry());
 
-        let removed = store.register(
-            Bytes::from(vec![1u8; 16]),
+        let removed = store.register_body(
+            SlotBody::InMemory(Bytes::from(vec![1u8; 16])),
             Some(RegisterOptions::new().ttl(Duration::from_secs(3600))),
         );
-        assert!(store.remove(removed).is_some());
+        assert!(store.release_owner_reference(removed));
+        assert!(store.metadata(removed).is_none());
         assert!(!store.has_pending_expiry());
     }
 
@@ -1447,7 +1412,7 @@ mod tests {
     async fn the_reaper_runs_only_while_something_is_pending() {
         let store = Arc::new(DataStore::new());
         let ttl = || Some(RegisterOptions::new().ttl(Duration::from_millis(20)));
-        let first = store.register(Bytes::from(vec![1u8; 16]), ttl());
+        let first = store.register_body(SlotBody::InMemory(Bytes::from(vec![1u8; 16])), ttl());
         ensure_reaper(&store);
         assert!(store.reaper.running.load(Ordering::Acquire));
         assert!(
@@ -1459,7 +1424,7 @@ mod tests {
             "the reaper stopped with nothing pending"
         );
 
-        let second = store.register(Bytes::from(vec![2u8; 16]), ttl());
+        let second = store.register_body(SlotBody::InMemory(Bytes::from(vec![2u8; 16])), ttl());
         ensure_reaper(&store);
         assert!(
             eventually(|| store.metadata(second).is_none()).await,
@@ -1472,8 +1437,8 @@ mod tests {
     #[tokio::test]
     async fn a_stopped_reaper_stays_stopped() {
         let store = Arc::new(DataStore::new());
-        let id = store.register(
-            Bytes::from(vec![1u8; 16]),
+        let id = store.register_body(
+            SlotBody::InMemory(Bytes::from(vec![1u8; 16])),
             Some(RegisterOptions::new().ttl(Duration::from_millis(1))),
         );
         store.stop_reaper();
@@ -1499,8 +1464,8 @@ mod tests {
             .set(Box::new(move |store: &DataStore| {
                 store.sweep_expired(later);
             }));
-        let id = store.register(
-            Bytes::from(vec![1u8; 16]),
+        let id = store.register_body(
+            SlotBody::InMemory(Bytes::from(vec![1u8; 16])),
             Some(RegisterOptions::new().ttl(Duration::ZERO)),
         );
         assert_eq!(
@@ -1525,8 +1490,8 @@ mod tests {
     #[test]
     fn a_deadline_for_a_lease_that_expiry_ended_is_dropped() {
         let store = DataStore::new();
-        let id = store.register(
-            Bytes::from(vec![1u8; 4096]),
+        let id = store.register_body(
+            SlotBody::InMemory(Bytes::from(vec![1u8; 4096])),
             Some(RegisterOptions::new().ttl(Duration::ZERO)),
         );
         let lease = store.acquire_read_lock(id).unwrap();

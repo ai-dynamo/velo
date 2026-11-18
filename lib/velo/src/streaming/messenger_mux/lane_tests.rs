@@ -19,8 +19,8 @@ use futures::StreamExt;
 use super::lane_choice::keyed_lane;
 use super::{LaneIndex, MessengerMuxTransport, PeerLane};
 use crate::Velo;
-use crate::streaming::{StreamAnchor, StreamAnchorHandle, StreamFrame};
 use crate::transports::quic::{QuicTransport, QuicTransportBuilder};
+use crate::{StreamAnchor, StreamAnchorHandle, StreamFrame};
 
 const BOUND: Duration = Duration::from_secs(20);
 
@@ -125,7 +125,7 @@ async fn eventually(what: &str, mut predicate: impl FnMut() -> bool) {
 }
 
 /// Send [`ITEMS`] items and a finalize, and read them back in order.
-async fn stream_through(sender: crate::streaming::StreamSender<u32>, anchor: StreamAnchor<u32>) {
+async fn stream_through(sender: crate::StreamSender<u32>, anchor: StreamAnchor<u32>) {
     let send = tokio::spawn(async move {
         for n in 0..ITEMS {
             sender.send(n).await.expect("send");
@@ -319,7 +319,7 @@ async fn attach_all(
     consumer: &Node,
     producer: &Node,
     count: usize,
-) -> Vec<(crate::streaming::StreamSender<u32>, StreamAnchor<u32>)> {
+) -> Vec<(crate::StreamSender<u32>, StreamAnchor<u32>)> {
     let anchors: Vec<StreamAnchor<u32>> = (0..count)
         .map(|_| consumer.velo.create_anchor::<u32>())
         .collect();
@@ -1124,7 +1124,7 @@ async fn a_lane_that_refuses_admission_fails_only_its_own_streams() {
     .await
     .expect("the consumer on the refusing lane must see its stream end");
     assert!(
-        matches!(end, Some(Err(crate::streaming::StreamError::SenderDropped))),
+        matches!(end, Some(Err(crate::StreamError::SenderDropped))),
         "the consumer on the refusing lane must see SenderDropped, got {end:?}"
     );
     assert!(

@@ -4,5 +4,3 @@
 //! Shared utility functions for transport implementations.
 
 pub mod interfaces;
-
-pub use interfaces::*;
