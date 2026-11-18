@@ -349,11 +349,11 @@ async fn stream_round(
             let mut seen = 0u64;
             while let Some(frame) = anchor.next().await {
                 match frame? {
-                    velo::streaming::StreamFrame::Item(item) => {
+                    velo::StreamFrame::Item(item) => {
                         anyhow::ensure!(item.len() == item_bytes, "item of {} bytes", item.len());
                         seen += 1;
                     }
-                    velo::streaming::StreamFrame::Finalized => break,
+                    velo::StreamFrame::Finalized => break,
                     other => anyhow::bail!("unexpected frame: {other:?}"),
                 }
             }
@@ -683,7 +683,7 @@ async fn serve(transport_type: TransportType, done_tx: flume::Sender<()>) -> Res
 
 /// Attach to the client's anchor and send it `items` items.
 async fn stream_items(velo: &Velo, request: StreamRequest) -> Result<()> {
-    let handle = velo::streaming::StreamAnchorHandle::from_u128(request.handle);
+    let handle = velo::StreamAnchorHandle::from_u128(request.handle);
     let sender = velo.attach_anchor::<Bytes>(handle).await?;
     let item = Bytes::from(vec![0u8; request.item_bytes]);
     for _ in 0..request.items {

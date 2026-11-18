@@ -34,9 +34,10 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use prometheus::Registry;
+use velo::StreamFrame;
 use velo::observability::VeloMetrics;
 use velo::observability::test_helpers::MetricSnapshot;
-use velo::streaming::{MuxConfig, StreamFrame};
+use velo::streaming::MuxConfig;
 use velo::transports::tcp::TcpTransportBuilder;
 use velo::{StreamConfig, TcpConfig, Velo};
 
@@ -97,10 +98,7 @@ async fn make_pair() -> (Velo, Velo, Registry) {
 }
 
 /// Drain an anchor until `Finalized`, returning the items in arrival order.
-async fn collect_items(
-    anchor: &mut velo::streaming::StreamAnchor<u32>,
-    expected: usize,
-) -> Vec<u32> {
+async fn collect_items(anchor: &mut velo::StreamAnchor<u32>, expected: usize) -> Vec<u32> {
     let mut items = Vec::with_capacity(expected);
     let drain = async {
         while let Some(frame) = anchor.next().await {

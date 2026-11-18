@@ -14,7 +14,7 @@ instead of it.
 
 **When.** Over the messenger mux, for an item larger than the eager budget:
 the smaller of the transport's frame limit and the stager's threshold
-(`RendezvousStager::with_threshold`, 256 KiB by default), less the message
+(`Velo::staging_threshold()`, 256 KiB), less the message
 envelope.
 
 **Why.** Such an item leaves the producer as a handle. Its bytes stay staged
@@ -49,32 +49,6 @@ still queued.
 shutdown that follows `Sent`.
 
 **Lifted by.** Not scheduled.
-
-## A hand-built `AnchorManager` reports a per-stream `Sent` at enqueue
-
-**What happens.** Over the per-stream TCP and gRPC transports of this crate,
-`Sent` means that the stream's pump wrote the terminal (TCP) or that the
-server took the whole stream (gRPC), but only when the `Velo` builder
-installed the transport. An `AnchorManager` built by hand, with
-`AnchorManagerBuilder` or `AnchorManager::new`, reports `Sent` as the
-terminal enters the egress channel, while the pump still has to write it.
-The same holds for a frame transport from outside velo.
-
-**When.** A producer that builds its `AnchorManager` itself, whether or not
-its node calls `stream_config` or `stream_bind_addr`, and a `FrameTransport`
-implementation from another crate. The `Velo` builder installs the retiring
-transports only for the per-stream transport it builds after one of those
-two calls.
-
-**Why.** `FrameTransport` is published in `velo-ext`, so the retirement does
-not go through it. The `Velo` builder names the in-crate transports to the
-anchor manager by key; nothing else can.
-
-**Workaround.** Build the node with `Velo::builder()`.
-
-**Lifted by.** [#142](https://github.com/ai-dynamo/velo/issues/142): a
-defaulted method on `FrameTransport` at the next `velo-ext` release, which
-also deletes the second map.
 
 ## Per-stream TCP cannot see a consumer that dropped its anchor
 

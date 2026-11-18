@@ -55,7 +55,10 @@ use bytes::Bytes;
 use prometheus::Registry;
 use velo::observability::VeloMetrics;
 use velo::rendezvous::RdmaTestHook;
-use velo::rendezvous::protocol::AcquireResponse;
+use velo::rendezvous::rdma::{
+    Deregistered, RdmaConfig, RdmaError, RdmaPoolConfig, RdmaRendezvousConfig,
+};
+use velo::test_helpers::AcquireResponse;
 use velo::transports::ucx::UcxTransportBuilder;
 use velo::*;
 
@@ -305,15 +308,13 @@ where
     panic!("{what} never became true; observed: {}", describe());
 }
 
-/// Whether the owner has freed a slot. Local, so it reflects the owner's own
-/// state rather than a round trip that might race with it.
-/// Arm a fault hook on `velo`'s rendezvous manager. The hook is test-only
-/// and has no `Velo` form.
-#[allow(deprecated)]
+/// Arm a fault hook on `velo`'s rendezvous manager. The hook is test-only.
 fn arm_rdma_hook(velo: &Velo, hook: RdmaTestHook) {
-    velo.rendezvous_manager().arm_rdma_hook(hook);
+    velo.arm_rdma_hook(hook);
 }
 
+/// Whether the owner has freed a slot. Local, so it reflects the owner's own
+/// state rather than a round trip that might race with it.
 async fn slot_is_gone(node: &Node, handle: DataHandle) -> bool {
     node.velo.metadata(handle).await.is_err()
 }

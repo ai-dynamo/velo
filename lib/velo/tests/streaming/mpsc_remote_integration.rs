@@ -17,12 +17,12 @@ mod common;
 use std::time::Duration;
 
 use futures::StreamExt;
-use velo::streaming::control::StreamCancelHandle;
-use velo::streaming::mpsc::{
+use velo::streaming::{MpscAnchorConfig, MpscFrame, SenderId};
+use velo::test_helpers::{
     MpscAnchorAttachRequest, MpscAnchorAttachResponse, MpscAnchorCancelRequest,
-    MpscAnchorDetachRequest,
+    MpscAnchorDetachRequest, StreamCancelHandle,
 };
-use velo::streaming::{AttachError, MpscAnchorConfig, MpscFrame, SenderId, StreamAnchorHandle};
+use velo::{AttachError, StreamAnchorHandle};
 use velo_ext::WorkerId;
 
 fn roundtrip_handle(handle: StreamAnchorHandle) -> StreamAnchorHandle {
@@ -654,7 +654,7 @@ async fn test_mpsc_controller_cancel_propagates_cross_worker() {
     // The remote sender's cancellation token should be set by now.
     let result = sender.send(2).await;
     assert!(
-        matches!(result, Err(velo::streaming::SendError::ChannelClosed)),
+        matches!(result, Err(velo::SendError::ChannelClosed)),
         "remote sender must see ChannelClosed after cancel, got {result:?}"
     );
 

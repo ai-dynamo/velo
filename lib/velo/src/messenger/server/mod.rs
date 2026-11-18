@@ -956,8 +956,7 @@ mod tests {
             .unwrap();
         messenger
             .register_handler(
-                crate::messenger::Handler::unary_handler("ping", |ctx| Ok(Some(ctx.payload)))
-                    .build(),
+                crate::Handler::unary_handler("ping", |ctx| Ok(Some(ctx.payload))).build(),
             )
             .unwrap();
         messenger.register_peer(messenger.peer_info()).unwrap();

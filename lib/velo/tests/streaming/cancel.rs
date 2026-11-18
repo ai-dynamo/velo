@@ -12,7 +12,8 @@ mod common;
 
 use std::time::Duration;
 
-use velo::streaming::{AnchorConfig, AttachError};
+use velo::AttachError;
+use velo::streaming::AnchorConfig;
 
 // ---------------------------------------------------------------------------
 // TEST-CANCEL-01: Drop StreamAnchor with attached sender — token fires, send() fails
@@ -56,7 +57,7 @@ async fn test_cancel_01_drop_with_sender() {
     // send() must return Err(ChannelClosed)
     let result = sender.send(42u32).await;
     assert!(
-        matches!(result, Err(velo::streaming::SendError::ChannelClosed)),
+        matches!(result, Err(velo::SendError::ChannelClosed)),
         "send() must return ChannelClosed after anchor dropped, got {:?}",
         result
     );
@@ -107,7 +108,7 @@ async fn test_cancel_02_controller_cancel() {
     // send() must return Err
     let result = sender.send(42u32).await;
     assert!(
-        matches!(result, Err(velo::streaming::SendError::ChannelClosed)),
+        matches!(result, Err(velo::SendError::ChannelClosed)),
         "send() must return ChannelClosed after controller cancel, got {:?}",
         result
     );
@@ -145,7 +146,7 @@ async fn test_cancel_04_drop_no_sender() {
 // TCP helpers + TEST-CANCEL-03 (remote two-worker cancel)
 // ---------------------------------------------------------------------------
 
-use velo::streaming::control::StreamCancelRequest;
+use velo::test_helpers::StreamCancelRequest;
 
 /// TEST-CANCEL-03: Remote cross-worker cancel via _stream_cancel AM over TCP.
 ///
@@ -225,9 +226,10 @@ async fn test_cancel_03_remote_cancel() {
 // test asks for an idle producer, which only the second path cannot serve.
 
 use futures::StreamExt;
+use velo::StreamOpenTicket;
 use velo::Velo;
-use velo::streaming::control::StreamOpenTicket;
-use velo::streaming::{MuxConfig, StreamAnchorHandle, StreamFrame};
+use velo::streaming::MuxConfig;
+use velo::{StreamAnchorHandle, StreamFrame};
 
 /// Long enough to absorb a loaded machine, short enough that a hang fails the
 /// test rather than the runner.
@@ -334,7 +336,7 @@ async fn cancel_with_a_record_in_flight_already_errors() {
 }
 
 /// Behavioural. Under zero-RTT setup there is no attach, so the anchor never
-/// learns a [`velo::streaming::control::StreamCancelHandle`] and cannot cancel
+/// learns a stream cancel handle and cannot cancel
 /// its producer directly. The producer is idle, so the ingress fault that rides
 /// on the next arriving record cannot reach it either. The close the dying
 /// pre-bind posts is the only thing left, and this is the test of it.

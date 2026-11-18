@@ -12,13 +12,13 @@
 #![deny(missing_docs)]
 
 // Core types
-mod event;
-mod manager;
+pub(crate) mod event;
+pub(crate) mod manager;
 
 // Public types
-pub mod factory;
-mod handle;
-mod status;
+mod factory;
+pub(crate) mod handle;
+pub(crate) mod status;
 
 // Core event storage engine
 mod base;
@@ -29,12 +29,13 @@ pub(crate) mod slot;
 // ── Re-exports ───────────────────────────────────────────────────────
 
 pub(crate) use base::EventSystemBase;
-pub use event::{Event, EventBackend};
+// Their public path is the crate root (`velo::Event`, ...).
+pub(crate) use event::{Event, EventBackend};
 pub use factory::DistributedEventFactory;
-pub use handle::EventHandle;
-pub use manager::EventManager;
-pub use slot::EventAwaiter;
-pub use status::{EventPoison, EventStatus};
+pub(crate) use handle::EventHandle;
+pub(crate) use manager::EventManager;
+pub(crate) use slot::EventAwaiter;
+pub(crate) use status::{EventPoison, EventStatus};
 
 #[cfg(test)]
 mod tests {
@@ -262,7 +263,7 @@ mod tests {
 
     #[tokio::test]
     async fn distributed_factory_stamps_system_id() -> Result<()> {
-        use crate::events::factory::DistributedEventFactory;
+        use crate::events::DistributedEventFactory;
 
         let factory = DistributedEventFactory::new(0x42.try_into().unwrap());
         assert_eq!(factory.system_id(), 0x42);

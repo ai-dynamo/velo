@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
-use velo::streaming::{StreamController, StreamFrame};
+use velo::{StreamController, StreamFrame};
 
 async fn make_manager() -> Arc<velo::Velo> {
     Arc::new(common::local_node().await)
@@ -200,7 +200,7 @@ async fn test_e03_rapid_create_destroy_anchors() {
 /// The consumer must receive all 500 items followed by Err(SenderDropped).
 #[tokio::test(flavor = "multi_thread")]
 async fn test_e04_sender_panic_drop() {
-    use velo::streaming::StreamError;
+    use velo::StreamError;
 
     let mgr = make_manager().await;
     let mut anchor = mgr.create_anchor::<u32>();

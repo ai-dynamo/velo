@@ -146,7 +146,7 @@ async fn an_mpsc_detach_reaches_a_draining_consumer() {
     let handle = transfer(anchor.handle());
     consumer.velo.begin_drain();
 
-    let request = velo::streaming::mpsc::MpscAnchorDetachRequest {
+    let request = velo::test_helpers::MpscAnchorDetachRequest {
         handle,
         sender_id: 1,
     };

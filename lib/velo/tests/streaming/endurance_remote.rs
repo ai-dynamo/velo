@@ -35,7 +35,7 @@ mod common;
 use std::time::Duration;
 
 use futures::StreamExt;
-use velo::streaming::StreamFrame;
+use velo::StreamFrame;
 
 // ---------------------------------------------------------------------------
 // Two-node fixture
