@@ -233,7 +233,7 @@ The additions this work made to `velo-ext` were shaped to last. `Transport::max_
 
 The cost of having no such seam is bounded. The per-stream transports get no multiplexing, and nothing else breaks. A receiver offers `messenger-mux-v2` only when the mux is installed and enabled, so a deployment without the mux degrades correctly.
 
-Methods that the mux needs outside the trait (`advertised_limits`, `connect_negotiated`, `take_drain_signal`, `prebind`, `release_bind`, `close_claimed_slot`) are inherent on the concrete `MessengerMuxTransport`. `AnchorManager` already holds the concrete type, so none of them needs a trait change.
+Methods that the mux needs outside the trait (`advertised_limits`, `connect_negotiated`, `bind_on_lane`, `release_bind`, `cancel_claimed_session`) are inherent on the concrete `MessengerMuxTransport`. `AnchorManager` already holds the concrete type, so none of them needs a trait change.
 
 ## Failures and their mechanisms
 

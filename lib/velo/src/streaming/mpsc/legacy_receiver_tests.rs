@@ -142,7 +142,7 @@ async fn legacy_mpsc_receiver(answers_with: &str) -> LegacyReceiver {
             async move {
                 let (_, local_id) = ctx.input.handle.unpack();
                 let routing_session_id = 1;
-                let rx = stream.bind(local_id, routing_session_id).await?;
+                let rx = stream.bind(local_id, routing_session_id).await?.rx;
                 tokio::spawn(async move {
                     while let Ok(bytes) = rx.recv_async().await {
                         if frame_tx.send_async(bytes).await.is_err() {

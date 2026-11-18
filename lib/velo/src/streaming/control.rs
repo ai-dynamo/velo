@@ -439,7 +439,13 @@ pub(crate) fn anchor_attach_handler(manager: Weak<AnchorManager>) -> crate::Hand
                     Ok(selection) => selection.bind(local_id, routing_session_id).await,
                     Err(error) => Err(error),
                 };
-                let (receiver, terms) = match bound {
+                let (
+                    crate::streaming::transport::Bound {
+                        rx: receiver,
+                        drain,
+                    },
+                    terms,
+                ) = match bound {
                     Ok(bound) => bound,
                     Err(e) => {
                         manager.record_streaming_operation(
@@ -543,31 +549,28 @@ pub(crate) fn anchor_attach_handler(manager: Weak<AnchorManager>) -> crate::Hand
                                 );
                             }
 
-                            // Start the stream's consumer side. Only the mux
-                            // parks a drain signal, and only for the pair it
-                            // just bound: a mux bind's consumer reads the slot
-                            // buffer itself (see `control::feed`), and its feed
-                            // is installed before the shard lock drops, so a
-                            // retire or a removal cannot land in between. Every
-                            // other transport gets a reader pump.
+                            // Start the stream's consumer side. Only a mux
+                            // bind has a drain signal: its consumer reads the
+                            // slot buffer itself (see `control::feed`), and its
+                            // feed is installed before the shard lock drops, so
+                            // a retire or a removal cannot land in between.
+                            // Every other transport gets a reader pump.
                             let (_, local_id) = req.handle.unpack();
-                            let direct = manager
-                                .take_mux_drain_signal(local_id, routing_session_id)
-                                .map(|drain| {
-                                    install_direct_feed(
-                                        entry,
-                                        DirectFeed {
-                                            rx: receiver.clone(),
-                                            drain,
-                                            pump_token: pump_cancel.clone(),
-                                            release: manager.mux_handle().map(|mux| SlotRelease {
-                                                mux,
-                                                anchor_id: local_id,
-                                                session_id: routing_session_id,
-                                            }),
-                                        },
-                                    )
-                                });
+                            let direct = drain.map(|drain| {
+                                install_direct_feed(
+                                    entry,
+                                    DirectFeed {
+                                        rx: receiver.clone(),
+                                        drain,
+                                        pump_token: pump_cancel.clone(),
+                                        release: manager.mux_handle().map(|mux| SlotRelease {
+                                            mux,
+                                            anchor_id: local_id,
+                                            session_id: routing_session_id,
+                                        }),
+                                    },
+                                )
+                            });
 
                             // Drop shard lock before spawning
                             drop(occ);

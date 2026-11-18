@@ -387,7 +387,13 @@ pub(crate) fn mpsc_anchor_attach_handler(manager: Weak<AnchorManager>) -> crate:
                     Ok(selection) => selection.bind(local_id, routing_session_id).await,
                     Err(error) => Err(error),
                 };
-                let (transport_rx, terms) = match bound {
+                let (
+                    crate::streaming::transport::Bound {
+                        rx: transport_rx,
+                        drain,
+                    },
+                    terms,
+                ) = match bound {
                     Ok(bound) => bound,
                     Err(e) => {
                         manager.record_streaming_operation(
@@ -468,7 +474,6 @@ pub(crate) fn mpsc_anchor_attach_handler(manager: Weak<AnchorManager>) -> crate:
 
                 // Spawn the per-sender pump outside the shard lock.
                 let pump_registry = manager.mpsc_registry.clone();
-                let drain = manager.take_mux_drain_signal(local_id, routing_session_id);
                 let release = drain.as_ref().and(manager.mux_handle()).map(|mux| {
                     crate::streaming::control::SlotRelease {
                         mux,

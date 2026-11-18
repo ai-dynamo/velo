@@ -135,7 +135,7 @@ use crate::messenger::Messenger;
 use crate::messenger::large_payload::RefusedPayload;
 use crate::observability::{MuxMetricsHandle, VeloMetrics};
 use crate::streaming::deadline::DeadlineQueue;
-use crate::streaming::transport::{Connected, FrameTransport};
+use crate::streaming::transport::{Bound, Connected, FrameTransport};
 use crate::{Context, Handler};
 
 pub use self::config::{AutoFlush, FlushPolicy, MuxConfig};
@@ -280,16 +280,6 @@ struct MuxCore {
     /// [`ingress::DrainSignal`].
     drain_tx: flume::Sender<PeerLane>,
     drain_rx: flume::Receiver<PeerLane>,
-    /// Drain signals waiting to be collected by the attach that will start the
-    /// feed and watchdog (or MPSC pump) holding them.
-    ///
-    /// `bind` cannot hand this back directly — `FrameTransport::bind` returns a
-    /// receiver and nothing else, and the per-stream transports that share the
-    /// trait have no drain signal to return. So the signal is
-    /// parked here for the attach path to take, which it does a few lines after
-    /// `bind` returns. Take-once: whoever collects it owns it, and the bind
-    /// expiry that already exists drops any that was never collected.
-    drains: DashMap<(u64, u64), Arc<ingress::DrainSignal>>,
     /// One expiry entry per bind. Renewal moves the deadline stored with the
     /// bind, not this entry; when the entry comes due, the sweep reads the
     /// stored deadline and queues the entry again if it moved. A bind claimed
@@ -340,23 +330,6 @@ impl MessengerMuxTransport {
                 cancel: false,
             }],
         );
-    }
-
-    /// Take the [`ingress::DrainSignal`] `bind` parked for this pair.
-    ///
-    /// Called once by the attach path, between `bind` returning and the
-    /// consumer side being started. Returns `None` for a pair this transport did not bind,
-    /// which is the honest answer for the legacy per-stream transports — they
-    /// have no mux credit to return.
-    pub(crate) fn take_drain_signal(
-        &self,
-        anchor_id: u64,
-        session_id: u64,
-    ) -> Option<Arc<ingress::DrainSignal>> {
-        self.core
-            .drains
-            .remove(&(anchor_id, session_id))
-            .map(|(_, signal)| signal)
     }
 
     /// Build a mux over `messenger` and register its batch handlers, one per
@@ -417,7 +390,6 @@ impl MessengerMuxTransport {
             tasks,
             drain_tx,
             drain_rx,
-            drains: DashMap::new(),
             bind_deadlines: DeadlineQueue::new(BIND_RECHECK, BIND_RECHECK),
             accept_window,
             #[cfg(test)]
@@ -696,8 +668,6 @@ impl MuxCore {
             for (_, (anchor_id, session_id)) in due {
                 if let Some(deadline) = self.ingress.expire_due(anchor_id, session_id, now) {
                     renewed.push((deadline, (anchor_id, session_id)));
-                } else {
-                    self.drains.remove(&(anchor_id, session_id));
                 }
             }
             // One lock for every requeue: binds take this lock too.
@@ -767,25 +737,28 @@ fn open_bind(
     anchor_id: u64,
     session_id: u64,
     lane: LaneReservation,
-) -> Result<flume::Receiver<Vec<u8>>> {
+) -> Result<(flume::Receiver<Vec<u8>>, Arc<ingress::DrainSignal>)> {
     anyhow::ensure!(!core.tasks.is_stopped(), "messenger mux shut down");
     // `C + 1`: `C` data credits plus the one reserved terminal credit.
     // Credit is issued against *this* buffer and never against the
     // anchor's `frame_tx`, which has writers other than the mux.
     let (frame_tx, frame_rx) = flume::bounded::<Vec<u8>>(core.limits.slot_buffer_depth());
     let drain = Arc::new(ingress::DrainSignal::new(core.drain_tx.clone()));
-    core.drains
-        .insert((anchor_id, session_id), Arc::clone(&drain));
     // The deadline that counts is stored with the bind, and renewal moves it.
     // The queue entry below only says when to look again, at most
     // `BIND_RECHECK` ahead.
     let expires = crate::streaming::deadline::deadline_after(core.accept_window);
-    core.ingress
-        .register_bind(anchor_id, session_id, frame_tx, drain, lane, expires);
+    core.ingress.register_bind(
+        anchor_id,
+        session_id,
+        frame_tx,
+        Arc::clone(&drain),
+        lane,
+        expires,
+    );
 
     // Close the race with shutdown between the initial check and registration.
     if core.tasks.is_stopped() {
-        core.drains.remove(&(anchor_id, session_id));
         core.ingress.expire_bind(anchor_id, session_id);
         return Err(anyhow!("messenger mux shut down"));
     }
@@ -795,7 +768,7 @@ fn open_bind(
     // handle would, for the full window after the last owner dropped it.
     core.bind_deadlines.push(expires, (anchor_id, session_id));
 
-    Ok(frame_rx)
+    Ok((frame_rx, drain))
 }
 
 impl FrameTransport for MessengerMuxTransport {
@@ -810,16 +783,18 @@ impl FrameTransport for MessengerMuxTransport {
         WorkerAddress::empty()
     }
 
-    fn bind(
-        &self,
-        anchor_id: u64,
-        session_id: u64,
-    ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>> {
+    fn bind(&self, anchor_id: u64, session_id: u64) -> BoxFuture<'_, Result<Bound>> {
         let core = Arc::clone(&self.core);
         // Lane 0, as `connect` below: the bare trait names no peer and carries
         // no lane to the sender. Counted, so the next choice sees it.
         let lane = core.lane_load.reserve_on(None, LaneIndex::ZERO);
-        Box::pin(async move { open_bind(&core, anchor_id, session_id, lane) })
+        Box::pin(async move {
+            let (rx, drain) = open_bind(&core, anchor_id, session_id, lane)?;
+            Ok(Bound {
+                rx,
+                drain: Some(drain),
+            })
+        })
     }
 
     /// Opens a slot at *this node's* limits.
@@ -875,17 +850,16 @@ impl MessengerMuxTransport {
         anchor_id: u64,
         session_id: u64,
         lane: LaneReservation,
-    ) -> Result<flume::Receiver<Vec<u8>>> {
-        let receiver = open_bind(&self.core, anchor_id, session_id, lane)?;
+    ) -> Result<(flume::Receiver<Vec<u8>>, Arc<ingress::DrainSignal>)> {
+        let bound = open_bind(&self.core, anchor_id, session_id, lane)?;
         #[cfg(test)]
         if let Some(hook) = self.core.bind_hook.get() {
             hook(anchor_id);
         }
-        Ok(receiver)
+        Ok(bound)
     }
 
-    /// Give back a bind nobody claimed, along with the drain signal parked with
-    /// it.
+    /// Give back a bind nobody claimed.
     ///
     /// The accept window does the same thing when it expires, and stays as the
     /// backstop. This is for the owner that already knows: a pre-bound anchor
@@ -896,7 +870,6 @@ impl MessengerMuxTransport {
     /// Idempotent: a bind already claimed or already released is not there to
     /// remove, and removing nothing is the right answer for both.
     pub(crate) fn release_bind(&self, anchor_id: u64, session_id: u64) {
-        self.core.drains.remove(&(anchor_id, session_id));
         self.core.ingress.expire_bind(anchor_id, session_id);
     }
 
@@ -935,12 +908,6 @@ impl MessengerMuxTransport {
     #[cfg(test)]
     pub(crate) fn pending_binds(&self) -> usize {
         self.core.ingress.bind_count()
-    }
-
-    /// Drain signals a bind parked and no attach has collected.
-    #[cfg(test)]
-    pub(crate) fn parked_drains(&self) -> usize {
-        self.core.drains.len()
     }
 
     /// Live receive-side slots for one (peer, lane).

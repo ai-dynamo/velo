@@ -1595,21 +1595,20 @@ impl AnchorManager {
         // own pre-binds. Chosen before the bind so the bind is counted on it.
         let lane = mux.choose_lane(None, lane_key);
         let lane_index = lane.lane();
-        // The bind fails once the mux is stopped. Its drain signal is missing
-        // only when mux shutdown cleared it after the bind, which is the same
-        // case, a moment later.
+        // The bind fails once the mux is stopped. Mux shutdown can also land
+        // just after the bind: it drops the bind's sending half, which leaves
+        // the receiver disconnected. That is the same case, a moment later.
         let bound = mux
             .bind_on_lane(local_id, routing_session_id, lane)
             .ok()
-            .and_then(
-                |receiver| match mux.take_drain_signal(local_id, routing_session_id) {
-                    Some(drain) => Some((receiver, drain)),
-                    None => {
-                        mux.release_bind(local_id, routing_session_id);
-                        None
-                    }
-                },
-            );
+            .and_then(|(receiver, drain)| {
+                if receiver.is_disconnected() {
+                    mux.release_bind(local_id, routing_session_id);
+                    None
+                } else {
+                    Some((receiver, drain))
+                }
+            });
         let Some((receiver, drain)) = bound else {
             tracing::debug!(%handle, "prebind_anchor: the mux is shut down; no ticket minted");
             self.record_streaming_operation(
@@ -1871,20 +1870,6 @@ impl AnchorManager {
         &self,
     ) -> Option<std::sync::Weak<crate::streaming::messenger_mux::MessengerMuxTransport>> {
         self.mux.get().map(Arc::downgrade)
-    }
-
-    /// Take the drain signal the mux parked for a bind, if the mux made it.
-    ///
-    /// `None` for the legacy per-stream transports, which is the honest answer:
-    /// they issue no credit over that seam, so there is nothing to return.
-    pub(crate) fn take_mux_drain_signal(
-        &self,
-        anchor_id: u64,
-        session_id: u64,
-    ) -> Option<Arc<crate::streaming::messenger_mux::ingress::DrainSignal>> {
-        self.mux
-            .get()
-            .and_then(|mux| mux.take_drain_signal(anchor_id, session_id))
     }
 
     /// Write what the mux's batchers have staged, if a mux is installed.
@@ -3026,8 +3011,12 @@ mod tests {
             &self,
             _anchor_id: u64,
             _session_id: u64,
-        ) -> BoxFuture<'_, AnyhowResult<flume::Receiver<Vec<u8>>>> {
-            Box::pin(async { Ok(flume::bounded::<Vec<u8>>(256).1) })
+        ) -> BoxFuture<'_, AnyhowResult<crate::streaming::transport::Bound>> {
+            Box::pin(async {
+                Ok(crate::streaming::transport::Bound::uncredited(
+                    flume::bounded::<Vec<u8>>(256).1,
+                ))
+            })
         }
 
         fn connect(
@@ -4730,8 +4719,12 @@ mod tests {
             &self,
             _anchor_id: u64,
             _session_id: u64,
-        ) -> BoxFuture<'_, AnyhowResult<flume::Receiver<Vec<u8>>>> {
-            Box::pin(async { Ok(flume::bounded(1).1) })
+        ) -> BoxFuture<'_, AnyhowResult<crate::streaming::transport::Bound>> {
+            Box::pin(async {
+                Ok(crate::streaming::transport::Bound::uncredited(
+                    flume::bounded(1).1,
+                ))
+            })
         }
 
         fn connect(
@@ -5061,8 +5054,12 @@ mod tests {
             &self,
             _anchor_id: u64,
             _session_id: u64,
-        ) -> BoxFuture<'_, AnyhowResult<flume::Receiver<Vec<u8>>>> {
-            Box::pin(async { Ok(flume::bounded::<Vec<u8>>(256).1) })
+        ) -> BoxFuture<'_, AnyhowResult<crate::streaming::transport::Bound>> {
+            Box::pin(async {
+                Ok(crate::streaming::transport::Bound::uncredited(
+                    flume::bounded::<Vec<u8>>(256).1,
+                ))
+            })
         }
 
         fn connect(

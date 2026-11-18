@@ -61,7 +61,7 @@ use velo_ext::{PeerInfo, TransportKey, WorkerAddress, WorkerId};
 use crate::streaming::control::RetireGuard;
 use crate::streaming::sender::RetiresOn;
 use crate::streaming::sender::is_terminal_sentinel;
-use crate::streaming::transport::{Connected, FrameTransport};
+use crate::streaming::transport::{Bound, Connected, FrameTransport};
 
 /// Maximum time a registered (anchor, session) slot may sit unused before its
 /// slot is freed. After expiry, an arriving connection with that handshake is
@@ -663,11 +663,7 @@ impl FrameTransport for TcpFrameTransport {
         self.peers.remove(&instance_id.worker_id());
     }
 
-    fn bind(
-        &self,
-        anchor_id: u64,
-        session_id: u64,
-    ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>> {
+    fn bind(&self, anchor_id: u64, session_id: u64) -> BoxFuture<'_, Result<Bound>> {
         let registry = self.registry.clone();
         Box::pin(async move {
             if self.tasks.is_stopped() {
@@ -692,7 +688,7 @@ impl FrameTransport for TcpFrameTransport {
                 return Err(anyhow!("TCP streaming transport shut down"));
             }
 
-            Ok(frame_rx)
+            Ok(Bound::uncredited(frame_rx))
         })
     }
 
@@ -735,7 +731,7 @@ mod tests {
             .await
             .unwrap();
         let addr = server.bound_addr();
-        let pending = server.bind(1, 1).await.unwrap();
+        let pending = server.bind(1, 1).await.unwrap().rx;
         let mut idle = TcpStream::connect(addr).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), server.shutdown())
             .await
@@ -764,7 +760,7 @@ mod tests {
         let _ = client_worker; // currently unused on this side
 
         // Server binds, client connects.
-        let rx = server.bind(42, 7).await.unwrap();
+        let rx = server.bind(42, 7).await.unwrap().rx;
         let tx = client.connect(server_worker, 42, 7, None).await.unwrap().tx;
 
         let frame_bytes =
@@ -804,14 +800,14 @@ mod tests {
         assert!(format!("{err}").contains("not registered"), "{err}");
 
         client.register(&server_peer).unwrap();
-        let _rx = server.bind(1, 1).await.unwrap();
+        let _rx = server.bind(1, 1).await.unwrap().rx;
         client.connect(server_worker, 1, 1, None).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn unknown_session_is_rejected() {
         let transport = TcpFrameTransport::default_bound().await.unwrap();
-        let rx = transport.bind(1, 1).await.unwrap();
+        let rx = transport.bind(1, 1).await.unwrap().rx;
 
         // Connect manually with a wrong session_id handshake.
         let addr = transport.bound_addr();
@@ -835,7 +831,7 @@ mod tests {
         let (server_worker, server_peer) = fresh_peer(server.address());
         client.register(&server_peer).unwrap();
 
-        let rx = server.bind(1, 1).await.unwrap();
+        let rx = server.bind(1, 1).await.unwrap().rx;
         let tx = client.connect(server_worker, 1, 1, None).await.unwrap().tx;
         let frame = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::<String>::Item(
             "data".to_string(),
@@ -868,7 +864,7 @@ mod tests {
         let (server_worker, server_peer) = fresh_peer(server.address());
         client.register(&server_peer).unwrap();
 
-        let rx = server.bind(1, 1).await.unwrap();
+        let rx = server.bind(1, 1).await.unwrap().rx;
         let tx = client.connect(server_worker, 1, 1, None).await.unwrap().tx;
 
         let finalized =
@@ -908,7 +904,7 @@ mod tests {
             let server = server.clone();
             let client = client.clone();
             handles.push(tokio::spawn(async move {
-                let rx = server.bind(i, 0).await.unwrap();
+                let rx = server.bind(i, 0).await.unwrap().rx;
                 let tx = client.connect(server_worker, i, 0, None).await.unwrap().tx;
                 let payload =
                     rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::<u64>::Item(i))

@@ -27,7 +27,10 @@ use anyhow::Result;
 use futures::future::BoxFuture;
 use velo_ext::{InstanceId, PeerInfo, TransportKey, WorkerAddress, WorkerId};
 
+use std::sync::Arc;
+
 use crate::streaming::control::SenderClosed;
+use crate::streaming::messenger_mux::ingress::DrainSignal;
 use crate::streaming::sender::RetiresOn;
 
 /// A transport that carries one stream's frames in order.
@@ -73,12 +76,9 @@ pub(crate) trait FrameTransport: Send + Sync {
     /// Bind the receive end of one attachment of `anchor_id`. `session_id`
     /// tells successive attachments of one anchor apart, so a stale frame
     /// from an earlier session is never delivered. Returns the receiver of
-    /// the attachment's frames.
-    fn bind(
-        &self,
-        anchor_id: u64,
-        session_id: u64,
-    ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>>;
+    /// the attachment's frames, and the drain signal of a transport that
+    /// issues credit.
+    fn bind(&self, anchor_id: u64, session_id: u64) -> BoxFuture<'_, Result<Bound>>;
 
     /// Connect the send end to `peer`'s bound `anchor_id` and `session_id`,
     /// at the address [`register`](Self::register) cached for `peer`.
@@ -93,6 +93,23 @@ pub(crate) trait FrameTransport: Send + Sync {
         session_id: u64,
         retire: Option<SenderClosed>,
     ) -> BoxFuture<'_, Result<Connected>>;
+}
+
+/// What [`FrameTransport::bind`] hands back.
+pub(crate) struct Bound {
+    /// The attachment's frames.
+    pub(crate) rx: flume::Receiver<Vec<u8>>,
+    /// What the consumer tells for each record it takes out of `rx`, so the
+    /// mux returns the sender's credit. `None` for a per-stream transport,
+    /// which issues no credit.
+    pub(crate) drain: Option<Arc<DrainSignal>>,
+}
+
+impl Bound {
+    /// A receiver whose transport issues no credit.
+    pub(crate) fn uncredited(rx: flume::Receiver<Vec<u8>>) -> Self {
+        Self { rx, drain: None }
+    }
 }
 
 /// What [`FrameTransport::connect`] hands back: the stream's egress channel,

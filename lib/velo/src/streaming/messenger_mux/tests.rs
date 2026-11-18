@@ -150,8 +150,8 @@ async fn recv(rx: &flume::Receiver<Vec<u8>>) -> Vec<u8> {
 
 /// One bound slot's consumer side, standing in for a mux-fed `StreamAnchor`.
 ///
-/// The attach path installs a direct feed holding both the receiver `bind`
-/// returned and the drain signal the mux parked for that pair, and the consumer
+/// The attach path installs a direct feed holding both the receiver and the
+/// drain signal that `bind` returned for that pair, and the consumer
 /// counts every record it takes out on that signal. Credit is returned against
 /// that count, so a test taking records straight from the receiver would look
 /// to the ledger like a stream whose consumer was gone — and the first thing that reaches is
@@ -177,11 +177,14 @@ impl BoundSlot {
 
 /// `bind` on `mux`, with the drain signal the attach path would hand the feed.
 async fn bind_slot(mux: &MessengerMuxTransport, anchor_id: u64, session_id: u64) -> BoundSlot {
-    let rx = mux.bind(anchor_id, session_id).await.expect("bind");
-    let drain = mux
-        .take_drain_signal(anchor_id, session_id)
-        .expect("bind parks a drain signal for the attach path to take");
-    BoundSlot { rx, drain }
+    let bound = mux.bind(anchor_id, session_id).await.expect("bind");
+    let drain = bound
+        .drain
+        .expect("a mux bind hands back a drain signal for the attach path");
+    BoundSlot {
+        rx: bound.rx,
+        drain,
+    }
 }
 
 /// A staged item can finish resolving after its batcher's epoch ends.
@@ -527,7 +530,7 @@ fn aborting_a_retiring_batchers_final_flush_stops_the_mux() {
         .unwrap();
         let hooks = Arc::new(TestHooks::default());
         assert!(mux.core.hooks.set(hooks.clone()).is_ok());
-        let receiver = mux.bind(1, 1).await.unwrap();
+        let receiver = mux.bind(1, 1).await.unwrap().rx;
         let key = lane0(peer.worker_id());
         let batcher = mux.core.batcher(key).unwrap();
         let slot = protocol::SlotId::from_raw(7);
@@ -588,7 +591,7 @@ async fn a_batcher_dropped_by_stop_sending_leaves_slots_to_shutdown() {
     .unwrap();
     let hooks = Arc::new(TestHooks::default());
     assert!(mux.core.hooks.set(hooks.clone()).is_ok());
-    let receiver = mux.bind(1, 1).await.unwrap();
+    let receiver = mux.bind(1, 1).await.unwrap().rx;
     let batcher = mux.core.batcher(lane0(peer.worker_id())).unwrap();
 
     hooks.pause();
@@ -1360,7 +1363,7 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
     )
     .expect("producer mux");
 
-    let rx = consumer.bind(1, 1).await.expect("bind");
+    let rx = consumer.bind(1, 1).await.expect("bind").rx;
     let tx = producer
         .connect(consumer_messenger.instance_id().worker_id(), 1, 1, None)
         .await
@@ -1858,12 +1861,6 @@ async fn unclaimed_bind_is_reclaimed_on_anchor_death_without_the_timer() {
         .expect("a mux is installed, so a ticket is minted");
     assert!(ticket.routing_session_id > 0);
     assert_eq!(mux.pending_binds(), 1, "the pre-bind registered a bind");
-    assert_eq!(
-        mux.parked_drains(),
-        0,
-        "`prebind_anchor` collected the drain signal inline, before spawning the watchdog, so no \
-         later attach can find one parked here"
-    );
 
     drop(anchor);
 
@@ -1872,7 +1869,6 @@ async fn unclaimed_bind_is_reclaimed_on_anchor_death_without_the_timer() {
         0,
         "the anchor died unclaimed, so its bind must be gone with it"
     );
-    assert_eq!(mux.parked_drains(), 0);
     assert_eq!(
         mux.live_ingress_slots(lane0(messenger.instance_id().worker_id())),
         0
@@ -1895,7 +1891,7 @@ async fn close_claimed_slot_is_idempotent() {
     pair.consumer
         .close_claimed_slot(lane0(pair.producer_worker), protocol::SlotId::from_raw(0));
 
-    let rx = pair.consumer.bind(1, 1).await.expect("bind");
+    let rx = pair.consumer.bind(1, 1).await.expect("bind").rx;
     let tx = pair
         .producer
         .connect(pair.consumer_worker, 1, 1, None)
@@ -2105,7 +2101,7 @@ async fn a_close_refused_by_a_retired_batcher_reaches_the_producer_through_its_r
 async fn close_claimed_slot_off_runtime_closes_through_the_mux_runtime() {
     let pair = mux_pair(test_config()).await;
 
-    let rx = pair.consumer.bind(1, 1).await.expect("bind");
+    let rx = pair.consumer.bind(1, 1).await.expect("bind").rx;
     let tx = pair
         .producer
         .connect(pair.consumer_worker, 1, 1, None)

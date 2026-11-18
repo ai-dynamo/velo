@@ -189,8 +189,12 @@ mod tests {
             &self,
             _anchor_id: u64,
             _session_id: u64,
-        ) -> BoxFuture<'_, anyhow::Result<flume::Receiver<Vec<u8>>>> {
-            Box::pin(async { Ok(flume::bounded::<Vec<u8>>(1).1) })
+        ) -> BoxFuture<'_, anyhow::Result<crate::streaming::transport::Bound>> {
+            Box::pin(async {
+                Ok(crate::streaming::transport::Bound::uncredited(
+                    flume::bounded::<Vec<u8>>(1).1,
+                ))
+            })
         }
 
         fn connect(
