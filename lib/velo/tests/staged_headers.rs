@@ -25,8 +25,9 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use futures::future::BoxFuture;
+use velo::Transport;
 use velo::transports::{
-    HealthCheckError, MessageType, SendOutcome, Transport, TransportAdapter, TransportError,
+    HealthCheckError, MessageType, SendOutcome, TransportAdapter, TransportError,
     TransportErrorHandler,
 };
 use velo::*;

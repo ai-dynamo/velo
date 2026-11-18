@@ -291,8 +291,29 @@ jobs:
       with:
         bucket: ${{ secrets.SCCACHE_S3_BUCKET }}
     - name: Install cargo-llvm-cov if missing
+      # A prebuilt, statically linked release, pinned by version and SHA-256.
+      # Building it with `cargo install` took about a minute on every run, and
+      # the runner often killed the pod mid-build (exit 137). The old check
+      # also never matched: the binary answers `--version` only as the cargo
+      # subcommand, so it rebuilt even when the tool was there.
       run: |
-        cargo-llvm-cov --version 2>/dev/null | grep -qF '0.8.5' || cargo install cargo-llvm-cov@0.8.5 --locked
+        set -eu
+        if cargo llvm-cov --version 2>/dev/null | grep -qF '0.8.5'; then exit 0; fi
+        case "$(uname -m)" in
+          aarch64) asset=cargo-llvm-cov-aarch64-unknown-linux-musl.tar.gz
+                   sha256=bc14a4551e633b12ec89bb15469e6099b4ddc998a5d1bcad0fd95320b148a40f ;;
+          x86_64)  asset=cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz
+                   sha256=e9fc23dbbdc502ee9267544f8c6e8e162c6d7df8fb2e3f62d8289a4c0bd240ce ;;
+          *) echo "no pinned cargo-llvm-cov for $(uname -m)" >&2; exit 1 ;;
+        esac
+        tmp="$(mktemp -d)"
+        curl -sSfL --retry 3 -o "$tmp/$asset" "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.8.5/$asset"
+        echo "$sha256  $tmp/$asset" | sha256sum -c -
+        bin="${CARGO_HOME:-$HOME/.cargo}/bin"
+        mkdir -p "$bin"
+        tar -xzf "$tmp/$asset" -C "$bin" cargo-llvm-cov
+        rm -rf "$tmp"
+        cargo llvm-cov --version
     - name: Add llvm-tools component
       run: rustup component list --installed | grep -q '^llvm-tools' || rustup component add llvm-tools-preview
     - name: Generate coverage

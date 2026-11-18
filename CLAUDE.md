@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Two crates only, plus the documented exceptions below:
 
 - **`lib/velo`** — the runtime. All concrete transport / discovery / streaming / messenger / queue / rendezvous / observability code lives here as modules (`velo::transports::tcp`, `velo::discovery::etcd`, `velo::streaming`, etc.). This is what application authors depend on.
-- **`lib/velo-ext`** — the extension trait surface. Out-of-tree implementors of `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, or `TransportObservability` depend only on this crate. It must remain small, free of heavy deps (especially `prometheus`), and stable.
+- **`lib/velo-ext`** — the extension trait surface. Out-of-tree implementors of `Transport`, `PeerDiscovery`, `ServiceDiscovery`, or `TransportObservability` depend only on this crate. It must remain small, free of heavy deps (especially `prometheus`), and stable.
 
 One documented exception: **`crates/ucx-rs`** — Rust bindings + a vendored static
 build of UCX, backing the `ucx` transport feature. It is a leaf FFI crate that
@@ -18,7 +18,7 @@ to crates.io before a `velo` release that enables the `ucx` feature can ship.
 A second documented exception: **`lib/velo-hub`** — a crate for building a hub, one service that is the peer discovery for a velo application and hosts pluggable extensions. Unlike `ucx-rs` it *does* share types with `velo` (its API names `Velo`, `PeerInfo`, and axum `Router`), so moving it to another velo minor is a breaking change cargo-semver-checks cannot see. These rules make that safe:
 
 1. `lib/velo-hub/Cargo.toml` uses `version.workspace = true` and `velo = { workspace = true }`, so a velo minor bump is always a velo-hub minor bump.
-2. `[workspace.dependencies]` requires velo with a **caret** on the workspace version (`velo = { path = "lib/velo", version = "0.22.1", ... }`), not `=`. Pre-1.0 a caret on `0.Y.Z` never admits a second minor; `=` would only stop a velo patch reaching velo-hub users. `scripts/check-semver.sh` fails if the requirement's major.minor differs from `[workspace.package] version`, even under `semver:skip`.
+2. `[workspace.dependencies]` requires velo with a **caret** on the workspace version (`velo = { path = "lib/velo", version = "0.23.0", ... }`), not `=`. Pre-1.0 a caret on `0.Y.Z` never admits a second minor; `=` would only stop a velo patch reaching velo-hub users. `scripts/check-semver.sh` fails if the requirement's major.minor differs from `[workspace.package] version`, even under `semver:skip`.
 3. velo and velo-hub publish together, from one commit.
 4. velo-hub re-exports what its API exposes (`velo_hub::velo`, `velo_hub::axum`, `velo_hub::protocol`); downstream hub crates use those re-exports and depend on `velo-hub` with a caret.
 
@@ -27,7 +27,7 @@ velo-hub carries `publish = false` until a real port (kvbm's indexer and p2p as 
 A third documented exception: **`lib/velo-hub-ext`** — the wire protocol of velo-hub, on `velo-ext` alone. It is for crates that speak the hub's wire protocol without the velo runtime. It depends on `velo-ext`, `serde`, `serde_json`, `uuid`, and `http`, and never on `velo`; CI fails if `cargo tree -p velo-hub-ext` shows `velo` or `prometheus`. It shares types with velo-hub, so the same four rules apply:
 
 1. `lib/velo-hub-ext/Cargo.toml` uses `version.workspace = true`, so a velo minor bump is always a velo-hub-ext minor bump.
-2. `[workspace.dependencies]` requires it with a **caret** on the workspace version (`velo-hub-ext = { path = "lib/velo-hub-ext", version = "0.22.1" }`), not `=`. `scripts/check-semver.sh` fails if the requirement's major.minor differs from `[workspace.package] version`, even under `semver:skip`.
+2. `[workspace.dependencies]` requires it with a **caret** on the workspace version (`velo-hub-ext = { path = "lib/velo-hub-ext", version = "0.23.0" }`), not `=`. `scripts/check-semver.sh` fails if the requirement's major.minor differs from `[workspace.package] version`, even under `semver:skip`.
 3. velo, velo-hub, and velo-hub-ext publish together, from one commit.
 4. velo-hub re-exports it as `velo_hub::protocol`; downstream hub crates use that re-export.
 
@@ -82,7 +82,7 @@ The bug class that motivated the workspace collapse: a 0.1.1 "patch" of an inter
 1. **Only `velo` and `velo-ext` are publishable** (plus `ucx-rs` and, once its publish gate clears, `velo-hub` and `velo-hub-ext` — the documented exceptions above). Any new crate added to the workspace must have `publish = false` in its `Cargo.toml` unless there is a deliberate, documented reason to publish it. Adding a third publishable crate reopens the bug class.
 2. **`velo-ext` is `=`-pinned in `[workspace.dependencies]`.** The line is:
    ```toml
-   velo-ext = { path = "lib/velo-ext", version = "=0.5.6" }
+   velo-ext = { path = "lib/velo-ext", version = "=0.6.0" }
    ```
    The `=` is load-bearing. Caret (the cargo default) lets a future "compatible" patch silently re-resolve downstream lockfiles. Do not relax this to a caret requirement.
 3. **When `velo-ext` moves past its latest published version, `velo` must carry a bump over its own latest published version too.** The `=` pin in `[workspace.dependencies]` must track `velo-ext`'s version; cargo fails to resolve the workspace otherwise.
@@ -93,12 +93,13 @@ The bug class that motivated the workspace collapse: a 0.1.1 "patch" of an inter
 
 ### What lives in `velo-ext` (and why it must stay small)
 
-- Trait definitions: `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`
+- Trait definitions: `Transport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`
 - Value/error types referenced by those traits: `WorkerId`, `InstanceId`, `PeerInfo`, `WorkerAddress`, `TransportKey`, `MessageType`, `TransportError`, `HealthCheckError`, `SendOutcome`, `SendAdmission`, `AdmissionError`, `AdmissionState`, `ShutdownState`, `Direction`, `TransportRejection`, `DrainExemption`, etc.
 - Channel plumbing types used in trait signatures: `TransportAdapter`, `DataStreams`, `make_channels`, `AdmissionGate`
 
 What does **not** live in `velo-ext`:
 
+- The frame transport trait of the per-stream transports. It is crate-private in `velo` (`streaming::transport`): stream transports are in-tree only, and a new transport implements `Transport`, whose streams ride the mux
 - Concrete impls (TCP/NATS/gRPC/etc. transports, etcd/filesystem/NATS discovery)
 - `prometheus`, `tonic`, `axum`, or any heavyweight dep
 - The `Messenger`, `Velo`, `AnchorManager`, `RendezvousManager` runtime types
@@ -129,7 +130,7 @@ The acceptance test for the boundary: `cargo tree -p velo-ext | grep -c promethe
 
 `nats-transport`, `nats-discovery`, and `nats-queue` select separate code paths that share `async-nats`. They do not enable each other. The discovery and queue features enable `services`; the transport feature does not.
 
-Core builds retain discovery traits, direct peer registration, metrics, ACK/NACK messages, all streaming APIs, and full rendezvous. The `ucx` feature keeps its messaging and RDMA APIs without `services`. Use `VeloBuilder::mux_only()` to omit the extra stream listener at runtime; this adds no compile-time feature. See `docs/src/guides/migrate-services.md`.
+Core builds retain discovery traits, direct peer registration, metrics, ACK/NACK messages, all streaming APIs, and full rendezvous. The `ucx` feature keeps its messaging and RDMA APIs without `services`. A `Velo` opens a per-stream listener only when the builder calls `stream_config` or `stream_bind_addr`; otherwise the messenger mux is its only stream transport, and turning the mux off fails `build`. `VeloBuilder::mux_only()` makes the mux-only choice explicit. None of this is a compile-time feature. See `docs/src/guides/migrate-services.md`.
 
 ## Transport layer
 
@@ -158,7 +159,7 @@ External authors depend only on `velo-ext` and implement `Transport` against it.
 
 ```toml
 [dependencies]
-velo-ext = "0.5"  # exact pin tracked by velo's workspace
+velo-ext = "0.6"  # exact pin tracked by velo's workspace
 ```
 
 ## Code Style

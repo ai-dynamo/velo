@@ -1038,6 +1038,7 @@ impl UcxTransportBuilder {
     /// `UCX_PROTO_EMULATION_ENABLE=y` instead. The environment always wins, as
     /// for every other `UCX_*` setting velo has a default for.
     #[cfg(any(test, feature = "test-helpers"))]
+    #[doc(hidden)]
     pub fn allow_software_rma(mut self, allow: bool) -> Self {
         self.software_rma = allow;
         self
