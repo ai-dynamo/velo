@@ -40,8 +40,13 @@ impl crate::streaming::transport::FrameTransport for MockFrameTransport {
         _peer: velo_ext::WorkerId,
         _anchor_id: u64,
         _session_id: u64,
-    ) -> BoxFuture<'_, AnyhowResult<flume::Sender<Vec<u8>>>> {
-        Box::pin(async { Ok(flume::bounded::<Vec<u8>>(256).0) })
+        _retire: Option<crate::streaming::control::SenderClosed>,
+    ) -> BoxFuture<'_, AnyhowResult<crate::streaming::transport::Connected>> {
+        Box::pin(async {
+            Ok(crate::streaming::transport::Connected::queued(
+                flume::bounded::<Vec<u8>>(256).0,
+            ))
+        })
     }
 }
 

@@ -669,21 +669,6 @@ impl VeloBuilder {
                 .build()
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
         );
-        // The per-stream transport of this crate reports a stream's
-        // retirement from its pump; the registry's public type cannot say so.
-        if let Some(owned) = &owned_stream_transport {
-            let retiring: Arc<dyn crate::streaming::transport::RetiringFrameTransport> = match owned
-            {
-                OwnedStreamTransport::Tcp(tcp) => Arc::clone(tcp) as _,
-                #[cfg(feature = "grpc")]
-                OwnedStreamTransport::Grpc(grpc) => Arc::clone(grpc) as _,
-            };
-            anchor_manager.install_retiring_transports(std::collections::HashMap::from([(
-                stream_transport.key().as_str().to_string(),
-                retiring,
-            )]));
-        }
-
         if let Some(mux) = mux {
             anchor_manager.install_mux(mux)?;
         }

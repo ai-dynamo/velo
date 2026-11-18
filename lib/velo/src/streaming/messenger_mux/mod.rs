@@ -135,7 +135,7 @@ use crate::messenger::Messenger;
 use crate::messenger::large_payload::RefusedPayload;
 use crate::observability::{MuxMetricsHandle, VeloMetrics};
 use crate::streaming::deadline::DeadlineQueue;
-use crate::streaming::transport::FrameTransport;
+use crate::streaming::transport::{Connected, FrameTransport};
 use crate::{Context, Handler};
 
 pub use self::config::{AutoFlush, FlushPolicy, MuxConfig};
@@ -831,16 +831,23 @@ impl FrameTransport for MessengerMuxTransport {
     /// usable through the bare [`FrameTransport`] trait — a mux wired in
     /// directly, with no anchor manager between the two ends, has no attach
     /// response to learn a window from.
+    ///
+    /// The slot reports no retirement here: that takes the sender's whole
+    /// [`SenderEntry`](crate::streaming::control::SenderEntry), which only the
+    /// attach path has. So `retire` is unused, and the sender reports `Sent`
+    /// as the terminal enters the channel.
     fn connect(
         &self,
         peer: WorkerId,
         anchor_id: u64,
         session_id: u64,
-    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
+        _retire: Option<crate::streaming::control::SenderClosed>,
+    ) -> BoxFuture<'_, Result<Connected>> {
         let limits = self.core.limits;
         // Lane 0: the bare trait has no attach response to carry a lane.
         let key = PeerLane::new(peer, LaneIndex::ZERO);
-        self.connect_negotiated(key, anchor_id, session_id, limits)
+        let connect = self.connect_negotiated(key, anchor_id, session_id, limits);
+        Box::pin(async move { connect.await.map(Connected::queued) })
     }
 }
 

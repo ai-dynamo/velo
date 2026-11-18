@@ -466,9 +466,10 @@ fn runtime_shutdown_cancels_a_mux_with_live_batchers() {
         let receiver = pair.bind(1, 1).await;
         let sender = pair
             .producer
-            .connect(pair.consumer_worker, 1, 1)
+            .connect(pair.consumer_worker, 1, 1, None)
             .await
-            .unwrap();
+            .unwrap()
+            .tx;
         (pair, receiver, sender)
     });
     runtime.shutdown_timeout(Duration::from_secs(5));
@@ -677,8 +678,9 @@ fn a_secondary_runtime_does_not_own_the_mux_batchers() {
     let pair = owner.block_on(mux_pair(test_config()));
     let receiver = owner.block_on(pair.bind(1, 1));
     let sender = caller
-        .block_on(pair.producer.connect(pair.consumer_worker, 1, 1))
-        .unwrap();
+        .block_on(pair.producer.connect(pair.consumer_worker, 1, 1, None))
+        .unwrap()
+        .tx;
     caller.shutdown_timeout(Duration::from_secs(1));
     owner.block_on(async {
         assert!(!pair.producer.core.tasks.is_stopped());
@@ -834,9 +836,10 @@ async fn a_stream_round_trips_and_ends_on_its_terminal() {
     let rx = pair.bind(1, 1).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 1, 1)
+        .connect(pair.consumer_worker, 1, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
 
     for n in 0..8u32 {
         tx.send_async(item(n)).await.expect("send item");
@@ -870,9 +873,10 @@ async fn credit_returns_let_a_producer_outrun_its_window() {
     let rx = pair.bind(2, 2).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 2, 2)
+        .connect(pair.consumer_worker, 2, 2, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
 
     const FRAMES: u32 = 200;
     let producer = tokio::spawn(async move {
@@ -900,14 +904,16 @@ async fn concurrent_sessions_on_one_anchor_stay_separate() {
     let rx_b = pair.bind(5, 2).await;
     let tx_a = pair
         .producer
-        .connect(pair.consumer_worker, 5, 1)
+        .connect(pair.consumer_worker, 5, 1, None)
         .await
-        .expect("connect a");
+        .expect("connect a")
+        .tx;
     let tx_b = pair
         .producer
-        .connect(pair.consumer_worker, 5, 2)
+        .connect(pair.consumer_worker, 5, 2, None)
         .await
-        .expect("connect b");
+        .expect("connect b")
+        .tx;
 
     for n in 0..16u32 {
         tx_a.send_async(item(n)).await.expect("send a");
@@ -928,14 +934,16 @@ async fn a_session_nobody_bound_is_rejected_without_disturbing_a_live_one() {
     let rx = pair.bind(9, 1).await;
     let live = pair
         .producer
-        .connect(pair.consumer_worker, 9, 1)
+        .connect(pair.consumer_worker, 9, 1, None)
         .await
-        .expect("connect live");
+        .expect("connect live")
+        .tx;
     let orphan = pair
         .producer
-        .connect(pair.consumer_worker, 9, 999)
+        .connect(pair.consumer_worker, 9, 999, None)
         .await
-        .expect("connect orphan");
+        .expect("connect orphan")
+        .tx;
 
     // The reverse race: the receiver replies `CloseSlot{UnknownSlot}` and the
     // sender's channel closes. The peer itself is never failed.
@@ -953,9 +961,10 @@ async fn dropping_a_producer_without_a_terminal_injects_dropped() {
     let rx = pair.bind(11, 1).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 11, 1)
+        .connect(pair.consumer_worker, 11, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
 
     tx.send_async(item(1)).await.expect("send item");
     assert_eq!(rx.recv().await, item(1));
@@ -979,9 +988,10 @@ async fn live_slots_returns_to_zero_when_the_producers_go_away() {
         receivers.push(pair.bind(20, session).await);
         senders.push(
             pair.producer
-                .connect(pair.consumer_worker, 20, session)
+                .connect(pair.consumer_worker, 20, session, None)
                 .await
-                .expect("connect"),
+                .expect("connect")
+                .tx,
         );
     }
     for tx in &senders {
@@ -1016,9 +1026,10 @@ async fn dropping_the_transports_tears_every_slot_down_promptly() {
         receivers.push(pair.bind(30, session).await);
         senders.push(
             pair.producer
-                .connect(pair.consumer_worker, 30, session)
+                .connect(pair.consumer_worker, 30, session, None)
                 .await
-                .expect("connect"),
+                .expect("connect")
+                .tx,
         );
     }
     // One bind with no `connect` behind it, so an accept window really is open.
@@ -1232,7 +1243,13 @@ async fn one_flush_reaches_every_peer_batcher() {
         for slot in 0..SLOTS_PER_PEER {
             let id = (peer as u64 + 1) * 100 + slot;
             receivers.push(bind_slot(&mux, id, id).await);
-            senders.push(producer.connect(worker, id, id).await.expect("connect"));
+            senders.push(
+                producer
+                    .connect(worker, id, id, None)
+                    .await
+                    .expect("connect")
+                    .tx,
+            );
         }
         consumer_muxes.push(mux);
     }
@@ -1345,9 +1362,10 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
 
     let rx = consumer.bind(1, 1).await.expect("bind");
     let tx = producer
-        .connect(consumer_messenger.instance_id().worker_id(), 1, 1)
+        .connect(consumer_messenger.instance_id().worker_id(), 1, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
 
     let snapshot = || MetricSnapshot::from_registry(&consumer_reg);
     let waits = || {
@@ -1880,9 +1898,10 @@ async fn close_claimed_slot_is_idempotent() {
     let rx = pair.consumer.bind(1, 1).await.expect("bind");
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 1, 1)
+        .connect(pair.consumer_worker, 1, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     tx.send_async(item(0)).await.expect("send item");
     assert_eq!(recv(&rx).await, item(0));
 
@@ -1939,9 +1958,10 @@ async fn a_close_posted_past_the_batchers_last_drain_still_reaches_the_producer(
     let _rx = pair.bind(1, 1).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 1, 1)
+        .connect(pair.consumer_worker, 1, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     eventually(|| {
         pair.consumer
             .live_ingress_slots(lane0(pair.producer_worker))
@@ -2014,9 +2034,10 @@ async fn a_close_refused_by_a_retired_batcher_reaches_the_producer_through_its_r
     let _rx = pair.bind(1, 1).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 1, 1)
+        .connect(pair.consumer_worker, 1, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     eventually(|| {
         pair.consumer
             .live_ingress_slots(lane0(pair.producer_worker))
@@ -2087,9 +2108,10 @@ async fn close_claimed_slot_off_runtime_closes_through_the_mux_runtime() {
     let rx = pair.consumer.bind(1, 1).await.expect("bind");
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 1, 1)
+        .connect(pair.consumer_worker, 1, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     tx.send_async(item(0)).await.expect("send item");
     assert_eq!(recv(&rx).await, item(0));
 
@@ -2410,9 +2432,15 @@ async fn a_prebound_slot_opens_on_the_terms_its_ticket_quotes() {
 
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
+        .connect(
+            pair.consumer_worker,
+            local_id,
+            ticket.routing_session_id,
+            None,
+        )
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     tx.send_async(item(0)).await.expect("send item");
     eventually(|| {
         pair.consumer
@@ -2544,9 +2572,15 @@ async fn a_consumer_that_never_polls_holds_its_sender_to_the_window() {
     let ticket = manager.prebind_anchor(anchor.handle()).expect("ticket");
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
+        .connect(
+            pair.consumer_worker,
+            local_id,
+            ticket.routing_session_id,
+            None,
+        )
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     let producer = tokio::spawn(async move {
         for n in 0..SENT {
             tx.send_async(item(n)).await.expect("send item");
@@ -2676,9 +2710,10 @@ async fn watched_anchor<T: serde::de::DeserializeOwned>(
         watched_anchor_unconnected::<T>(config, heartbeat, adopt).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, local_id, session_id)
+        .connect(pair.consumer_worker, local_id, session_id, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     (pair, manager, anchor, local_id, tx)
 }
 
@@ -2727,9 +2762,10 @@ async fn the_watchdog_does_not_fire_while_its_sender_is_parked() {
         .store(true, std::sync::atomic::Ordering::Release);
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, local_id, session_id)
+        .connect(pair.consumer_worker, local_id, session_id, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     for n in 0..CREDIT {
         tx.send_async(item(n)).await.expect("send item");
     }
@@ -2975,9 +3011,10 @@ async fn a_watchdog_firing_closes_its_slot() {
         watched_anchor_unconnected::<u32>(test_config(), heartbeat, true).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, local_id, session_id)
+        .connect(pair.consumer_worker, local_id, session_id, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     for n in 0..3 {
         // Fails only once the watchdog has ended the stream.
         if tx.send_async(item(n)).await.is_err() {
@@ -3129,9 +3166,15 @@ async fn a_reattach_over_the_mux_does_not_overtake_the_detached_tail() {
     let ticket = manager.prebind_anchor(anchor.handle()).expect("ticket");
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
+        .connect(
+            pair.consumer_worker,
+            local_id,
+            ticket.routing_session_id,
+            None,
+        )
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     tx.send_async(item(100)).await.expect("send");
     eventually(|| {
         pair.consumer
@@ -3557,9 +3600,10 @@ async fn serve_one_stream_then_idle(pair: &Pair) {
     let rx = pair.bind(1, 1).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 1, 1)
+        .connect(pair.consumer_worker, 1, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     for n in 0..8u32 {
         tx.send_async(item(n)).await.expect("send item");
     }
@@ -3695,9 +3739,10 @@ async fn a_busy_tick_returns_credit_no_doorbell_asked_for() {
     let rx = pair.bind(3, 3).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 3, 3)
+        .connect(pair.consumer_worker, 3, 3, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     let producer = tokio::spawn(async move {
         for n in 0..2 * WINDOW {
             tx.send_async(item(n)).await.expect("send item");
@@ -3783,9 +3828,10 @@ async fn a_late_reply_after_the_idle_fixture_is_not_counted_as_idle() {
     let receiver = pair.bind(9, 9).await;
     let sender = pair
         .producer
-        .connect(pair.consumer_worker, 9, 9)
+        .connect(pair.consumer_worker, 9, 9, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     sender.send_async(item(0)).await.expect("send item");
     assert_eq!(receiver.recv().await, item(0));
     hooks.wait_until_parked().await;

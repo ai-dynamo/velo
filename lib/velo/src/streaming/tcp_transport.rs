@@ -59,8 +59,9 @@ use tokio_util::sync::CancellationToken;
 use velo_ext::{PeerInfo, TransportKey, WorkerAddress, WorkerId};
 
 use crate::streaming::control::RetireGuard;
+use crate::streaming::sender::RetiresOn;
 use crate::streaming::sender::is_terminal_sentinel;
-use crate::streaming::transport::{FrameTransport, RetiringFrameTransport};
+use crate::streaming::transport::{Connected, FrameTransport};
 
 /// Maximum time a registered (anchor, session) slot may sit unused before its
 /// slot is freed. After expiry, an arriving connection with that handshake is
@@ -542,8 +543,16 @@ impl TcpFrameTransport {
         peer: WorkerId,
         anchor_id: u64,
         session_id: u64,
-        retire: Option<RetireGuard>,
-    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
+        retire: Option<crate::streaming::control::SenderClosed>,
+    ) -> BoxFuture<'_, Result<Connected>> {
+        // The pump reports the stream's retirement only when it holds the
+        // stream's flag; without one, the sender reports `Sent` as it queues.
+        let retires_on = if retire.is_some() {
+            RetiresOn::Transport
+        } else {
+            RetiresOn::Queue
+        };
+        let retire = retire.map(RetireGuard::new);
         let peers = self.peers.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -596,26 +605,15 @@ impl TcpFrameTransport {
                 return Err(anyhow!("TCP streaming transport shut down"));
             }
 
-            Ok(tx)
+            Ok(Connected {
+                tx,
+                retires_on,
+                // The codec's frame limit. `EgressFrame` carries no header,
+                // so an item at this size is exactly what the codec still
+                // encodes.
+                item_limit: Some(crate::streaming::transport::MAX_ITEM_BYTES),
+            })
         })
-    }
-}
-
-impl RetiringFrameTransport for TcpFrameTransport {
-    fn connect_retiring(
-        &self,
-        peer: WorkerId,
-        anchor_id: u64,
-        session_id: u64,
-        closed: crate::streaming::control::SenderClosed,
-    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
-        self.connect_with(peer, anchor_id, session_id, Some(RetireGuard::new(closed)))
-    }
-
-    /// The codec's frame limit. `EgressFrame` carries no header, so an item
-    /// at this size is exactly what the codec still encodes.
-    fn item_limit(&self) -> Option<usize> {
-        Some(crate::streaming::transport::MAX_ITEM_BYTES)
     }
 }
 
@@ -703,8 +701,9 @@ impl FrameTransport for TcpFrameTransport {
         peer: WorkerId,
         anchor_id: u64,
         session_id: u64,
-    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
-        self.connect_with(peer, anchor_id, session_id, None)
+        retire: Option<crate::streaming::control::SenderClosed>,
+    ) -> BoxFuture<'_, Result<Connected>> {
+        self.connect_with(peer, anchor_id, session_id, retire)
     }
 }
 
@@ -766,7 +765,7 @@ mod tests {
 
         // Server binds, client connects.
         let rx = server.bind(42, 7).await.unwrap();
-        let tx = client.connect(server_worker, 42, 7).await.unwrap();
+        let tx = client.connect(server_worker, 42, 7, None).await.unwrap().tx;
 
         let frame_bytes =
             rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::<u32>::Item(99)).unwrap();
@@ -801,12 +800,12 @@ mod tests {
         let (server_worker, server_peer) = fresh_peer(server.address());
         client.register(&server_peer).unwrap();
         client.unregister(server_peer.instance_id());
-        let err = client.connect(server_worker, 1, 1).await.unwrap_err();
+        let err = client.connect(server_worker, 1, 1, None).await.unwrap_err();
         assert!(format!("{err}").contains("not registered"), "{err}");
 
         client.register(&server_peer).unwrap();
         let _rx = server.bind(1, 1).await.unwrap();
-        client.connect(server_worker, 1, 1).await.unwrap();
+        client.connect(server_worker, 1, 1, None).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -837,7 +836,7 @@ mod tests {
         client.register(&server_peer).unwrap();
 
         let rx = server.bind(1, 1).await.unwrap();
-        let tx = client.connect(server_worker, 1, 1).await.unwrap();
+        let tx = client.connect(server_worker, 1, 1, None).await.unwrap().tx;
         let frame = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::<String>::Item(
             "data".to_string(),
         ))
@@ -870,7 +869,7 @@ mod tests {
         client.register(&server_peer).unwrap();
 
         let rx = server.bind(1, 1).await.unwrap();
-        let tx = client.connect(server_worker, 1, 1).await.unwrap();
+        let tx = client.connect(server_worker, 1, 1, None).await.unwrap().tx;
 
         let finalized =
             rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::<()>::Finalized).unwrap();
@@ -910,7 +909,7 @@ mod tests {
             let client = client.clone();
             handles.push(tokio::spawn(async move {
                 let rx = server.bind(i, 0).await.unwrap();
-                let tx = client.connect(server_worker, i, 0).await.unwrap();
+                let tx = client.connect(server_worker, i, 0, None).await.unwrap().tx;
                 let payload =
                     rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::<u64>::Item(i))
                         .unwrap();
@@ -984,9 +983,10 @@ mod tests {
         client.register(&info).unwrap();
         let closed = crate::streaming::control::SenderClosed::default();
         let tx = client
-            .connect_retiring(peer, 1, 1, closed.clone())
+            .connect(peer, 1, 1, Some(closed.clone()))
             .await
-            .unwrap();
+            .unwrap()
+            .tx;
         for _ in 0..FRAMES {
             tx.send_async(frame.clone()).await.unwrap();
         }
@@ -1014,9 +1014,10 @@ mod tests {
         });
         let closed = crate::streaming::control::SenderClosed::default();
         let tx = client
-            .connect_retiring(peer, 2, 2, closed.clone())
+            .connect(peer, 2, 2, Some(closed.clone()))
             .await
-            .unwrap();
+            .unwrap()
+            .tx;
         for _ in 0..FRAMES {
             tx.send_async(frame.clone()).await.unwrap();
         }

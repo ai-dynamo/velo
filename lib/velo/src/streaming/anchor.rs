@@ -1137,16 +1137,6 @@ pub(crate) struct AnchorManager {
     pub transport_registry:
         Arc<HashMap<String, Arc<dyn crate::streaming::transport::FrameTransport>>>,
 
-    /// The transports of the registry that report a stream's retirement
-    /// themselves, by the same key. Installed once, after the build, by
-    /// [`install_retiring_transports`](Self::install_retiring_transports);
-    /// a key that is not here connects through the registry, and its sender
-    /// reports `Sent` as the terminal enters the channel.
-    #[builder(setter(skip), default)]
-    pub(crate) retiring_transports: std::sync::OnceLock<
-        HashMap<String, Arc<dyn crate::streaming::transport::RetiringFrameTransport>>,
-    >,
-
     /// Default inactivity timeout for newly created SPSC anchors. MPSC
     /// anchors do not inherit it; see [`crate::streaming::mpsc::MpscAnchorConfig`].
     /// The anchor is auto-removed if no sender attaches within this duration:
@@ -1261,14 +1251,6 @@ impl AnchorManagerBuilder {
         }
         Ok(manager)
     }
-}
-
-/// What `AnchorManager::connect_streaming` hands back: the stream's egress
-/// channel, who reports its retirement, and the transport's item limit.
-struct Connected {
-    tx: flume::Sender<Vec<u8>>,
-    retires_on: crate::streaming::sender::RetiresOn,
-    item_limit: Option<usize>,
 }
 
 impl AnchorManager {
@@ -1974,15 +1956,15 @@ impl AnchorManager {
     /// `CreditUpdate` used to cost.
     ///
     /// Also answers who reports the stream's retirement: the mux slot, a
-    /// per-stream transport of this crate once it wrote the terminal, or the
-    /// sender itself as the terminal enters the channel.
+    /// per-stream transport once it wrote the terminal, or the sender itself
+    /// as the terminal enters the channel.
     async fn connect_streaming(
         &self,
         ticket: &crate::streaming::control::StreamOpenTicket,
         peer: velo_ext::WorkerId,
         anchor_id: u64,
         lifecycle: crate::streaming::control::SenderEntry,
-    ) -> Result<Connected, AttachError> {
+    ) -> Result<crate::streaming::transport::Connected, AttachError> {
         use crate::streaming::sender::RetiresOn;
         let key = &ticket.streaming_transport_key;
         let session_id = ticket.routing_session_id;
@@ -2002,49 +1984,20 @@ impl AnchorManager {
                 let tx = mux
                     .connect_controlled(key, anchor_id, session_id, limits, Some(lifecycle))
                     .await?;
-                Ok(Connected {
+                Ok(crate::streaming::transport::Connected {
                     tx,
                     retires_on: RetiresOn::Transport,
                     item_limit: None,
                 })
             }
-            Ok(crate::streaming::negotiation::Connect::Legacy) => {
-                let retiring = self
-                    .retiring_transports
-                    .get()
-                    .and_then(|transports| transports.get(key.as_str()));
-                if let Some(transport) = retiring {
-                    let tx = transport
-                        .connect_retiring(peer, anchor_id, session_id, lifecycle.closed)
-                        .await?;
-                    return Ok(Connected {
-                        tx,
-                        retires_on: RetiresOn::Transport,
-                        item_limit: transport.item_limit(),
-                    });
-                }
-                let transport = self.resolve_transport(key)?;
-                let tx = transport.connect(peer, anchor_id, session_id).await?;
-                Ok(Connected {
-                    tx,
-                    retires_on: RetiresOn::Queue,
-                    item_limit: None,
-                })
-            }
+            Ok(crate::streaming::negotiation::Connect::Legacy) => Ok(self
+                .resolve_transport(key)?
+                .connect(peer, anchor_id, session_id, Some(lifecycle.closed))
+                .await?),
             Err(error) => Err(AttachError::TransportError(anyhow::anyhow!(
                 "peer answered with {key} but {error}"
             ))),
         }
-    }
-
-    /// Name the transports of the registry that report a stream's retirement
-    /// themselves. Once, after the build: the registry's type is public and
-    /// cannot carry them.
-    pub(crate) fn install_retiring_transports(
-        &self,
-        transports: HashMap<String, Arc<dyn crate::streaming::transport::RetiringFrameTransport>>,
-    ) {
-        let _ = self.retiring_transports.set(transports);
     }
 
     /// Resolve a FrameTransport by streaming-transport key.
@@ -2491,7 +2444,7 @@ impl AnchorManager {
 
         // Resolve the local FrameTransport that matches the remote worker's
         // bound streaming transport, then connect by WorkerId.
-        let Connected {
+        let crate::streaming::transport::Connected {
             tx: frame_tx,
             retires_on,
             item_limit,
@@ -2978,7 +2931,7 @@ impl AnchorManager {
                 } else {
                     sender_stream_id
                 };
-                let Connected {
+                let crate::streaming::transport::Connected {
                     tx: frame_tx,
                     retires_on,
                     item_limit,
@@ -3082,8 +3035,13 @@ mod tests {
             _peer: velo_ext::WorkerId,
             _anchor_id: u64,
             _session_id: u64,
-        ) -> BoxFuture<'_, AnyhowResult<flume::Sender<Vec<u8>>>> {
-            Box::pin(async { Ok(flume::bounded::<Vec<u8>>(256).0) })
+            _retire: Option<crate::streaming::control::SenderClosed>,
+        ) -> BoxFuture<'_, AnyhowResult<crate::streaming::transport::Connected>> {
+            Box::pin(async {
+                Ok(crate::streaming::transport::Connected::queued(
+                    flume::bounded::<Vec<u8>>(256).0,
+                ))
+            })
         }
     }
 
@@ -4781,8 +4739,13 @@ mod tests {
             _peer: velo_ext::WorkerId,
             _anchor_id: u64,
             _session_id: u64,
-        ) -> BoxFuture<'_, AnyhowResult<flume::Sender<Vec<u8>>>> {
-            Box::pin(async { Ok(flume::bounded(1).0) })
+            _retire: Option<crate::streaming::control::SenderClosed>,
+        ) -> BoxFuture<'_, AnyhowResult<crate::streaming::transport::Connected>> {
+            Box::pin(async {
+                Ok(crate::streaming::transport::Connected::queued(
+                    flume::bounded(1).0,
+                ))
+            })
         }
     }
 
@@ -5107,8 +5070,13 @@ mod tests {
             _peer: velo_ext::WorkerId,
             _anchor_id: u64,
             _session_id: u64,
-        ) -> BoxFuture<'_, AnyhowResult<flume::Sender<Vec<u8>>>> {
-            Box::pin(async { Ok(flume::bounded::<Vec<u8>>(256).0) })
+            _retire: Option<crate::streaming::control::SenderClosed>,
+        ) -> BoxFuture<'_, AnyhowResult<crate::streaming::transport::Connected>> {
+            Box::pin(async {
+                Ok(crate::streaming::transport::Connected::queued(
+                    flume::bounded::<Vec<u8>>(256).0,
+                ))
+            })
         }
     }
 
@@ -5420,12 +5388,13 @@ mod tests {
         }
     }
 
-    /// An `AnchorManager` built by hand over `TcpFrameTransport` has no one
-    /// to name the transport as one that reports retirement from its pump:
-    /// only the `Velo` builder does that. Its senders report `Sent` as the
-    /// terminal enters the egress channel. Only unit tests build one.
+    /// An `AnchorManager` built by hand over `TcpFrameTransport` retires its
+    /// streams as a `Velo`-built one does: from the transport's pump, once it
+    /// wrote the terminal. The transport's `connect` takes the stream's
+    /// retirement and says it reports it, so nothing has to be installed
+    /// after the build for that. Only unit tests build one by hand.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn a_hand_built_manager_retires_as_the_terminal_is_queued() {
+    async fn a_hand_built_manager_retires_from_the_transport_pump() {
         use crate::streaming::sender::RetiresOn;
         use crate::streaming::tcp_transport::TcpFrameTransport;
         use crate::streaming::transport::FrameTransport;
@@ -5510,7 +5479,7 @@ mod tests {
             sender.negotiated_transport().map(|k| k.as_str()),
             Some("tcp-stream")
         );
-        assert_eq!(sender.retires_on(), RetiresOn::Queue);
+        assert_eq!(sender.retires_on(), RetiresOn::Transport);
         drop(anchor);
     }
 
