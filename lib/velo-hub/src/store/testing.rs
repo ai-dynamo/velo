@@ -81,6 +81,7 @@ pub struct FaultStore {
     resolve_gate: Mutex<Option<Arc<Gate>>>,
     stubborn_liveness: AtomicBool,
     fail_next_remove: AtomicBool,
+    fence_next_remove: AtomicBool,
     fail_next_resolve: AtomicBool,
     continuity: watch::Sender<Continuity>,
 }
@@ -103,6 +104,7 @@ impl FaultStore {
             resolve_gate: Mutex::new(None),
             stubborn_liveness: AtomicBool::new(false),
             fail_next_remove: AtomicBool::new(false),
+            fence_next_remove: AtomicBool::new(false),
             fail_next_resolve: AtomicBool::new(false),
             continuity: watch::Sender::new(Continuity::Live),
         }
@@ -155,6 +157,14 @@ impl FaultStore {
     /// The next remove fails with [`StoreError::Backend`], removing nothing.
     pub fn fail_next_remove(&self) {
         self.fail_next_remove.store(true, Ordering::Release);
+    }
+
+    /// The next remove finds the store fenced, as a remote backend's lock
+    /// compare does when another hub took the store: it reports
+    /// [`Continuity::Fenced`], then fails with [`StoreError::Backend`],
+    /// removing nothing.
+    pub fn fence_next_remove(&self) {
+        self.fence_next_remove.store(true, Ordering::Release);
     }
 
     /// The next resolve fails with [`StoreError::Backend`].
@@ -224,6 +234,14 @@ impl HubStore for FaultStore {
         id: InstanceId,
         incarnation: Incarnation,
     ) -> BoxFuture<'_, Result<(), StoreError>> {
+        if self.fence_next_remove.swap(false, Ordering::AcqRel) {
+            self.continuity.send_replace(Continuity::Fenced);
+            return Box::pin(async {
+                Err(StoreError::Backend(anyhow::anyhow!(
+                    "injected fence: the lock is no longer this hub's"
+                )))
+            });
+        }
         if self.fail_next_remove.swap(false, Ordering::AcqRel) {
             return Box::pin(async {
                 Err(StoreError::Backend(anyhow::anyhow!(

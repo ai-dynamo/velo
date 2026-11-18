@@ -42,6 +42,8 @@ pub mod simulation;
 pub mod test_helpers;
 
 #[cfg(test)]
+mod crash_report_tests;
+#[cfg(test)]
 mod learned_peer_tests;
 #[cfg(test)]
 pub(crate) mod test_alloc;

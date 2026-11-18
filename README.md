@@ -122,6 +122,7 @@ Stream reservations default to 120 seconds before ordinary attachment and 180 se
 ```bash
 cargo build --all-features
 cargo test --all-features --all-targets   # NATS on localhost:4222 and etcd on :2379 for those tests
+cargo test --all-features --doc -p velo -p velo-ext -p velo-hub -p velo-hub-ext   # --all-targets leaves out doctests
 cargo clippy --all-features --no-deps --all-targets -- -D warnings
 cargo fmt --check
 cargo machete

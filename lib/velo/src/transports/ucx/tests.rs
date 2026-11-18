@@ -2292,6 +2292,16 @@ async fn shutdown_resolves_parked_unmap_and_get() {
 /// The transfer keeps running — that is deliberate, and it is what stops UCX
 /// writing into a range the caller has since unmapped. What must still happen is
 /// the decrement, without which the region could never be unmapped at all.
+///
+/// The GET is held in flight with the owner's `progress_hold`: over the tcp
+/// lane a GET needs the owner's progress thread, so it cannot finish until the
+/// hold is released. Timing cannot make this certain. A short timeout around
+/// the GET polls the GET first, so a test thread descheduled just after the
+/// post sees the GET finish and the timeout return its result. A stall forced
+/// after the first poll does that every time.
+///
+/// `live_rkeys`, not `inflight_ops`, shows the GET is posted: only a GET
+/// unpacks an rkey, while `inflight_ops` also counts Active Message sends.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_cancel_still_releases_the_region() {
     const LEN: usize = 32 * 1024 * 1024;
@@ -2299,17 +2309,39 @@ async fn get_cancel_still_releases_the_region() {
     let dst = PageBuf::new(LEN);
     src.fill_pattern();
 
-    let pair = start_rma_pair().await;
+    // Pinned to tcp: the hold below stops a GET only where it needs the
+    // owner's progress thread.
+    let pair = start_rma_pair_with(|b| software_rma(b).tls("tcp")).await;
     let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
     let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+    // Wires up the endpoint, so the held GET below is a transfer waiting on
+    // the owner and not a connection waiting on it.
+    let mut warm_up = get_request(&pair, &src, &remote, &local);
+    warm_up.len = 4096;
+    pair.puller_rma.get(warm_up).await.expect("warm-up get");
 
-    let cancelled = tokio::time::timeout(
-        Duration::from_millis(1),
-        pair.puller_rma
-            .get(get_request(&pair, &src, &remote, &local)),
-    )
-    .await;
-    assert!(cancelled.is_err(), "the GET must be cancelled mid-transfer");
+    let owner = &pair.owner.transport.shared;
+    let puller = &pair.puller.transport.shared;
+    let owner_hold = hold_at(&owner.progress_hold, &owner.progress_held, "the owner").await;
+
+    let endpoint = pair.puller_rma.clone();
+    let req = get_request(&pair, &src, &remote, &local);
+    let get = tokio::spawn(async move { endpoint.get(req).await });
+    assert!(
+        wait_until(T, || puller.live_rkeys.load(Ordering::SeqCst) >= 1).await,
+        "the GET must be posted before it is cancelled"
+    );
+    get.abort();
+    let joined = get.await;
+    assert!(
+        joined.as_ref().is_err_and(|e| e.is_cancelled()),
+        "the GET must be cancelled, not finished: {joined:?}"
+    );
+    assert!(
+        puller.live_rkeys.load(Ordering::SeqCst) >= 1,
+        "the GET must still be in flight after its caller dropped it"
+    );
+    drop(owner_hold);
 
     // Resolves only once the abandoned operation has completed and decremented.
     tokio::time::timeout(T, pair.puller_rma.unmap_region(local.region_id))
@@ -2698,6 +2730,31 @@ async fn settle(node: &Node) {
         wait_until(T, || shared.passes.load(Ordering::Acquire) >= passes + 2).await,
         "the progress thread ran no more passes"
     );
+}
+
+/// Wait until every send `node` posted has completed, and the pass that ran
+/// the completion has ended.
+///
+/// A send's completion is a use of its endpoint, stamped from the reaper
+/// clock when `node`'s progress thread runs it. That can be after the peer
+/// already has the frame: on a new endpoint over the tcp lane the send waits
+/// for wireup, and its completion can run a pass or more after the peer
+/// received it. A test that moves the clock before then has the completion
+/// stamped at the moved time, which makes the endpoint look used later than
+/// the test thinks. The completion lowers `inflight_ops` before it stamps,
+/// so this also waits for two more passes.
+async fn sends_completed(node: &Node) {
+    assert!(
+        wait_until(T, || node
+            .transport
+            .shared
+            .inflight_ops
+            .load(Ordering::Acquire)
+            == 0)
+        .await,
+        "a send never completed"
+    );
+    settle(node).await;
 }
 
 /// Idle reaps of an endpoint whose peer sent a frame within the timeout.
@@ -3155,6 +3212,10 @@ async fn an_endpoint_whose_peer_never_sends_is_reaped_after_the_setup_bound() {
 
     ping_message(&a, &b, &errs).await;
     assert_eq!(eps_open(&a), 1);
+    // B has the frame, but A's send may not have completed yet. A completion
+    // run after the clock moves is stamped at the moved time, and the
+    // endpoint is then not idle for a timeout at the last step below.
+    sends_completed(&a).await;
 
     // Up to the bound, the endpoint is still being set up.
     advance(&a, EP_SETUP_BOUND).await;
@@ -3522,19 +3583,7 @@ async fn a_send_in_flight_keeps_its_endpoint_open() {
         recv_message(&b.streams.message_stream, T).await.is_some(),
         "the frame was lost while its send was in flight"
     );
-    assert!(
-        wait_until(T, || a
-            .transport
-            .shared
-            .inflight_ops
-            .load(Ordering::Acquire)
-            == 0)
-        .await,
-        "A's send never completed"
-    );
-    // The completion callback lowers `inflight_ops` before it stamps the
-    // completion time; let its pass finish before the clock moves.
-    settle(&a).await;
+    sends_completed(&a).await;
     assert_eq!(
         errs.count(),
         0,
