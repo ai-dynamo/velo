@@ -21,10 +21,9 @@ use super::test_support::{lane0, stalled_producer};
 use super::*;
 use crate::observability::test_helpers::MetricSnapshot;
 use crate::streaming::sender::{cached_dropped, cached_finalized};
-use crate::streaming::{
-    AnchorConfig, AnchorManager, AnchorManagerBuilder, StreamAnchorHandle, StreamFrame,
-};
+use crate::streaming::{AnchorConfig, AnchorManager, AnchorManagerBuilder};
 use crate::transports::tcp::TcpTransportBuilder;
+use crate::{StreamAnchorHandle, StreamFrame};
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -58,10 +57,8 @@ async fn messenger_pair() -> (Arc<Messenger>, Arc<Messenger>) {
         .build()
         .await
         .expect("messenger b");
-    a.register_peer_inner(b.peer_info())
-        .expect("register b on a");
-    b.register_peer_inner(a.peer_info())
-        .expect("register a on b");
+    a.register_peer(b.peer_info()).expect("register b on a");
+    b.register_peer(a.peer_info()).expect("register a on b");
     tokio::time::sleep(Duration::from_millis(200)).await;
     (a, b)
 }
@@ -357,7 +354,7 @@ async fn a_payload_refusal_ends_an_anchor_with_a_terminal_in_the_hold() {
     let terminal = tokio::time::timeout(Duration::from_secs(1), anchor.next())
         .await
         .expect("the refused item must end the anchor even when its terminal arrived first");
-    let Some(Err(crate::streaming::StreamError::TransportError(why))) = terminal else {
+    let Some(Err(crate::StreamError::TransportError(why))) = terminal else {
         panic!("expected the size error, got {terminal:?}");
     };
     assert!(why.contains("67108864"), "{why}");
@@ -438,10 +435,7 @@ async fn a_payload_refusal_ends_a_stream_whose_open_is_queued() {
         .await
         .expect("a refusal must survive an OpenSlot already queued on its ordered lane");
     assert!(
-        matches!(
-            terminal,
-            Some(Err(crate::streaming::StreamError::TransportError(_)))
-        ),
+        matches!(terminal, Some(Err(crate::StreamError::TransportError(_)))),
         "expected the size error, got {terminal:?}"
     );
     assert_eq!(node.mux.core.ingress.live_slots(key), 0);
@@ -516,7 +510,7 @@ fn aborting_a_retiring_batchers_final_flush_stops_the_mux() {
             .unwrap();
         let peer = velo_ext::InstanceId::new_v4();
         messenger
-            .register_peer_inner(velo_ext::PeerInfo::new(peer, stalling_address()))
+            .register_peer(velo_ext::PeerInfo::new(peer, stalling_address()))
             .unwrap();
         let mux = MessengerMuxTransport::new(
             messenger,
@@ -582,7 +576,7 @@ async fn a_batcher_dropped_by_stop_sending_leaves_slots_to_shutdown() {
         .unwrap();
     let peer = velo_ext::InstanceId::new_v4();
     messenger
-        .register_peer_inner(velo_ext::PeerInfo::new(peer, stalling_address()))
+        .register_peer(velo_ext::PeerInfo::new(peer, stalling_address()))
         .unwrap();
     let mux = MessengerMuxTransport::new(
         messenger,
@@ -1199,9 +1193,9 @@ async fn one_flush_reaches_every_peer_batcher() {
             .await
             .expect("consumer messenger");
         producer_messenger
-            .register_peer_inner(m.peer_info())
+            .register_peer(m.peer_info())
             .expect("register consumer");
-        m.register_peer_inner(producer_messenger.peer_info())
+        m.register_peer(producer_messenger.peer_info())
             .expect("register producer");
         consumers.push(m);
     }
@@ -1321,10 +1315,10 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
         .await
         .expect("consumer messenger");
     producer_messenger
-        .register_peer_inner(consumer_messenger.peer_info())
+        .register_peer(consumer_messenger.peer_info())
         .expect("register consumer");
     consumer_messenger
-        .register_peer_inner(producer_messenger.peer_info())
+        .register_peer(producer_messenger.peer_info())
         .expect("register producer");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -2294,10 +2288,7 @@ async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window
         .await
         .expect("the watchdog already exited on the accept window; the consumer must not block");
     assert!(
-        matches!(
-            next,
-            Some(Err(crate::streaming::StreamError::SenderDropped))
-        ),
+        matches!(next, Some(Err(crate::StreamError::SenderDropped))),
         "expected SenderDropped, got {next:?}"
     );
 }
@@ -2339,10 +2330,7 @@ async fn an_unclaimed_prebind_closes_at_its_accept_window_and_not_before() {
         .await
         .expect("the bind is closed; the consumer must not block");
     assert!(
-        matches!(
-            next,
-            Some(Err(crate::streaming::StreamError::SenderDropped))
-        ),
+        matches!(next, Some(Err(crate::StreamError::SenderDropped))),
         "expected SenderDropped, got {next:?}"
     );
 }
@@ -2486,7 +2474,7 @@ async fn open_anchor_stream_on_the_minting_worker_fails_fast() {
     .expect_err("a ticket opened on the worker that minted it must be refused");
 
     assert!(
-        matches!(err, crate::streaming::AttachError::TransportError(_)),
+        matches!(err, crate::AttachError::TransportError(_)),
         "expected TransportError naming the misuse, got {err:?}"
     );
     assert!(
@@ -2811,10 +2799,7 @@ async fn a_silent_sender_with_credit_is_reaped_while_records_wait_unread() {
         .await
         .expect("the reaped stream must end, not hang");
     assert!(
-        matches!(
-            next,
-            Some(Err(crate::streaming::StreamError::SenderDropped))
-        ),
+        matches!(next, Some(Err(crate::StreamError::SenderDropped))),
         "expected SenderDropped before any buffered record, got {next:?}"
     );
     drop((anchor, tx));
@@ -2953,7 +2938,7 @@ async fn an_ended_consumer_releases_its_slot_while_the_anchor_is_held() {
     assert!(
         matches!(
             ended,
-            Some(Err(crate::streaming::StreamError::DeserializationError(_)))
+            Some(Err(crate::StreamError::DeserializationError(_)))
         ),
         "expected DeserializationError, got {ended:?}"
     );

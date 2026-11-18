@@ -213,7 +213,7 @@ pub(crate) trait RdmaBackend: Send + Sync {
     ///
     /// The default. A backend that cannot report gives up the check entirely,
     /// and the latch then rests solely on the call-ordering guarantee — that
-    /// `Velo::graceful_shutdown` runs it after transport teardown has joined
+    /// `Velo::shutdown` runs it after transport teardown has joined
     /// the progress thread. That is where the guarantee stood before this
     /// method existed; `None` is not weaker than the status quo ante, but it is
     /// weaker than `Some(0)`.

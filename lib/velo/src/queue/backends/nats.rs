@@ -31,9 +31,9 @@ use futures::StreamExt;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::queue::backend::{ReceiverBackend, SenderBackend, WorkQueueBackend};
-use crate::queue::error::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
-use crate::queue::options::NextOptions;
+use crate::queue::NextOptions;
+use crate::queue::{ReceiverBackend, SenderBackend, WorkQueueBackend};
+use crate::queue::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
 
 /// NATS JetStream work queue backend.
 ///

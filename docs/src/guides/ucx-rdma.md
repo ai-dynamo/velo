@@ -61,7 +61,8 @@ Add UCX with `add_ucx_transport`, not `add_transport`. Only `add_ucx_transport` 
 use std::sync::Arc;
 use velo::transports::tcp::TcpTransportBuilder;
 use velo::transports::ucx::UcxTransportBuilder;
-use velo::{RdmaConfig, Velo};
+use velo::Velo;
+use velo::rendezvous::rdma::RdmaConfig;
 
 let tcp = Arc::new(
     TcpTransportBuilder::new()

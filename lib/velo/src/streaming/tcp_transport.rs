@@ -86,11 +86,11 @@ struct PendingStream {
 
 type SessionRegistry = DashMap<(u64, u64), PendingStream>;
 
-/// TCP-based [`FrameTransport`] backed by a single shared listener.
+/// The per-stream TCP transport, backed by a single shared listener.
 ///
 /// One listener + one accept loop per transport instance, regardless of how
 /// many concurrent streams are active. `bind()` is O(1).
-pub struct TcpFrameTransport {
+pub(crate) struct TcpFrameTransport {
     key: TransportKey,
     bind_addr: SocketAddr,
     local_address: WorkerAddress,
@@ -203,13 +203,15 @@ impl TcpFrameTransport {
     }
 
     /// Convenience: bind on `0.0.0.0:0`.
-    pub async fn default_bound() -> Result<Arc<Self>> {
+    #[cfg(test)]
+    pub(crate) async fn default_bound() -> Result<Arc<Self>> {
         Self::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)).await
     }
 
     /// Returns the actual bound listener address. Useful for tests that need
     /// to dial the listener directly.
-    pub fn bound_addr(&self) -> SocketAddr {
+    #[cfg(test)]
+    pub(crate) fn bound_addr(&self) -> SocketAddr {
         self.bind_addr
     }
 
