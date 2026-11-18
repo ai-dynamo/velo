@@ -298,7 +298,10 @@ jobs:
       # subcommand, so it rebuilt even when the tool was there.
       run: |
         set -eu
-        if cargo llvm-cov --version 2>/dev/null | grep -qF '0.8.5'; then exit 0; fi
+        # Compare the whole version token: a substring match would also take
+        # 0.8.5-dev or 0.8.50 for the pinned release.
+        have="$(cargo llvm-cov --version 2>/dev/null | awk '{print $NF}')"
+        if [ "$have" = 0.8.5 ]; then exit 0; fi
         case "$(uname -m)" in
           aarch64) asset=cargo-llvm-cov-aarch64-unknown-linux-musl.tar.gz
                    sha256=bc14a4551e633b12ec89bb15469e6099b4ddc998a5d1bcad0fd95320b148a40f ;;
