@@ -1087,7 +1087,7 @@ async fn a_delayed_payload_refusal_reply_spares_a_reused_slot() {
         .await;
     let original = old_open.records[0].slot;
     apply(&old_open);
-    let oversized = rmp_serde::to_vec(&crate::streaming::StreamFrame::Item(vec![7u8; 512 * 1024]))
+    let oversized = rmp_serde::to_vec(&crate::StreamFrame::Item(vec![7u8; 512 * 1024]))
         .expect("oversized item");
     old_inlet.send(oversized).expect("queue oversized");
     old_inlet
@@ -1096,7 +1096,7 @@ async fn a_delayed_payload_refusal_reply_spares_a_reused_slot() {
     let unresolved = harness.next_batch().await;
     assert_eq!(unresolved.records.len(), 1);
     apply(&harness.next_batch().await);
-    let error = rmp_serde::to_vec(&crate::streaming::StreamFrame::<()>::TransportError(
+    let error = rmp_serde::to_vec(&crate::StreamFrame::<()>::TransportError(
         "payload over limit".into(),
     ))
     .expect("error frame");
@@ -1141,7 +1141,6 @@ async fn a_delayed_payload_refusal_reply_spares_a_reused_slot() {
     assert_eq!(replacement_rx.try_recv().ok(), Some(item(7)));
 
     // Applied as the producer applies each kind of reply when it arrives.
-    hooks.pause();
     match reply {
         ReplyRecord::CloseSlot { slot, reason } => harness.handle.peer_closed(slot, reason),
         ReplyRecord::LifecycleSlot {
@@ -1151,17 +1150,23 @@ async fn a_delayed_payload_refusal_reply_spares_a_reused_slot() {
         } => harness.handle.peer_stopped(slot, session_id, cancel),
         other => panic!("unexpected refusal reply: {other:?}"),
     }
-    hooks.wait_until_parked().await;
-    assert_eq!(
-        harness.handle.pending_control(),
-        0,
-        "the reply was consumed"
-    );
+    // Wait until the batcher has applied every control entry posted so far.
+    // Do not wait for the run loop's barrier. This reply names the old
+    // session, so the inbox drops it, and the wake it causes finds nothing
+    // to apply and skips the barrier. Only the next probe tick, up to 5 s
+    // later, reaches the barrier then.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !harness.handle.control_settled(&hooks) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the batcher never applied the reply"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
     let live = harness
         .handle
         .live_slots
         .load(std::sync::atomic::Ordering::Relaxed);
-    hooks.release();
     assert_eq!(
         live, 1,
         "the old session's size-refusal reply closed the replacement after slot generation wrap"

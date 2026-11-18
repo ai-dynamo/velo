@@ -17,7 +17,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::super::super::{AutoFlush, FlushPolicy};
-use super::support::{Harness, RECV_TIMEOUT, harness, harness_with_hooks, item};
+use super::support::{
+    Harness, RECV_TIMEOUT, harness, harness_with_clock, harness_with_hooks, item,
+};
 use crate::streaming::messenger_mux::MuxConfig;
 use crate::streaming::messenger_mux::protocol::{
     BATCH_HEADER_LEN, CloseReason, RecordType, SlotId, record_encoded_len,
@@ -221,14 +223,12 @@ async fn a_flush_with_nothing_staged_writes_nothing() {
 /// polish: the peer's sender is parked waiting for this window, and no
 /// application on *this* side knows it owes that peer anything. If credit
 /// could wait for `flush_batch`, a node with a quiet producer would starve a
-/// busy one. Bounded by an explicit short `reply_linger` rather than
-/// `RECV_TIMEOUT`, so this discriminates a held reply from one that moved —
-/// the assertion held at any `reply_linger` under five seconds before
-/// `flush_gate` bounded a reply's window to records joining it either way.
+/// busy one. The window is on a clock the test moves, so the reply is held
+/// until the window ends and goes when it does, however slow the host.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_credit_reply_moves_under_manual() {
     let window = Duration::from_millis(50);
-    let harness = harness(MuxConfig {
+    let (harness, clock) = harness_with_clock(MuxConfig {
         reply_linger: window,
         ..manual()
     })
@@ -241,8 +241,11 @@ async fn a_credit_reply_moves_under_manual() {
             slot: peer_slot,
             delta: 32,
         }]);
+    harness.await_staged(1).await;
+    assert_nothing_written(&harness).await;
 
-    let batch = tokio::time::timeout(window * 4, harness.next_batch())
+    clock.advance(window);
+    let batch = tokio::time::timeout(RECV_TIMEOUT, harness.next_batch())
         .await
         .expect("a credit reply must not wait past its own window");
     assert_eq!(batch.records.len(), 1);
@@ -259,7 +262,9 @@ async fn a_credit_reply_moves_under_manual() {
 /// the reply's window never started and nothing under `Manual` — no policy, no
 /// timer — ever rescued it. `await_staged(1)` is the positive fact that the
 /// data record reached the gate before the reply is sent, which is what makes
-/// this Family A rather than a reply-alone case.
+/// this Family A rather than a reply-alone case. Timed like
+/// `a_credit_reply_moves_under_manual`: the slot's probe wakes the batcher
+/// every 5 s, but under `Manual` a probe writes nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_credit_reply_moves_under_manual_behind_a_staged_record() {
     let window = Duration::from_millis(50);
@@ -281,7 +286,7 @@ async fn a_credit_reply_moves_under_manual_behind_a_staged_record() {
             delta: 32,
         }]);
 
-    let batch = tokio::time::timeout(window * 4, harness.next_batch())
+    let batch = tokio::time::timeout(RECV_TIMEOUT, harness.next_batch())
         .await
         .expect("a reply joining an already-staged batch keeps its own window under Manual");
     let kinds: Vec<RecordType> = batch.records.iter().map(|r| r.kind).collect();
@@ -462,24 +467,27 @@ fn windowed(window: Duration, on_complete: bool, at_bytes: Option<usize>) -> Mux
 /// stream whose first token came less than a window after its open waited
 /// until a window after the open.
 #[tokio::test(flavor = "multi_thread")]
+///
+/// The window is on a clock the test moves. The first batch goes while the
+/// clock stands still, so only "the batch is complete" can have written it.
 async fn on_complete_writes_a_lone_slot_at_once_but_once_per_window() {
     const WINDOW: Duration = Duration::from_secs(1);
-    let harness = harness(windowed(WINDOW, true, None)).await;
+    let (harness, clock) = harness_with_clock(windowed(WINDOW, true, None)).await;
     let (inlet, _) = harness.open_credited(1, 1, CREDIT).await;
 
-    let sent = Instant::now();
     inlet.send(item(0)).expect("stage a record");
     let batch = harness.next_batch().await;
-    assert_eq!(batch.records.len(), 1);
-    assert!(
-        sent.elapsed() < WINDOW / 2,
-        "the only live slot is in the batch, so it goes at once; took {:?}",
-        sent.elapsed()
+    assert_eq!(
+        batch.records.len(),
+        1,
+        "the only live slot is in the batch, so it goes at once"
     );
 
     inlet.send(item(1)).expect("stage a second record");
     harness.await_staged(1).await;
+    clock.advance(WINDOW - Duration::from_millis(1));
     assert_nothing_written(&harness).await;
+    clock.advance(Duration::from_millis(1));
     let batch = harness.next_batch().await;
     assert_eq!(
         batch.records.len(),
@@ -526,13 +534,15 @@ async fn an_empty_kick_does_not_hold_a_lone_record() {
 /// still send, so the batch is not complete. Once both have a record in it, it
 /// goes at once, as one write, without waiting for the window.
 #[tokio::test(flavor = "multi_thread")]
+///
+/// The window is on a clock the test moves, and it never moves here: the
+/// batch can go only because it is complete.
 async fn on_complete_waits_for_every_live_slot() {
     const WINDOW: Duration = Duration::from_secs(1);
-    let harness = harness(windowed(WINDOW, true, None)).await;
+    let (harness, _clock) = harness_with_clock(windowed(WINDOW, true, None)).await;
     let (a, _) = harness.open_credited(1, 1, CREDIT).await;
     let (b, _) = harness.open_credited(2, 2, CREDIT).await;
 
-    let first = Instant::now();
     a.send(item(0)).expect("stage on a");
     harness.await_staged(1).await;
     assert_nothing_written(&harness).await;
@@ -541,11 +551,6 @@ async fn on_complete_waits_for_every_live_slot() {
     let batch = harness.next_batch().await;
     assert_eq!(batch.records.len(), 2, "one record from each slot");
     assert_eq!(batch.slots().len(), 2);
-    assert!(
-        first.elapsed() < WINDOW,
-        "the batch went when it was complete, not when a's window ran out; took {:?}",
-        first.elapsed()
-    );
 }
 
 /// A slot that closes with its record still in the batch stops counting
@@ -559,7 +564,7 @@ async fn on_complete_waits_for_every_live_slot() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_slot_closed_after_staging_does_not_complete_the_batch() {
     const WINDOW: Duration = Duration::from_secs(1);
-    let harness = harness(windowed(WINDOW, true, None)).await;
+    let (harness, clock) = harness_with_clock(windowed(WINDOW, true, None)).await;
     let (a, a_slot) = harness.open_credited(1, 1, CREDIT).await;
     let (b, _) = harness.open_credited(2, 2, CREDIT).await;
     let (_c, _) = harness.open_credited(3, 3, CREDIT).await;
@@ -577,7 +582,9 @@ async fn a_slot_closed_after_staging_does_not_complete_the_batch() {
     .await;
 
     b.send(item(1)).expect("stage on b");
+    harness.await_staged(2).await;
     assert_nothing_written(&harness).await;
+    clock.advance(WINDOW);
     let batch = harness.next_batch().await;
     assert_eq!(batch.records.len(), 2, "a's record and b's, at the window");
 }

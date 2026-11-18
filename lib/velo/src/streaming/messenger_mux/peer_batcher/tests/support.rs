@@ -14,7 +14,6 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use super::super::*;
-use crate::messenger::{Context, Handler};
 use crate::observability::VeloMetrics;
 use crate::streaming::messenger_mux::LaneIndex;
 use crate::streaming::messenger_mux::flow_control::SlotCredit;
@@ -23,6 +22,7 @@ use crate::streaming::messenger_mux::protocol::{
 };
 use crate::streaming::messenger_mux::test_support::{StallingTransport, stalling_address};
 use crate::transports::tcp::TcpTransportBuilder;
+use crate::{Context, Handler};
 
 pub(super) const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -127,6 +127,24 @@ pub(super) async fn harness(config: MuxConfig) -> Harness {
     harness_with_hooks(config, None).await
 }
 
+/// As [`harness`], with the batcher's flush windows on a clock that stands
+/// still until the test moves it.
+///
+/// For a test that checks what happens before a window ends. On the real
+/// clock a host that stalls the test for longer than the window ends it in
+/// the middle of the check (see "A test of a timeout must control the clock
+/// the timeout reads" in the coding gotchas).
+pub(super) async fn harness_with_clock(
+    config: MuxConfig,
+) -> (Harness, Arc<super::super::test_hooks::ManualClock>) {
+    let clock = super::super::test_hooks::ManualClock::new();
+    let hooks = super::super::test_hooks::TestHooks::with_clock(Arc::clone(&clock));
+    (
+        harness_with_hooks(config, Some(Arc::new(hooks))).await,
+        clock,
+    )
+}
+
 /// A sender messenger and a peer capturing every `_stream_batch` payload it is
 /// sent.
 ///
@@ -144,10 +162,10 @@ pub(super) async fn capture_pair() -> (Arc<Messenger>, Arc<Messenger>, flume::Re
         .await
         .expect("capture messenger");
     sender
-        .register_peer_inner(capture.peer_info())
+        .register_peer(capture.peer_info())
         .expect("register capture");
     capture
-        .register_peer_inner(sender.peer_info())
+        .register_peer(sender.peer_info())
         .expect("register sender");
 
     let (batch_tx, batches) = flume::unbounded::<Bytes>();
@@ -533,7 +551,7 @@ pub(super) async fn stalled_harness_with_hooks(
     // gate is the only thing under test.
     let peer_instance = velo_ext::InstanceId::new_v4();
     sender
-        .register_peer_inner(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
+        .register_peer(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
         .expect("register peer");
 
     let registry = prometheus::Registry::new();
@@ -689,6 +707,10 @@ impl Drop for StalledHarness {
 
 /// A messenger without a stager can send a singleton up to its transport's
 /// frame limit. Adding the mux's refusal header must not lose that record.
+///
+/// The record is 16 MiB over TCP. A lost record never arrives, so the wait is
+/// only a guard against a hang. It used to be 2 s, and a host that stopped
+/// the test process for longer failed the test with the record on its way.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_singleton_at_the_eager_frame_limit_reaches_its_peer() {
     let harness = harness(MuxConfig::default()).await;
@@ -720,7 +742,7 @@ async fn a_singleton_at_the_eager_frame_limit_reaches_its_peer() {
     assert_eq!(control.records[0].data, frame);
 
     inlet.send(frame.clone()).expect("queue singleton");
-    let payload = tokio::time::timeout(Duration::from_secs(2), harness.batches.recv_async())
+    let payload = tokio::time::timeout(RECV_TIMEOUT, harness.batches.recv_async())
         .await
         .expect("a singleton that fits the eager frame limit must reach its peer")
         .expect("capture channel");

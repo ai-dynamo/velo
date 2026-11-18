@@ -16,7 +16,7 @@ use velo_hub::protocol::{HubDescriptor, paths};
 use velo_hub::store::testing::FaultStore;
 use velo_hub::store::{HubStore, Removal};
 #[allow(unused_imports)]
-use velo_hub::velo::PeerDiscovery;
+use velo_hub::velo::discovery::PeerDiscovery;
 use velo_hub::{
     AttachContext, Bundle, BundleInstaller, Committed, Extension, GraphError, Hub, Rejection,
     StartContext, Txn,
@@ -782,6 +782,43 @@ async fn a_probe_to_a_wedged_peer_times_out() {
         "probe took {:?}",
         started.elapsed()
     );
+}
+
+/// A stop that learns of the fence from its own remove reports Ok, as a stop
+/// that knew of it before does. With a remote store the hub hears of a
+/// fence through the store's watch, so a stop that starts right after
+/// another hub took the store can send its remove first; the lock compare
+/// then refuses it. The entry goes with the hub's custody lease either way,
+/// so the stop has nothing to report. A remove that fails without a fence
+/// is still reported: the control below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_that_finds_the_store_fenced_by_its_own_remove_reports_ok() {
+    let fenced = Arc::new(FaultStore::default());
+    let hub = builder()
+        .store(fenced.clone())
+        .velo(velo_builder())
+        .serve()
+        .await
+        .unwrap();
+    fenced.fence_next_remove();
+    let stopped = tokio::time::timeout(Duration::from_secs(20), hub.shutdown())
+        .await
+        .expect("the stop hung");
+    assert!(stopped.is_ok(), "{stopped:?}");
+
+    let failing = Arc::new(FaultStore::default());
+    let hub = builder()
+        .store(failing.clone())
+        .velo(velo_builder())
+        .serve()
+        .await
+        .unwrap();
+    failing.fail_next_remove();
+    let stopped = tokio::time::timeout(Duration::from_secs(20), hub.shutdown())
+        .await
+        .expect("the stop hung");
+    let error = format!("{:#}", stopped.expect_err("a failed remove is reported"));
+    assert!(error.contains("removing the hub's own entry"), "{error}");
 }
 
 /// Dropping a `shutdown()` future part-way does not leave the hub half

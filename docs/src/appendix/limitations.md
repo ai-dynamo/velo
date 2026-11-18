@@ -14,13 +14,13 @@ instead of it.
 
 **When.** Over the messenger mux, for an item larger than the eager budget:
 the smaller of the transport's frame limit and the stager's threshold
-(`RendezvousStager::with_threshold`, 256 KiB by default), less the message
+(`Velo::staging_threshold()`, 256 KiB), less the message
 envelope.
 
 **Why.** Such an item leaves the producer as a handle. Its bytes stay staged
 in the producer's rendezvous store until the consumer pulls them. `Sent` is
 reported when the batch that carries the handle is admitted by the transport,
-and the drain of `graceful_shutdown` counts requests in flight, not staged
+and the drain of `Velo::shutdown` counts requests in flight, not staged
 payloads, so neither waits for the pull.
 
 **Workaround.** Keep stream items under the eager budget, or wait for the
@@ -37,7 +37,7 @@ that test asserts.
 when the transport tears down is reported as failed. A stream whose `Sent`
 came just before the shutdown can lose its tail over QUIC.
 
-**When.** At the teardown step of `graceful_shutdown`, over the `quic`
+**When.** At the teardown step of `Velo::shutdown`, over the `quic`
 transport.
 
 **Why.** TCP and UDS keep writing admitted frames for the teardown grace.
@@ -49,32 +49,6 @@ still queued.
 shutdown that follows `Sent`.
 
 **Lifted by.** Not scheduled.
-
-## A hand-built `AnchorManager` reports a per-stream `Sent` at enqueue
-
-**What happens.** Over the per-stream TCP and gRPC transports of this crate,
-`Sent` means that the stream's pump wrote the terminal (TCP) or that the
-server took the whole stream (gRPC), but only when the `Velo` builder
-installed the transport. An `AnchorManager` built by hand, with
-`AnchorManagerBuilder` or `AnchorManager::new`, reports `Sent` as the
-terminal enters the egress channel, while the pump still has to write it.
-The same holds for a frame transport from outside velo.
-
-**When.** A producer that builds its `AnchorManager` itself, whether or not
-its node calls `stream_config` or `stream_bind_addr`, and a `FrameTransport`
-implementation from another crate. The `Velo` builder installs the retiring
-transports only for the per-stream transport it builds after one of those
-two calls.
-
-**Why.** `FrameTransport` is published in `velo-ext`, so the retirement does
-not go through it. The `Velo` builder names the in-crate transports to the
-anchor manager by key; nothing else can.
-
-**Workaround.** Build the node with `Velo::builder()`.
-
-**Lifted by.** [#142](https://github.com/ai-dynamo/velo/issues/142): a
-defaulted method on `FrameTransport` at the next `velo-ext` release, which
-also deletes the second map.
 
 ## Per-stream TCP cannot see a consumer that dropped its anchor
 
@@ -140,7 +114,7 @@ transport's teardown grace (`teardown_flush_grace` on the builders, 1 s by
 default), but only the frames already in its channel: at most
 `channel_capacity` per connection. A frame that waits in the connection's admission gate when teardown starts is refused, and a send after teardown fails at once. A send that races the start of teardown can still be admitted and then fail; closing that needs a terminal state on the admission gate in `velo-ext`. Over the messenger mux, a refused batch retires its streams as `Discarded`.
 
-**When.** The close step of `graceful_shutdown`.
+**When.** The close step of `Velo::shutdown`.
 
 **Why.** The grace starts after the drain. The time the work behind the
 frames takes belongs to the drain, which `ShutdownPolicy::Timeout` bounds;

@@ -86,9 +86,8 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use velo::observability::VeloMetrics;
 use velo::observability::test_helpers::MetricSnapshot;
-use velo::streaming::{
-    FlushPolicy, MuxConfig, StreamAnchor, StreamAnchorHandle, StreamFrame, StreamSender,
-};
+use velo::streaming::{FlushPolicy, MuxConfig};
+use velo::{StreamAnchor, StreamAnchorHandle, StreamFrame, StreamSender};
 use velo::{Velo, VeloBuilder};
 use velo_examples::{TransportType, new_transport};
 

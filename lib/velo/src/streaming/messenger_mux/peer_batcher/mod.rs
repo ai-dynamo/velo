@@ -73,7 +73,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
 use self::control::{ControlInbox, DrainedControl, OwnedControl, PeerControl};
-use self::flush_gate::{FlushContext, FlushGate, linger_until};
+use self::flush_gate::{FlushContext, FlushGate};
 pub(crate) use self::slot_stream::AllocError;
 use self::slot_stream::{EgressSlots, SlotItem, SlotStream};
 #[cfg(test)]
@@ -242,6 +242,16 @@ impl BatcherHandle {
         self.control.pending_len()
     }
 
+    /// Whether the batcher has applied every control entry posted so far:
+    /// nothing is pending, and each drain it took has been applied. Needs
+    /// the batcher to have been built with test hooks, which count the
+    /// applied drains.
+    #[cfg(test)]
+    pub(crate) fn control_settled(&self, hooks: &TestHooks) -> bool {
+        let (drains, pending) = self.control.drains_and_pending();
+        pending == 0 && hooks.controls_applied() == drains
+    }
+
     /// Whether the task has taken its last drain, so a reply posted now is
     /// refused rather than taken.
     pub(crate) fn is_closed(&self) -> bool {
@@ -307,6 +317,11 @@ pub(crate) fn spawn(key: PeerLane, ctx: BatcherContext) -> Arc<BatcherHandle> {
         ctx.config.reply_linger,
         ctx.metrics.clone(),
     );
+    #[cfg(test)]
+    let gate = match ctx.hooks.as_ref().and_then(|hooks| hooks.clock()) {
+        Some(clock) => gate.with_clock(flush_gate::GateClock::manual(clock)),
+        None => gate,
+    };
     let async_open_ack = ctx.config.async_open_ack;
     let writer = BatchWriter::new(
         Arc::clone(&ctx.messenger),
@@ -466,6 +481,7 @@ impl Batcher {
         );
         probe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let control = Arc::clone(&self.control);
+        let clock = self.gate.clock();
         loop {
             let deadline = self.gate.deadline(self.flush_context());
             let work = tokio::select! {
@@ -482,7 +498,7 @@ impl Batcher {
                 },
                 _ = probe.tick(), if self.slots.live() > 0 => Work::Probe,
                 Some((index, item)) = self.streams.next() => Work::Slot(index, item),
-                () = linger_until(deadline) => Work::Linger,
+                () = clock.linger_until(deadline) => Work::Linger,
             };
             self.handle.mark_active();
             if let Some(metrics) = &self.metrics {
@@ -626,6 +642,10 @@ impl Batcher {
         }
         if drained.retire {
             self.on_retire();
+        }
+        #[cfg(test)]
+        if let Some(hooks) = &self.hooks {
+            hooks.note_control_applied();
         }
     }
 

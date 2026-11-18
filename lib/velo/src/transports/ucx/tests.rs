@@ -2732,6 +2732,31 @@ async fn settle(node: &Node) {
     );
 }
 
+/// Wait until every send `node` posted has completed, and the pass that ran
+/// the completion has ended.
+///
+/// A send's completion is a use of its endpoint, stamped from the reaper
+/// clock when `node`'s progress thread runs it. That can be after the peer
+/// already has the frame: on a new endpoint over the tcp lane the send waits
+/// for wireup, and its completion can run a pass or more after the peer
+/// received it. A test that moves the clock before then has the completion
+/// stamped at the moved time, which makes the endpoint look used later than
+/// the test thinks. The completion lowers `inflight_ops` before it stamps,
+/// so this also waits for two more passes.
+async fn sends_completed(node: &Node) {
+    assert!(
+        wait_until(T, || node
+            .transport
+            .shared
+            .inflight_ops
+            .load(Ordering::Acquire)
+            == 0)
+        .await,
+        "a send never completed"
+    );
+    settle(node).await;
+}
+
 /// Idle reaps of an endpoint whose peer sent a frame within the timeout.
 ///
 /// Zero at any load for a correct reaper: this is the exact form of "a frame
@@ -3187,6 +3212,10 @@ async fn an_endpoint_whose_peer_never_sends_is_reaped_after_the_setup_bound() {
 
     ping_message(&a, &b, &errs).await;
     assert_eq!(eps_open(&a), 1);
+    // B has the frame, but A's send may not have completed yet. A completion
+    // run after the clock moves is stamped at the moved time, and the
+    // endpoint is then not idle for a timeout at the last step below.
+    sends_completed(&a).await;
 
     // Up to the bound, the endpoint is still being set up.
     advance(&a, EP_SETUP_BOUND).await;
@@ -3554,19 +3583,7 @@ async fn a_send_in_flight_keeps_its_endpoint_open() {
         recv_message(&b.streams.message_stream, T).await.is_some(),
         "the frame was lost while its send was in flight"
     );
-    assert!(
-        wait_until(T, || a
-            .transport
-            .shared
-            .inflight_ops
-            .load(Ordering::Acquire)
-            == 0)
-        .await,
-        "A's send never completed"
-    );
-    // The completion callback lowers `inflight_ops` before it stamps the
-    // completion time; let its pass finish before the clock moves.
-    settle(&a).await;
+    sends_completed(&a).await;
     assert_eq!(
         errs.count(),
         0,

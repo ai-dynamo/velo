@@ -15,10 +15,13 @@
 //! this is: a barrier the loop offers only when a test installed one, and a
 //! no-op — one `Option` check per wake, in `cfg(test)` builds only — otherwise.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Notify;
+
+pub(crate) use super::flush_gate::ManualClock;
 
 /// How long [`TestHooks::wait_until_parked`] waits before calling it a bug.
 const PATIENCE: Duration = Duration::from_secs(5);
@@ -53,9 +56,25 @@ pub(crate) struct TestHooks {
     /// decision the test makes instead of one it hopes for.
     resolutions_held: AtomicBool,
     resolutions_gate: Notify,
+    /// The clock the batcher's flush gate reads, when a test moves it by hand.
+    clock: Option<Arc<ManualClock>>,
+    /// Control drains the batcher has finished applying.
+    controls_applied: AtomicU64,
 }
 
 impl TestHooks {
+    /// Hooks whose batcher reads `clock` for its flush windows.
+    pub(crate) fn with_clock(clock: Arc<ManualClock>) -> Self {
+        Self {
+            clock: Some(clock),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn clock(&self) -> Option<Arc<ManualClock>> {
+        self.clock.clone()
+    }
+
     /// Hold the loop at the barrier the next time it reaches one.
     pub(crate) fn pause(&self) {
         self.paused.store(true, Ordering::Release);
@@ -81,6 +100,15 @@ impl TestHooks {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         panic!("the batcher never reached the barrier within {PATIENCE:?}");
+    }
+
+    /// Record that the batcher finished applying one control drain.
+    pub(super) fn note_control_applied(&self) {
+        self.controls_applied.fetch_add(1, Ordering::Release);
+    }
+
+    pub(super) fn controls_applied(&self) -> u64 {
+        self.controls_applied.load(Ordering::Acquire)
     }
 
     /// Record that `fire_singleton` raised the fence.

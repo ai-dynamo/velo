@@ -237,6 +237,10 @@ struct ControlState {
     /// past its cap. An ordinary stale-generation race is not counted here —
     /// see `entry_mine`.
     refused: u64,
+    /// Drains the task has taken, so a test can tell when every one of them
+    /// has been applied (`TestHooks::controls_applied`).
+    #[cfg(test)]
+    drains: u64,
 }
 
 impl ControlState {
@@ -288,6 +292,10 @@ impl ControlState {
     /// the failed-admission-wins rule lives in the singleton resolution
     /// methods, which preserve the first admission error.
     fn drain(&mut self) -> DrainedControl {
+        #[cfg(test)]
+        {
+            self.drains += 1;
+        }
         let mut mine = std::mem::take(&mut self.mine);
         for (raw, (admitted, error)) in std::mem::take(&mut self.resolutions) {
             let entry = mine.entry(raw).or_default();
@@ -458,6 +466,13 @@ impl ControlInbox {
     #[cfg(test)]
     pub(super) fn pending_len(&self) -> usize {
         self.lock().len()
+    }
+
+    /// Drains taken so far, and the entries still pending, read together.
+    #[cfg(test)]
+    pub(super) fn drains_and_pending(&self) -> (u64, usize) {
+        let state = self.lock();
+        (state.drains, state.len())
     }
 
     /// Whether the task has taken its last drain and refuses later replies.

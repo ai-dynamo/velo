@@ -21,7 +21,7 @@ use std::sync::Arc;
 async fn test_velo_facade_mpsc_create_and_attach() {
     use futures::StreamExt;
     use velo::StreamConfig;
-    use velo::streaming::mpsc::{MpscFrame, SenderId};
+    use velo::streaming::{MpscFrame, SenderId};
 
     let transport = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -86,7 +86,7 @@ async fn test_velo_facade_mpsc_create_and_attach() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_velo_facade_mpsc_with_config() {
     use velo::StreamConfig;
-    use velo::streaming::mpsc::MpscAnchorConfig;
+    use velo::streaming::MpscAnchorConfig;
 
     let transport = {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -153,16 +153,13 @@ async fn test_velo_facade_mpsc_with_config() {
 async fn the_default_builder_installs_only_the_mux() {
     let velo = tcp_node(velo::Velo::builder()).await;
 
-    // The transport registry has no `Velo` form.
-    #[allow(deprecated)]
-    let manager = velo.anchor_manager();
     assert_eq!(
-        manager.transport_registry.keys().collect::<Vec<_>>(),
+        velo.stream_transport_keys(),
         [velo::streaming::MESSENGER_MUX_KEY],
         "a default node installs the mux and nothing else"
     );
     assert_eq!(
-        manager.transport.key().as_str(),
+        velo.default_stream_transport_key(),
         velo::streaming::MESSENGER_MUX_KEY,
         "the mux is the default node's stream transport"
     );
@@ -208,15 +205,7 @@ async fn an_explicit_stream_config_installs_the_per_stream_transport() {
     ];
     for (builder, key) in opted_in {
         let velo = tcp_node(builder).await;
-        // The transport registry has no `Velo` form.
-        #[allow(deprecated)]
-        let manager = velo.anchor_manager();
-        let mut keys = manager
-            .transport_registry
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>();
-        keys.sort();
+        let keys = velo.stream_transport_keys();
         let mut expected = vec![
             key.to_string(),
             velo::streaming::MESSENGER_MUX_KEY.to_string(),
@@ -226,7 +215,7 @@ async fn an_explicit_stream_config_installs_the_per_stream_transport() {
             keys, expected,
             "{key}: the per-stream transport and the mux"
         );
-        assert_eq!(manager.transport.key().as_str(), key);
+        assert_eq!(velo.default_stream_transport_key(), key);
         let advertised = velo
             .peer_info()
             .worker_address()
@@ -281,8 +270,8 @@ async fn a_disabled_mux_without_a_stream_config_fails_the_build() {
 #[tokio::test(flavor = "multi_thread")]
 async fn test_discover_and_register_peer_fans_out_to_streaming() {
     use futures::StreamExt;
-    use velo::PeerDiscovery;
-    use velo::streaming::StreamFrame;
+    use velo::StreamFrame;
+    use velo::discovery::PeerDiscovery;
 
     #[derive(Default)]
     struct MemoryDiscovery(std::sync::Mutex<Vec<velo::PeerInfo>>);
@@ -407,7 +396,7 @@ async fn default_pair(mux: Option<velo::streaming::MuxConfig>) -> (velo::Velo, v
 /// (`None` is the builder default), after one item has crossed.
 async fn negotiated_key(mux: Option<velo::streaming::MuxConfig>) -> String {
     use futures::StreamExt;
-    use velo::streaming::StreamFrame;
+    use velo::StreamFrame;
 
     let (producer, consumer) = default_pair(mux).await;
     let mut anchor = consumer.create_anchor::<u32>();
@@ -474,7 +463,8 @@ async fn tcp_node(builder: velo::VeloBuilder) -> velo::Velo {
 async fn mux_only_carries_streams_and_large_messages() {
     use bytes::Bytes;
     use futures::StreamExt;
-    use velo::streaming::{MESSENGER_MUX_KEY, StreamFrame, mpsc::MpscFrame};
+    use velo::StreamFrame;
+    use velo::streaming::{MESSENGER_MUX_KEY, MpscFrame};
 
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         let producer = tcp_node(velo::Velo::builder().mux_only()).await;
@@ -482,11 +472,7 @@ async fn mux_only_carries_streams_and_large_messages() {
         producer.register_peer(consumer.peer_info()).unwrap();
         consumer.register_peer(producer.peer_info()).unwrap();
         for node in [&producer, &consumer] {
-            // The transport registry has no `Velo` form.
-            #[allow(deprecated)]
-            let registry = &node.anchor_manager().transport_registry;
-            assert_eq!(registry.len(), 1);
-            assert!(registry.contains_key(MESSENGER_MUX_KEY));
+            assert_eq!(node.stream_transport_keys(), [MESSENGER_MUX_KEY]);
             assert!(
                 node.peer_info()
                     .worker_address
