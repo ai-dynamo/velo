@@ -649,3 +649,50 @@ so a plain wait fails a run instead of hanging the test runner.
 
 Test: `transports::quic::listener::tests::a_peer_close_preserves_acknowledged_frames`
 (`lib/velo/src/transports/quic/listener.rs`).
+
+## A bare SIGSEGV from a test binary is not a stack overflow
+
+**Rule.** When a Rust test binary dies with `signal: 11, SIGSEGV` and prints
+nothing else, do not look for a stack overflow. Rust reports an overflow on
+any thread it starts as SIGABRT, with `thread '<name>' has overflowed its
+stack`. Look at native code, at `unsafe`, and at the host.
+
+Two things make this hold. Rust installs a SIGSEGV handler that knows the
+guard page of each thread it starts: test threads, `std::thread`s, and tokio
+workers. Stack probes make each large frame touch that guard page, so a
+frame of 256 KiB cannot jump over it. Both hold in the debug build and in
+the `-C instrument-coverage` build of the Coverage job. The rule breaks in
+one case: if SIGSEGV already has a handler when Rust starts, or is ignored,
+Rust does not install its own handler. An overflow then gives a bare SIGSEGV.
+
+**Failure.** One CI Coverage run of the `velo` unit-test binary died with a
+bare SIGSEGV in the mux tests, 6 s after it started. A stack overflow in the
+instrumented build was the first suspect. In local runs, no UCX thread was
+alive at that point: the `rendezvous::rdma` tests had ended, and the
+`transports::ucx` tests had not started. With `RUST_MIN_STACK` at 64 KiB or 128 KiB, the binary stopped
+every time with SIGABRT and the overflow message. Under a memory limit it
+was killed with SIGKILL (exit 137). In 173 full runs, and 320 runs of the
+mux tests alone, with 4 to 12 copies at a time, it never gave a SIGSEGV. In
+the same ten minutes, three other Coverage jobs on the same runner pool were
+killed with exit 137 before their tests started.
+
+**Test.** Run the binary again from a test, overflow a 64 KiB stack in the
+child, and check that the child ends with SIGABRT and the message. Run it
+once with SIGSEGV ignored (`trap '' SEGV` in the shell that starts it). The
+test must then fail, with a bare SIGSEGV.
+
+Test: `crash_report_tests::a_stack_overflow_aborts_with_a_message_not_a_bare_sigsegv`
+(`lib/velo/src/crash_report_tests.rs`).
+
+## A per-thread log capture misses events in a shared test binary
+
+**Rule.** To assert on what velo logs, give the test a binary of its own, install the capture with `tracing::subscriber::set_global_default`, and assert one line that must appear before you assert that a line is absent. Do not capture with `tracing::subscriber::set_default` in a binary whose other tests log at the same time.
+
+`tracing` keeps its per-callsite filter state for the whole process, and every test thread that logs shares it. A per-thread subscriber is one input to that state among the threads that log beside it.
+
+**Failure.** A test that set a per-thread subscriber and then built two nodes captured nothing at all, not even the transports' start-up lines, in 4 of 5 runs of its module beside the other tests. Run alone, it passed. Its "no warning" check would have passed for nothing. Only the check that a debug line appears caught it.
+
+**Test.** Run the capture test with the rest of its binary, 50 times. A check that a line is absent proves nothing until a check in the same capture shows that a line is present.
+
+Test: `a_default_node_learns_peers_without_a_per_stream_transport`
+(`lib/velo/tests/streaming/default_node_peers.rs`).

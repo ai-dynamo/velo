@@ -267,16 +267,6 @@ impl RvHandleWire {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Error response
-// ---------------------------------------------------------------------------
-
-/// Error returned by rendezvous control-plane handlers.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RvError {
-    pub message: String,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -16,8 +16,9 @@
 //! `use super::*` shares them whole, the way `outcome` does.
 
 use super::*;
-use velo::streaming::AttachError;
-use velo::streaming::control::{AnchorAttachRequest, StreamOpenTicket};
+use velo::AttachError;
+use velo::StreamOpenTicket;
+use velo::test_helpers::AnchorAttachRequest;
 
 /// Stop leaves output usable; cancel wakes an idle producer on both open paths.
 #[tokio::test(flavor = "multi_thread")]
@@ -304,8 +305,8 @@ fn terms(response: AnchorAttachResponse) -> StreamOpenTicket {
 /// Drive `count` items and a `Finalized` through an already-open sender,
 /// asserting each arrives exactly once and in order.
 async fn drain_stream(
-    mut anchor: velo::streaming::StreamAnchor<u32>,
-    sender: velo::streaming::StreamSender<u32>,
+    mut anchor: velo::StreamAnchor<u32>,
+    sender: velo::StreamSender<u32>,
     count: u32,
 ) {
     let send = tokio::spawn(async move {

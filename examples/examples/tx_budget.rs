@@ -35,9 +35,8 @@ use tokio_util::codec::FramedRead;
 
 use velo::transports::tcp::{TcpFrameCodec, TcpTransportBuilder};
 use velo::transports::uds::UdsTransportBuilder;
-use velo::transports::{
-    InboundMessage, MessageType, Transport, TransportErrorHandler, make_channels,
-};
+use velo::transports::{InboundMessage, MessageType, TransportErrorHandler, make_channels};
+use velo::Transport;
 use velo::{InstanceId, PeerInfo};
 
 /// Frame preamble written by `TcpFrameCodec` (version + type + 2 lengths).

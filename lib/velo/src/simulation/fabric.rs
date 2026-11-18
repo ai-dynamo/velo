@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use crate::transports::{AdmitOutcome, MessageType, TransportAdapter, TransportErrorHandler};
 use velo_ext::{InstanceId, PeerInfo, WorkerId};
 
-use crate::simulation::network::NetworkModel;
+use crate::simulation::NetworkModel;
 
 /// In-flight message transfer through the simulated fabric.
 pub struct Transfer {
@@ -335,7 +335,7 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
-    use crate::simulation::network::BisectionBandwidth;
+    use crate::simulation::BisectionBandwidth;
     use crate::transports::TransportErrorHandler;
     use loom_rs::sim::SimulationRuntime;
     use parking_lot::Mutex;
