@@ -838,7 +838,7 @@ async fn connection_writer_inner(
         &QuicWriterObserver {
             peer: peer_name,
             addr,
-            egress: metrics.map(EgressMetrics::new),
+            egress: metrics.clone().map(EgressMetrics::new),
         },
     )
     .await;
@@ -853,8 +853,14 @@ async fn connection_writer_inner(
     // a peer restart, so it is logged at debug, whether the close came before
     // the finish or during the wait. Every other end (our own force close at
     // CLOSE_WAIT, an idle timeout, a reset, a STOP_SENDING, the wait timing
-    // out) can leave written frames unread, so it is a warning.
+    // out) can leave written frames unread, so it is a warning, and it is
+    // counted in `velo_transport_unacknowledged_closes_total`. The count is of
+    // closes, not frames: quinn does not say how much of the stream the peer
+    // acknowledged, so the frames that may be lost cannot be counted.
     let loss = |why: String| {
+        if let Some(metrics) = &metrics {
+            metrics.record_unacknowledged_close();
+        }
         warn!(
             "QUIC: {peer_name} ({}) did not acknowledge the stream end ({why}); \
              frames written but not acknowledged can be lost",

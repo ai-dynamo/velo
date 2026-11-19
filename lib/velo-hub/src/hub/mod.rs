@@ -778,11 +778,15 @@ async fn stop(shared: &Shared, running: Running) -> anyhow::Result<()> {
     }
     let mut result = Ok(());
     // A fenced store accepts no write; the hub that fenced it owns the
-    // prefix, and the entry goes with this hub's custody lease.
-    let fenced = *shared.store.continuity().borrow() == Continuity::Fenced;
-    if let Some((id, incarnation)) = running.pinned.filter(|_| !fenced)
+    // prefix, and the entry goes with this hub's custody lease. A remote
+    // store can learn of the fence from this very remove (its lock compare
+    // fails before its watch reports the fence), so read it again after a
+    // failure: that stop is in the same state as one that knew before.
+    let fenced = || *shared.store.continuity().borrow() == Continuity::Fenced;
+    if let Some((id, incarnation)) = running.pinned.filter(|_| !fenced())
         && let Err(error) = shared.remove_bounded(id, incarnation).await
         && !error.is_gone()
+        && !fenced()
     {
         result = Err(anyhow::Error::new(error).context("removing the hub's own entry"));
     }

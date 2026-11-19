@@ -159,6 +159,10 @@ jobs:
       run: cargo metadata --locked --format-version 1 > /dev/null
     - name: Compile and run tests
       run: cargo test --locked --all-features --all-targets
+    # --all-targets leaves out doctests. ucx-rs is left out because its
+    # generated bindings carry C code in doc comments.
+    - name: Run doctests
+      run: cargo test --locked --all-features --doc -p velo -p velo-ext -p velo-hub -p velo-hub-ext
     - name: sccache stats
       if: always()
       run: /tmp/use-sccache.sh show-stats "tests" || true
