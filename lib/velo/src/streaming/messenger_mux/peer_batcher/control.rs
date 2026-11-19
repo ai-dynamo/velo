@@ -237,6 +237,10 @@ struct ControlState {
     /// past its cap. An ordinary stale-generation race is not counted here —
     /// see `entry_mine`.
     refused: u64,
+    /// Drains the task has taken, so a test can tell when every one of them
+    /// has been applied (`TestHooks::controls_applied`).
+    #[cfg(test)]
+    drains: u64,
 }
 
 impl ControlState {
@@ -288,6 +292,10 @@ impl ControlState {
     /// the failed-admission-wins rule lives in the singleton resolution
     /// methods, which preserve the first admission error.
     fn drain(&mut self) -> DrainedControl {
+        #[cfg(test)]
+        {
+            self.drains += 1;
+        }
         let mut mine = std::mem::take(&mut self.mine);
         for (raw, (admitted, error)) in std::mem::take(&mut self.resolutions) {
             let entry = mine.entry(raw).or_default();
@@ -458,6 +466,15 @@ impl ControlInbox {
     #[cfg(test)]
     pub(super) fn pending_len(&self) -> usize {
         self.lock().len()
+    }
+
+    /// Whether the task has applied everything posted so far, given how many
+    /// drains it has applied (`TestHooks::controls_applied`): nothing is
+    /// pending, flags included, and every drain taken has been applied.
+    #[cfg(test)]
+    pub(super) fn settled(&self, drains_applied: u64) -> bool {
+        let state = self.lock();
+        state.is_idle() && state.drains == drains_applied
     }
 
     /// Whether the task has taken its last drain and refuses later replies.
@@ -662,6 +679,29 @@ mod tests {
             inbox.note_allocated(slot(index, 0));
         }
         inbox
+    }
+
+    /// A kick or a retire sets a flag and adds no map entry. A check that
+    /// counts entries calls the inbox settled while the command still waits for
+    /// the task, so a test that waits on it reads the state before the command
+    /// has had its effect.
+    #[test]
+    fn a_flag_is_pending_until_the_task_drains_it() {
+        for post in [ControlInbox::kick_flush, ControlInbox::retire] {
+            let inbox = ControlInbox::default();
+            assert!(inbox.settled(0), "a new inbox has nothing pending");
+            post(&inbox);
+            assert!(
+                !inbox.settled(0),
+                "a flag the task has not taken is still pending"
+            );
+            inbox.take().expect("a flag is something to take");
+            assert!(
+                !inbox.settled(0),
+                "a drain the task has taken but not applied is still pending"
+            );
+            assert!(inbox.settled(1), "taken and applied: settled");
+        }
     }
 
     #[test]

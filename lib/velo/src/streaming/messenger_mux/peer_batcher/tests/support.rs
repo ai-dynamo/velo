@@ -127,6 +127,24 @@ pub(super) async fn harness(config: MuxConfig) -> Harness {
     harness_with_hooks(config, None).await
 }
 
+/// As [`harness`], with the batcher's flush windows on a clock that stands
+/// still until the test moves it.
+///
+/// For a test that checks what happens before a window ends. On the real
+/// clock a host that stalls the test for longer than the window ends it in
+/// the middle of the check (see "A test of a timeout must control the clock
+/// the timeout reads" in the coding gotchas).
+pub(super) async fn harness_with_clock(
+    config: MuxConfig,
+) -> (Harness, Arc<super::super::test_hooks::ManualClock>) {
+    let clock = super::super::test_hooks::ManualClock::new();
+    let hooks = super::super::test_hooks::TestHooks::with_clock(Arc::clone(&clock));
+    (
+        harness_with_hooks(config, Some(Arc::new(hooks))).await,
+        clock,
+    )
+}
+
 /// A sender messenger and a peer capturing every `_stream_batch` payload it is
 /// sent.
 ///

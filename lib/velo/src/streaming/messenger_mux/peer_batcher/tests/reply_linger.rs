@@ -8,8 +8,9 @@
 //! through the `linger` timer, not some incidental wake; a close reply does
 //! not wait and carries the replies staged before it; a zero window is the
 //! urgent flush the batcher had before. The windows here are long (a second)
-//! and the waits short (tens of milliseconds), so the assertions hold on a
-//! loaded runner without depending on how fast the peer admits.
+//! and the waits short (tens of milliseconds). A test whose check a stall
+//! longer than the window would break runs the window on a clock it moves
+//! (`harness_with_clock`).
 
 use std::time::Duration;
 
@@ -76,21 +77,24 @@ async fn credit_replies_alone_form_one_batch_for_the_window() {
     );
 }
 
+/// The reply window is on a clock the test moves, and it never moves here:
+/// a host that stalls the test for longer than the window cannot send the
+/// reply alone before the close is staged.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_close_reply_does_not_wait_and_carries_the_replies_before_it() {
-    let harness = harness(with_reply_linger(WINDOW)).await;
+    let (harness, _clock) = harness_with_clock(with_reply_linger(WINDOW)).await;
     let (_inlet, slot) = harness.open_credited(1, 1, CREDIT).await;
 
     harness
         .handle
         .reply(&[ReplyRecord::CreditUpdate { slot, delta: 7 }]);
-    tokio::time::sleep(Duration::from_millis(20)).await;
+    harness.await_staged(1).await;
     harness.handle.reply(&[ReplyRecord::CloseSlot {
         slot,
         reason: CloseReason::UnknownSlot,
     }]);
 
-    let batch = tokio::time::timeout(SOON, harness.next_batch())
+    let batch = tokio::time::timeout(RECV_TIMEOUT, harness.next_batch())
         .await
         .expect("a close is liveness: it must not wait for the reply window");
     let kinds: Vec<RecordType> = batch.records.iter().map(|r| r.kind).collect();
