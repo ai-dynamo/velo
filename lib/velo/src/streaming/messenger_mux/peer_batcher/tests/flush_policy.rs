@@ -266,7 +266,9 @@ async fn a_credit_reply_moves_under_manual() {
 /// data record reached the gate before the reply is sent, which is what makes
 /// this Family A rather than a reply-alone case. Timed like
 /// `a_credit_reply_moves_under_manual`: the slot's probe wakes the batcher
-/// every 5 s, but under `Manual` a probe writes nothing.
+/// every 5 s, and a probe wake writes a reply that is overdue under any policy.
+/// It does not rescue the reply here: a window that never started is never
+/// overdue.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_credit_reply_moves_under_manual_behind_a_staged_record() {
     let window = Duration::from_millis(50);

@@ -2577,7 +2577,8 @@ fn eps_closed_idle(node: &Node) -> u64 {
 }
 
 /// Send one `Message` frame and wait for it to arrive, so the sender's endpoint
-/// is provably established and provably not still carrying an in-flight AM.
+/// is provably established. The send can still be completing on the sender:
+/// [`sends_completed`] waits for that.
 async fn ping_message(from: &Node, to: &Node, errs: &Arc<CountingErrors>) {
     ping_message_to(from, to.instance_id, to, errs, "frame").await
 }

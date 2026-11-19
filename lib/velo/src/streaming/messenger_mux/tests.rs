@@ -2864,9 +2864,13 @@ async fn a_sender_starved_by_the_byte_budget_is_not_reaped() {
 
     drain.hold_watchdog(false);
     let judged = drain.watchdog_windows();
+    // A window is counted before it is judged, and the first one after the
+    // release usually only refreshes what the watchdog has seen. So a firing
+    // comes at window `DETECTION_MULTIPLIER + 1`; counting the window after
+    // it shows that one was judged.
     eventually(|| {
         drain.watchdog_windows()
-            > judged + u64::from(crate::streaming::control::DETECTION_MULTIPLIER)
+            > judged + u64::from(crate::streaming::control::DETECTION_MULTIPLIER) + 1
     })
     .await;
     assert!(
