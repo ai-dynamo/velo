@@ -358,6 +358,14 @@ not for a fixed time or a quiet spell, so a passing run stays short.
 - The TCP stream pump test took over 30 s to encode its frames, and the
   socket's `TCP_USER_TIMEOUT` aborted the connection to a peer that never
   reads.
+- A QUIC writer waits 1 s for the peer to acknowledge its last frames. With
+  48 copies of a delivery-count test on one CPU, and the process paused at
+  random points, that wait ran out in 190 runs of 240. The writer then closed
+  the connection and warned that frames can be lost, as the shutdown chapter
+  says it does, and up to 13 frames of 256 were neither delivered nor failed.
+  With a 30 s grace, 0 runs of 240 failed. The count also waited for a quiet
+  spell of 3 s, which a stall can make too. It now waits until every frame is
+  delivered or failed.
 
 **Test.** Make the stall happen. Block the thread at the point you suspect,
 with `std::thread::sleep` in a scratch build, or pause the whole test process
@@ -367,7 +375,40 @@ Check that the old test fails and the new one passes. Then remove the
 behavior the test checks, for example skip the close, and check that the new
 test still fails.
 
-Test: `transports::quic::transport::tests::the_senders_exit_closes_its_connection`
+Tests: `transports::quic::transport::tests::the_senders_exit_closes_its_connection`
+and `transports::quic::transport::tests::frames_survive_the_runtime_ending_right_after_close`
+(`lib/velo/src/transports/quic/tests.rs`).
+
+## A test that checks a log line runs in its own process
+
+**Rule.** Do not check a log line with `tracing::subscriber::set_default` in
+the shared test process. Run the test again in a child process, alone, with a
+global subscriber.
+
+`tracing` decides once per call site, for the whole process, whether a
+subscriber wants that site. A `set_default` subscriber is seen only on its own
+thread. While it is the only subscriber alive, a call site first reached on
+another thread asks only that thread's subscriber, which is none. The site is
+then marked unwanted on every thread, and the test's own line from it is
+dropped. In a check that a line is absent, the same miss makes the test pass
+without checking anything.
+
+**Failure.** `a_forced_close_warns_of_frames_the_peer_did_not_read` failed 1
+time in 30 full `--lib` runs (6 at once on 4 CPUs, with random pauses), with
+"nothing warned". The writer had reached its `warn!`: a print just before it
+showed in the output. Another QUIC test had reached the same `warn!` first.
+Run alone, the test passed 240 runs of 240.
+
+**Test.** Hold the `set_default` subscriber. Then make a thread with no
+subscriber reach the same call site first, and then run the scenario. The old
+test then fails every time (10 runs of 10, each in a new process). If the other
+thread reaches the site before `set_default`, it passes every time. The fixed
+tests call `logs_in_child`, which runs the test again with `--exact` in a
+child process. In the child, the subscriber is global. To check that the
+fixed test is not empty, change the text of the warning: it must fail.
+
+Tests: `transports::quic::transport::tests::a_forced_close_warns_of_frames_the_peer_did_not_read`
+and `transports::quic::transport::tests::a_dialer_does_not_count_the_servers_shutdown_as_a_decode_error`
 (`lib/velo/src/transports/quic/tests.rs`).
 
 ## Test timer logic on a paused clock

@@ -21,7 +21,7 @@ impl TransportErrorHandler for Errors {
     }
 }
 
-/// Log lines captured for one test, through `tracing::subscriber::set_default`.
+/// Log lines captured for one test, in the child process of `logs_in_child`.
 #[derive(Clone, Default)]
 struct CapturedLogs(Arc<Mutex<Vec<u8>>>);
 
@@ -46,6 +46,51 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }
+}
+
+/// Marks the child process that `logs_in_child` starts.
+const LOG_CHILD: &str = "VELO_QUIC_LOG_TEST_CHILD";
+
+/// Runs the test named `test` again, alone, in a child process, and returns
+/// `None` once the child has passed. In the child it returns the log lines at
+/// WARN and above from every thread, and the test then runs its body.
+///
+/// A test that checks a log line must not use `set_default` in the shared
+/// test process. `tracing` decides once per call site, for the whole process,
+/// whether a subscriber wants it. While a `set_default` subscriber is the only
+/// one alive, a call site first reached on another test's thread asks only
+/// that thread's subscriber, which is none. The site is then marked unwanted
+/// everywhere, and this test's own line from it is dropped. In the child no
+/// other test runs, and the subscriber is global, so every thread sees it.
+fn logs_in_child(test: &str) -> Option<CapturedLogs> {
+    if std::env::var_os(LOG_CHILD).is_some() {
+        let logs = CapturedLogs::default();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_writer(logs.clone())
+                .with_max_level(tracing::Level::WARN)
+                .with_ansi(false)
+                .finish(),
+        )
+        .expect("the child process sets the only global subscriber");
+        return Some(logs);
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads=1"])
+        .env(LOG_CHILD, "1")
+        .output()
+        .expect("run the test in a child process");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "{test} failed in its child process:\n{stdout}\n{stderr}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the child process ran no test named {test}:\n{stdout}"
+    );
+    None
 }
 
 async fn started() -> (QuicTransport, DataStreams, InstanceId) {
@@ -345,10 +390,14 @@ async fn started_observed(observed: Arc<Rejections>) -> (QuicTransport, DataStre
 /// the reader sees the close. The other order proves nothing: the dialer's own
 /// shutdown stops its reader before the server's close arrives.
 ///
-/// The runtime is `current_thread`, so the log subscriber, which is set for
-/// this thread only, sees the writer's end.
+/// It checks the log, so it runs in a child process (`logs_in_child`).
 #[tokio::test]
 async fn a_dialer_does_not_count_the_servers_shutdown_as_a_decode_error() {
+    let Some(logs) = logs_in_child(
+        "transports::quic::transport::tests::a_dialer_does_not_count_the_servers_shutdown_as_a_decode_error",
+    ) else {
+        return;
+    };
     let client_seen = Arc::new(Rejections::default());
     let (client, _client_streams, _) = started_observed(client_seen.clone()).await;
     let (server, server_streams, server_id) = started().await;
@@ -376,14 +425,6 @@ async fn a_dialer_does_not_count_the_servers_shutdown_as_a_decode_error() {
     .expect("the frame arrives")
     .unwrap();
 
-    let logs = CapturedLogs::default();
-    let _logging = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish(),
-    );
     server.shutdown();
     server.closed().await;
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -519,6 +560,14 @@ async fn replacing_a_dead_connection_does_not_deadlock() {
 ///
 /// The sender runs on its own runtime, which is dropped right after
 /// `shutdown()` and `closed()`.
+///
+/// The sender's close grace is long. With the default, a host that stalls the
+/// process for a second runs out the writer's wait for the acknowledgement.
+/// The writer then closes the connection and warns that frames written but
+/// not acknowledged can be lost: that is the documented end of the wait, not
+/// the loss this test looks for. Under load it lost up to 13 frames that way.
+/// The count then waits until every frame is delivered or failed, not for a
+/// quiet spell, which a stall can also make.
 #[test]
 fn frames_survive_the_runtime_ending_right_after_close() {
     const FRAMES: usize = 256;
@@ -538,7 +587,8 @@ fn frames_survive_the_runtime_ending_right_after_close() {
         .build()
         .unwrap();
     let first = tx_rt.block_on(async {
-        let (client, _client_streams, _) = started().await;
+        let (client, _client_streams, _) =
+            started_with(QuicTransportBuilder::new().close_grace(Duration::from_secs(30))).await;
         client.register(server_peer).unwrap();
         for i in 0..FRAMES {
             let _ = client.send_message(
@@ -551,7 +601,7 @@ fn frames_survive_the_runtime_ending_right_after_close() {
         }
         // Close once frames are flowing, so it lands mid-stream.
         let first = tokio::time::timeout(
-            Duration::from_secs(5),
+            Duration::from_secs(30),
             server_streams.response_stream.recv_async(),
         )
         .await
@@ -565,20 +615,22 @@ fn frames_survive_the_runtime_ending_right_after_close() {
     drop(tx_rt);
     assert!(first);
 
+    // Every failure is in: the runtime that reports them is gone.
+    let failed = errors.0.lock().unwrap().len();
     let rest = rx_rt.block_on(async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         let mut rest = 0;
-        while let Ok(Ok(_)) = tokio::time::timeout(
-            Duration::from_secs(3),
-            server_streams.response_stream.recv_async(),
-        )
-        .await
-        {
-            rest += 1;
+        while 1 + rest + failed < FRAMES {
+            match tokio::time::timeout_at(deadline, server_streams.response_stream.recv_async())
+                .await
+            {
+                Ok(Ok(_)) => rest += 1,
+                _ => break,
+            }
         }
         rest
     });
-    let delivered = 1 + rest;
-    let failed = errors.0.lock().unwrap().len();
+    let delivered = 1 + rest + server_streams.response_stream.drain().count();
     assert_eq!(
         delivered + failed,
         FRAMES,
@@ -959,10 +1011,14 @@ async fn closed_accounts_for_every_frame_when_the_peer_stops_reading() {
 /// read. Only a peer close is an orderly end; a forced close, an idle timeout
 /// or a reset is not.
 ///
-/// The runtime is `current_thread`, so the log subscriber, which is set for
-/// this thread only, sees the writer's end.
+/// It checks the log, so it runs in a child process (`logs_in_child`).
 #[tokio::test]
 async fn a_forced_close_warns_of_frames_the_peer_did_not_read() {
+    let Some(logs) = logs_in_child(
+        "transports::quic::transport::tests::a_forced_close_warns_of_frames_the_peer_did_not_read",
+    ) else {
+        return;
+    };
     const FRAMES: usize = 64;
     let (accepted_tx, accepted_rx) = tokio::sync::oneshot::channel();
     let (peer, peer_id) = raw_server(
@@ -991,14 +1047,6 @@ async fn a_forced_close_warns_of_frames_the_peer_did_not_read() {
         .expect("the writer never reached the peer")
         .unwrap();
 
-    let logs = CapturedLogs::default();
-    let _logging = tracing::subscriber::set_default(
-        tracing_subscriber::fmt()
-            .with_writer(logs.clone())
-            .with_max_level(tracing::Level::WARN)
-            .with_ansi(false)
-            .finish(),
-    );
     client.shutdown();
     client.closed().await;
     let failed = errors.0.lock().unwrap().len();
