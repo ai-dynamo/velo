@@ -2292,6 +2292,16 @@ async fn shutdown_resolves_parked_unmap_and_get() {
 /// The transfer keeps running — that is deliberate, and it is what stops UCX
 /// writing into a range the caller has since unmapped. What must still happen is
 /// the decrement, without which the region could never be unmapped at all.
+///
+/// The GET is held in flight with the owner's `progress_hold`: over the tcp
+/// lane a GET needs the owner's progress thread, so it cannot finish until the
+/// hold is released. Timing cannot make this certain. A short timeout around
+/// the GET polls the GET first, so a test thread descheduled just after the
+/// post sees the GET finish and the timeout return its result. A stall forced
+/// after the first poll does that every time.
+///
+/// `live_rkeys`, not `inflight_ops`, shows the GET is posted: only a GET
+/// unpacks an rkey, while `inflight_ops` also counts Active Message sends.
 #[tokio::test(flavor = "multi_thread")]
 async fn get_cancel_still_releases_the_region() {
     const LEN: usize = 32 * 1024 * 1024;
@@ -2299,17 +2309,39 @@ async fn get_cancel_still_releases_the_region() {
     let dst = PageBuf::new(LEN);
     src.fill_pattern();
 
-    let pair = start_rma_pair().await;
+    // Pinned to tcp: the hold below stops a GET only where it needs the
+    // owner's progress thread.
+    let pair = start_rma_pair_with(|b| software_rma(b).tls("tcp")).await;
     let remote = pair.owner_rma.map_region(src.addr(), LEN).await.unwrap();
     let local = pair.puller_rma.map_region(dst.addr(), LEN).await.unwrap();
+    // Wires up the endpoint, so the held GET below is a transfer waiting on
+    // the owner and not a connection waiting on it.
+    let mut warm_up = get_request(&pair, &src, &remote, &local);
+    warm_up.len = 4096;
+    pair.puller_rma.get(warm_up).await.expect("warm-up get");
 
-    let cancelled = tokio::time::timeout(
-        Duration::from_millis(1),
-        pair.puller_rma
-            .get(get_request(&pair, &src, &remote, &local)),
-    )
-    .await;
-    assert!(cancelled.is_err(), "the GET must be cancelled mid-transfer");
+    let owner = &pair.owner.transport.shared;
+    let puller = &pair.puller.transport.shared;
+    let owner_hold = hold_at(&owner.progress_hold, &owner.progress_held, "the owner").await;
+
+    let endpoint = pair.puller_rma.clone();
+    let req = get_request(&pair, &src, &remote, &local);
+    let get = tokio::spawn(async move { endpoint.get(req).await });
+    assert!(
+        wait_until(T, || puller.live_rkeys.load(Ordering::SeqCst) >= 1).await,
+        "the GET must be posted before it is cancelled"
+    );
+    get.abort();
+    let joined = get.await;
+    assert!(
+        joined.as_ref().is_err_and(|e| e.is_cancelled()),
+        "the GET must be cancelled, not finished: {joined:?}"
+    );
+    assert!(
+        puller.live_rkeys.load(Ordering::SeqCst) >= 1,
+        "the GET must still be in flight after its caller dropped it"
+    );
+    drop(owner_hold);
 
     // Resolves only once the abandoned operation has completed and decremented.
     tokio::time::timeout(T, pair.puller_rma.unmap_region(local.region_id))
