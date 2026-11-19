@@ -301,8 +301,10 @@ waited 200 ms for a reply with a 50 ms window, and
 16 MiB record. A host that stopped the test process for longer failed them
 with the record on its way. With random stops of up to 2.5 s, 12 of 640
 replies took more than 200 ms, and all of them arrived. Under `Manual`
-nothing else in the reply tests moves a batch, so a reply that waits for a
-flush never arrives, and the long wait still catches it. Do not count which
+only the reply's own window moves a batch in these tests: a probe wake writes
+a reply only when it is overdue, and a window that never started is never
+overdue. So a reply that waits for a flush never arrives, and the long wait
+still catches it. Do not count which
 wake wrote the batch: after a stall, the reply window can be over at the
 wake that staged the reply, and that wake writes it.
 
@@ -569,12 +571,14 @@ four windows after the first read. The old tests then fail every time. The
 fixed tests wait for the anchor to go, the sender's channel to close, and no
 live slot. They hold credit back until the test returns it with one sweep.
 The other two hold the watchdog (`DrainSignal::hold_watchdog`, in test builds)
-until the records have arrived. To show that a watchdog did not fire, they
+until the records they need have arrived, or in the byte-budget test have been
+read. To show that a watchdog did not fire, they
 wait for it to judge more windows than a firing needs (`watchdog_windows`),
 not for a fixed time.
 
 Tests: `streaming::messenger_mux::tests::a_watchdog_firing_closes_its_slot`,
 `streaming::messenger_mux::tests::the_watchdog_does_not_fire_while_its_sender_is_parked`,
+`streaming::messenger_mux::tests::a_silent_sender_with_credit_is_reaped_while_records_wait_unread`,
 and `streaming::messenger_mux::tests::a_sender_starved_by_the_byte_budget_is_not_reaped`
 (`lib/velo/src/streaming/messenger_mux/tests.rs`).
 
