@@ -689,6 +689,10 @@ impl Drop for StalledHarness {
 
 /// A messenger without a stager can send a singleton up to its transport's
 /// frame limit. Adding the mux's refusal header must not lose that record.
+///
+/// The record is 16 MiB over TCP. A lost record never arrives, so the wait is
+/// only a guard against a hang. It used to be 2 s, and a host that stopped
+/// the test process for longer failed the test with the record on its way.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_singleton_at_the_eager_frame_limit_reaches_its_peer() {
     let harness = harness(MuxConfig::default()).await;
@@ -720,7 +724,7 @@ async fn a_singleton_at_the_eager_frame_limit_reaches_its_peer() {
     assert_eq!(control.records[0].data, frame);
 
     inlet.send(frame.clone()).expect("queue singleton");
-    let payload = tokio::time::timeout(Duration::from_secs(2), harness.batches.recv_async())
+    let payload = tokio::time::timeout(RECV_TIMEOUT, harness.batches.recv_async())
         .await
         .expect("a singleton that fits the eager frame limit must reach its peer")
         .expect("capture channel");
