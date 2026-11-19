@@ -9,8 +9,8 @@ use std::sync::Arc;
 use bytes::Bytes;
 use serde::Serialize;
 
-use crate::queue::backend::SenderBackend;
-use crate::queue::error::WorkQueueSendError;
+use crate::queue::SenderBackend;
+use crate::queue::WorkQueueSendError;
 
 /// A typed sender handle for a named work queue.
 ///

@@ -12,6 +12,6 @@ Velo is experimental. The APIs are not stable.
 - Documentation: [the Velo book](https://ai-dynamo.github.io/velo/)
 - Repository: <https://github.com/ai-dynamo/velo>
 
-A `Velo` instance wraps a `Messenger`, an `AnchorManager`, and a `RendezvousManager`. Use `velo.messenger()`, `velo.anchor_manager()`, or `velo.rendezvous_manager()` for direct access.
+A `Velo` instance puts messaging, streams, and rendezvous behind one API. Its methods cover all three.
 
 To write a transport or discovery backend in another crate, depend on `velo-ext` instead. It is the small, stable trait surface.

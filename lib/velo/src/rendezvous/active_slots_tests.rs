@@ -18,7 +18,7 @@ use bytes::Bytes;
 use prometheus::Registry;
 
 use super::handle::DataHandle;
-use super::store::DataStore;
+use super::store::{DataStore, SlotBody};
 use crate::observability::VeloMetrics;
 use crate::observability::test_helpers::MetricSnapshot;
 
@@ -176,7 +176,8 @@ fn concurrent_frees_leave_the_gauge_at_zero() {
             let (store, registry, barrier, stale) = (&store, &registry, &barrier, &stale);
             scope.spawn(move || {
                 for round in 0..ROUNDS {
-                    let slot = store.register(Bytes::from_static(PAYLOAD), None);
+                    let slot =
+                        store.register_body(SlotBody::InMemory(Bytes::from_static(PAYLOAD)), None);
                     barrier.wait();
                     assert!(store.release_owner_reference(slot));
                     if barrier.wait().is_leader() {

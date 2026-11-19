@@ -122,9 +122,8 @@ use serde::{Deserialize, Serialize};
 use tokio::task::JoinSet;
 use velo::observability::VeloMetrics;
 use velo::observability::test_helpers::MetricSnapshot;
-use velo::streaming::{
-    FlushPolicy, MuxConfig, StreamAnchor, StreamAnchorHandle, StreamFrame, StreamSender,
-};
+use velo::streaming::{FlushPolicy, MuxConfig};
+use velo::{StreamAnchor, StreamAnchorHandle, StreamFrame, StreamSender};
 use velo::{Velo, VeloBuilder};
 use velo_examples::{TransportType, new_transport};
 
@@ -136,7 +135,7 @@ const HOSTS: usize = 3;
 const MUX_KEY: &str = velo::streaming::MESSENGER_MUX_KEY;
 
 /// The streaming transport every node has: one TCP connection per stream.
-const LEGACY_KEY: &str = velo::streaming::tcp_transport::TCP_STREAM_KEY;
+const LEGACY_KEY: &str = velo::streaming::TCP_STREAM_KEY;
 
 /// A bound on the whole run, so a bug reports itself instead of hanging.
 const PATIENCE: Duration = Duration::from_secs(60);
