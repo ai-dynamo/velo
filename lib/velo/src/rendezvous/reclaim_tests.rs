@@ -22,12 +22,12 @@ use velo_ext::WorkerId;
 
 use super::RendezvousManager;
 use super::handle::DataHandle;
-use super::store::DataStore;
+use super::store::{DataStore, SlotBody};
 
 const PAYLOAD: &[u8] = b"payload";
 
-/// Drop the owner's reference the way a caller with the store does it,
-/// while the reader's lease still holds the slot.
+/// Drop the owner's reference the way the owner's release does it, while
+/// the reader's lease still holds the slot.
 fn drop_owner_reference(store: &DataStore, handle: DataHandle, lease: u64) {
     let (_, slot) = handle.unpack();
     assert_eq!(
@@ -36,11 +36,7 @@ fn drop_owner_reference(store: &DataStore, handle: DataHandle, lease: u64) {
         "the reader is attached"
     );
     assert_eq!(store.metadata(slot).unwrap().refcount, 1);
-    assert!(
-        !store.ref_decrement(slot),
-        "the read lock keeps the slot while the reader is attached"
-    );
-    store.try_free(slot);
+    assert!(store.release_owner_reference(slot));
     let meta = store
         .metadata(slot)
         .expect("the reader's lease keeps the slot");
@@ -104,7 +100,7 @@ async fn a_lease_guard_drop_frees_the_slot_of_a_released_owner() {
 #[test]
 fn the_reaper_frees_the_slot_of_a_released_owner() {
     let store = DataStore::new();
-    let slot = store.register(Bytes::from_static(PAYLOAD), None);
+    let slot = store.register_body(SlotBody::InMemory(Bytes::from_static(PAYLOAD)), None);
     let lease = store.acquire_read_lock(slot).unwrap();
     let handle = DataHandle::pack(WorkerId::from_u64(1), slot);
     store.set_lease_deadline(lease, slot, Duration::from_secs(1));
@@ -150,7 +146,7 @@ async fn a_slot_with_a_reader_still_attached_is_not_freed() {
 #[test]
 fn reaping_one_of_two_leases_keeps_the_slot() {
     let store = DataStore::new();
-    let slot = store.register(Bytes::from_static(PAYLOAD), None);
+    let slot = store.register_body(SlotBody::InMemory(Bytes::from_static(PAYLOAD)), None);
     let first = store.acquire_read_lock(slot).unwrap();
     let second = store.acquire_read_lock(slot).unwrap();
     let handle = DataHandle::pack(WorkerId::from_u64(1), slot);
@@ -165,21 +161,21 @@ fn reaping_one_of_two_leases_keeps_the_slot() {
     assert_eq!(store.get_data(slot).unwrap(), Bytes::from_static(PAYLOAD));
 }
 
-/// A reader that attaches after the last one detached, but before the owner's
-/// `try_free`, keeps the slot: `try_free` checks both counts as it removes.
+/// A reader that attaches before the last one detaches keeps the slot of a
+/// released owner, and so does a later `try_free`: it checks both counts as
+/// it removes.
 #[test]
 fn a_reader_that_attaches_before_try_free_keeps_the_slot() {
     let store = DataStore::new();
-    let slot = store.register(Bytes::from_static(PAYLOAD), None);
+    let slot = store.register_body(SlotBody::InMemory(Bytes::from_static(PAYLOAD)), None);
     let first = store.acquire_read_lock(slot).unwrap();
-    assert!(!store.ref_decrement(slot));
-    assert_eq!(
-        store.consume_lease(first, slot),
-        super::store::LeaseOutcome::Consumed
-    );
-    assert!(store.release_read_lock(slot));
+    assert!(store.release_owner_reference(slot));
 
     let second = store.acquire_read_lock(slot).unwrap();
+    assert_eq!(
+        store.end_lease(first, slot, super::store::LeaseEnd::Detach),
+        super::store::LeaseOutcome::Consumed
+    );
     store.try_free(slot);
     assert_eq!(store.metadata(slot).unwrap().refcount, 0);
     assert_eq!(store.get_data(slot).unwrap(), Bytes::from_static(PAYLOAD));
@@ -194,7 +190,7 @@ fn a_reader_that_attaches_before_try_free_keeps_the_slot() {
 #[test]
 fn a_reaped_heap_chunk_stays_owned() {
     let store = DataStore::new();
-    let slot = store.register(Bytes::from(vec![42u8; 2048]), None);
+    let slot = store.register_body(SlotBody::InMemory(Bytes::from(vec![42u8; 2048])), None);
     let lease = store.acquire_read_lock(slot).unwrap();
     let (transfer, _, _) = store.create_transfer(slot, lease, 1024).unwrap();
     let held = store.get_chunk(transfer, 0).unwrap();
@@ -293,8 +289,8 @@ async fn remote_release_frees_the_slot_of_a_released_owner() {
 /// The owner's reference and the last reader's lock can drop at the same time,
 /// on two threads. One of the two must free the slot. If each side compared a
 /// relaxed load of the other's count, both could read the old value on a
-/// weakly ordered CPU and neither would free. The owner here frees the way a
-/// caller with the store does: `try_free` only when `ref_decrement` says so.
+/// weakly ordered CPU and neither would free. The owner here leaves through
+/// `release_owner_reference`, the call the owner's release makes.
 #[test]
 fn an_owner_and_its_last_reader_leaving_together_free_the_slot() {
     use super::store::LeaseEnd;
@@ -302,16 +298,14 @@ fn an_owner_and_its_last_reader_leaving_together_free_the_slot() {
 
     for _ in 0..2_000 {
         let store = Arc::new(DataStore::new());
-        let slot = store.register(Bytes::from_static(PAYLOAD), None);
+        let slot = store.register_body(SlotBody::InMemory(Bytes::from_static(PAYLOAD)), None);
         let lease = store.acquire_read_lock(slot).unwrap();
         let start = Arc::new(Barrier::new(2));
         let owner = {
             let (store, start) = (Arc::clone(&store), Arc::clone(&start));
             std::thread::spawn(move || {
                 start.wait();
-                if store.ref_decrement(slot) {
-                    store.try_free(slot);
-                }
+                store.release_owner_reference(slot);
             })
         };
         start.wait();

@@ -18,7 +18,7 @@ use anyhow::Result;
 use bytes::Bytes;
 use futures::future::BoxFuture;
 
-use crate::RendezvousManager;
+use crate::rendezvous::RendezvousManager;
 
 /// Default threshold for auto-staging large payloads (256 KiB).
 ///
@@ -30,10 +30,10 @@ use crate::RendezvousManager;
 /// property of the defaults and not a guarantee — a smaller configured chunk
 /// size costs proportionally more pulls, and payloads far above the threshold
 /// take as many as their size requires.
-pub const DEFAULT_THRESHOLD: usize = 256 * 1024;
+pub(crate) const DEFAULT_THRESHOLD: usize = 256 * 1024;
 
 /// Sender-side: stages large payloads locally via the [`RendezvousManager`].
-pub struct RendezvousStager {
+pub(crate) struct RendezvousStager {
     manager: Arc<RendezvousManager>,
     threshold: usize,
 }
@@ -46,6 +46,7 @@ impl RendezvousStager {
         }
     }
 
+    #[cfg(test)]
     pub fn with_threshold(mut self, threshold: usize) -> Self {
         self.threshold = threshold;
         self
@@ -98,7 +99,7 @@ impl LargePayloadStager for RendezvousStager {
 ///
 /// Performs a full get() + release() cycle since transparent staging
 /// uses single-use handles (refcount = 1).
-pub struct RendezvousResolver {
+pub(crate) struct RendezvousResolver {
     manager: Arc<RendezvousManager>,
     limit: u64,
     fetch_timeout: Option<Duration>,

@@ -29,7 +29,8 @@ use velo_ext::{PeerInfo, TransportKey, WorkerAddress, WorkerId};
 mod connection;
 
 use crate::streaming::control::RetireGuard;
-use crate::streaming::transport::{FrameTransport, RetiringFrameTransport};
+use crate::streaming::sender::RetiresOn;
+use crate::streaming::transport::{Bound, Connected, FrameTransport};
 use crate::transports::address::WorkerAddressBuilder;
 use crate::transports::utils::interfaces::{
     InterfaceEndpoint, InterfaceFilter, parse_endpoints, resolve_advertise_endpoints,
@@ -247,9 +248,9 @@ fn read_u64_meta<T>(request: &Request<T>, name: &str) -> Result<u64, Box<Status>
 // GrpcFrameTransport (public API)
 // ---------------------------------------------------------------------------
 
-/// gRPC-based [`FrameTransport`] providing per-(anchor, session) routing via
+/// The per-stream gRPC transport, providing per-(anchor, session) routing via
 /// a shared tonic server.
-pub struct GrpcFrameTransport {
+pub(crate) struct GrpcFrameTransport {
     key: TransportKey,
     bind_addr: SocketAddr,
     local_address: WorkerAddress,
@@ -371,11 +372,14 @@ impl GrpcFrameTransport {
     }
 
     /// Convenience: bind on `0.0.0.0:0`.
-    pub async fn default_new() -> Result<Arc<Self>> {
+    #[cfg(test)]
+    pub(crate) async fn default_new() -> Result<Arc<Self>> {
         Self::new("0.0.0.0:0".parse().unwrap()).await
     }
 
-    pub fn bound_addr(&self) -> SocketAddr {
+    /// The bound listener address, for tests that dial it directly.
+    #[cfg(test)]
+    pub(crate) fn bound_addr(&self) -> SocketAddr {
         self.bind_addr
     }
 
@@ -408,8 +412,16 @@ impl GrpcFrameTransport {
         peer: WorkerId,
         anchor_id: u64,
         session_id: u64,
-        retire: Option<RetireGuard>,
-    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
+        retire: Option<crate::streaming::control::SenderClosed>,
+    ) -> BoxFuture<'_, Result<Connected>> {
+        // The pump reports the stream's retirement only when it holds the
+        // stream's flag; without one, the sender reports `Sent` as it queues.
+        let retires_on = if retire.is_some() {
+            RetiresOn::Transport
+        } else {
+            RetiresOn::Queue
+        };
+        let retire = retire.map(RetireGuard::new);
         let peers = self.peers.clone();
         Box::pin(async move {
             if self.tasks.is_stopped() {
@@ -543,24 +555,12 @@ impl GrpcFrameTransport {
                 return Err(anyhow!("gRPC streaming transport shut down"));
             }
 
-            Ok(frame_tx)
+            Ok(Connected {
+                tx: frame_tx,
+                retires_on,
+                item_limit: Some(MAX_ITEM_BYTES),
+            })
         })
-    }
-}
-
-impl RetiringFrameTransport for GrpcFrameTransport {
-    fn connect_retiring(
-        &self,
-        peer: WorkerId,
-        anchor_id: u64,
-        session_id: u64,
-        closed: crate::streaming::control::SenderClosed,
-    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
-        self.connect_with(peer, anchor_id, session_id, Some(RetireGuard::new(closed)))
-    }
-
-    fn item_limit(&self) -> Option<usize> {
-        Some(MAX_ITEM_BYTES)
     }
 }
 
@@ -610,11 +610,7 @@ impl FrameTransport for GrpcFrameTransport {
         self.peers.remove(&instance_id.worker_id());
     }
 
-    fn bind(
-        &self,
-        anchor_id: u64,
-        session_id: u64,
-    ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>> {
+    fn bind(&self, anchor_id: u64, session_id: u64) -> BoxFuture<'_, Result<Bound>> {
         let routing = self.routing.clone();
         Box::pin(async move {
             if self.tasks.is_stopped() {
@@ -633,7 +629,7 @@ impl FrameTransport for GrpcFrameTransport {
                 routing.remove(&(anchor_id, session_id));
                 return Err(anyhow!("gRPC streaming transport shut down"));
             }
-            Ok(frame_rx)
+            Ok(Bound::uncredited(frame_rx))
         })
     }
 
@@ -642,8 +638,9 @@ impl FrameTransport for GrpcFrameTransport {
         peer: WorkerId,
         anchor_id: u64,
         session_id: u64,
-    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
-        self.connect_with(peer, anchor_id, session_id, None)
+        retire: Option<crate::streaming::control::SenderClosed>,
+    ) -> BoxFuture<'_, Result<Connected>> {
+        self.connect_with(peer, anchor_id, session_id, retire)
     }
 }
 
@@ -666,14 +663,14 @@ mod tests {
             .await
             .unwrap();
         let addr = server.bound_addr();
-        let pending = server.bind(1, 1).await.unwrap();
-        let active = server.bind(2, 2).await.unwrap();
+        let pending = server.bind(1, 1).await.unwrap().rx;
+        let active = server.bind(2, 2).await.unwrap().rx;
         let client = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
             .await
             .unwrap();
         let (peer, info) = fresh_peer(server.address());
         client.register(&info).unwrap();
-        let sender = client.connect(peer, 2, 2).await.unwrap();
+        let sender = client.connect(peer, 2, 2, None).await.unwrap().tx;
         sender.send_async(b"data".to_vec()).await.unwrap();
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(2), active.recv_async())
@@ -749,7 +746,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn response_completes_only_after_request_stream_drains() {
         let server = GrpcFrameTransport::default_new().await.unwrap();
-        let rx = server.bind(9, 4).await.unwrap();
+        let rx = server.bind(9, 4).await.unwrap().rx;
 
         let addr = SocketAddr::new(
             std::net::Ipv4Addr::LOCALHOST.into(),
@@ -832,8 +829,12 @@ mod tests {
         let dropped = crate::streaming::sender::cached_dropped().clone();
 
         for cycle in 1..=CYCLES {
-            let rx = server.bind(cycle, cycle).await.unwrap();
-            let tx = client.connect(server_worker, cycle, cycle).await.unwrap();
+            let rx = server.bind(cycle, cycle).await.unwrap().rx;
+            let tx = client
+                .connect(server_worker, cycle, cycle, None)
+                .await
+                .unwrap()
+                .tx;
 
             let fin = finalized.clone();
             let producer = tokio::spawn(async move {
@@ -877,8 +878,8 @@ mod tests {
         let (server_worker, server_peer) = fresh_peer(server.address());
         client.register(&server_peer).unwrap();
 
-        let rx = server.bind(7, 1).await.unwrap();
-        let tx = client.connect(server_worker, 7, 1).await.unwrap();
+        let rx = server.bind(7, 1).await.unwrap().rx;
+        let tx = client.connect(server_worker, 7, 1, None).await.unwrap().tx;
         let payload = b"hello".to_vec();
         tx.send_async(payload.clone()).await.unwrap();
         let received = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv_async())
@@ -905,10 +906,10 @@ mod tests {
     async fn bind_overwrite_emits_warn_and_returns_new_rx() {
         let server = GrpcFrameTransport::default_new().await.unwrap();
         // First bind grabs the slot.
-        let rx1 = server.bind(42, 7).await.unwrap();
+        let rx1 = server.bind(42, 7).await.unwrap().rx;
         // Second bind for the same (anchor_id, session_id) overwrites; the
         // previous frame_tx is dropped, so rx1's channel closes.
-        let _rx2 = server.bind(42, 7).await.unwrap();
+        let _rx2 = server.bind(42, 7).await.unwrap().rx;
         // rx1 should observe the close (no more frames will arrive on it).
         let res = tokio::time::timeout(std::time::Duration::from_millis(200), rx1.recv_async())
             .await
@@ -963,19 +964,19 @@ mod tests {
         let (server_worker, server_peer) = fresh_peer(server.address());
         client.register(&server_peer).unwrap();
         client.unregister(server_peer.instance_id());
-        let err = client.connect(server_worker, 1, 1).await.unwrap_err();
+        let err = client.connect(server_worker, 1, 1, None).await.unwrap_err();
         assert!(format!("{err}").contains("not registered"), "{err}");
 
         client.register(&server_peer).unwrap();
-        let _rx = server.bind(1, 1).await.unwrap();
-        client.connect(server_worker, 1, 1).await.unwrap();
+        let _rx = server.bind(1, 1).await.unwrap().rx;
+        client.connect(server_worker, 1, 1, None).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn connect_to_unregistered_peer_errors() {
         let transport = GrpcFrameTransport::default_new().await.unwrap();
         let bogus = InstanceId::new_v4().worker_id();
-        let err = transport.connect(bogus, 1, 1).await.unwrap_err();
+        let err = transport.connect(bogus, 1, 1, None).await.unwrap_err();
         let msg = format!("{err}");
         assert!(msg.contains("not registered"), "got: {msg}");
     }
@@ -995,8 +996,8 @@ mod tests {
         let (server_worker, server_peer) = fresh_peer(server.address());
         client.register(&server_peer).unwrap();
 
-        let rx = server.bind(11, 3).await.unwrap();
-        let tx = client.connect(server_worker, 11, 3).await.unwrap();
+        let rx = server.bind(11, 3).await.unwrap().rx;
+        let tx = client.connect(server_worker, 11, 3, None).await.unwrap().tx;
 
         let finalized =
             rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::<()>::Finalized).unwrap();
@@ -1049,12 +1050,13 @@ mod tests {
             .unwrap();
         let (peer, info) = fresh_peer(server.address());
         client.register(&info).unwrap();
-        let consumer = server.bind(3, 3).await.unwrap();
+        let consumer = server.bind(3, 3).await.unwrap().rx;
         let closed = crate::streaming::control::SenderClosed::default();
         let tx = client
-            .connect_retiring(peer, 3, 3, closed.clone())
+            .connect(peer, 3, 3, Some(closed.clone()))
             .await
-            .unwrap();
+            .unwrap()
+            .tx;
         drop(consumer);
         tx.send_async(b"data".to_vec()).await.unwrap();
         tx.send_async(crate::streaming::sender::cached_finalized().clone())
@@ -1141,7 +1143,7 @@ mod tests {
             .await
             .unwrap();
 
-        let consumer = server.bind(4, 4).await.unwrap();
+        let consumer = server.bind(4, 4).await.unwrap().rx;
         assert!(call_ends_cleanly_after(&server, 4, UNDER_IT).await);
         let item = consumer.recv_async().await.unwrap();
         assert_eq!(item.len(), UNDER_IT);
@@ -1150,7 +1152,7 @@ mod tests {
             *crate::streaming::sender::cached_finalized()
         );
 
-        let consumer = server.bind(5, 5).await.unwrap();
+        let consumer = server.bind(5, 5).await.unwrap().rx;
         assert!(!call_ends_cleanly_after(&server, 5, OVER_THE_DECODE_LIMIT).await);
         assert_eq!(
             consumer.recv_async().await.unwrap(),

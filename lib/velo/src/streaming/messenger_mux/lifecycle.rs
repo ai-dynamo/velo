@@ -43,7 +43,6 @@ impl MessengerMuxTransport {
         self.stop_sending();
         self.core.batchers.clear();
         close_ingress(&self.core.ingress, self.core.metrics.as_ref());
-        self.core.drains.clear();
     }
 }
 

@@ -2615,6 +2615,7 @@ pub fn apply_remote_parent(span: &tracing::Span, headers: Option<&HashMap<String
 /// Enable with `velo-observability = { ..., features = ["test-helpers"] }` in
 /// `[dev-dependencies]`.
 #[cfg(any(test, feature = "test-helpers"))]
+#[doc(hidden)]
 pub mod test_helpers {
     use prometheus::Registry;
     use prometheus::proto::MetricFamily;
