@@ -178,7 +178,7 @@ pub(super) async fn stalled_producer(config: MuxConfig) -> Stalled {
     // the whole of the far side.
     let peer_instance = velo_ext::InstanceId::new_v4();
     messenger
-        .register_peer_inner(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
+        .register_peer(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
         .expect("register peer");
     let producer = MessengerMuxTransport::new(
         Arc::clone(&messenger),

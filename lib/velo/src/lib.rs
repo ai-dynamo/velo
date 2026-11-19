@@ -6,14 +6,18 @@
 //! Active messaging runtime for Velo distributed systems. Wraps [`Messenger`]
 //! with builder sugar for discovery wiring and re-exports the full public API.
 //!
-//! Out-of-tree implementors of [`Transport`], [`crate::streaming::FrameTransport`],
-//! [`PeerDiscovery`], or [`crate::discovery::ServiceDiscovery`] should depend
-//! on the smaller [`velo_ext`] crate instead of `velo`. Everything that lives
+//! Out-of-tree implementors of [`Transport`], [`PeerDiscovery`], or
+//! [`crate::discovery::ServiceDiscovery`] should depend on the smaller
+//! [`velo_ext`] crate instead of `velo`. Everything that lives
 //! here is the runtime and concrete impls.
 
 use std::sync::Arc;
 
+use crate::discovery::PeerDiscovery;
 use crate::messenger::MessengerParts;
+use crate::observability::VeloMetrics;
+#[cfg(all(target_os = "linux", feature = "ucx"))]
+use crate::rendezvous::rdma::{PinnedBuf, RdmaError, RegionGuard};
 use anyhow::Result;
 
 // ── Subsystem modules (each was previously a sibling crate) ────────────────
@@ -30,6 +34,12 @@ pub mod transports;
 
 #[cfg(feature = "simulation")]
 pub mod simulation;
+
+// Not a supported API, and hidden so that `cargo semver-checks`, which
+// builds with every feature, does not gate releases on it.
+#[cfg(feature = "test-helpers")]
+#[doc(hidden)]
+pub mod test_helpers;
 
 #[cfg(test)]
 mod crash_report_tests;
@@ -52,42 +62,44 @@ pub use velo_ext::{
 pub use velo_ext as ext;
 
 // Messenger surface
-#[allow(deprecated)] // re-exported until 0.23.0 removes `MessengerBuilder`
-pub use crate::messenger::{
-    Admitted, AmHandlerBuilder, AmSendBuilder, AmSyncBuilder, AsyncExecutor, Context, FireResult,
-    Handler, HandlerExecutor, Messenger, MessengerBuilder, OrderedConfig, OrderingKey,
-    OverflowPolicy, PeerDiscovery, RequestTimeout, SyncExecutor, SyncResult, TypedContext,
-    TypedUnaryBuilder, TypedUnaryHandlerBuilder, TypedUnaryResult, UnaryBuilder,
-    UnaryHandlerBuilder, UnaryResult, UnifiedResponse,
+pub use crate::messenger::client::builders::{
+    Admitted, AmSendBuilder, AmSyncBuilder, FireResult, RequestTimeout, SyncResult,
+    TypedUnaryBuilder, TypedUnaryResult, UnaryBuilder, UnaryResult,
 };
+pub use crate::messenger::handlers::{
+    AmHandlerBuilder, AsyncExecutor, Context, Handler, HandlerExecutor, OrderedConfig, OrderingKey,
+    OverflowPolicy, SyncExecutor, TypedContext, TypedUnaryHandlerBuilder, UnaryHandlerBuilder,
+    UnifiedResponse,
+};
+pub use crate::messenger::messenger::Messenger;
 
 // Events
 #[cfg(feature = "services")]
-pub use crate::events::{
-    Event, EventAwaiter, EventBackend, EventHandle, EventManager, EventPoison, EventStatus,
-};
+pub use crate::events::event::{Event, EventBackend};
 #[cfg(feature = "services")]
-pub use crate::messenger::VeloEvents;
+pub use crate::events::handle::EventHandle;
+#[cfg(feature = "services")]
+pub use crate::events::manager::EventManager;
+#[cfg(feature = "services")]
+pub use crate::events::slot::EventAwaiter;
+#[cfg(feature = "services")]
+pub use crate::events::status::{EventPoison, EventStatus};
+#[cfg(feature = "services")]
+pub use crate::messenger::events::VeloEvents;
 
-// Streaming (flat at root for convenience; full surface still under [`streaming`])
+// Streaming: the types a `Velo` stream method takes or returns. Configuration
+// and the rest of the stream surface are under [`streaming`].
+pub use crate::streaming::anchor::{AttachError, StreamAnchor, StreamController};
 pub use crate::streaming::control::StreamOpenTicket;
-pub use crate::streaming::{
-    AnchorManager, AttachError, SendError, StreamAnchor, StreamAnchorHandle, StreamController,
-    StreamError, StreamFrame, StreamSender,
-};
+pub use crate::streaming::frame::{SendError, StreamError, StreamFrame};
+pub use crate::streaming::handle::StreamAnchorHandle;
+pub use crate::streaming::sender::StreamSender;
 
 // Rendezvous
-pub use crate::rendezvous::{
-    DataHandle, DataMetadata, RegisterOptions, RendezvousManager, RendezvousWrite, StageMode,
-};
-
-// RDMA registration. Gated exactly as `transports::ucx` is: these types are the
-// public face of a subsystem that only exists when a UCX transport can back it.
-#[cfg(all(target_os = "linux", feature = "ucx"))]
-pub use crate::rendezvous::rdma::{
-    Deregistered, PinnedBuf, RdmaConfig, RdmaError, RdmaPoolConfig, RdmaRendezvousConfig,
-    RegionGuard, RegionWatch, RegisterOwnedError,
-};
+pub use crate::rendezvous::handle::DataHandle;
+pub use crate::rendezvous::protocol::DataMetadata;
+pub use crate::rendezvous::store::RegisterOptions;
+pub use crate::rendezvous::write::RendezvousWrite;
 
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 pub use crate::rendezvous::write::PinnedWriter;
@@ -97,9 +109,6 @@ pub use crate::rendezvous::write::PinnedWriter;
 /// shape in every build; only velo can construct one, so a build without the
 /// RDMA path simply never does.
 pub use crate::rendezvous::write::RdmaDestination;
-
-// Observability
-pub use crate::observability::VeloMetrics;
 
 /// Configuration for TCP streaming transport.
 ///
@@ -151,40 +160,40 @@ impl Default for GrpcConfig {
 ///
 /// # Default
 ///
-/// Unless [`VeloBuilder::mux_only`] is set, if neither
-/// [`VeloBuilder::stream_config`] nor [`VeloBuilder::stream_bind_addr`]
-/// is called, the builder defaults to [`StreamConfig::Tcp(None)`](StreamConfig::Tcp)
-/// — bind `0.0.0.0:<ephemeral>` and advertise every UP non-loopback interface
-/// via [`Vec<InterfaceEndpoint>`](crate::transports::utils::interfaces::InterfaceEndpoint)
+/// None. A builder that calls neither [`VeloBuilder::stream_config`] nor
+/// [`VeloBuilder::stream_bind_addr`] opens no per-stream listener: the
+/// messenger mux carries its remote streams, and a peer without the mux
+/// cannot attach to it. Set a `StreamConfig` to serve such peers, or to keep
+/// streaming with the mux turned off.
+///
+/// `StreamConfig::Tcp(None)` binds `0.0.0.0:<ephemeral>` and advertises every
+/// UP non-loopback interface via
+/// [`Vec<InterfaceEndpoint>`](crate::transports::utils::interfaces::InterfaceEndpoint)
 /// in the local [`WorkerAddress`]. The peer-side `register()` walks the
 /// advertised list and calls `select_best_endpoint` (NUMA + subnet match)
-/// against its own interfaces to choose a routable address — multi-node
-/// correctness comes from interface advertisement, not from defaulting away
-/// from TCP.
+/// against its own interfaces to choose a routable address.
 ///
 /// # Variants
 ///
-/// - [`StreamConfig::Tcp`]: TCP-based streaming via
-///   [`TcpFrameTransport`](crate::streaming::TcpFrameTransport). Pass `None`
-///   to bind on `0.0.0.0:0`, or provide a [`TcpConfig`] for an explicit
-///   single-interface bind.
+/// - [`StreamConfig::Tcp`]: TCP-based streaming, under the `tcp-stream` key.
+///   Pass `None` to bind on `0.0.0.0:0`, or provide a [`TcpConfig`] for an
+///   explicit single-interface bind.
 ///
-/// - [`StreamConfig::Grpc`]: gRPC-based streaming via
-///   [`GrpcFrameTransport`](crate::streaming::GrpcFrameTransport). Only
-///   available when the `grpc` feature is enabled. Same advertise-and-select
-///   semantics as `Tcp`.
+/// - [`StreamConfig::Grpc`]: gRPC-based streaming, under the `grpc-stream`
+///   key. Only available when the `grpc` feature is enabled. Same
+///   advertise-and-select semantics as `Tcp`.
 #[derive(Debug, Clone)]
 pub enum StreamConfig {
-    /// TCP-based streaming transport (TcpFrameTransport).
+    /// TCP-based streaming transport, under the `tcp-stream` key.
     Tcp(Option<TcpConfig>),
-    /// gRPC-based streaming transport (GrpcFrameTransport).
+    /// gRPC-based streaming transport, under the `grpc-stream` key.
     #[cfg(feature = "grpc")]
     Grpc(Option<GrpcConfig>),
 }
 
 /// High-level facade for the Velo distributed system.
 ///
-/// Wraps a [`Messenger`], [`AnchorManager`], and [`RendezvousManager`]
+/// Wraps a [`Messenger`], the anchor manager, and the rendezvous manager,
 /// and provides the same public API with a simpler name.
 ///
 /// `Velo` is a handle: cloning it is one reference-count increment, and every
@@ -247,7 +256,7 @@ struct VeloInner {
     /// through [`VeloBuilder::add_ucx_transport`].
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     rdma: Option<Arc<crate::rendezvous::rdma::RdmaRegistry>>,
-    /// Serialises [`graceful_shutdown`](Velo::graceful_shutdown).
+    /// Serialises the messenger half of [`shutdown`](Velo::shutdown).
     ///
     /// [`Velo`] is `Clone`, so two clones can call it at once. Without this the
     /// second caller finds the transport's join handle already taken, skips the
@@ -258,8 +267,8 @@ struct VeloInner {
     shutdown: ShutdownOnce,
 }
 
-/// Makes [`Velo::graceful_shutdown`] run exactly once, and makes concurrent
-/// callers wait for the run rather than start their own.
+/// Makes the messenger half of [`Velo::shutdown`] run exactly once, and makes
+/// concurrent callers wait for the run rather than start their own.
 struct ShutdownOnce {
     lock: tokio::sync::Mutex<()>,
     done: std::sync::atomic::AtomicBool,
@@ -392,7 +401,14 @@ impl VeloBuilder {
         self
     }
 
-    /// Set the streaming transport configuration.
+    /// Opt in to the per-stream path: install a TCP or gRPC stream listener
+    /// beside the messenger mux.
+    ///
+    /// Without this call, or [`stream_bind_addr`](Self::stream_bind_addr),
+    /// the node opens no stream listener, and a peer that does not offer the
+    /// mux cannot attach to it. With it, each attach picks the mux or this
+    /// transport from what the peer offers, and turning the mux off falls
+    /// back to this transport.
     ///
     /// Only one transport server is allowed per Velo instance. Returns [`Err`]
     /// if called more than once on the same builder.
@@ -406,8 +422,9 @@ impl VeloBuilder {
         Ok(self)
     }
 
-    /// Convenience: pin the TCP streaming listener to a single interface IP
-    /// (instead of the default `0.0.0.0` + multi-interface advertise).
+    /// Opt in to the per-stream path with a TCP stream listener pinned to one
+    /// interface IP, instead of `0.0.0.0` and every interface advertised.
+    /// See [`stream_config`](Self::stream_config).
     pub fn stream_bind_addr(self, addr: std::net::IpAddr) -> Self {
         self.stream_config(StreamConfig::Tcp(Some(TcpConfig::new(addr))))
             .unwrap()
@@ -422,18 +439,29 @@ impl VeloBuilder {
     /// to tune it, or with `enabled: false` to turn it off, in which case
     /// nothing is registered and nothing is advertised.
     ///
-    /// Unless `mux_only()` is selected, the per-stream transport stays
-    /// configured either way — a mux-enabled
-    /// node registers both, and each attach picks between them from what the
-    /// peer advertised, so a peer without the mux is still served. **Rollback
-    /// is the same flag**: set it to `false` and the node stops advertising
-    /// `messenger-mux-v2`, so the next attach negotiates the per-stream path.
-    /// No code change, no wire change, and no coordination with peers, because
-    /// a key that is never advertised is never selected. An application that
-    /// never calls this can still turn the mux off: set
+    /// A node that opted in to the per-stream path with
+    /// [`stream_config`](Self::stream_config) or
+    /// [`stream_bind_addr`](Self::stream_bind_addr) registers both
+    /// transports, and each attach picks between them from what the peer
+    /// advertised, so a peer without the mux is still served. On such a node
+    /// **rollback is the same flag**: set it to `false` and the node stops
+    /// advertising `messenger-mux-v2`, so the next attach negotiates the
+    /// per-stream path, with no wire change. The peer needs the same
+    /// per-stream transport: with the mux off, each side offers and accepts
+    /// only its own per-stream key (`tcp-stream` or `grpc-stream`), and a
+    /// peer on the default build has only the mux, so an attach finds no
+    /// transport in common. Give the peers the same `stream_config` (or
+    /// `stream_bind_addr`, which is TCP) before the mux goes off. An
+    /// application that never calls this can still turn the mux off: set
     /// `VELO_MESSENGER_MUX_DISABLE=1` and restart. The variable is read once,
     /// per [`build`](Self::build), and it wins over `enabled: true` set in
-    /// code. With `mux_only()`, disabling the mux makes the build fail.
+    /// code.
+    ///
+    /// A node with no stream config has no per-stream transport to fall back
+    /// to, so turning its mux off, by either form, makes
+    /// [`build`](Self::build) fail. On a default node the error names
+    /// `stream_config` and `stream_bind_addr`; on a `mux_only()` node it
+    /// names `mux_only`.
     ///
     /// Only one mux may be installed per instance: its `_stream_batch` handler
     /// is registered on the messenger for its lifetime. The messenger would
@@ -451,9 +479,11 @@ impl VeloBuilder {
 
     /// Use only the messenger mux for remote streams, with no extra listener.
     ///
-    /// Peers must support the messenger mux. An explicit `stream_config` or
+    /// A builder with no stream config already does this. `mux_only()` also
+    /// makes the choice explicit: an explicit `stream_config` or
     /// `stream_bind_addr`, a disabled mux, or an active
-    /// `VELO_MESSENGER_MUX_DISABLE` makes `build` return an error.
+    /// `VELO_MESSENGER_MUX_DISABLE` makes `build` return an error that names
+    /// `mux_only`. Peers must support the messenger mux.
     pub fn mux_only(mut self) -> Self {
         self.mux_only = true;
         self
@@ -519,21 +549,38 @@ impl VeloBuilder {
 
     /// Build the Velo system with the configured transports and discovery.
     ///
-    /// Validates the streaming mode before starting transports. Default builds
-    /// install the mux beside a per-stream TCP or gRPC listener. `mux_only`
-    /// installs only the mux. Both modes retain the full rendezvous API.
+    /// Validates the streaming mode before starting transports. A builder with
+    /// no stream config, and one that calls `mux_only`, installs only the mux.
+    /// A builder with `stream_config` or `stream_bind_addr` installs the mux
+    /// beside a per-stream TCP or gRPC listener. Every mode retains the full
+    /// rendezvous API.
+    ///
+    /// # Errors
+    ///
+    /// Fails before it starts a transport when the mux is turned off, by
+    /// `MuxConfig { enabled: false, .. }` or `VELO_MESSENGER_MUX_DISABLE`, and
+    /// no stream config is set, because the node would have no remote stream
+    /// transport. Also fails when `mux_only` is combined with a stream config
+    /// or a disabled mux.
     pub async fn build(self) -> Result<Velo> {
         anyhow::ensure!(
             !self.mux_only || self.stream_config.is_none(),
             "mux_only cannot be combined with stream_config or stream_bind_addr"
         );
         self.reservation_config.validate()?;
+        let mode = if self.mux_only {
+            StreamMode::MuxOnly
+        } else if self.stream_config.is_some() {
+            StreamMode::PerStream
+        } else {
+            StreamMode::MuxDefault
+        };
         // Read the override once at build so this instance keeps the same
         // transport offers for every attach.
         let config = resolve_mux_config(
             self.mux_config.unwrap_or_default(),
             messenger_mux_disabled_by_env(),
-            self.mux_only,
+            mode,
         )?;
         let messenger = self.inner.build().await?;
         let worker_id = messenger.instance_id().worker_id();
@@ -549,41 +596,41 @@ impl VeloBuilder {
             None
         };
 
-        // Default builds keep a per-stream listener for peers without the mux.
-        // In mux-only mode, the mux itself fills the default transport field.
-        // Set metrics before type erasure: the public FrameTransport trait
-        // must not require Prometheus in external implementations.
+        // A node with a stream config keeps a per-stream listener for peers
+        // without the mux. Otherwise the mux itself fills the default
+        // transport field. Set metrics before type erasure: the
+        // FrameTransport trait carries no metrics handle.
         let (stream_transport, owned_stream_transport): (
             Arc<dyn crate::streaming::FrameTransport>,
             Option<OwnedStreamTransport>,
-        ) = if self.mux_only {
-            let mux = mux
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("mux_only requires the messenger mux"))?;
-            (Arc::clone(mux) as _, None)
-        } else {
-            match self.stream_config.unwrap_or(StreamConfig::Tcp(None)) {
-                StreamConfig::Tcp(tcp_cfg) => {
-                    let bind_addr = tcp_cfg.unwrap_or_default().bind_addr;
-                    let tcp = crate::streaming::TcpFrameTransport::new(bind_addr).await?;
-                    if let Some(metrics) = &self.metrics {
-                        tcp.set_metrics(Arc::clone(metrics));
-                    }
-                    (tcp.clone() as _, Some(OwnedStreamTransport::Tcp(tcp)))
+        ) = match self.stream_config {
+            None => {
+                // `resolve_mux_config` refused a disabled mux in this mode.
+                let mux = mux.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("no stream config requires the messenger mux")
+                })?;
+                (Arc::clone(mux) as _, None)
+            }
+            Some(StreamConfig::Tcp(tcp_cfg)) => {
+                let bind_addr = tcp_cfg.unwrap_or_default().bind_addr;
+                let tcp = crate::streaming::TcpFrameTransport::new(bind_addr).await?;
+                if let Some(metrics) = &self.metrics {
+                    tcp.set_metrics(Arc::clone(metrics));
                 }
-                #[cfg(feature = "grpc")]
-                StreamConfig::Grpc(grpc_cfg) => {
-                    let bind_addr = grpc_cfg.unwrap_or_default().bind_addr;
-                    let grpc = crate::streaming::GrpcFrameTransport::new(bind_addr)
-                        .await
-                        .map_err(|e| {
-                            anyhow::anyhow!("Failed to start gRPC streaming transport: {e}")
-                        })?;
-                    if let Some(metrics) = &self.metrics {
-                        grpc.set_metrics(Arc::clone(metrics));
-                    }
-                    (grpc.clone() as _, Some(OwnedStreamTransport::Grpc(grpc)))
+                (tcp.clone() as _, Some(OwnedStreamTransport::Tcp(tcp)))
+            }
+            #[cfg(feature = "grpc")]
+            Some(StreamConfig::Grpc(grpc_cfg)) => {
+                let bind_addr = grpc_cfg.unwrap_or_default().bind_addr;
+                let grpc = crate::streaming::GrpcFrameTransport::new(bind_addr)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!("Failed to start gRPC streaming transport: {e}")
+                    })?;
+                if let Some(metrics) = &self.metrics {
+                    grpc.set_metrics(Arc::clone(metrics));
                 }
+                (grpc.clone() as _, Some(OwnedStreamTransport::Grpc(grpc)))
             }
         };
         // Every way the messenger learns a peer reaches the stream
@@ -602,7 +649,7 @@ impl VeloBuilder {
             stream_transport.key().as_str().to_string(),
             Arc::clone(&stream_transport),
         );
-        if !self.mux_only
+        if owned_stream_transport.is_some()
             && let Some(mux) = &mux
         {
             registry.insert(
@@ -624,21 +671,6 @@ impl VeloBuilder {
                 .build()
                 .map_err(|e| anyhow::anyhow!("{}", e))?,
         );
-        // The per-stream transport of this crate reports a stream's
-        // retirement from its pump; the registry's public type cannot say so.
-        if let Some(owned) = &owned_stream_transport {
-            let retiring: Arc<dyn crate::streaming::transport::RetiringFrameTransport> = match owned
-            {
-                OwnedStreamTransport::Tcp(tcp) => Arc::clone(tcp) as _,
-                #[cfg(feature = "grpc")]
-                OwnedStreamTransport::Grpc(grpc) => Arc::clone(grpc) as _,
-            };
-            anchor_manager.install_retiring_transports(std::collections::HashMap::from([(
-                stream_transport.key().as_str().to_string(),
-                retiring,
-            )]));
-        }
-
         if let Some(mux) = mux {
             anchor_manager.install_mux(mux)?;
         }
@@ -663,7 +695,7 @@ impl VeloBuilder {
             Some(limit) => resolver.with_limit(limit),
             None => resolver,
         });
-        messenger.set_large_payload_support_inner(stager, resolver);
+        messenger.set_large_payload_support(stager, resolver);
 
         // Build the RDMA registration layer, if a UCX transport was
         // added through `add_ucx_transport`.
@@ -749,15 +781,45 @@ fn rdma_rendezvous_disabled_by_env() -> bool {
     )
 }
 
+/// Which remote stream transports [`VeloBuilder::build`] installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamMode {
+    /// `mux_only()`: the mux alone, chosen explicitly.
+    MuxOnly,
+    /// No stream config: the mux alone, by default.
+    MuxDefault,
+    /// `stream_config` or `stream_bind_addr`: a per-stream listener, with
+    /// the mux beside it unless the mux is off.
+    PerStream,
+}
+
+/// The mux config `build` installs, with the kill switch applied, or the
+/// reason the node cannot start.
+///
+/// Kept apart from the environment read so the whole grid of mode, config
+/// and switch can be tested without setting a process-wide variable.
 fn resolve_mux_config(
     mut config: crate::streaming::MuxConfig,
     disabled_by_env: bool,
-    mux_only: bool,
+    mode: StreamMode,
 ) -> Result<crate::streaming::MuxConfig> {
-    anyhow::ensure!(
-        !mux_only || (config.enabled && !disabled_by_env),
-        "mux_only requires the messenger mux; it was disabled by config or VELO_MESSENGER_MUX_DISABLE"
-    );
+    let mux_off = !config.enabled || disabled_by_env;
+    match mode {
+        StreamMode::MuxOnly => anyhow::ensure!(
+            !mux_off,
+            "mux_only requires the messenger mux; it was disabled by config or VELO_MESSENGER_MUX_DISABLE"
+        ),
+        // Checked before any transport starts: without the mux this node
+        // would have no remote stream transport, and every attach to it would
+        // fail long after startup.
+        StreamMode::MuxDefault => anyhow::ensure!(
+            !mux_off,
+            "the messenger mux is disabled (by MuxConfig::enabled or VELO_MESSENGER_MUX_DISABLE) \
+             and no per-stream transport is configured: call stream_config or stream_bind_addr \
+             on the builder to stream without the mux"
+        ),
+        StreamMode::PerStream => {}
+    }
     if disabled_by_env && config.enabled {
         tracing::info!("VELO_MESSENGER_MUX_DISABLE is set: disabling the messenger mux");
         config.enabled = false;
@@ -819,106 +881,22 @@ impl Velo {
 
     /// Begin Phase 1 (Gate) of graceful shutdown: reject new inbound requests
     /// while responses, acks, events, and the messages of streams already open
-    /// keep flowing. See
-    /// [`Messenger::begin_drain`].
+    /// keep flowing.
+    ///
+    /// Transport listeners answer each rejected request with a ShuttingDown
+    /// correlation reply, so remote senders fail fast ("peer is shutting
+    /// down") instead of hanging until their response timeout. Handlers
+    /// already running continue to completion. Call [`shutdown`](Self::shutdown)
+    /// to also wait for them and tear down. To let open streams finish first,
+    /// call this, wait for them, then call `shutdown`. Idempotent.
     pub fn begin_drain(&self) {
-        self.inner.messenger.begin_drain_inner();
+        self.inner.messenger.begin_drain();
     }
 
-    /// Perform a graceful shutdown of the messenger transports: gate inbound
-    /// requests, wait for in-flight handler invocations per `policy`, tear
-    /// down, then wait for each transport's close. See
-    /// [`Messenger::graceful_shutdown`].
-    ///
-    /// Streams opened before the drain keep flowing through it: the gate lets
-    /// their messages through. The drain counts each such message only while
-    /// its handler runs, not the stream, so an open stream, busy or quiet, does
-    /// not hold this call open. Teardown then ends the streams that ride the
-    /// messenger mux. To let streams
-    /// finish, call [`begin_drain`](Self::begin_drain), wait for them, then
-    /// call this. The per-stream transports have their own teardown, which
-    /// this call does not cover.
-    ///
-    /// # RDMA registrations go first, and are declared released last
-    ///
-    /// When an RDMA registration layer is installed, shutdown has four
-    /// steps:
-    ///
-    /// 1. [`begin_drain`](Self::begin_drain) — idempotent, and repeated by the
-    ///    messenger shutdown below. Closing the inbound gate first means no new
-    ///    request can start while registrations are being torn down. The pull
-    ///    of a payload staged before the drain still passes the gate, but a
-    ///    draining owner answers it chunked, never with an RDMA descriptor.
-    /// 2. The registry sweep: registrations refused,
-    ///    in-flight transfers drained, every region and arena unmapped.
-    /// 3. Messenger gate, drain, teardown and close, unchanged.
-    /// 4. Every registration that survived step 2 is declared released.
-    ///
-    /// Step 1 to 2 is load-bearing, not tidiness. An RDMA GET is issued by the
-    /// *peer's* NIC, so it never appears in this instance's in-flight counts;
-    /// tearing the transport down first and unmapping afterwards would
-    /// deregister memory a peer is still reading.
-    ///
-    /// Step 4 is what makes [`RegionGuard::deregistered`] a signal worth
-    /// waiting on. A region whose unmap could not be confirmed in step 2 — a
-    /// wedged backend, a transport already going down — is nonetheless
-    /// genuinely unmapped once step 3 returns, because transport teardown
-    /// force-unmaps everything the progress thread still holds. Without step 4
-    /// those latches would stay pending forever and a caller waiting on one
-    /// would hold its memory for the life of the process.
-    ///
-    /// Step 2 begins by moving anything staged in registered memory onto the
-    /// heap. That releases what the sweep's own drains wait on, and it costs
-    /// one transient copy of everything staged — the price of letting a
-    /// chunked transfer that was already admitted finish rather than fail
-    /// halfway through.
-    ///
-    /// Step 4 is itself conditional: it checks with the backend that nothing is
-    /// still registered, and declines to declare anything released if the
-    /// answer is not "none". After an abnormal teardown — a panicking progress
-    /// thread — the latches therefore stay pending and that memory is leaked on
-    /// purpose. Velo will not tell a caller to free pages it cannot establish
-    /// were released.
-    ///
-    /// # Called once, even from clones
-    ///
-    /// [`Velo`] is `Clone`, so concurrent callers are possible. They are
-    /// serialised: the first runs the sequence, the rest wait and return as
-    /// soon as it finishes. Only one caller can take the transport's join
-    /// handle, and step 4's claim rests on that join having completed — a
-    /// second caller running the tail concurrently would be declaring memory
-    /// released while the progress thread was still alive.
-    ///
-    /// # One deadline, not one per phase
-    ///
-    /// [`ShutdownPolicy::Timeout`] bounds the sweep and messenger drain
-    /// together, rather than giving each phase the full duration. Joining mux
-    /// tasks comes after the drain and needs the owning runtime to make
-    /// progress. The transports' close step also comes on top: it is bounded by each
-    /// transport's own [`Transport::closed`] (QUIC: 2.5 s; TCP and UDS: their
-    /// teardown grace, 1 s unless the builder set it, plus 1.5 s), not by the policy,
-    /// because cutting it short would discard frames already written.
-    /// Under [`ShutdownPolicy::WaitForever`] the sweep still takes
-    /// [`RdmaConfig::shutdown_timeout`], because a peer that crashed
-    /// mid-transfer must not wedge shutdown forever even when the caller is
-    /// willing to wait on local work.
-    ///
-    /// # Panics
-    ///
-    /// Panics if a transport's shutdown hook panicked. The other hooks still
-    /// ran, but shutdown cannot report the instance, or its RDMA memory, as
-    /// released. A later call panics at once, without draining again.
-    #[deprecated(
-        since = "0.22.1",
-        note = "Use `Velo::shutdown`. 0.23.0 folds `graceful_shutdown` into `shutdown`"
-    )]
-    pub async fn graceful_shutdown(&self, policy: ShutdownPolicy) {
-        self.graceful_shutdown_inner(policy).await;
-    }
-
-    /// The messenger half of [`shutdown`](Self::shutdown), and what
-    /// [`graceful_shutdown`](Self::graceful_shutdown) runs.
-    pub(crate) async fn graceful_shutdown_inner(&self, policy: ShutdownPolicy) {
+    /// The messenger half of [`shutdown`](Self::shutdown): the RDMA sweep,
+    /// then gate, drain, mux-send join, teardown and close. It runs once per
+    /// instance, under the lock every clone shares.
+    async fn shutdown_messenger(&self, policy: ShutdownPolicy) {
         // Serialised, and run once. `Velo` is `Clone`, so two clones can arrive
         // here together; the sequence below takes a transport join handle and
         // then declares memory released on the strength of that join having
@@ -1002,18 +980,132 @@ impl Velo {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
-    /// Drain messenger work and stop this instance's streaming services.
+    /// Shut this instance down: drain messenger work, tear down its
+    /// transports, and stop its streaming services.
     ///
-    /// This also cancels live streams, and joins the receive loops and the
-    /// streaming transport tasks owned by the builder. Stream reader pumps are
-    /// cancelled, not joined. Custom frame transports
-    /// remain the caller's responsibility. Stream watchdogs and heartbeats are
-    /// cancelled; application handlers that exceed `policy` can still be running.
-    /// If the sender of a stream is on this instance, shutdown cancels that
-    /// sender: its `cancellation_token` fires, and later sends fail. The reader
-    /// ends when the application drops or finalizes the sender.
-    /// Use this when an instance is removed while its Tokio runtime stays alive.
-    /// It closes resources. Drop the instance and its handles to release their memory.
+    /// The messenger transports go through four phases:
+    ///
+    /// 1. **Gate** — new inbound requests are rejected (see
+    ///    [`begin_drain`](Self::begin_drain)).
+    /// 2. **Drain** — wait, per `policy`, for accepted work to finish: both
+    ///    handlers that are running and requests still on the inbound queue,
+    ///    which are counted from the moment a transport admits them. Their
+    ///    responses still flow out through the gate.
+    /// 3. **Teardown** — cancel listeners, connections, and transports.
+    /// 4. **Close** — wait for each transport's [`Transport::closed`], so what
+    ///    it wrote is on the wire (bounded by the transport, not by `policy`).
+    ///
+    /// Then the streaming services stop. Live streams are cancelled, and the
+    /// receive loops and the streaming transport tasks owned by the builder
+    /// are joined. Stream reader pumps are cancelled, not joined. Custom frame
+    /// transports remain the caller's responsibility. Stream watchdogs and
+    /// heartbeats are cancelled. If the sender of a stream is on this
+    /// instance, shutdown cancels that sender: its `cancellation_token` fires,
+    /// and later sends fail. The reader ends when the application drops or
+    /// finalizes the sender.
+    ///
+    /// After this returns the instance can no longer send or receive, and no
+    /// further handler is dispatched. Use it when an instance is removed while
+    /// its Tokio runtime stays alive. It closes resources; drop the instance
+    /// and its handles to release their memory.
+    ///
+    /// # Open streams and the drain
+    ///
+    /// Streams opened before the drain keep flowing through it: the gate lets
+    /// their messages through. The drain counts each such message only while
+    /// its handler runs, not the stream, so an open stream, busy or quiet, does
+    /// not hold this call open. Teardown then ends the streams that ride the
+    /// messenger mux. To let streams finish, call
+    /// [`begin_drain`](Self::begin_drain), wait for them, then call this.
+    ///
+    /// # What a timeout leaves behind
+    ///
+    /// Under [`ShutdownPolicy::WaitForever`] the drain costs nothing: it
+    /// completes only once the queue is empty *and* every accepted handler has
+    /// finished, so every admitted request ran to completion. Under
+    /// [`ShutdownPolicy::Timeout`] two things outlive the return.
+    ///
+    /// Work still queued when teardown starts is abandoned rather than
+    /// dispatched: the message handler drops the backlog at teardown.
+    /// Teardown starts after the drain timeout and after the mux's send tasks
+    /// are joined, so work queued in that gap can still be dispatched. Its
+    /// senders were admitted, so they get no `ShuttingDown` correlation and
+    /// wait out their own response timeout. (The in-flight guards riding with
+    /// those messages *are* released as they are dropped. Left parked in the
+    /// channel buffer, they would pin the in-flight count above zero for good
+    /// and wedge every later drain wait.)
+    ///
+    /// A handler already *running* when the timeout expires is not cancelled
+    /// either: teardown stops dispatch, it does not abort tasks. It finishes in
+    /// the background after this call has returned. Sequence anything a
+    /// handler touches accordingly. Both are the price of bounding shutdown.
+    ///
+    /// # RDMA registrations go first, and are declared released last
+    ///
+    /// When an RDMA registration layer is installed, shutdown has four
+    /// steps:
+    ///
+    /// 1. [`begin_drain`](Self::begin_drain) — idempotent, and repeated by the
+    ///    messenger shutdown below. Closing the inbound gate first means no new
+    ///    request can start while registrations are being torn down. The pull
+    ///    of a payload staged before the drain still passes the gate, but a
+    ///    draining owner answers it chunked, never with an RDMA descriptor.
+    /// 2. The registry sweep: registrations refused,
+    ///    in-flight transfers drained, every region and arena unmapped.
+    /// 3. Messenger gate, drain, teardown and close, unchanged.
+    /// 4. Every registration that survived step 2 is declared released.
+    ///
+    /// Step 1 to 2 is load-bearing, not tidiness. An RDMA GET is issued by the
+    /// *peer's* NIC, so it never appears in this instance's in-flight counts;
+    /// tearing the transport down first and unmapping afterwards would
+    /// deregister memory a peer is still reading.
+    ///
+    /// Step 4 is what makes [`RegionGuard::deregistered`] a signal worth
+    /// waiting on. A region whose unmap could not be confirmed in step 2 — a
+    /// wedged backend, a transport already going down — is nonetheless
+    /// genuinely unmapped once step 3 returns, because transport teardown
+    /// force-unmaps everything the progress thread still holds. Without step 4
+    /// those latches would stay pending forever and a caller waiting on one
+    /// would hold its memory for the life of the process.
+    ///
+    /// Step 2 begins by moving anything staged in registered memory onto the
+    /// heap. That releases what the sweep's own drains wait on, and it costs
+    /// one transient copy of everything staged — the price of letting a
+    /// chunked transfer that was already admitted finish rather than fail
+    /// halfway through.
+    ///
+    /// Step 4 is itself conditional: it checks with the backend that nothing is
+    /// still registered, and declines to declare anything released if the
+    /// answer is not "none". After an abnormal teardown — a panicking progress
+    /// thread — the latches therefore stay pending and that memory is leaked on
+    /// purpose. Velo will not tell a caller to free pages it cannot establish
+    /// were released.
+    ///
+    /// # Called once, even from clones
+    ///
+    /// [`Velo`] is `Clone`, so concurrent callers are possible. They are
+    /// serialised: the first runs the four steps above, and the rest wait for
+    /// it and skip them. Every caller then runs the streaming step and waits
+    /// for the transports to close, so each returns once both are done.
+    ///
+    /// Only one caller can take the transport's join handle, and step 4's
+    /// claim rests on that join having completed — a second caller running
+    /// the tail concurrently would be declaring memory released while the
+    /// progress thread was still alive.
+    ///
+    /// # One deadline, not one per phase
+    ///
+    /// [`ShutdownPolicy::Timeout`] bounds the sweep and messenger drain
+    /// together, rather than giving each phase the full duration. Joining mux
+    /// tasks comes after the drain and needs the owning runtime to make
+    /// progress. The transports' close step also comes on top: it is bounded by each
+    /// transport's own [`Transport::closed`] (QUIC: 2.5 s; TCP and UDS: their
+    /// teardown grace, 1 s unless the builder set it, plus 1.5 s), not by the policy,
+    /// because cutting it short would discard frames already written.
+    /// Under [`ShutdownPolicy::WaitForever`] the sweep still takes
+    /// [`RdmaConfig::shutdown_timeout`](crate::rendezvous::rdma::RdmaConfig::shutdown_timeout), because a peer that crashed
+    /// mid-transfer must not wedge shutdown forever even when the caller is
+    /// willing to wait on local work.
     ///
     /// # Panics
     ///
@@ -1021,7 +1113,7 @@ impl Velo {
     /// ran, but shutdown cannot report the instance, or its RDMA memory, as
     /// released. A later call panics at once, without draining again.
     pub async fn shutdown(&self, policy: ShutdownPolicy) {
-        self.graceful_shutdown_inner(policy).await;
+        self.shutdown_messenger(policy).await;
         self.inner.anchor_manager.shutdown().await;
         if let Some(transport) = &self.inner.stream_owner.transport {
             transport.shutdown().await;
@@ -1075,10 +1167,12 @@ impl Velo {
     /// Get the peer information for this instance.
     ///
     /// The returned [`PeerInfo`] carries the messenger transport entries.
-    /// Default builds also publish a per-stream endpoint, such as `tcp-stream`
-    /// or `grpc-stream`, for [`crate::streaming::FrameTransport::register`].
-    /// In [`VeloBuilder::mux_only`] mode the primary stream transport is the
-    /// mux, which uses the messenger endpoints and adds no streaming endpoint.
+    /// A node built with [`VeloBuilder::stream_config`] or
+    /// [`VeloBuilder::stream_bind_addr`] also publishes a per-stream endpoint,
+    /// such as `tcp-stream` or `grpc-stream`, for the peer's per-stream
+    /// transport to connect to. Otherwise the primary
+    /// stream transport is the mux, which uses the messenger endpoints and
+    /// adds no streaming endpoint.
     pub fn peer_info(&self) -> PeerInfo {
         self.inner.messenger.backend().advertised_peer_info()
     }
@@ -1133,10 +1227,9 @@ impl Velo {
     /// fails as one to a peer never registered.
     ///
     /// A peer learned any other way reaches the streaming transport too: by
-    /// its `_hello`, by discovery when a send names its worker, or by the
-    /// messenger's own `register_peer`.
+    /// its `_hello`, or by discovery when a send names its worker.
     pub fn register_peer(&self, peer_info: PeerInfo) -> Result<()> {
-        self.inner.messenger.register_peer_inner(peer_info)
+        self.inner.messenger.register_peer(peer_info)
     }
 
     /// Forget a peer that [`register_peer`](Self::register_peer) added.
@@ -1156,7 +1249,7 @@ impl Velo {
     /// from the peer registers it again too. The messenger mux keeps small
     /// per-peer receive tables that this does not drop.
     pub fn unregister_peer(&self, instance_id: InstanceId) {
-        self.inner.messenger.unregister_peer_inner(instance_id);
+        self.inner.messenger.unregister_peer(instance_id);
     }
 
     /// Discover a peer by instance_id and register it for communication.
@@ -1239,7 +1332,6 @@ impl Velo {
 
     /// Create a new streaming anchor with per-anchor liveness settings.
     ///
-    /// Delegates to [`AnchorManager::create_anchor_with_config`](crate::streaming::AnchorManager::create_anchor_with_config).
     /// Each `Some` field of `config` overrides this node's default; `None`
     /// inherits it.
     pub fn create_anchor_with_config<T>(&self, config: streaming::AnchorConfig) -> StreamAnchor<T> {
@@ -1250,7 +1342,6 @@ impl Velo {
 
     /// How many SPSC anchors this node holds now.
     ///
-    /// Delegates to [`AnchorManager::active_anchor_count`](crate::streaming::AnchorManager::active_anchor_count).
     /// MPSC anchors are not counted. The `velo_streaming_active_anchors`
     /// gauge counts both kinds.
     pub fn active_anchor_count(&self) -> usize {
@@ -1260,7 +1351,6 @@ impl Velo {
     /// Renew anchor reservations this node holds on other nodes, or on itself,
     /// before a producer opens its stream.
     ///
-    /// Delegates to [`AnchorManager::renew_reservations`](crate::streaming::AnchorManager::renew_reservations).
     /// Reservations that are attached, cancelled, expired or replaced are
     /// skipped. Only a transport failure returns an error, so `Ok` does not
     /// prove that a reservation still exists. The caller decides when to renew
@@ -1275,9 +1365,27 @@ impl Velo {
             .await
     }
 
-    /// Attach a sender to an existing anchor (local or remote).
+    /// Attach a sender to an existing anchor.
     ///
-    /// Delegates to [`AnchorManager::attach_stream_anchor`](crate::streaming::AnchorManager::attach_stream_anchor).
+    /// A handle whose anchor lives on another worker attaches over the
+    /// network: this node asks the anchor's node with an `_anchor_attach`
+    /// message, and the stream rides the transport the two agree on. A handle
+    /// whose anchor lives on this node attaches locally: the anchor must exist
+    /// and have no sender, and it is marked attached at once. Items from a
+    /// local sender go straight to the [`StreamAnchor<T>`], with no transport.
+    ///
+    /// # Errors
+    /// - [`AttachError::AnchorNotFound`] if this node holds no anchor for the
+    ///   handle (local path)
+    /// - [`AttachError::AlreadyAttached`] if another sender is already connected, which
+    ///   includes a pre-bound slot an `OpenSlot` has already claimed (local path)
+    /// - [`AttachError::TransportError`] for all remote path errors (messenger unavailable,
+    ///   AM send failed, remote error response)
+    ///
+    /// Over the mux, the consumer places the stream on the lane with the
+    /// fewest streams from this worker;
+    /// [`attach_anchor_keyed`](Self::attach_anchor_keyed) places
+    /// it by a key instead.
     pub async fn attach_anchor<T: serde::Serialize>(
         &self,
         handle: StreamAnchorHandle,
@@ -1291,7 +1399,6 @@ impl Velo {
     /// Attach a sender to an anchor, placing the stream on the mux lane `key`
     /// hashes to.
     ///
-    /// Delegates to [`AnchorManager::attach_stream_anchor_keyed`](crate::streaming::AnchorManager::attach_stream_anchor_keyed).
     /// The key is a placement hint, not an ordering guarantee: streams with
     /// one key to one consumer share a lane, but the mux never orders records
     /// across streams. [`attach_anchor`](Velo::attach_anchor) lets the
@@ -1307,17 +1414,43 @@ impl Velo {
             .await
     }
 
-    /// Bind a stream for an anchor now, so its sender never has to ask.
+    /// Bind a mux slot for `handle` and start its feed now, so its sender
+    /// never has to ask for one.
     ///
-    /// Delegates to [`AnchorManager::prebind_anchor`](crate::streaming::AnchorManager::prebind_anchor).
-    /// Carry the returned [`streaming::control::StreamOpenTicket`] to the worker
-    /// in whatever request envelope you already send it, and have the worker
-    /// open its sender with [`open_anchor_stream`](Velo::open_anchor_stream).
-    /// `None` means no ticket was minted and the worker should
-    /// [`attach_anchor`](Velo::attach_anchor) the ordinary way.
+    /// Returns the terms that sender must open on, to be carried to it in
+    /// whatever envelope the application already sends — see
+    /// [`StreamOpenTicket`] and its counterpart
+    /// [`open_anchor_stream`](Self::open_anchor_stream). Everything the
+    /// `_anchor_attach` handler would have done on the round trip happens here
+    /// instead, so the sender's first record is its first message.
+    ///
+    /// `None` means *no ticket was minted; attach the ordinary way*, and as a
+    /// return it is never an error. With no mux installed nothing here can run
+    /// and every stream takes the per-stream path — which is what keeps
+    /// `MuxConfig::enabled` the complete rollback for this path too, and why
+    /// that `None` alone is silent.
+    ///
+    /// `None` is also the answer for a handle this node cannot pre-bind: one
+    /// belonging to another worker, an MPSC anchor, an anchor already attached
+    /// or already pre-bound, or one that has since been removed. Those are
+    /// logged at debug and recorded as `outcome="error"` under
+    /// `velo_streaming_anchor_operations_total{operation="prebind"}`, because
+    /// unlike the rollback they are a caller mistake rather than a
+    /// configuration.
     ///
     /// Must be called from a runtime context: it spawns the stream watchdog,
     /// exactly as the attach handler does for a mux bind.
+    ///
+    /// The ticket waits for the configured reservation timeout (180 seconds
+    /// by default). Holders can extend it with [`Self::renew_reservations`].
+    /// Heartbeat detection starts when `OpenSlot` claims the bind. The ordinary
+    /// unattached timeout stays paused while the reservation exists.
+    /// Renewing a claimed, expired, cancelled, or replaced reservation is a no-op.
+    ///
+    /// The ticket names the mux lane with the least load on this node: its
+    /// live slots from every peer, plus its pre-binds not yet claimed,
+    /// released or expired. [`prebind_anchor_keyed`](Self::prebind_anchor_keyed)
+    /// places it by a key instead.
     pub fn prebind_anchor(
         &self,
         handle: StreamAnchorHandle,
@@ -1328,7 +1461,6 @@ impl Velo {
     /// As [`prebind_anchor`](Velo::prebind_anchor), placing the stream on the
     /// mux lane `key` hashes to.
     ///
-    /// Delegates to [`AnchorManager::prebind_anchor_keyed`](crate::streaming::AnchorManager::prebind_anchor_keyed).
     pub fn prebind_anchor_keyed(
         &self,
         handle: StreamAnchorHandle,
@@ -1337,15 +1469,35 @@ impl Velo {
         self.inner.anchor_manager.prebind_anchor_keyed(handle, key)
     }
 
-    /// Open a sender for an anchor whose slot the consumer already bound.
+    /// Open the sender half of a stream whose slot the receiver already bound.
     ///
-    /// Delegates to [`AnchorManager::open_anchor_stream`](crate::streaming::AnchorManager::open_anchor_stream).
-    /// The zero-RTT counterpart of [`attach_anchor`](Velo::attach_anchor): no
-    /// `_anchor_attach` round trip, because `ticket` already carries what one
-    /// would have returned.
+    /// The zero-RTT twin of [`attach_anchor`](Self::attach_anchor):
+    /// the same tail with the `_anchor_attach` round trip cut out, because
+    /// `ticket` already carries the answer that round trip existed to fetch.
+    /// The receiver minted it with [`prebind_anchor`](Self::prebind_anchor);
+    /// the application carried it here.
     ///
-    /// The mux carries stop and cancel through the ticket's session and slot
-    /// identity. Both producer tokens work even before the first item is sent.
+    /// The worker's first batch opens the pre-bound slot by the ticket's
+    /// routing session id, which is the claim — bind-on-`OpenSlot` is how a mux
+    /// bind has always been taken up, and nothing about that changes.
+    ///
+    /// `Ok` means the local egress slot is staged, not that the receiver has
+    /// accepted the ticket: the `OpenSlot` this call stages is eager and
+    /// unacked, the same as an ordinary attach's, so a ticket whose bind was
+    /// already released or has expired still returns `Ok` here and only
+    /// surfaces later, as a send failure on the returned `StreamSender`.
+    ///
+    /// Slot lifecycle signals reach the producer even before its first send.
+    ///
+    /// # Errors
+    /// - [`AttachError::TransportError`] if `handle` names this node's own
+    ///   worker id (a ticket is for a *different* worker to open; a
+    ///   same-worker sender should use
+    ///   [`attach_anchor`](Self::attach_anchor) instead), if
+    ///   the ticket names `messenger-mux-v2` but this node has no mux
+    ///   installed, if the ticket names a transport key this node cannot
+    ///   resolve, or if staging the local slot fails after retrying a
+    ///   batcher that keeps retiring underneath it.
     pub async fn open_anchor_stream<T: serde::Serialize>(
         &self,
         handle: StreamAnchorHandle,
@@ -1355,15 +1507,6 @@ impl Velo {
             .anchor_manager
             .open_anchor_stream::<T>(handle, ticket)
             .await
-    }
-
-    /// Get the underlying anchor manager for direct registry access.
-    #[deprecated(
-        since = "0.22.1",
-        note = "use the anchor methods on `Velo`: `create_anchor_with_config`, `active_anchor_count`, `renew_reservations`, `create_anchor`, `attach_anchor`, `prebind_anchor`, `open_anchor_stream`"
-    )]
-    pub fn anchor_manager(&self) -> &crate::streaming::AnchorManager {
-        &self.inner.anchor_manager
     }
 
     // -----------------------------------------------------------------------
@@ -1408,7 +1551,6 @@ impl Velo {
     /// As [`attach_mpsc_anchor`](Velo::attach_mpsc_anchor), placing the sender
     /// on the mux lane `key` hashes to.
     ///
-    /// Delegates to [`AnchorManager::attach_mpsc_stream_anchor_keyed`](crate::streaming::AnchorManager::attach_mpsc_stream_anchor_keyed).
     pub async fn attach_mpsc_anchor_keyed<T: serde::Serialize>(
         &self,
         handle: StreamAnchorHandle,
@@ -1438,13 +1580,33 @@ impl Velo {
         self.inner.rendezvous_manager.register_data_with(data, opts)
     }
 
-    /// Stage data in RDMA-registered memory, so a capable consumer reads it
-    /// with a single RDMA GET instead of a chunk-by-chunk pull.
+    /// Stage data in RDMA-registered pool memory, so consumers that can issue
+    /// an RDMA GET read it without a chunk round trip.
     ///
-    /// Never fails: pool pressure, a spent registered-bytes budget, a
-    /// switched-off kill switch and an instance with no UCX transport all stage
-    /// the data in plain memory instead. See
-    /// [`RendezvousManager::register_data_pinned`] for the full contract.
+    /// # This never fails
+    ///
+    /// It returns a [`DataHandle`], not a `Result`, and that is the contract.
+    /// Pool exhaustion, a registered-bytes budget that is already spent, a
+    /// switched-off kill switch, an instance with no UCX transport at all —
+    /// every one of them stages the data in plain memory instead and records
+    /// the reason on `velo_rendezvous_rdma_path_total`. Pinning is a transfer
+    /// optimisation, and a *staging* call that failed because the pool was busy
+    /// would push a fallback onto every caller that most of them would get
+    /// wrong.
+    ///
+    /// The slot is readable either way: a pinned slot still answers the chunked
+    /// path, so falling back changes how fast the data moves and never whether
+    /// it can be reached.
+    ///
+    /// # Cost
+    ///
+    /// One copy, always: the bytes are copied into registered memory here so a
+    /// peer's NIC can read them later, and the fallback copies them into a
+    /// `Bytes`. Zero-length data is staged in plain memory — there is nothing
+    /// for a GET to transfer.
+    ///
+    /// To stage without a copy, register the memory yourself and use
+    /// `register_data_in_region` (UCX builds).
     pub async fn register_data_pinned(&self, data: &[u8]) -> DataHandle {
         self.inner
             .rendezvous_manager
@@ -1452,11 +1614,50 @@ impl Velo {
             .await
     }
 
-    /// Stage a range of memory this instance already registered, zero-copy.
+    /// Stage a range of memory the caller registered, without copying it.
     ///
-    /// See [`RendezvousManager::register_data_in_region`]: the slot holds an
-    /// in-flight guard on the region, so
-    /// [`RegionGuard::unregister`] waits for the anchors staged inside it.
+    /// The zero-copy counterpart to
+    /// [`register_data_pinned`](Self::register_data_pinned): the bytes stay
+    /// where the caller put them and the slot merely describes them. `range` is
+    /// measured from the pointer that was registered, not from
+    /// [`RegionGuard::effective_range`](crate::rendezvous::rdma::RegionGuard::effective_range), so
+    /// a caller can never name a byte inside the registration but outside its
+    /// own allocation.
+    ///
+    /// # The staged slot holds the region open
+    ///
+    /// The slot takes an in-flight guard on `guard`'s own accounting, so
+    /// [`RegionGuard::unregister`](crate::rendezvous::rdma::RegionGuard::unregister) drains the
+    /// anchors staged inside the region before it unmaps. Freeing the slot —
+    /// the last `release` — is what lets the deregistration through. A caller
+    /// that stages anchors and then unregisters without releasing them sees
+    /// `unregister` wait and, if it runs out of budget, unmap anyway with a
+    /// warning.
+    ///
+    /// Reads of that slot refuse from the moment the region's
+    /// [`deregistered`](crate::rendezvous::rdma::RegionGuard::deregistered) latch closes — which
+    /// is the moment the caller is told it may free the memory, and is what the
+    /// refusal protects. Between the unmap and the latch a read may still run:
+    /// unmapping deregisters rather than frees, so the pages are still there.
+    /// The read and the latch are ordered against each other by the region's
+    /// copy gate, so neither can catch the other half-done.
+    ///
+    /// # Errors
+    ///
+    /// [`NotConfigured`](crate::rendezvous::rdma::RdmaError::NotConfigured) without a UCX
+    /// transport, [`OutOfRange`](crate::rendezvous::rdma::RdmaError::OutOfRange) for an empty,
+    /// inverted, or out-of-bounds range, and
+    /// [`ShuttingDown`](crate::rendezvous::rdma::RdmaError::ShuttingDown) once the region or the
+    /// registry has begun to go away.
+    ///
+    /// Unlike `register_data_pinned` this *does* return a `Result`, because no
+    /// fallback could honour what was asked: staging in plain memory would
+    /// silently copy bytes the caller asked not to be copied.
+    ///
+    /// The kill switch does not affect it. The memory is registered either way,
+    /// so anchoring in it costs nothing extra; the switch decides whether
+    /// `_rv_acquire` answers with a descriptor, and a switched-off owner serves
+    /// the same slot chunked.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub fn register_data_in_region(
         &self,
@@ -1483,9 +1684,54 @@ impl Velo {
 
     /// Pull data from a handle into registered memory, with no copy out.
     ///
-    /// Returns `(buffer, lease_id)`. Dropping the buffer returns its space to
-    /// the pool. See [`RendezvousManager::get_pinned`] for what the lease does
-    /// and does not cover.
+    /// The zero-copy counterpart to [`get`](Self::get): where the owner answers
+    /// with an RDMA descriptor, the bytes land in the returned buffer written
+    /// by this instance's NIC and are never copied. Where it answers chunked —
+    /// a heap-staged slot, a payload under the threshold, a kill switch, an
+    /// owner without the RDMA path — the chunks are pulled and copied into a
+    /// pooled buffer, so the return type does not depend on what the owner
+    /// decided.
+    ///
+    /// # Holding the buffer
+    ///
+    /// Dropping the [`PinnedBuf`] returns its space to the
+    /// pool; nothing else is required and nothing is unregistered. Until then
+    /// the space is a live reservation against the registered-bytes budget, so
+    /// hold it for as long as the bytes are being used and no longer.
+    ///
+    /// The lease is a separate matter, and this does **not** hold it open for
+    /// you: the renewal ticker is scoped to the transfer, so a caller that
+    /// keeps the buffer past the lease deadline will find the owner has
+    /// force-released the lease. Release it as soon as the transfer is done —
+    /// the returned buffer stays valid, because it is this instance's memory.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`get`](Self::get) can fail with, plus
+    /// [`RdmaError::NotConfigured`] when this
+    /// instance has no RDMA registry to allocate a destination from — including
+    /// for a purely local handle, which still needs somewhere pinned to copy
+    /// into.
+    ///
+    /// # Cancellation
+    ///
+    /// Dropping this future does not stop the transfer. UCX has no way to
+    /// recall a submitted RMA operation, so the NIC keeps writing into the
+    /// destination until it is done; what the drop abandons is the
+    /// notification, not the work.
+    ///
+    /// Velo makes that safe rather than pretending otherwise: the destination's
+    /// pool space is reserved by the *transfer*, not by this future, so it is
+    /// returned when the backend finishes and never while a write is still
+    /// landing in it. Without that a cancelled transfer would silently
+    /// overwrite whatever the pool handed the space to next.
+    ///
+    /// The visible cost is that the space stays spoken for a little after the
+    /// cancellation. A caller that drops one of these and immediately retries
+    /// at the same size can see the retry answer
+    /// [`BudgetExceeded`](crate::rendezvous::rdma::RdmaError::BudgetExceeded) under a tight pool,
+    /// until the abandoned transfer completes. That is the reservation working,
+    /// not a leak.
     #[cfg(all(target_os = "linux", feature = "ucx"))]
     pub async fn get_pinned(&self, handle: DataHandle) -> Result<(PinnedBuf, u64)> {
         self.inner.rendezvous_manager.get_pinned(handle).await
@@ -1559,8 +1805,7 @@ impl Velo {
     /// rendezvous instead of sending it inline.
     ///
     /// A payload is staged when its length is greater than this value. It is
-    /// 256 KiB today ([`rendezvous::transparent::DEFAULT_THRESHOLD`]), and
-    /// `VeloBuilder` has no setting for it.
+    /// 256 KiB today, and `VeloBuilder` has no setting for it.
     pub fn staging_threshold(&self) -> usize {
         self.inner
             .messenger
@@ -1582,6 +1827,7 @@ impl Velo {
     /// branch it is on. Without it, a change to transport priority could move
     /// the coverage back onto the primary path with nothing failing.
     #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
     pub fn primary_transport_key(&self, instance: InstanceId) -> Option<String> {
         self.inner
             .messenger
@@ -1597,6 +1843,7 @@ impl Velo {
     /// its result is dropped) must give its slot back, and the arena is fixed
     /// size, so a leak shows up here long before it exhausts the arena.
     #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
     pub fn response_slots_in_use(&self) -> usize {
         self.inner
             .messenger
@@ -1605,13 +1852,98 @@ impl Velo {
             .pending_outcome_count()
     }
 
-    /// Get the underlying rendezvous manager for direct access.
-    #[deprecated(
-        since = "0.22.1",
-        note = "use the rendezvous methods on `Velo`: `unregister_data` instead of `data_store()` with `ref_decrement` and `try_free`, `register_data_in_region`, `register_data`, `get`, `detach`, `release`, `staging_threshold`"
-    )]
-    pub fn rendezvous_manager(&self) -> &crate::rendezvous::RendezvousManager {
-        &self.inner.rendezvous_manager
+    /// How many senders attached through this instance are still live: one
+    /// for each `StreamSender` or `MpscStreamSender` that has not ended.
+    ///
+    /// Exposed for tests only. Every way a sender ends (finalize, detach,
+    /// drop, a cancel from the anchor, an abandoned detach future) must take
+    /// it out of the sender registry. A sender left there keeps its cancel
+    /// path and its heartbeat state alive for the life of the node.
+    #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
+    pub fn stream_senders_in_use(&self) -> usize {
+        self.inner.anchor_manager.sender_registry.senders.len()
+    }
+
+    /// The keys of the stream transports this instance installed, sorted:
+    /// the mux and the per-stream transport, as the builder chose them.
+    ///
+    /// Exposed for tests only. Which transports a node installs follows from
+    /// several builder settings (`stream_config`, `messenger_mux`,
+    /// `mux_only`, and the mux kill switch); a test of those rules must see
+    /// the result, and the peer address shows only the transports that
+    /// listen.
+    #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
+    pub fn stream_transport_keys(&self) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .inner
+            .anchor_manager
+            .transport_registry
+            .keys()
+            .cloned()
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// The key of the stream transport this instance falls back to when an
+    /// attach does not negotiate one: the per-stream transport when the
+    /// builder set a stream config, and the mux otherwise.
+    ///
+    /// Exposed for tests only, for the same reason as
+    /// [`stream_transport_keys`](Self::stream_transport_keys).
+    #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
+    pub fn default_stream_transport_key(&self) -> String {
+        crate::streaming::FrameTransport::key(self.inner.anchor_manager.transport.as_ref())
+            .as_str()
+            .to_string()
+    }
+
+    /// The length of the payload this instance holds staged under
+    /// `local_id`, or `None` once it is gone.
+    ///
+    /// Exposed for tests only. Every way a staged payload ends (release,
+    /// detach, a reaped lease, a TTL, the owner's own release) must free its
+    /// slot, and a slot that is never freed holds its bytes for the life of
+    /// the node.
+    #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
+    pub fn staged_payload_len(&self, local_id: u64) -> Option<u64> {
+        self.inner
+            .rendezvous_manager
+            .data_store()
+            .get_total_len(local_id)
+    }
+
+    /// What this instance's `_rv_acquire` handler answers to `request` and
+    /// `headers`, as an owner that is not draining.
+    ///
+    /// Exposed for tests only, for a test that wraps the handler, for example
+    /// to stall a fetch.
+    #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
+    pub fn serve_rv_acquire(
+        &self,
+        request: &crate::test_helpers::RvAcquireRequest,
+        headers: Option<&std::collections::HashMap<String, String>>,
+    ) -> Result<crate::test_helpers::AcquireResponse> {
+        crate::rendezvous::handlers::acquire_lease(
+            self.inner.rendezvous_manager.data_store(),
+            request,
+            headers,
+        )
+    }
+
+    /// Arm one fault for this instance's next RDMA transfer. See
+    /// [`RdmaTestHook`](crate::rendezvous::RdmaTestHook).
+    ///
+    /// Exposed for tests only.
+    #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    #[doc(hidden)]
+    pub fn arm_rdma_hook(&self, hook: crate::rendezvous::RdmaTestHook) {
+        self.inner.rendezvous_manager.arm_rdma_hook(hook);
     }
 
     // -----------------------------------------------------------------------
@@ -1636,7 +1968,7 @@ impl Velo {
     ///
     /// The registration lasts until [`RegionGuard::deregistered`] resolves —
     /// which happens on a confirmed unmap, or at the end of
-    /// [`graceful_shutdown`](Self::graceful_shutdown), whichever comes first.
+    /// [`shutdown`](Self::shutdown), whichever comes first.
     /// It does **not** end when the guard is dropped, and it does not end when
     /// an `unregister` returns `Err`. For that whole time, all of the following
     /// must hold.
@@ -1720,6 +2052,7 @@ impl Velo {
     /// future instead races the acquire round trip, and a cancelled future
     /// looks identical whether the transfer began or never did.
     #[cfg(all(target_os = "linux", feature = "ucx", feature = "test-helpers"))]
+    #[doc(hidden)]
     pub fn rdma_in_flight_transfers(&self) -> usize {
         self.inner
             .rdma
@@ -1746,15 +2079,46 @@ impl Velo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::rendezvous::RendezvousManager;
 
+    /// Every mode against both kill-switch forms, the config field and the
+    /// environment variable. Only a node that opted in to the per-stream path
+    /// starts with the mux off; the other two would have no remote stream
+    /// transport, and each says which call to make.
     #[test]
-    fn mux_only_rejects_the_environment_kill_switch() {
-        assert!(resolve_mux_config(Default::default(), true, true).is_err());
-        assert!(
-            !resolve_mux_config(Default::default(), true, false)
-                .unwrap()
-                .enabled
-        );
+    fn the_kill_switch_needs_a_stream_config() {
+        for mode in [
+            StreamMode::MuxOnly,
+            StreamMode::MuxDefault,
+            StreamMode::PerStream,
+        ] {
+            for enabled in [true, false] {
+                for disabled_by_env in [false, true] {
+                    let config = crate::streaming::MuxConfig {
+                        enabled,
+                        ..Default::default()
+                    };
+                    let case = format!("{mode:?}, enabled {enabled}, env {disabled_by_env}");
+                    let resolved = resolve_mux_config(config, disabled_by_env, mode);
+                    let mux_off = !enabled || disabled_by_env;
+                    match (mode, mux_off) {
+                        (_, false) => assert!(resolved.unwrap().enabled, "{case}"),
+                        (StreamMode::PerStream, true) => {
+                            assert!(!resolved.unwrap().enabled, "{case}")
+                        }
+                        (StreamMode::MuxOnly, true) => {
+                            let error = resolved.unwrap_err().to_string();
+                            assert!(error.contains("mux_only"), "{case}: {error}");
+                        }
+                        (StreamMode::MuxDefault, true) => {
+                            let error = resolved.unwrap_err().to_string();
+                            assert!(error.contains("stream_config"), "{case}: {error}");
+                            assert!(error.contains("stream_bind_addr"), "{case}: {error}");
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Every kill switch fires on an affirmative and on nothing else.
@@ -1989,10 +2353,10 @@ mod tests {
     /// Shutdown through one clone is shutdown of the instance: the other clone
     /// sees it as done, and a repeat call through the other clone returns.
     ///
-    /// This test cannot tell one teardown from two, because a second pass over
-    /// a TCP-only node is idempotent. The once-only guarantee is proven by
-    /// `rendezvous::rdma::tests::concurrent_graceful_shutdowns_are_serialised`,
-    /// which counts one RDMA sweep across eight clones.
+    /// `transports::tests::concurrent_shutdowns_through_two_clones_drain_once`
+    /// counts the runs, and
+    /// `rendezvous::rdma::tests::concurrent_shutdowns_are_serialised` counts
+    /// one RDMA sweep across eight clones.
     #[tokio::test]
     async fn shutdown_through_one_clone_is_seen_by_the_other() {
         let velo = tcp_stream_node(None).await;
@@ -2021,13 +2385,12 @@ mod tests {
     /// the first rather than starting a teardown of its own. Holding the lock
     /// stands in for a first caller that is mid-sequence.
     #[tokio::test]
-    #[allow(deprecated)] // tests the lock of the deprecated `Velo::graceful_shutdown`
-    async fn clones_serialise_graceful_shutdown_on_one_lock() {
+    async fn clones_serialise_shutdown_on_one_lock() {
         let velo = tcp_stream_node(None).await;
         let clone = velo.clone();
 
         let guard = velo.inner.shutdown.lock.lock().await;
-        let blocked = clone.graceful_shutdown(ShutdownPolicy::WaitForever);
+        let blocked = clone.shutdown(ShutdownPolicy::WaitForever);
         futures::pin_mut!(blocked);
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), blocked.as_mut())
@@ -2060,8 +2423,11 @@ mod tests {
                     .unwrap(),
             )
         };
+        // Opt in to the per-stream path: this test checks that shutdown
+        // closes its listener.
         let velo = Velo::builder()
             .add_transport(transport)
+            .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
             .build()
             .await
             .unwrap();
@@ -2115,10 +2481,10 @@ mod tests {
                 .unwrap();
         }
 
-        let anchor: crate::streaming::StreamAnchor<String> = velo.create_anchor::<String>();
+        let anchor: crate::StreamAnchor<String> = velo.create_anchor::<String>();
         let handle = anchor.handle();
 
-        let result: Result<crate::streaming::StreamSender<String>, crate::streaming::AttachError> =
+        let result: Result<crate::StreamSender<String>, crate::AttachError> =
             velo.attach_anchor::<String>(handle).await;
 
         let sender = result.expect("local attach should succeed");
@@ -2162,10 +2528,12 @@ mod tests {
                     .build()
                     .unwrap(),
             ));
+            // The other arm opts in to the per-stream path, so that final
+            // drop is checked with a builder-owned stream listener too.
             let builder = if mux_only {
                 builder.mux_only()
             } else {
-                builder
+                builder.stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
             };
             let node = builder.build().await.unwrap();
             (node, addr)
@@ -2206,6 +2574,11 @@ mod tests {
                 Some(OwnedStreamTransport::Grpc(_)) => unreachable!(),
                 None => None,
             };
+            assert_eq!(
+                frame_transport.is_some(),
+                !mux_only,
+                "only the per-stream arm owns a stream listener"
+            );
             let stream_addr = frame_transport
                 .as_ref()
                 .map(|transport| transport.bound_addr());
@@ -2223,10 +2596,7 @@ mod tests {
             let frame = tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
                 .await
                 .expect("a Velo clone lost its stream");
-            assert!(matches!(
-                frame,
-                Some(Ok(crate::streaming::StreamFrame::Item(7)))
-            ));
+            assert!(matches!(frame, Some(Ok(crate::StreamFrame::Item(7)))));
 
             drop(last_owner);
             let ended = tokio::time::timeout(std::time::Duration::from_secs(2), anchor.next())
@@ -2319,12 +2689,13 @@ mod tests {
     /// A worker registers each frontend it serves, and a restarted frontend
     /// comes back with a new instance id. Unless the worker forgets the old
     /// one, it stays in the backend routes, the handler cache, the transport's
-    /// peer and connection maps, and, in default mode, the stream transport's
-    /// address cache. After `unregister_peer` none of them holds the peer, a
-    /// unary to it fails as one to a peer never registered, a unary to another
-    /// peer still works, and registering the peer again handshakes and dials
-    /// afresh. Both modes run, because only default mode has a stream
-    /// transport that caches peers.
+    /// peer and connection maps, and, on a node with a per-stream listener,
+    /// the stream transport's address cache. After `unregister_peer` none of
+    /// them holds the peer, a unary to it fails as one to a peer never
+    /// registered, a unary to another peer still works, and registering the
+    /// peer again handshakes and dials afresh. A per-stream node and a
+    /// `mux_only()` node both run, because only the per-stream transport
+    /// caches peers.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unregister_peer_forgets_the_peer_and_leaves_others_alone() {
         use crate::transports::tcp::{TcpTransport, TcpTransportBuilder};
@@ -2487,10 +2858,7 @@ mod tests {
         let first = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
             .await
             .unwrap();
-        assert!(matches!(
-            first,
-            Some(Ok(crate::streaming::StreamFrame::Item(1)))
-        ));
+        assert!(matches!(first, Some(Ok(crate::StreamFrame::Item(1)))));
 
         let send_errors = || {
             MetricSnapshot::from_registry(&registry).counter(
@@ -2571,10 +2939,7 @@ mod tests {
             let first = tokio::time::timeout(std::time::Duration::from_secs(5), anchor.next())
                 .await
                 .unwrap();
-            assert!(matches!(
-                first,
-                Some(Ok(crate::streaming::StreamFrame::Item(1)))
-            ));
+            assert!(matches!(first, Some(Ok(crate::StreamFrame::Item(1)))));
 
             let reader = tokio::spawn(async move { anchor.next().await });
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -2637,7 +3002,7 @@ mod tests {
                 .unwrap();
             assert!(matches!(
                 first,
-                Some(Ok((_, crate::streaming::mpsc::MpscFrame::Item(1))))
+                Some(Ok((_, crate::streaming::MpscFrame::Item(1))))
             ));
 
             let send_errors = || {
@@ -2822,10 +3187,7 @@ mod tests {
             .expect("SPSC reader still waiting after its sender was dropped")
             .unwrap();
         assert!(
-            matches!(
-                ended,
-                Some(Err(crate::streaming::StreamError::SenderDropped))
-            ),
+            matches!(ended, Some(Err(crate::StreamError::SenderDropped))),
             "got {ended:?}"
         );
         let ended = tokio::time::timeout(std::time::Duration::from_secs(2), mpsc_reader)
@@ -2835,7 +3197,7 @@ mod tests {
         assert!(
             matches!(
                 ended,
-                Some(Ok((_, crate::streaming::mpsc::MpscFrame::Dropped(_))))
+                Some(Ok((_, crate::streaming::MpscFrame::Dropped(_))))
             ),
             "got {ended:?}"
         );
@@ -3059,7 +3421,7 @@ mod tests {
             .unwrap();
         let peer_instance = crate::InstanceId::new_v4();
         messenger
-            .register_peer_inner(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
+            .register_peer(velo_ext::PeerInfo::new(peer_instance, stalling_address()))
             .unwrap();
         (messenger, peer_instance, sends)
     }
@@ -3079,7 +3441,7 @@ mod tests {
         // The gate holds one frame: the first detach is admitted at once, the
         // second waits on admission for as long as the peer stays stalled.
         for lease in 1..=2 {
-            let handle = crate::rendezvous::DataHandle::pack(peer_instance.worker_id(), lease);
+            let handle = crate::DataHandle::pack(peer_instance.worker_id(), lease);
             drop(rendezvous.lease_guard(handle, lease, Some(messenger.client())));
         }
         drop(messenger);
@@ -3120,7 +3482,7 @@ mod tests {
             .send()
             .await
             .unwrap();
-        let handle = crate::rendezvous::DataHandle::pack(peer_instance.worker_id(), 1);
+        let handle = crate::DataHandle::pack(peer_instance.worker_id(), 1);
         let calls: Vec<tokio::task::JoinHandle<()>> = vec![
             tokio::spawn({
                 let rendezvous = Arc::clone(&rendezvous);
@@ -3180,9 +3542,7 @@ mod tests {
         let (messenger, peer_instance, sends) = counted_stalled_messenger().await;
         let weak = Arc::downgrade(&messenger);
         let backend = Arc::clone(messenger.backend());
-        let handler =
-            crate::messenger::Handler::typed_unary("typed", |_: TypedContext<u32>| Ok(0u32))
-                .build();
+        let handler = crate::Handler::typed_unary("typed", |_: TypedContext<u32>| Ok(0u32)).build();
         // The gate holds one frame: the first error reply is admitted at once,
         // the second waits on admission for as long as the peer stays stalled.
         for slot in 1..=2u128 {
@@ -3234,10 +3594,9 @@ mod tests {
         let (messenger, peer_instance, sends) = counted_stalled_messenger().await;
         let weak = Arc::downgrade(&messenger);
         let backend = Arc::clone(messenger.backend());
-        let handler =
-            crate::messenger::Handler::typed_unary("ordered", |_: TypedContext<u32>| Ok(0u32))
-                .ordered()
-                .build();
+        let handler = crate::Handler::typed_unary("ordered", |_: TypedContext<u32>| Ok(0u32))
+            .ordered()
+            .build();
         // The gate holds one frame: the first reply is admitted at once, the
         // second waits on admission, and the third waits in the lane queue.
         for slot in 1..=3u128 {
@@ -3325,7 +3684,7 @@ mod tests {
             .unwrap();
         let resolver = Arc::new(NeverResolves::default());
         let resolver_alive = Arc::downgrade(&resolver);
-        messenger.set_large_payload_support_inner(resolver.clone(), resolver);
+        messenger.set_large_payload_support(resolver.clone(), resolver);
         let backend = Arc::clone(messenger.backend());
         let headers = std::collections::HashMap::from([(
             crate::messenger::large_payload::RV_HEADER_KEY.to_string(),
@@ -3480,10 +3839,10 @@ mod tests {
     }
 
     /// The per-stream transports of this crate report a stream's retirement
-    /// from their pump, but only because the builder names them to the anchor
-    /// manager. A sender over either of them retires on its transport; a
-    /// builder that forgot to install them would silently fall back to
-    /// reporting as the terminal enters the channel.
+    /// from their pump. `connect_streaming` hands each one the stream's
+    /// retirement, and each says it reports it, so a sender over either of
+    /// them retires on its transport. Without that, the sender would report
+    /// as the terminal enters the channel.
     async fn per_stream_node(config: StreamConfig) -> Velo {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         Velo::builder()
@@ -3530,7 +3889,7 @@ mod tests {
         assert_eq!(
             sender.retires_on(),
             crate::streaming::sender::RetiresOn::Transport,
-            "the builder must name its per-stream transport to the anchor manager"
+            "a per-stream transport must take the stream's retirement in `connect` and report it from its pump"
         );
         drop(anchor);
     }

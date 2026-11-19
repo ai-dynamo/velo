@@ -6,11 +6,11 @@ Velo is experimental. The APIs are not stable yet. Do not use Velo in production
 
 ## What a Velo instance holds
 
-A `Velo` instance wraps three managers behind one API:
+A `Velo` instance puts three subsystems behind one API:
 
-- **Messenger**: active messages with four patterns (fire-and-forget, sync, unary, typed unary) and named handlers.
-- **AnchorManager**: typed streams. One producer attaches to one anchor and sends items to the consumer that owns the anchor.
-- **RendezvousManager**: large payloads. The owner stages the bytes, and a peer pulls them by handle. Over UCX, the pull is a one-sided RDMA read.
+- **Messaging**: active messages with four patterns (fire-and-forget, sync, unary, typed unary) and named handlers.
+- **Streams**: typed streams. One producer attaches to one anchor and sends items to the consumer that owns the anchor.
+- **Rendezvous**: large payloads. The owner stages the bytes, and a peer pulls them by handle. Over UCX, the pull is a one-sided RDMA read.
 
 You inject transports, discovery, and metrics when you build the instance.
 
@@ -18,8 +18,8 @@ You inject transports, discovery, and metrics when you build the instance.
 graph TD
     App[Application] --> V[Velo]
     V --> M[Messenger]
-    V --> A[AnchorManager]
-    V --> R[RendezvousManager]
+    V --> A[Streams]
+    V --> R[Rendezvous]
     M --> T["Transports<br>TCP, UDS, QUIC, NATS, gRPC, ZMQ, UCX"]
     A --> FT["Frame transport or<br>batched streaming (mux)"]
     R --> M
@@ -33,7 +33,7 @@ graph TD
 | Crate | For | Contents |
 |---|---|---|
 | `velo` | Application authors | The runtime: messaging, streaming, rendezvous, events, queues, discovery, all in-tree transports, metrics |
-| `velo-ext` | Authors of out-of-tree plugins | The stable trait surface: `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`, and the value types these traits use |
+| `velo-ext` | Authors of out-of-tree plugins | The stable trait surface: `Transport`, `PeerDiscovery`, `ServiceDiscovery`, `TransportObservability`, and the value types these traits use |
 | `velo-hub` | Authors of a hub service | A hub: peer discovery, registration, and liveness for a velo application, plus hosted extensions. See [The hub](concepts/hub.md). |
 
 Application authors depend on `velo` only. See [Workspace crates](development/architecture.md) for why the runtime is one crate, and why `velo-hub` is a crate of its own.

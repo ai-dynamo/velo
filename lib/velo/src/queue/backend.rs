@@ -13,8 +13,8 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 
-use crate::queue::error::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
-use crate::queue::options::NextOptions;
+use crate::queue::NextOptions;
+use crate::queue::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
 
 /// Boxed future type alias for sender backend creation.
 pub type SenderFuture<'a> =

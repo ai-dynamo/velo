@@ -36,8 +36,12 @@ impl FrameTransport for LegacyTransport {
         &self,
         _anchor_id: u64,
         _session_id: u64,
-    ) -> BoxFuture<'_, anyhow::Result<flume::Receiver<Vec<u8>>>> {
-        Box::pin(async { Ok(flume::bounded::<Vec<u8>>(1).1) })
+    ) -> BoxFuture<'_, anyhow::Result<crate::streaming::transport::Bound>> {
+        Box::pin(async {
+            Ok(crate::streaming::transport::Bound::uncredited(
+                flume::bounded::<Vec<u8>>(1).1,
+            ))
+        })
     }
 
     fn connect(
@@ -45,8 +49,13 @@ impl FrameTransport for LegacyTransport {
         _peer: WorkerId,
         _anchor_id: u64,
         _session_id: u64,
-    ) -> BoxFuture<'_, anyhow::Result<flume::Sender<Vec<u8>>>> {
-        Box::pin(async { Ok(flume::bounded::<Vec<u8>>(1).0) })
+        _retire: Option<crate::streaming::control::SenderClosed>,
+    ) -> BoxFuture<'_, anyhow::Result<crate::streaming::transport::Connected>> {
+        Box::pin(async {
+            Ok(crate::streaming::transport::Connected::queued(
+                flume::bounded::<Vec<u8>>(1).0,
+            ))
+        })
     }
 }
 
@@ -210,6 +219,32 @@ fn a_nonempty_offer_must_include_the_selected_transport() {
         assert!(select(&offered, None, &legacy(), peer(), None).is_err());
     }
     assert!(select(&[], None, &legacy(), peer(), None).is_ok());
+}
+
+/// A node whose stream transport is the mux, the default since the
+/// per-stream path became opt-in, has nothing to serve a sender without the
+/// mux on. The refusal names the calls that would give it something, because
+/// it reaches the sender as the attach error, far from the receiver's code.
+#[tokio::test]
+async fn a_mux_default_refuses_a_sender_without_the_mux_and_names_the_opt_in() {
+    let mux = mux(MuxConfig::default()).await;
+    let default_transport = Arc::clone(&mux) as Arc<dyn FrameTransport>;
+    for offered in [keys(&["tcp-stream"]), keys(&[])] {
+        let Err(error) = select(&offered, Some(&mux), &default_transport, peer(), None) else {
+            panic!("{offered:?}: a sender without the mux was accepted");
+        };
+        let error = error.to_string();
+        assert!(
+            error.contains("the sender does not offer the messenger mux"),
+            "{error}"
+        );
+        assert!(
+            error.contains("the anchor's node has no per-stream transport"),
+            "{error}"
+        );
+        assert!(error.contains("stream_config"), "{error}");
+        assert!(error.contains("stream_bind_addr"), "{error}");
+    }
 }
 
 // ---------------------------------------------------------------------------
