@@ -808,3 +808,14 @@ Test: `transports::quic::listener::tests::a_peer_close_preserves_acknowledged_fr
 
 Test: `a_default_node_learns_peers_without_a_per_stream_transport`
 (`lib/velo/tests/streaming/default_node_peers.rs`).
+
+## A send to a call that the server can end must tolerate the end
+
+**Rule.** When a test sends on a channel that feeds a call, and the server can end that call by itself, do not `unwrap` the send. Read the verdict from the response instead. To test a send that comes after the end with certainty, wait for the channel to close (`Sender::closed`) and then send.
+
+**Failure.** `a_frame_the_server_cannot_receive_ends_the_call_with_an_error` sent an oversized frame and then the terminal. The server rejects the frame and ends the call, and that drops the request body, so the terminal send can fail. It failed with `SendError` once in 720 stressed runs, and in two of seven PRs in one CI wave. The server has to be quick for this, so a test run on a quiet host rarely sees it.
+
+**Test.** Wait for `tx.closed()`, then send the terminal: the send fails every time. The old test with its `unwrap` failed with `SendError` in the first run of this check. With the send allowed to fail, the test passes 20 of 20 runs.
+
+Test: `streaming::grpc_transport::tests::a_call_the_server_ended_first_still_reads_as_an_error`
+(`lib/velo/src/streaming/grpc_transport.rs`).
