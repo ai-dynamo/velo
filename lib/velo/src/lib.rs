@@ -3837,10 +3837,10 @@ mod tests {
     }
 
     /// The per-stream transports of this crate report a stream's retirement
-    /// from their pump, but only because the builder names them to the anchor
-    /// manager. A sender over either of them retires on its transport; a
-    /// builder that forgot to install them would silently fall back to
-    /// reporting as the terminal enters the channel.
+    /// from their pump. `connect_streaming` hands each one the stream's
+    /// retirement, and each says it reports it, so a sender over either of
+    /// them retires on its transport. Without that, the sender would report
+    /// as the terminal enters the channel.
     async fn per_stream_node(config: StreamConfig) -> Velo {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         Velo::builder()
@@ -3887,7 +3887,7 @@ mod tests {
         assert_eq!(
             sender.retires_on(),
             crate::streaming::sender::RetiresOn::Transport,
-            "the builder must name its per-stream transport to the anchor manager"
+            "a per-stream transport must take the stream's retirement in `connect` and report it from its pump"
         );
         drop(anchor);
     }
