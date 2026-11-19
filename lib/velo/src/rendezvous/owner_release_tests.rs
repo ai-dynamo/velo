@@ -18,7 +18,7 @@ use velo_ext::WorkerId;
 
 use super::RendezvousManager;
 use super::handle::DataHandle;
-use super::store::{DataStore, LeaseEnd, LeaseOutcome};
+use super::store::{DataStore, LeaseEnd, LeaseOutcome, SlotBody};
 
 const PAYLOAD: &[u8] = b"payload";
 
@@ -123,7 +123,7 @@ fn the_owner_call_and_the_last_reader_leaving_together_free_the_slot() {
 
     for _ in 0..2_000 {
         let store = Arc::new(DataStore::new());
-        let slot = store.register(Bytes::from_static(PAYLOAD), None);
+        let slot = store.register_body(SlotBody::InMemory(Bytes::from_static(PAYLOAD)), None);
         let lease = store.acquire_read_lock(slot).unwrap();
         let start = Arc::new(Barrier::new(2));
         let owner = {

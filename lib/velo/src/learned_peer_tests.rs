@@ -5,7 +5,7 @@
 //!
 //! The messenger backend owns the peer table, and the per-stream transport
 //! keeps a second table of its own: the endpoint it dials for each peer. A
-//! peer learned by `_hello`, by send-time discovery, or by
+//! peer learned by `_hello`, by send-time discovery, or by the crate-private
 //! `Messenger::register_peer` used to reach only the first table. With the mux
 //! off, an attach to such a peer then failed with "TCP streaming: peer ... not
 //! registered", though messages to it worked. These tests learn a peer each
@@ -76,9 +76,8 @@ async fn node(discovery: Option<PeerInfo>, mux: bool) -> Velo {
 /// A messenger with no `Velo` around it. It installs no stream transport
 /// and advertises messenger endpoints only, which is what every 0.22.0 node
 /// sends in `_hello`.
-#[allow(deprecated)] // Messenger::builder is deprecated in 0.22.1; a 0.22.0-style node needs it.
 async fn messenger_only() -> Arc<Messenger> {
-    Messenger::builder()
+    crate::messenger::MessengerParts::new()
         .add_transport(tcp_transport())
         .build()
         .await
@@ -117,10 +116,10 @@ async fn close(nodes: &[&Velo]) {
 
 #[derive(Clone, Copy, Debug)]
 enum Learned {
-    /// `Velo::register_peer`, which reached the stream transport before.
+    /// `Velo::register_peer`, which reached the stream transport before. It
+    /// forwards to the crate-private `Messenger::register_peer`, which
+    /// `_hello` also calls, so this row covers that call too.
     Velo,
-    /// `Messenger::register_peer`.
-    Messenger,
     /// The `_hello` the producer sends on its first message to the consumer.
     Hello,
     /// Discovery of the consumer when the producer first sends to its worker id.
@@ -131,23 +130,18 @@ enum Learned {
 /// the consumer created. The attach dials the consumer through the
 /// producer's stream transport, so it works only if that transport learned
 /// the consumer too.
-#[allow(deprecated)] // Messenger::register_peer is deprecated in 0.22.1; this test calls it on purpose.
 async fn attach_after_learning(path: Learned, mux: bool) {
     let consumer = node(None, mux).await;
     let discovery = matches!(path, Learned::Discovery).then(|| consumer.peer_info());
     let producer = node(discovery, mux).await;
     match path {
         Learned::Velo => producer.register_peer(consumer.peer_info()).unwrap(),
-        Learned::Messenger => producer
-            .messenger()
-            .register_peer(consumer.peer_info())
-            .unwrap(),
         Learned::Hello | Learned::Discovery => {}
     }
     match path {
         // The consumer answers an attach through its own peer table, so it
         // learns the producer from the `_hello` of this first message.
-        Learned::Velo | Learned::Messenger => ping(&producer, &consumer, false).await,
+        Learned::Velo => ping(&producer, &consumer, false).await,
         Learned::Hello => {
             consumer.register_peer(producer.peer_info()).unwrap();
             // The consumer's first message carries its `_hello`.
@@ -208,11 +202,6 @@ async fn send_time_discovery_registers_with_the_stream_transport() {
     attach_after_learning(Learned::Discovery, false).await;
 }
 
-#[tokio::test]
-async fn messenger_register_peer_registers_with_the_stream_transport() {
-    attach_after_learning(Learned::Messenger, false).await;
-}
-
 /// Control: the path that always reached the stream transport.
 #[tokio::test]
 async fn velo_register_peer_registers_with_the_stream_transport() {
@@ -230,7 +219,6 @@ async fn hello_with_the_mux_attaches_over_the_mux() {
 /// messenger's address only, so the receiver had nothing to register with
 /// its stream transport, however it forwarded the peer.
 #[tokio::test]
-#[allow(deprecated)] // Messenger::register_peer is deprecated in 0.22.1; this handler copies the real `_hello`.
 async fn hello_carries_the_stream_endpoint() {
     let sender = node(None, false).await;
     let receiver = node(None, false).await;
@@ -279,7 +267,6 @@ async fn handshake(sender: &Messenger, receiver: InstanceId) -> Result<Vec<Strin
 /// an address with no entry for its key. Forwarding that rejection would
 /// leave the handshake unanswered until the sender timed out.
 #[tokio::test]
-#[allow(deprecated)] // Messenger::{register_peer, graceful_shutdown} are deprecated in 0.22.1; the 0.22.0 sender calls them.
 async fn a_hello_without_a_stream_endpoint_still_completes() {
     for mux in [false, true] {
         let old = messenger_only().await;
@@ -311,7 +298,6 @@ async fn a_hello_without_a_stream_endpoint_still_completes() {
 /// registers the sender. A plain messenger is that receiver, and so is a
 /// mux-only node, whose stream transport has a different key.
 #[tokio::test]
-#[allow(deprecated)] // Messenger::graceful_shutdown is deprecated in 0.22.1; the 0.22.0 receiver calls it.
 async fn a_hello_with_a_stream_endpoint_reaches_a_receiver_without_one() {
     for mux_only in [false, true] {
         let new = node(None, false).await;
@@ -350,41 +336,26 @@ async fn a_hello_with_a_stream_endpoint_reaches_a_receiver_without_one() {
     }
 }
 
-/// Unregistering through `Velo` or `Messenger` drops the peer from the
-/// stream transport too, and so does it for a peer the node learned by
-/// `_hello`, which no caller registered by hand.
+/// Unregistering drops the peer from the stream transport too, and so does
+/// it for a peer the node learned by `_hello`, which no caller registered by
+/// hand. `Velo::unregister_peer` forwards to the crate-private messenger
+/// call, so one path covers both.
 #[tokio::test]
-#[allow(deprecated)] // Messenger::unregister_peer is deprecated in 0.22.1; this test calls it on purpose.
 async fn unregister_reaches_the_stream_transport_on_every_path() {
-    for through_messenger in [false, true] {
-        let a = node(None, false).await;
-        let b = node(None, false).await;
-        a.register_peer(b.peer_info()).unwrap();
-        // b learns a by a's `_hello`.
-        ping(&a, &b, false).await;
-        let forget = |node: &Velo, peer: InstanceId| {
-            if through_messenger {
-                node.messenger().unregister_peer(peer);
-            } else {
-                node.unregister_peer(peer);
-            }
-        };
-        assert!(stream_knows(&a, b.instance_id()));
-        assert!(stream_knows(&b, a.instance_id()));
-        forget(&a, b.instance_id());
-        forget(&b, a.instance_id());
-        let a_knows = stream_knows(&a, b.instance_id());
-        let b_knows = stream_knows(&b, a.instance_id());
-        close(&[&a, &b]).await;
-        assert!(
-            !a_knows,
-            "messenger path {through_messenger}: registered by hand"
-        );
-        assert!(
-            !b_knows,
-            "messenger path {through_messenger}: learned by _hello"
-        );
-    }
+    let a = node(None, false).await;
+    let b = node(None, false).await;
+    a.register_peer(b.peer_info()).unwrap();
+    // b learns a by a's `_hello`.
+    ping(&a, &b, false).await;
+    assert!(stream_knows(&a, b.instance_id()));
+    assert!(stream_knows(&b, a.instance_id()));
+    a.unregister_peer(b.instance_id());
+    b.unregister_peer(a.instance_id());
+    let a_knows = stream_knows(&a, b.instance_id());
+    let b_knows = stream_knows(&b, a.instance_id());
+    close(&[&a, &b]).await;
+    assert!(!a_knows, "registered by hand");
+    assert!(!b_knows, "learned by _hello");
 }
 
 /// The stream transport follows the messenger's peer table; it does not

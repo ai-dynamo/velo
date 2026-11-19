@@ -9,7 +9,7 @@
 //! # Architecture
 //!
 //! - [`SimFabric`] owns the network model and all in-flight transfer state
-//! - [`SimTransport`] implements the [`Transport`](crate::transports::Transport) trait,
+//! - [`SimTransport`] implements the [`Transport`](crate::Transport) trait,
 //!   routing messages through the fabric's DES queue
 //! - [`SimDiscovery`] implements [`PeerDiscovery`](crate::discovery::PeerDiscovery)
 //!   with an in-memory registry
@@ -30,12 +30,12 @@
 //! // ...
 //! ```
 
-pub mod discovery;
-pub mod fabric;
-pub mod network;
-pub mod transport;
+mod discovery;
+mod fabric;
+mod network;
+mod transport;
 
 pub use discovery::SimDiscovery;
-pub use fabric::SimFabric;
+pub use fabric::{SimFabric, Transfer};
 pub use network::{BisectionBandwidth, NetworkModel, NextCompletion};
 pub use transport::SimTransport;
