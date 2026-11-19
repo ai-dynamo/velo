@@ -248,8 +248,7 @@ impl BatcherHandle {
     /// applied drains.
     #[cfg(test)]
     pub(crate) fn control_settled(&self, hooks: &TestHooks) -> bool {
-        let (drains, pending) = self.control.drains_and_pending();
-        pending == 0 && hooks.controls_applied() == drains
+        self.control.settled(hooks.controls_applied())
     }
 
     /// Whether the task has taken its last drain, so a reply posted now is
