@@ -257,8 +257,15 @@ running at once, about 1 run in 80 read 0. Run alone, it passed 60 runs of
 reads. Run the test in a loop with many copies at once, for example 24. One
 copy on a quiet host hides the race.
 
-Test: `streaming::messenger_mux::peer_batcher::tests::instruments::singleton_records_are_counted_by_type`
-(`lib/velo/src/streaming/messenger_mux/peer_batcher/tests/instruments.rs`).
+The consumer side of the mux does the same with `velo_streaming_mux_live_slots`.
+It hands the terminal to the reader, and only then counts the slot closed. A
+test that read the gauge once, right after the reader's channel closed, read
+1 when the count came 100 ms late (10 runs of 10).
+
+Tests: `streaming::messenger_mux::peer_batcher::tests::instruments::singleton_records_are_counted_by_type`
+(`lib/velo/src/streaming/messenger_mux/peer_batcher/tests/instruments.rs`) and
+`streaming::messenger_mux::tests::a_stream_round_trips_and_ends_on_its_terminal`
+(`lib/velo/src/streaming/messenger_mux/tests.rs`).
 
 ## Hold a state open with a gate, not with a slow operation
 
@@ -539,8 +546,20 @@ records any reap of an endpoint whose peer sent a frame within the timeout.
 A correct reaper never adds to it, at any load. To show a test is not empty,
 remove the inbound stamp: the count must rise.
 
-Test: `transports::ucx::transport::tests::a_peer_that_keeps_sending_responses_keeps_its_endpoint`
-(`lib/velo/src/transports/ucx/tests.rs`).
+The mux batcher's flush windows had the same fault. Five tests checked that
+nothing was written for 200 ms inside a 1 s window, or that a reply moved
+within 200 ms. A stall of over 800 ms ended the window inside the check, and
+the batch went for a reason the test did not expect. With 8 copies of the mux
+tests on two CPUs and random pauses, 3 runs of 80 failed this way. `FlushGate`
+now reads a `GateClock`. Outside test builds it has no fields and reads
+`Instant::now()`. A test that uses `harness_with_clock` stops it, and moves it
+with `ManualClock::advance`. A stall of 900 ms inside the check failed the old
+form 10 runs of 10, and the new form passes it 10 of 10.
+
+Tests: `transports::ucx::transport::tests::a_peer_that_keeps_sending_responses_keeps_its_endpoint`
+(`lib/velo/src/transports/ucx/tests.rs`) and
+`streaming::messenger_mux::peer_batcher::tests::flush_policy::on_complete_waits_for_every_live_slot`
+(`lib/velo/src/streaming/messenger_mux/peer_batcher/tests/flush_policy.rs`).
 
 ## Wait for facts that stay true, and keep the test's own steps out of the state it checks
 
@@ -616,6 +635,34 @@ and `transports::ucx::transport::tests::an_endpoint_whose_peer_never_sends_is_re
 **Test.** Make the store's next remove report the fence and fail in one call, then stop the hub, and check that the stop reports Ok. As a control, make a remove fail with no fence, and check that the stop reports it.
 
 Test: `a_stop_that_finds_the_store_fenced_by_its_own_remove_reports_ok` (`lib/velo-hub/tests/lifecycle.rs`), with `FaultStore::fence_next_remove`.
+
+## A barrier proves an event was handled only if that event reaches it
+
+**Rule.** When a test holds a loop at a barrier to check the effect of an
+event, the event itself must bring the loop to the barrier. If the code can
+drop the event early, or handle it in a wake that has already passed the
+barrier, the loop stops there only at some later, unrelated wake. Wait for a
+count that the code moves once it has handled the event instead.
+
+**Failure.** `a_delayed_payload_refusal_reply_spares_a_reused_slot` posts a
+reply that names a session that has ended. The control inbox drops it at
+once. The batcher wakes, finds nothing to apply, and goes back to its select
+without passing the barrier. Only the probe tick, every 5 s while a slot is
+live, brought it there: 0.8 s to 4.9 s after the reply in 48 runs. The test
+waited 5 s, so a probe tick that load delayed failed it: 9 runs of 160 with
+8 copies on two CPUs and random pauses.
+
+**Test.** Print which work brought the loop to the barrier: here it was
+always the probe. The fixed test waits until nothing is pending and the
+batcher has applied every control drain it took
+(`BatcherHandle::control_settled`). To check that it still sees the defect,
+remove both session checks, in `ControlInbox::peer_stopped` and in
+`on_owned_control`: the test fails. With only one removed, the other one
+still stops the reply.
+
+Test: `streaming::messenger_mux::peer_batcher::tests::egress::a_delayed_payload_refusal_reply_spares_a_reused_slot`
+(`lib/velo/src/streaming/messenger_mux/peer_batcher/tests/egress.rs`).
+
 
 ## Before a test moves its clock, wait for the work that reads it
 
