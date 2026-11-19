@@ -20,7 +20,8 @@ use velo_ext::InstanceId;
 
 use super::super::protocol::{BATCH_HEADER_LEN, BatchEncoder, EncodeError, MAX_RECORDS_PER_BATCH};
 use super::super::{MuxConfig, PeerLane};
-use crate::messenger::{FireResult, Messenger};
+use crate::FireResult;
+use crate::messenger::Messenger;
 use crate::observability::MuxMetricsHandle;
 use crate::transports::tcp::framing::COALESCE_THRESHOLD;
 

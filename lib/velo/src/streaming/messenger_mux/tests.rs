@@ -21,10 +21,9 @@ use super::test_support::{lane0, stalled_producer};
 use super::*;
 use crate::observability::test_helpers::MetricSnapshot;
 use crate::streaming::sender::{cached_dropped, cached_finalized};
-use crate::streaming::{
-    AnchorConfig, AnchorManager, AnchorManagerBuilder, StreamAnchorHandle, StreamFrame,
-};
+use crate::streaming::{AnchorConfig, AnchorManager, AnchorManagerBuilder};
 use crate::transports::tcp::TcpTransportBuilder;
+use crate::{StreamAnchorHandle, StreamFrame};
 
 const RECV_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -58,10 +57,8 @@ async fn messenger_pair() -> (Arc<Messenger>, Arc<Messenger>) {
         .build()
         .await
         .expect("messenger b");
-    a.register_peer_inner(b.peer_info())
-        .expect("register b on a");
-    b.register_peer_inner(a.peer_info())
-        .expect("register a on b");
+    a.register_peer(b.peer_info()).expect("register b on a");
+    b.register_peer(a.peer_info()).expect("register a on b");
     tokio::time::sleep(Duration::from_millis(200)).await;
     (a, b)
 }
@@ -153,8 +150,8 @@ async fn recv(rx: &flume::Receiver<Vec<u8>>) -> Vec<u8> {
 
 /// One bound slot's consumer side, standing in for a mux-fed `StreamAnchor`.
 ///
-/// The attach path installs a direct feed holding both the receiver `bind`
-/// returned and the drain signal the mux parked for that pair, and the consumer
+/// The attach path installs a direct feed holding both the receiver and the
+/// drain signal that `bind` returned for that pair, and the consumer
 /// counts every record it takes out on that signal. Credit is returned against
 /// that count, so a test taking records straight from the receiver would look
 /// to the ledger like a stream whose consumer was gone — and the first thing that reaches is
@@ -180,11 +177,14 @@ impl BoundSlot {
 
 /// `bind` on `mux`, with the drain signal the attach path would hand the feed.
 async fn bind_slot(mux: &MessengerMuxTransport, anchor_id: u64, session_id: u64) -> BoundSlot {
-    let rx = mux.bind(anchor_id, session_id).await.expect("bind");
-    let drain = mux
-        .take_drain_signal(anchor_id, session_id)
-        .expect("bind parks a drain signal for the attach path to take");
-    BoundSlot { rx, drain }
+    let bound = mux.bind(anchor_id, session_id).await.expect("bind");
+    let drain = bound
+        .drain
+        .expect("a mux bind hands back a drain signal for the attach path");
+    BoundSlot {
+        rx: bound.rx,
+        drain,
+    }
 }
 
 /// A staged item can finish resolving after its batcher's epoch ends.
@@ -357,7 +357,7 @@ async fn a_payload_refusal_ends_an_anchor_with_a_terminal_in_the_hold() {
     let terminal = tokio::time::timeout(Duration::from_secs(1), anchor.next())
         .await
         .expect("the refused item must end the anchor even when its terminal arrived first");
-    let Some(Err(crate::streaming::StreamError::TransportError(why))) = terminal else {
+    let Some(Err(crate::StreamError::TransportError(why))) = terminal else {
         panic!("expected the size error, got {terminal:?}");
     };
     assert!(why.contains("67108864"), "{why}");
@@ -438,10 +438,7 @@ async fn a_payload_refusal_ends_a_stream_whose_open_is_queued() {
         .await
         .expect("a refusal must survive an OpenSlot already queued on its ordered lane");
     assert!(
-        matches!(
-            terminal,
-            Some(Err(crate::streaming::StreamError::TransportError(_)))
-        ),
+        matches!(terminal, Some(Err(crate::StreamError::TransportError(_)))),
         "expected the size error, got {terminal:?}"
     );
     assert_eq!(node.mux.core.ingress.live_slots(key), 0);
@@ -472,9 +469,10 @@ fn runtime_shutdown_cancels_a_mux_with_live_batchers() {
         let receiver = pair.bind(1, 1).await;
         let sender = pair
             .producer
-            .connect(pair.consumer_worker, 1, 1)
+            .connect(pair.consumer_worker, 1, 1, None)
             .await
-            .unwrap();
+            .unwrap()
+            .tx;
         (pair, receiver, sender)
     });
     runtime.shutdown_timeout(Duration::from_secs(5));
@@ -516,7 +514,7 @@ fn aborting_a_retiring_batchers_final_flush_stops_the_mux() {
             .unwrap();
         let peer = velo_ext::InstanceId::new_v4();
         messenger
-            .register_peer_inner(velo_ext::PeerInfo::new(peer, stalling_address()))
+            .register_peer(velo_ext::PeerInfo::new(peer, stalling_address()))
             .unwrap();
         let mux = MessengerMuxTransport::new(
             messenger,
@@ -532,7 +530,7 @@ fn aborting_a_retiring_batchers_final_flush_stops_the_mux() {
         .unwrap();
         let hooks = Arc::new(TestHooks::default());
         assert!(mux.core.hooks.set(hooks.clone()).is_ok());
-        let receiver = mux.bind(1, 1).await.unwrap();
+        let receiver = mux.bind(1, 1).await.unwrap().rx;
         let key = lane0(peer.worker_id());
         let batcher = mux.core.batcher(key).unwrap();
         let slot = protocol::SlotId::from_raw(7);
@@ -582,7 +580,7 @@ async fn a_batcher_dropped_by_stop_sending_leaves_slots_to_shutdown() {
         .unwrap();
     let peer = velo_ext::InstanceId::new_v4();
     messenger
-        .register_peer_inner(velo_ext::PeerInfo::new(peer, stalling_address()))
+        .register_peer(velo_ext::PeerInfo::new(peer, stalling_address()))
         .unwrap();
     let mux = MessengerMuxTransport::new(
         messenger,
@@ -593,7 +591,7 @@ async fn a_batcher_dropped_by_stop_sending_leaves_slots_to_shutdown() {
     .unwrap();
     let hooks = Arc::new(TestHooks::default());
     assert!(mux.core.hooks.set(hooks.clone()).is_ok());
-    let receiver = mux.bind(1, 1).await.unwrap();
+    let receiver = mux.bind(1, 1).await.unwrap().rx;
     let batcher = mux.core.batcher(lane0(peer.worker_id())).unwrap();
 
     hooks.pause();
@@ -683,8 +681,9 @@ fn a_secondary_runtime_does_not_own_the_mux_batchers() {
     let pair = owner.block_on(mux_pair(test_config()));
     let receiver = owner.block_on(pair.bind(1, 1));
     let sender = caller
-        .block_on(pair.producer.connect(pair.consumer_worker, 1, 1))
-        .unwrap();
+        .block_on(pair.producer.connect(pair.consumer_worker, 1, 1, None))
+        .unwrap()
+        .tx;
     caller.shutdown_timeout(Duration::from_secs(1));
     owner.block_on(async {
         assert!(!pair.producer.core.tasks.is_stopped());
@@ -840,9 +839,10 @@ async fn a_stream_round_trips_and_ends_on_its_terminal() {
     let rx = pair.bind(1, 1).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 1, 1)
+        .connect(pair.consumer_worker, 1, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
 
     for n in 0..8u32 {
         tx.send_async(item(n)).await.expect("send item");
@@ -874,9 +874,10 @@ async fn credit_returns_let_a_producer_outrun_its_window() {
     let rx = pair.bind(2, 2).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 2, 2)
+        .connect(pair.consumer_worker, 2, 2, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
 
     const FRAMES: u32 = 200;
     let producer = tokio::spawn(async move {
@@ -904,14 +905,16 @@ async fn concurrent_sessions_on_one_anchor_stay_separate() {
     let rx_b = pair.bind(5, 2).await;
     let tx_a = pair
         .producer
-        .connect(pair.consumer_worker, 5, 1)
+        .connect(pair.consumer_worker, 5, 1, None)
         .await
-        .expect("connect a");
+        .expect("connect a")
+        .tx;
     let tx_b = pair
         .producer
-        .connect(pair.consumer_worker, 5, 2)
+        .connect(pair.consumer_worker, 5, 2, None)
         .await
-        .expect("connect b");
+        .expect("connect b")
+        .tx;
 
     for n in 0..16u32 {
         tx_a.send_async(item(n)).await.expect("send a");
@@ -932,14 +935,16 @@ async fn a_session_nobody_bound_is_rejected_without_disturbing_a_live_one() {
     let rx = pair.bind(9, 1).await;
     let live = pair
         .producer
-        .connect(pair.consumer_worker, 9, 1)
+        .connect(pair.consumer_worker, 9, 1, None)
         .await
-        .expect("connect live");
+        .expect("connect live")
+        .tx;
     let orphan = pair
         .producer
-        .connect(pair.consumer_worker, 9, 999)
+        .connect(pair.consumer_worker, 9, 999, None)
         .await
-        .expect("connect orphan");
+        .expect("connect orphan")
+        .tx;
 
     // The reverse race: the receiver replies `CloseSlot{UnknownSlot}` and the
     // sender's channel closes. The peer itself is never failed.
@@ -957,9 +962,10 @@ async fn dropping_a_producer_without_a_terminal_injects_dropped() {
     let rx = pair.bind(11, 1).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 11, 1)
+        .connect(pair.consumer_worker, 11, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
 
     tx.send_async(item(1)).await.expect("send item");
     assert_eq!(rx.recv().await, item(1));
@@ -983,9 +989,10 @@ async fn live_slots_returns_to_zero_when_the_producers_go_away() {
         receivers.push(pair.bind(20, session).await);
         senders.push(
             pair.producer
-                .connect(pair.consumer_worker, 20, session)
+                .connect(pair.consumer_worker, 20, session, None)
                 .await
-                .expect("connect"),
+                .expect("connect")
+                .tx,
         );
     }
     for tx in &senders {
@@ -1020,9 +1027,10 @@ async fn dropping_the_transports_tears_every_slot_down_promptly() {
         receivers.push(pair.bind(30, session).await);
         senders.push(
             pair.producer
-                .connect(pair.consumer_worker, 30, session)
+                .connect(pair.consumer_worker, 30, session, None)
                 .await
-                .expect("connect"),
+                .expect("connect")
+                .tx,
         );
     }
     // One bind with no `connect` behind it, so an accept window really is open.
@@ -1197,9 +1205,9 @@ async fn one_flush_reaches_every_peer_batcher() {
             .await
             .expect("consumer messenger");
         producer_messenger
-            .register_peer_inner(m.peer_info())
+            .register_peer(m.peer_info())
             .expect("register consumer");
-        m.register_peer_inner(producer_messenger.peer_info())
+        m.register_peer(producer_messenger.peer_info())
             .expect("register producer");
         consumers.push(m);
     }
@@ -1236,7 +1244,13 @@ async fn one_flush_reaches_every_peer_batcher() {
         for slot in 0..SLOTS_PER_PEER {
             let id = (peer as u64 + 1) * 100 + slot;
             receivers.push(bind_slot(&mux, id, id).await);
-            senders.push(producer.connect(worker, id, id).await.expect("connect"));
+            senders.push(
+                producer
+                    .connect(worker, id, id, None)
+                    .await
+                    .expect("connect")
+                    .tx,
+            );
         }
         consumer_muxes.push(mux);
     }
@@ -1319,10 +1333,10 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
         .await
         .expect("consumer messenger");
     producer_messenger
-        .register_peer_inner(consumer_messenger.peer_info())
+        .register_peer(consumer_messenger.peer_info())
         .expect("register consumer");
     consumer_messenger
-        .register_peer_inner(producer_messenger.peer_info())
+        .register_peer(producer_messenger.peer_info())
         .expect("register producer");
     tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -1347,11 +1361,12 @@ async fn the_ordered_lane_is_observed_once_per_batch_not_once_per_record() {
     )
     .expect("producer mux");
 
-    let rx = consumer.bind(1, 1).await.expect("bind");
+    let rx = consumer.bind(1, 1).await.expect("bind").rx;
     let tx = producer
-        .connect(consumer_messenger.instance_id().worker_id(), 1, 1)
+        .connect(consumer_messenger.instance_id().worker_id(), 1, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
 
     let snapshot = || MetricSnapshot::from_registry(&consumer_reg);
     let waits = || {
@@ -1844,12 +1859,6 @@ async fn unclaimed_bind_is_reclaimed_on_anchor_death_without_the_timer() {
         .expect("a mux is installed, so a ticket is minted");
     assert!(ticket.routing_session_id > 0);
     assert_eq!(mux.pending_binds(), 1, "the pre-bind registered a bind");
-    assert_eq!(
-        mux.parked_drains(),
-        0,
-        "`prebind_anchor` collected the drain signal inline, before spawning the watchdog, so no \
-         later attach can find one parked here"
-    );
 
     drop(anchor);
 
@@ -1858,7 +1867,6 @@ async fn unclaimed_bind_is_reclaimed_on_anchor_death_without_the_timer() {
         0,
         "the anchor died unclaimed, so its bind must be gone with it"
     );
-    assert_eq!(mux.parked_drains(), 0);
     assert_eq!(
         mux.live_ingress_slots(lane0(messenger.instance_id().worker_id())),
         0
@@ -1881,12 +1889,13 @@ async fn close_claimed_slot_is_idempotent() {
     pair.consumer
         .close_claimed_slot(lane0(pair.producer_worker), protocol::SlotId::from_raw(0));
 
-    let rx = pair.consumer.bind(1, 1).await.expect("bind");
+    let rx = pair.consumer.bind(1, 1).await.expect("bind").rx;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 1, 1)
+        .connect(pair.consumer_worker, 1, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     tx.send_async(item(0)).await.expect("send item");
     assert_eq!(recv(&rx).await, item(0));
 
@@ -1943,9 +1952,10 @@ async fn a_close_posted_past_the_batchers_last_drain_still_reaches_the_producer(
     let _rx = pair.bind(1, 1).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 1, 1)
+        .connect(pair.consumer_worker, 1, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     eventually(|| {
         pair.consumer
             .live_ingress_slots(lane0(pair.producer_worker))
@@ -2018,9 +2028,10 @@ async fn a_close_refused_by_a_retired_batcher_reaches_the_producer_through_its_r
     let _rx = pair.bind(1, 1).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 1, 1)
+        .connect(pair.consumer_worker, 1, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     eventually(|| {
         pair.consumer
             .live_ingress_slots(lane0(pair.producer_worker))
@@ -2088,12 +2099,13 @@ async fn a_close_refused_by_a_retired_batcher_reaches_the_producer_through_its_r
 async fn close_claimed_slot_off_runtime_closes_through_the_mux_runtime() {
     let pair = mux_pair(test_config()).await;
 
-    let rx = pair.consumer.bind(1, 1).await.expect("bind");
+    let rx = pair.consumer.bind(1, 1).await.expect("bind").rx;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 1, 1)
+        .connect(pair.consumer_worker, 1, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     tx.send_async(item(0)).await.expect("send item");
     assert_eq!(recv(&rx).await, item(0));
 
@@ -2292,10 +2304,7 @@ async fn an_adopted_prebind_with_a_slow_heartbeat_is_reaped_by_the_accept_window
         .await
         .expect("the watchdog already exited on the accept window; the consumer must not block");
     assert!(
-        matches!(
-            next,
-            Some(Err(crate::streaming::StreamError::SenderDropped))
-        ),
+        matches!(next, Some(Err(crate::StreamError::SenderDropped))),
         "expected SenderDropped, got {next:?}"
     );
 }
@@ -2337,10 +2346,7 @@ async fn an_unclaimed_prebind_closes_at_its_accept_window_and_not_before() {
         .await
         .expect("the bind is closed; the consumer must not block");
     assert!(
-        matches!(
-            next,
-            Some(Err(crate::streaming::StreamError::SenderDropped))
-        ),
+        matches!(next, Some(Err(crate::StreamError::SenderDropped))),
         "expected SenderDropped, got {next:?}"
     );
 }
@@ -2420,9 +2426,15 @@ async fn a_prebound_slot_opens_on_the_terms_its_ticket_quotes() {
 
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
+        .connect(
+            pair.consumer_worker,
+            local_id,
+            ticket.routing_session_id,
+            None,
+        )
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     tx.send_async(item(0)).await.expect("send item");
     eventually(|| {
         pair.consumer
@@ -2484,7 +2496,7 @@ async fn open_anchor_stream_on_the_minting_worker_fails_fast() {
     .expect_err("a ticket opened on the worker that minted it must be refused");
 
     assert!(
-        matches!(err, crate::streaming::AttachError::TransportError(_)),
+        matches!(err, crate::AttachError::TransportError(_)),
         "expected TransportError naming the misuse, got {err:?}"
     );
     assert!(
@@ -2554,9 +2566,15 @@ async fn a_consumer_that_never_polls_holds_its_sender_to_the_window() {
     let ticket = manager.prebind_anchor(anchor.handle()).expect("ticket");
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
+        .connect(
+            pair.consumer_worker,
+            local_id,
+            ticket.routing_session_id,
+            None,
+        )
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     let producer = tokio::spawn(async move {
         for n in 0..SENT {
             tx.send_async(item(n)).await.expect("send item");
@@ -2686,9 +2704,10 @@ async fn watched_anchor<T: serde::de::DeserializeOwned>(
         watched_anchor_unconnected::<T>(config, heartbeat, adopt).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, local_id, session_id)
+        .connect(pair.consumer_worker, local_id, session_id, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     (pair, manager, anchor, local_id, tx)
 }
 
@@ -2737,9 +2756,10 @@ async fn the_watchdog_does_not_fire_while_its_sender_is_parked() {
         .store(true, std::sync::atomic::Ordering::Release);
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, local_id, session_id)
+        .connect(pair.consumer_worker, local_id, session_id, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     for n in 0..CREDIT {
         tx.send_async(item(n)).await.expect("send item");
     }
@@ -2779,29 +2799,37 @@ async fn the_watchdog_does_not_fire_while_its_sender_is_parked() {
 /// sent. The watchdog used to treat any unread record as proof of life, so a
 /// dead worker behind a slow client -- an HTTP reader that is connected but
 /// behind -- kept its anchor, slot and peer batcher until the client drained.
+///
+/// The watchdog is held until the records are in the buffer. On a loaded host
+/// the sender used to stall for three 50 ms windows between its attach and
+/// its sends: the watchdog then fired before the records arrived, which is
+/// correct, and the test failed on a send or on waiting to see the slot live,
+/// a state the watchdog ends by itself.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_silent_sender_with_credit_is_reaped_while_records_wait_unread() {
     let heartbeat = Duration::from_millis(50);
-    let (pair, manager, anchor, local_id, tx) =
-        watched_anchor::<u32>(test_config(), heartbeat, false).await;
+    let (pair, manager, anchor, local_id, session_id, drain) =
+        watched_anchor_unconnected::<u32>(test_config(), heartbeat, false).await;
+    drain.hold_watchdog(true);
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, local_id, session_id, None)
+        .await
+        .expect("connect")
+        .tx;
     for n in 0..3 {
         tx.send_async(item(n)).await.expect("send item");
     }
-    eventually(|| {
+    eventually(|| drain.arrivals() == 3).await;
+    assert_eq!(
         pair.consumer
-            .live_ingress_slots(lane0(pair.producer_worker))
-            == 1
-    })
-    .await;
+            .live_ingress_slots(lane0(pair.producer_worker)),
+        1
+    );
 
-    // Nobody reads. Detection is three windows, plus one of clock skew.
-    tokio::time::timeout(heartbeat * 20, async {
-        while manager.registry.contains_key(&local_id) {
-            tokio::time::sleep(heartbeat / 5).await;
-        }
-    })
-    .await
-    .expect("a silent sender that holds credit must be reaped with records unread");
+    // Nobody reads, and the sender sends nothing more.
+    drain.hold_watchdog(false);
+    eventually(|| !manager.registry.contains_key(&local_id)).await;
     // The records the dead sender left in the buffer are not delivered: the
     // consumer's next frame is the end of the stream.
     let mut anchor = anchor;
@@ -2809,10 +2837,7 @@ async fn a_silent_sender_with_credit_is_reaped_while_records_wait_unread() {
         .await
         .expect("the reaped stream must end, not hang");
     assert!(
-        matches!(
-            next,
-            Some(Err(crate::streaming::StreamError::SenderDropped))
-        ),
+        matches!(next, Some(Err(crate::StreamError::SenderDropped))),
         "expected SenderDropped before any buffered record, got {next:?}"
     );
     drop((anchor, tx));
@@ -2825,6 +2850,12 @@ async fn a_silent_sender_with_credit_is_reaped_while_records_wait_unread() {
 /// leave its sender with no credit and fewer than `C` records buffered. That
 /// sender cannot heartbeat either, and the silence is still the consumer's. A
 /// watchdog that looked only at the record count would reap it.
+///
+/// The watchdog is held until the window is read, then the test waits for it
+/// to judge more windows than a firing needs. The test used to let it run
+/// from the attach: a sender that stalled for three 50 ms windows before its
+/// last send held credit and was silent, so it was rightly reaped, and the
+/// test failed on a send or on waiting for the window to arrive.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sender_starved_by_the_byte_budget_is_not_reaped() {
     const CREDIT: u32 = 8;
@@ -2835,8 +2866,15 @@ async fn a_sender_starved_by_the_byte_budget_is_not_reaped() {
         slot_byte_budget: 1024,
         ..test_config()
     };
-    let (_pair, manager, mut anchor, local_id, tx) =
-        watched_anchor::<Vec<u8>>(config, heartbeat, false).await;
+    let (pair, manager, mut anchor, local_id, session_id, drain) =
+        watched_anchor_unconnected::<Vec<u8>>(config, heartbeat, false).await;
+    drain.hold_watchdog(true);
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, local_id, session_id, None)
+        .await
+        .expect("connect")
+        .tx;
     let big =
         |n: u32| rmp_serde::to_vec(&StreamFrame::Item(vec![n as u8; RECORD])).expect("encode item");
     for n in 0..CREDIT {
@@ -2845,14 +2883,7 @@ async fn a_sender_starved_by_the_byte_budget_is_not_reaped() {
     // All of them, not just the slot: a read while the window is still
     // arriving finds the buffer under the byte budget and grants credit back,
     // and a sender that holds credit and sends nothing is rightly reaped.
-    eventually(|| {
-        manager
-            .registry
-            .get(&local_id)
-            .and_then(|entry| entry.feed.current())
-            .is_some_and(|feed| feed.drain.arrivals() == u64::from(CREDIT))
-    })
-    .await;
+    eventually(|| drain.arrivals() == u64::from(CREDIT)).await;
     // Read all but two. Two large records still hold the byte budget, so the
     // credit this read earns is withheld.
     for _ in 0..CREDIT - 2 {
@@ -2863,7 +2894,18 @@ async fn a_sender_starved_by_the_byte_budget_is_not_reaped() {
             .expect("record decodes");
     }
 
-    tokio::time::sleep(heartbeat * 20).await;
+    drain.hold_watchdog(false);
+    let judged = drain.watchdog_windows();
+    // A window is counted before it is judged, and the first one after the
+    // release can only refresh what the watchdog has seen, if an arrival
+    // landed after the last held window. So a firing can come at window
+    // `DETECTION_MULTIPLIER + 1`; counting the window after it shows that one
+    // was judged.
+    eventually(|| {
+        drain.watchdog_windows()
+            > judged + u64::from(crate::streaming::control::DETECTION_MULTIPLIER) + 1
+    })
+    .await;
     assert!(
         manager.registry.contains_key(&local_id),
         "the byte budget withholds the sender's credit, so the silence is the consumer's"
@@ -2951,7 +2993,7 @@ async fn an_ended_consumer_releases_its_slot_while_the_anchor_is_held() {
     assert!(
         matches!(
             ended,
-            Some(Err(crate::streaming::StreamError::DeserializationError(_)))
+            Some(Err(crate::StreamError::DeserializationError(_)))
         ),
         "expected DeserializationError, got {ended:?}"
     );
@@ -2988,9 +3030,10 @@ async fn a_watchdog_firing_closes_its_slot() {
         watched_anchor_unconnected::<u32>(test_config(), heartbeat, true).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, local_id, session_id)
+        .connect(pair.consumer_worker, local_id, session_id, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     for n in 0..3 {
         // Fails only once the watchdog has ended the stream.
         if tx.send_async(item(n)).await.is_err() {
@@ -3142,9 +3185,15 @@ async fn a_reattach_over_the_mux_does_not_overtake_the_detached_tail() {
     let ticket = manager.prebind_anchor(anchor.handle()).expect("ticket");
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, local_id, ticket.routing_session_id)
+        .connect(
+            pair.consumer_worker,
+            local_id,
+            ticket.routing_session_id,
+            None,
+        )
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     tx.send_async(item(100)).await.expect("send");
     eventually(|| {
         pair.consumer
@@ -3570,9 +3619,10 @@ async fn serve_one_stream_then_idle(pair: &Pair) {
     let rx = pair.bind(1, 1).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 1, 1)
+        .connect(pair.consumer_worker, 1, 1, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     for n in 0..8u32 {
         tx.send_async(item(n)).await.expect("send item");
     }
@@ -3708,9 +3758,10 @@ async fn a_busy_tick_returns_credit_no_doorbell_asked_for() {
     let rx = pair.bind(3, 3).await;
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, 3, 3)
+        .connect(pair.consumer_worker, 3, 3, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     let producer = tokio::spawn(async move {
         for n in 0..2 * WINDOW {
             tx.send_async(item(n)).await.expect("send item");
@@ -3796,9 +3847,10 @@ async fn a_late_reply_after_the_idle_fixture_is_not_counted_as_idle() {
     let receiver = pair.bind(9, 9).await;
     let sender = pair
         .producer
-        .connect(pair.consumer_worker, 9, 9)
+        .connect(pair.consumer_worker, 9, 9, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     sender.send_async(item(0)).await.expect("send item");
     assert_eq!(receiver.recv().await, item(0));
     hooks.wait_until_parked().await;

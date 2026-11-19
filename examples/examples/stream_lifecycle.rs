@@ -34,7 +34,8 @@ use clap::{Parser, ValueEnum};
 use prometheus::Registry;
 use velo::observability::VeloMetrics;
 use velo::observability::test_helpers::MetricSnapshot;
-use velo::streaming::{MuxConfig, Retirement, StreamFrame};
+use velo::streaming::{MuxConfig, Retirement};
+use velo::StreamFrame;
 use velo::transports::tcp::TcpTransportBuilder;
 use velo::{Handler, Velo};
 

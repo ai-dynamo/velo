@@ -5,7 +5,7 @@ SPDX-License-Identifier: Apache-2.0
 
 # Move off the manager accessors in 0.22.1
 
-`Velo::anchor_manager()` and `Velo::rendezvous_manager()` are deprecated in 0.22.1. Each gives out a manager whose methods are now on `Velo`. A later breaking release removes both. Move each call to the `Velo` method in the tables below.
+`Velo::anchor_manager()` and `Velo::rendezvous_manager()` are deprecated in 0.22.1. Each gives out a manager whose methods are now on `Velo`. 0.23.0 removes both, and the managers are no longer public; see [Move to the public paths of 0.23.0](migrate-public-paths.md). Move each call to the `Velo` method in the tables below.
 
 ## Anchors
 
@@ -68,4 +68,4 @@ For a slot staged with `register_data_in_region`, freeing the slot gives back it
 
 ## Direct manager access
 
-A few uses have no `Velo` form, such as the anchor manager's `transport_registry`. Keep them under `#[allow(deprecated)]` for now.
+A few uses have no `Velo` form, such as the anchor manager's `transport_registry`. In 0.22.1, keep them under `#[allow(deprecated)]`. 0.23.0 removes them with no replacement.
