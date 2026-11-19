@@ -1079,10 +1079,15 @@ mod tests {
     /// client with no encode limit, as a client from another velo might,
     /// send one frame of `len` bytes and then the terminal, and return
     /// whether the response ended cleanly.
+    ///
+    /// With `wait_for_end`, the terminal is sent only after the server has
+    /// ended the call, which makes certain an order that otherwise depends on
+    /// how fast the server rejects the frame.
     async fn call_ends_cleanly_after(
         server: &GrpcFrameTransport,
         session: u64,
         len: usize,
+        wait_for_end: bool,
     ) -> bool {
         let addr = SocketAddr::new(
             std::net::Ipv4Addr::LOCALHOST.into(),
@@ -1109,9 +1114,22 @@ mod tests {
             payload,
         };
         tx.send(framed(vec![7u8; len])).await.unwrap();
-        tx.send(framed(crate::streaming::sender::cached_finalized().clone()))
-            .await
-            .unwrap();
+        if wait_for_end {
+            // The request body is dropped once the server has ended the call.
+            tokio::time::timeout(Duration::from_secs(10), tx.closed())
+                .await
+                .expect("the server ends the call");
+        }
+        // A server that rejects a frame ends the call, and that drops the
+        // request body, so this send can fail. That is not a failure of the
+        // test: whether the call ended with an error is read from the
+        // response below.
+        let terminal = tx
+            .send(framed(crate::streaming::sender::cached_finalized().clone()))
+            .await;
+        if wait_for_end {
+            assert!(terminal.is_err(), "the call ended before the terminal");
+        }
         drop(tx);
         let mut clean = true;
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -1144,7 +1162,7 @@ mod tests {
             .unwrap();
 
         let consumer = server.bind(4, 4).await.unwrap().rx;
-        assert!(call_ends_cleanly_after(&server, 4, UNDER_IT).await);
+        assert!(call_ends_cleanly_after(&server, 4, UNDER_IT, false).await);
         let item = consumer.recv_async().await.unwrap();
         assert_eq!(item.len(), UNDER_IT);
         assert_eq!(
@@ -1153,7 +1171,30 @@ mod tests {
         );
 
         let consumer = server.bind(5, 5).await.unwrap().rx;
-        assert!(!call_ends_cleanly_after(&server, 5, OVER_THE_DECODE_LIMIT).await);
+        assert!(!call_ends_cleanly_after(&server, 5, OVER_THE_DECODE_LIMIT, false).await);
+        assert_eq!(
+            consumer.recv_async().await.unwrap(),
+            *crate::streaming::sender::cached_dropped()
+        );
+        tokio::time::timeout(Duration::from_secs(2), server.shutdown())
+            .await
+            .unwrap();
+    }
+
+    /// The server can end the call before the client sends the terminal
+    /// behind an oversized frame: it rejects the frame at once, and the
+    /// client's request body is dropped. The call must still read as an error.
+    /// The test above reaches this order only when the server is fast, so a
+    /// loaded host failed it now and then with a `SendError` on the terminal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_call_the_server_ended_first_still_reads_as_an_error() {
+        const OVER_THE_DECODE_LIMIT: usize = MAX_ITEM_BYTES + (1 << 20);
+        let server = GrpcFrameTransport::new("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+
+        let consumer = server.bind(6, 6).await.unwrap().rx;
+        assert!(!call_ends_cleanly_after(&server, 6, OVER_THE_DECODE_LIMIT, true).await);
         assert_eq!(
             consumer.recv_async().await.unwrap(),
             *crate::streaming::sender::cached_dropped()
