@@ -85,7 +85,7 @@ pre-commit run --all-files
 
 ## velo-ext API stability
 
-`velo-ext` is the published trait surface that out-of-tree implementors of `Transport`, `FrameTransport`, `PeerDiscovery`, `ServiceDiscovery`, and `TransportObservability` compile against. Every change to it propagates to every downstream impl, so the bar is higher than for the runtime crate.
+`velo-ext` is the published trait surface that out-of-tree implementors of `Transport`, `PeerDiscovery`, `ServiceDiscovery`, and `TransportObservability` compile against. Every change to it propagates to every downstream impl, so the bar is higher than for the runtime crate.
 
 When changing `lib/velo-ext/`:
 

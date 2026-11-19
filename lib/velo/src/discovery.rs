@@ -6,12 +6,12 @@
 //! migrates to the two-crate (`velo` + `velo-ext`) layout.
 
 #[cfg(feature = "services")]
-pub mod filesystem;
+mod filesystem;
 #[cfg(feature = "services")]
 pub use filesystem::{FilesystemPeerDiscovery, FilesystemRegistrationGuard};
 
 #[cfg(feature = "services")]
-pub mod filesystem_service;
+mod filesystem_service;
 #[cfg(feature = "services")]
 pub use filesystem_service::{FilesystemServiceDiscovery, FilesystemServiceRegistrationGuard};
 

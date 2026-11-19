@@ -15,9 +15,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use dashmap::DashMap;
 
-use crate::queue::backend::{ReceiverBackend, SenderBackend, WorkQueueBackend};
-use crate::queue::error::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
-use crate::queue::options::NextOptions;
+use crate::queue::NextOptions;
+use crate::queue::{ReceiverBackend, SenderBackend, WorkQueueBackend};
+use crate::queue::{WorkQueueError, WorkQueueRecvError, WorkQueueSendError};
 
 /// An in-memory work queue backend.
 ///

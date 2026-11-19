@@ -19,8 +19,8 @@ use futures::StreamExt;
 use super::lane_choice::keyed_lane;
 use super::{LaneIndex, MessengerMuxTransport, PeerLane};
 use crate::Velo;
-use crate::streaming::{StreamAnchor, StreamAnchorHandle, StreamFrame};
 use crate::transports::quic::{QuicTransport, QuicTransportBuilder};
+use crate::{StreamAnchor, StreamAnchorHandle, StreamFrame};
 
 const BOUND: Duration = Duration::from_secs(20);
 
@@ -125,7 +125,7 @@ async fn eventually(what: &str, mut predicate: impl FnMut() -> bool) {
 }
 
 /// Send [`ITEMS`] items and a finalize, and read them back in order.
-async fn stream_through(sender: crate::streaming::StreamSender<u32>, anchor: StreamAnchor<u32>) {
+async fn stream_through(sender: crate::StreamSender<u32>, anchor: StreamAnchor<u32>) {
     let send = tokio::spawn(async move {
         for n in 0..ITEMS {
             sender.send(n).await.expect("send");
@@ -319,7 +319,7 @@ async fn attach_all(
     consumer: &Node,
     producer: &Node,
     count: usize,
-) -> Vec<(crate::streaming::StreamSender<u32>, StreamAnchor<u32>)> {
+) -> Vec<(crate::StreamSender<u32>, StreamAnchor<u32>)> {
     let anchors: Vec<StreamAnchor<u32>> = (0..count)
         .map(|_| consumer.velo.create_anchor::<u32>())
         .collect();
@@ -884,7 +884,6 @@ async fn an_attach_that_fails_after_its_bind_gives_its_lane_back() {
                 .map(|lane| mux.pending_binds_on(Some(peer), LaneIndex::new(lane)))
                 .sum::<usize>(),
             mux.pending_binds(),
-            mux.parked_drains(),
         )
     };
 
@@ -896,8 +895,8 @@ async fn an_attach_that_fails_after_its_bind_gives_its_lane_back() {
     assert!(attached.is_err(), "the anchor was removed during the bind");
     assert_eq!(
         counted(),
-        (0, 0, 0),
-        "a failed SPSC attach must give back its lane count, its bind and its drain signal"
+        (0, 0),
+        "a failed SPSC attach must give back its lane count and its bind"
     );
 
     let anchor = consumer.velo.create_mpsc_anchor::<u32>();
@@ -908,8 +907,8 @@ async fn an_attach_that_fails_after_its_bind_gives_its_lane_back() {
     assert!(attached.is_err(), "the anchor was removed during the bind");
     assert_eq!(
         counted(),
-        (0, 0, 0),
-        "a failed MPSC attach must give back its lane count, its bind and its drain signal"
+        (0, 0),
+        "a failed MPSC attach must give back its lane count and its bind"
     );
 }
 
@@ -1124,7 +1123,7 @@ async fn a_lane_that_refuses_admission_fails_only_its_own_streams() {
     .await
     .expect("the consumer on the refusing lane must see its stream end");
     assert!(
-        matches!(end, Some(Err(crate::streaming::StreamError::SenderDropped))),
+        matches!(end, Some(Err(crate::StreamError::SenderDropped))),
         "the consumer on the refusing lane must see SenderDropped, got {end:?}"
     );
     assert!(
@@ -1148,9 +1147,8 @@ async fn a_lane_that_refuses_admission_fails_only_its_own_streams() {
 /// it does not panic.
 ///
 /// `prebind_anchor` is a public sync call an application can make on any
-/// thread. Mux shutdown clears the parked drain signals, so one can vanish
-/// between the pre-bind's bind and its take. The bind hook plays that
-/// shutdown.
+/// thread. Mux shutdown can land between the pre-bind's bind and the ticket:
+/// it drops every unclaimed bind. The bind hook plays that shutdown.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_prebind_racing_shutdown_returns_none() {
     use crate::observability::test_helpers::MetricSnapshot;
@@ -1181,7 +1179,7 @@ async fn a_prebind_racing_shutdown_returns_none() {
             .bind_hook
             .set(Box::new(move |_| {
                 if let Some(core) = core.upgrade() {
-                    core.drains.clear();
+                    core.ingress.shutdown();
                 }
             }))
             .is_ok()

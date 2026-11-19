@@ -9,7 +9,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use velo::discovery::FilesystemPeerDiscovery;
+use velo::discovery::{FilesystemPeerDiscovery, PeerDiscovery};
 use velo::transports::tcp::TcpTransportBuilder;
 use velo::*;
 

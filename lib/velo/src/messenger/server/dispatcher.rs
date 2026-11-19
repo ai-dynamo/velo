@@ -687,7 +687,7 @@ impl DispatcherHub {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messenger::Handler;
+    use crate::Handler;
     use crate::transports::tcp::TcpTransportBuilder;
     use std::time::Duration;
 
@@ -728,9 +728,7 @@ mod tests {
             .build()
             .await
             .unwrap();
-        messenger
-            .register_peer_inner(messenger.peer_info())
-            .unwrap();
+        messenger.register_peer(messenger.peer_info()).unwrap();
         // The panic arm reads the metrics from the backend, not the Messenger;
         // a backend built without them would drop these counts silently.
         let panics = |reason| {
@@ -769,7 +767,7 @@ mod tests {
         assert_eq!(panics("handler_panic"), 2.0);
         assert_eq!(panics("ordered_handler_panic"), 2.0);
         messenger
-            .graceful_shutdown_inner(crate::ShutdownPolicy::WaitForever)
+            .graceful_shutdown(crate::ShutdownPolicy::WaitForever)
             .await;
         messenger.closed().await;
     }
@@ -843,7 +841,7 @@ mod tests {
             PendingHandler,
             OrderedConfig::global()
                 .with_max_queue_depth(Some(1))
-                .with_overflow(crate::messenger::OverflowPolicy::Reject),
+                .with_overflow(crate::OverflowPolicy::Reject),
         );
         let call = |n: u128| InboundCall {
             message_id: ResponseId::from_u128(n),

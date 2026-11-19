@@ -51,9 +51,11 @@ async fn make_pair() -> (Velo, Registry, Velo, Registry) {
 
     // The mux is off on both nodes: this file covers the per-stream cascade
     // (connect and bind channels, the server pump), and with the mux on (the
-    // default) the streams would ride it instead.
+    // default) the streams would ride it instead. A node with the mux off
+    // needs the per-stream path opted in.
     let producer = Velo::builder()
         .add_transport(new_messenger_transport())
+        .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
         .messenger_mux(MuxConfig {
             enabled: false,
             ..MuxConfig::default()
@@ -65,6 +67,7 @@ async fn make_pair() -> (Velo, Registry, Velo, Registry) {
         .unwrap();
     let consumer = Velo::builder()
         .add_transport(new_messenger_transport())
+        .stream_bind_addr(std::net::Ipv4Addr::LOCALHOST.into())
         .messenger_mux(MuxConfig {
             enabled: false,
             ..MuxConfig::default()
@@ -155,7 +158,7 @@ async fn reader_pump_backpressure_ticks_under_consumer_starvation() {
 
     // Drain the anchor so the producer task finalizes cleanly.
     while let Some(frame) = anchor.next().await {
-        if matches!(frame, Ok(streaming::StreamFrame::Finalized) | Err(_)) {
+        if matches!(frame, Ok(StreamFrame::Finalized) | Err(_)) {
             break;
         }
     }
@@ -179,8 +182,8 @@ async fn no_backpressure_counters_in_steady_state() {
         let mut got = 0;
         while let Some(frame) = anchor.next().await {
             match frame.unwrap() {
-                streaming::StreamFrame::Item(_) => got += 1,
-                streaming::StreamFrame::Finalized => break,
+                StreamFrame::Item(_) => got += 1,
+                StreamFrame::Finalized => break,
                 _ => {}
             }
         }
@@ -285,7 +288,7 @@ async fn attach_rtt_covers_the_round_trip_and_only_the_remote_one() {
     // for the trip, so it is observed — under `error`, and with no transport
     // scheme, because none was ever negotiated.
     let (consumer_worker, _) = handle.unpack();
-    let missing = velo::streaming::StreamAnchorHandle::pack(consumer_worker, 0x0000_0000_DEAD_BEEF);
+    let missing = velo::StreamAnchorHandle::pack(consumer_worker, 0x0000_0000_DEAD_BEEF);
     assert!(
         producer.attach_anchor::<u64>(missing).await.is_err(),
         "attaching to an anchor that was never created must fail"

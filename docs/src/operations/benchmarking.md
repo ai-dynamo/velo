@@ -117,7 +117,7 @@ On the per-stream path (`--path per-stream`), keep `--streams` to a few thousand
 
 ## Run anchor_setup_bench
 
-Run all commands from the `examples/` directory. The harness has no network and no mux, so its numbers show the cost of the anchor path only. It runs two phases, each on its own runtime and manager:
+Run all commands from the `examples/` directory. Every attach in the harness is local to one `Velo` node, so no frame crosses a transport, and its numbers show the cost of the anchor path only. It runs two phases, each on its own runtime and node:
 
 1. Create `--held` SPSC anchors and hold them unattached. The harness reports the create time of each anchor, and the tokio tasks and the RSS that they add.
 2. Run `--tasks` concurrent tasks. Each task runs `--streams` lifecycles: create an anchor, attach a sender on the same worker, finalize, and read the terminal. The harness reports streams per second and the p50, p99 and p99.9 of one lifecycle.

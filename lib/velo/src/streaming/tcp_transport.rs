@@ -59,8 +59,9 @@ use tokio_util::sync::CancellationToken;
 use velo_ext::{PeerInfo, TransportKey, WorkerAddress, WorkerId};
 
 use crate::streaming::control::RetireGuard;
+use crate::streaming::sender::RetiresOn;
 use crate::streaming::sender::is_terminal_sentinel;
-use crate::streaming::transport::{FrameTransport, RetiringFrameTransport};
+use crate::streaming::transport::{Bound, Connected, FrameTransport};
 
 /// Maximum time a registered (anchor, session) slot may sit unused before its
 /// slot is freed. After expiry, an arriving connection with that handshake is
@@ -86,11 +87,11 @@ struct PendingStream {
 
 type SessionRegistry = DashMap<(u64, u64), PendingStream>;
 
-/// TCP-based [`FrameTransport`] backed by a single shared listener.
+/// The per-stream TCP transport, backed by a single shared listener.
 ///
 /// One listener + one accept loop per transport instance, regardless of how
 /// many concurrent streams are active. `bind()` is O(1).
-pub struct TcpFrameTransport {
+pub(crate) struct TcpFrameTransport {
     key: TransportKey,
     bind_addr: SocketAddr,
     local_address: WorkerAddress,
@@ -203,13 +204,15 @@ impl TcpFrameTransport {
     }
 
     /// Convenience: bind on `0.0.0.0:0`.
-    pub async fn default_bound() -> Result<Arc<Self>> {
+    #[cfg(test)]
+    pub(crate) async fn default_bound() -> Result<Arc<Self>> {
         Self::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)).await
     }
 
     /// Returns the actual bound listener address. Useful for tests that need
     /// to dial the listener directly.
-    pub fn bound_addr(&self) -> SocketAddr {
+    #[cfg(test)]
+    pub(crate) fn bound_addr(&self) -> SocketAddr {
         self.bind_addr
     }
 
@@ -540,8 +543,16 @@ impl TcpFrameTransport {
         peer: WorkerId,
         anchor_id: u64,
         session_id: u64,
-        retire: Option<RetireGuard>,
-    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
+        retire: Option<crate::streaming::control::SenderClosed>,
+    ) -> BoxFuture<'_, Result<Connected>> {
+        // The pump reports the stream's retirement only when it holds the
+        // stream's flag; without one, the sender reports `Sent` as it queues.
+        let retires_on = if retire.is_some() {
+            RetiresOn::Transport
+        } else {
+            RetiresOn::Queue
+        };
+        let retire = retire.map(RetireGuard::new);
         let peers = self.peers.clone();
         let metrics = self.metrics.clone();
         Box::pin(async move {
@@ -594,26 +605,15 @@ impl TcpFrameTransport {
                 return Err(anyhow!("TCP streaming transport shut down"));
             }
 
-            Ok(tx)
+            Ok(Connected {
+                tx,
+                retires_on,
+                // The codec's frame limit. `EgressFrame` carries no header,
+                // so an item at this size is exactly what the codec still
+                // encodes.
+                item_limit: Some(crate::streaming::transport::MAX_ITEM_BYTES),
+            })
         })
-    }
-}
-
-impl RetiringFrameTransport for TcpFrameTransport {
-    fn connect_retiring(
-        &self,
-        peer: WorkerId,
-        anchor_id: u64,
-        session_id: u64,
-        closed: crate::streaming::control::SenderClosed,
-    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
-        self.connect_with(peer, anchor_id, session_id, Some(RetireGuard::new(closed)))
-    }
-
-    /// The codec's frame limit. `EgressFrame` carries no header, so an item
-    /// at this size is exactly what the codec still encodes.
-    fn item_limit(&self) -> Option<usize> {
-        Some(crate::streaming::transport::MAX_ITEM_BYTES)
     }
 }
 
@@ -663,11 +663,7 @@ impl FrameTransport for TcpFrameTransport {
         self.peers.remove(&instance_id.worker_id());
     }
 
-    fn bind(
-        &self,
-        anchor_id: u64,
-        session_id: u64,
-    ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>> {
+    fn bind(&self, anchor_id: u64, session_id: u64) -> BoxFuture<'_, Result<Bound>> {
         let registry = self.registry.clone();
         Box::pin(async move {
             if self.tasks.is_stopped() {
@@ -692,7 +688,7 @@ impl FrameTransport for TcpFrameTransport {
                 return Err(anyhow!("TCP streaming transport shut down"));
             }
 
-            Ok(frame_rx)
+            Ok(Bound::uncredited(frame_rx))
         })
     }
 
@@ -701,8 +697,9 @@ impl FrameTransport for TcpFrameTransport {
         peer: WorkerId,
         anchor_id: u64,
         session_id: u64,
-    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>> {
-        self.connect_with(peer, anchor_id, session_id, None)
+        retire: Option<crate::streaming::control::SenderClosed>,
+    ) -> BoxFuture<'_, Result<Connected>> {
+        self.connect_with(peer, anchor_id, session_id, retire)
     }
 }
 
@@ -734,7 +731,7 @@ mod tests {
             .await
             .unwrap();
         let addr = server.bound_addr();
-        let pending = server.bind(1, 1).await.unwrap();
+        let pending = server.bind(1, 1).await.unwrap().rx;
         let mut idle = TcpStream::connect(addr).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), server.shutdown())
             .await
@@ -763,8 +760,8 @@ mod tests {
         let _ = client_worker; // currently unused on this side
 
         // Server binds, client connects.
-        let rx = server.bind(42, 7).await.unwrap();
-        let tx = client.connect(server_worker, 42, 7).await.unwrap();
+        let rx = server.bind(42, 7).await.unwrap().rx;
+        let tx = client.connect(server_worker, 42, 7, None).await.unwrap().tx;
 
         let frame_bytes =
             rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::<u32>::Item(99)).unwrap();
@@ -799,18 +796,18 @@ mod tests {
         let (server_worker, server_peer) = fresh_peer(server.address());
         client.register(&server_peer).unwrap();
         client.unregister(server_peer.instance_id());
-        let err = client.connect(server_worker, 1, 1).await.unwrap_err();
+        let err = client.connect(server_worker, 1, 1, None).await.unwrap_err();
         assert!(format!("{err}").contains("not registered"), "{err}");
 
         client.register(&server_peer).unwrap();
-        let _rx = server.bind(1, 1).await.unwrap();
-        client.connect(server_worker, 1, 1).await.unwrap();
+        let _rx = server.bind(1, 1).await.unwrap().rx;
+        client.connect(server_worker, 1, 1, None).await.unwrap();
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn unknown_session_is_rejected() {
         let transport = TcpFrameTransport::default_bound().await.unwrap();
-        let rx = transport.bind(1, 1).await.unwrap();
+        let rx = transport.bind(1, 1).await.unwrap().rx;
 
         // Connect manually with a wrong session_id handshake.
         let addr = transport.bound_addr();
@@ -834,8 +831,8 @@ mod tests {
         let (server_worker, server_peer) = fresh_peer(server.address());
         client.register(&server_peer).unwrap();
 
-        let rx = server.bind(1, 1).await.unwrap();
-        let tx = client.connect(server_worker, 1, 1).await.unwrap();
+        let rx = server.bind(1, 1).await.unwrap().rx;
+        let tx = client.connect(server_worker, 1, 1, None).await.unwrap().tx;
         let frame = rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::<String>::Item(
             "data".to_string(),
         ))
@@ -867,8 +864,8 @@ mod tests {
         let (server_worker, server_peer) = fresh_peer(server.address());
         client.register(&server_peer).unwrap();
 
-        let rx = server.bind(1, 1).await.unwrap();
-        let tx = client.connect(server_worker, 1, 1).await.unwrap();
+        let rx = server.bind(1, 1).await.unwrap().rx;
+        let tx = client.connect(server_worker, 1, 1, None).await.unwrap().tx;
 
         let finalized =
             rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::<()>::Finalized).unwrap();
@@ -907,8 +904,8 @@ mod tests {
             let server = server.clone();
             let client = client.clone();
             handles.push(tokio::spawn(async move {
-                let rx = server.bind(i, 0).await.unwrap();
-                let tx = client.connect(server_worker, i, 0).await.unwrap();
+                let rx = server.bind(i, 0).await.unwrap().rx;
+                let tx = client.connect(server_worker, i, 0, None).await.unwrap().tx;
                 let payload =
                     rmp_serde::to_vec(&crate::streaming::frame::StreamFrame::<u64>::Item(i))
                         .unwrap();
@@ -982,9 +979,10 @@ mod tests {
         client.register(&info).unwrap();
         let closed = crate::streaming::control::SenderClosed::default();
         let tx = client
-            .connect_retiring(peer, 1, 1, closed.clone())
+            .connect(peer, 1, 1, Some(closed.clone()))
             .await
-            .unwrap();
+            .unwrap()
+            .tx;
         for _ in 0..FRAMES {
             tx.send_async(frame.clone()).await.unwrap();
         }
@@ -1012,9 +1010,10 @@ mod tests {
         });
         let closed = crate::streaming::control::SenderClosed::default();
         let tx = client
-            .connect_retiring(peer, 2, 2, closed.clone())
+            .connect(peer, 2, 2, Some(closed.clone()))
             .await
-            .unwrap();
+            .unwrap()
+            .tx;
         for _ in 0..FRAMES {
             tx.send_async(frame.clone()).await.unwrap();
         }
