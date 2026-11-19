@@ -47,8 +47,9 @@ use futures::StreamExt;
 use prometheus::Registry;
 use velo::observability::VeloMetrics;
 use velo::observability::test_helpers::MetricSnapshot;
-use velo::streaming::{MpscFrame, MuxConfig, StreamAnchor, StreamAnchorHandle, StreamFrame};
+use velo::streaming::{MpscFrame, MuxConfig};
 use velo::transports::tcp::TcpTransportBuilder;
+use velo::{StreamAnchor, StreamAnchorHandle, StreamFrame};
 use velo::{Velo, VeloBuilder};
 
 const PATIENCE: Duration = Duration::from_secs(30);

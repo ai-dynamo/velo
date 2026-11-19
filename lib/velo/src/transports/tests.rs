@@ -596,86 +596,6 @@ async fn test_send_message_unregistered_peer() {
 }
 
 #[tokio::test]
-async fn test_send_message_with_transport_primary_match() {
-    let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t.clone() as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
-
-    let peer = make_peer_info(&["tcp"]);
-    let peer_id = peer.instance_id();
-    backend.register_peer(peer).unwrap();
-
-    backend
-        .send_message_with_transport(
-            peer_id,
-            Bytes::from_static(&[1]),
-            Bytes::from_static(&[2]),
-            MessageType::Message,
-            Arc::new(NoopErrorHandler),
-            TransportKey::from("tcp"),
-        )
-        .unwrap();
-
-    assert_eq!(t.send_count.load(Ordering::Relaxed), 1);
-}
-
-#[tokio::test]
-async fn test_send_message_with_transport_alternative() {
-    let t1 = MockTransport::new("tcp", true);
-    let t2 = MockTransport::new("http", true);
-    let (backend, _streams) = VeloBackend::new(
-        vec![
-            t1.clone() as Arc<dyn Transport>,
-            t2.clone() as Arc<dyn Transport>,
-        ],
-        None,
-    )
-    .await
-    .unwrap();
-
-    let peer = make_peer_info(&["tcp", "http"]);
-    let peer_id = peer.instance_id();
-    backend.register_peer(peer).unwrap();
-
-    // Send via "http" (the alternative transport)
-    backend
-        .send_message_with_transport(
-            peer_id,
-            Bytes::from_static(&[1]),
-            Bytes::from_static(&[2]),
-            MessageType::Message,
-            Arc::new(NoopErrorHandler),
-            TransportKey::from("http"),
-        )
-        .unwrap();
-
-    assert_eq!(t2.send_count.load(Ordering::Relaxed), 1);
-}
-
-#[tokio::test]
-async fn test_send_message_with_transport_not_found() {
-    let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
-
-    let peer = make_peer_info(&["tcp"]);
-    let peer_id = peer.instance_id();
-    backend.register_peer(peer).unwrap();
-
-    let result = backend.send_message_with_transport(
-        peer_id,
-        Bytes::new(),
-        Bytes::new(),
-        MessageType::Message,
-        Arc::new(NoopErrorHandler),
-        TransportKey::from("grpc"),
-    );
-    assert!(result.is_err());
-}
-
-#[tokio::test]
 async fn test_try_translate_worker_id_not_found() {
     let t = MockTransport::new("tcp", true);
     let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
@@ -708,72 +628,6 @@ async fn failed_start_closes_all_transports_already_started() {
     assert!(failing.started.load(Ordering::Relaxed));
     assert!(!failing.shut_down.load(Ordering::Relaxed));
     assert!(!failing.closed.load(Ordering::Relaxed));
-}
-
-#[tokio::test]
-async fn test_set_transport_priority_valid() {
-    let t1 = MockTransport::new("tcp", true);
-    let t2 = MockTransport::new("http", true);
-    let (backend, _streams) = VeloBackend::new(
-        vec![t1 as Arc<dyn Transport>, t2 as Arc<dyn Transport>],
-        None,
-    )
-    .await
-    .unwrap();
-
-    // Reverse the priority
-    backend
-        .set_transport_priority(vec![TransportKey::from("http"), TransportKey::from("tcp")])
-        .unwrap();
-}
-
-#[tokio::test]
-async fn test_set_transport_priority_rejects_duplicate_without_changing_priority() {
-    let tcp = MockTransport::new("tcp", true);
-    let ucx = MockTransport::new("ucx", true);
-    let (backend, _streams) = VeloBackend::new(
-        vec![tcp as Arc<dyn Transport>, ucx as Arc<dyn Transport>],
-        None,
-    )
-    .await
-    .unwrap();
-    assert!(matches!(
-        backend.set_transport_priority(vec![TransportKey::from("tcp"), TransportKey::from("tcp")]),
-        Err(VeloBackendError::InvalidTransportPriority(_))
-    ));
-    assert_eq!(
-        *backend.priorities.lock(),
-        vec![TransportKey::from("tcp"), TransportKey::from("ucx")]
-    );
-}
-
-#[tokio::test]
-async fn test_set_transport_priority_wrong_length() {
-    let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
-
-    let result =
-        backend.set_transport_priority(vec![TransportKey::from("tcp"), TransportKey::from("http")]);
-    assert!(matches!(
-        result,
-        Err(VeloBackendError::InvalidTransportPriority(_))
-    ));
-}
-
-#[tokio::test]
-async fn test_set_transport_priority_unknown_key() {
-    let t = MockTransport::new("tcp", true);
-    let (backend, _streams) = VeloBackend::new(vec![t as Arc<dyn Transport>], None)
-        .await
-        .unwrap();
-
-    let result = backend.set_transport_priority(vec![TransportKey::from("unknown")]);
-    assert!(matches!(
-        result,
-        Err(VeloBackendError::InvalidTransportPriority(_))
-    ));
 }
 
 #[tokio::test]
@@ -813,7 +667,6 @@ async fn test_graceful_shutdown_calls_all_transports() {
 }
 
 #[tokio::test]
-#[allow(deprecated)] // tests the deprecated `Messenger::graceful_shutdown` itself
 async fn final_messenger_drop_stops_transports_once_after_any_teardown_path() {
     for prior_shutdown in ["none", "graceful", "token"] {
         let transport = MockTransport::new("mock", true);
@@ -854,7 +707,6 @@ async fn final_messenger_drop_stops_transports_once_after_any_teardown_path() {
 
 /// A cancelled waiter must not interrupt hooks or let another caller skip them.
 #[tokio::test]
-#[allow(deprecated)] // tests the deprecated `Messenger::graceful_shutdown` itself
 async fn concurrent_shutdown_waits_for_hooks_after_first_waiter_is_cancelled() {
     let mut transport = MockTransport::new("mock", true);
     let (entered_tx, entered) = flume::bounded(1);
@@ -987,7 +839,6 @@ async fn a_teardown_failure_is_seen_with_the_coop_budget_spent() {
 }
 
 #[tokio::test]
-#[allow(deprecated)] // tests the deprecated `Messenger::graceful_shutdown` itself
 async fn failed_teardown_never_reports_successful_shutdown() {
     use futures::FutureExt;
     let mut transport = MockTransport::new("mock", true);
@@ -1080,11 +931,59 @@ async fn a_disabled_mux_without_a_stream_config_fails_before_a_transport_starts(
     );
 }
 
+/// Two clones that call `shutdown` together run its messenger half once:
+/// one runs it, the other waits on the shared lock and returns when it is
+/// done. A later call runs nothing either. Each run drains the transport, so
+/// the mock's drain count tells one run from two; a node shut down once
+/// gives the count for one run.
+#[tokio::test]
+async fn concurrent_shutdowns_through_two_clones_drain_once() {
+    async fn node() -> (crate::Velo, Arc<MockTransport>) {
+        let transport = MockTransport::new("mock", true);
+        let velo = crate::Velo::builder()
+            .add_transport(transport.clone())
+            .build()
+            .await
+            .unwrap();
+        (velo, transport)
+    }
+    let bound = Duration::from_secs(10);
+    let (once, once_transport) = node().await;
+    tokio::time::timeout(bound, once.shutdown(ShutdownPolicy::WaitForever))
+        .await
+        .expect("a shutdown did not return");
+    let one_run = once_transport.drain_calls.load(Ordering::Relaxed);
+    assert!(one_run > 0, "a shutdown did not drain the transport");
+
+    let (velo, transport) = node().await;
+    let clone = velo.clone();
+    tokio::time::timeout(bound, async {
+        tokio::join!(
+            velo.shutdown(ShutdownPolicy::WaitForever),
+            clone.shutdown(ShutdownPolicy::WaitForever),
+        )
+    })
+    .await
+    .expect("two concurrent shutdowns did not both return");
+    assert_eq!(
+        transport.drain_calls.load(Ordering::Relaxed),
+        one_run,
+        "both clones ran the shutdown sequence"
+    );
+    tokio::time::timeout(bound, clone.shutdown(ShutdownPolicy::WaitForever))
+        .await
+        .expect("a later shutdown did not return");
+    assert_eq!(
+        transport.drain_calls.load(Ordering::Relaxed),
+        one_run,
+        "a later shutdown ran the sequence again"
+    );
+}
+
 /// A retry after a failed teardown must fail at once. Teardown ran once and
 /// failed for good, so running the drain and the RDMA sweep again only spends
 /// their budget (30 s by default for the sweep) before the same panic.
 #[tokio::test]
-#[allow(deprecated)] // tests the deprecated `Velo::graceful_shutdown` itself
 async fn velo_shutdown_retry_after_a_failed_hook_skips_the_drain() {
     use futures::FutureExt;
     let mut transport = MockTransport::new("mock", true);
@@ -1094,12 +993,12 @@ async fn velo_shutdown_retry_after_a_failed_hook_skips_the_drain() {
         .build()
         .await
         .unwrap();
-    let first = std::panic::AssertUnwindSafe(velo.graceful_shutdown(ShutdownPolicy::WaitForever))
+    let first = std::panic::AssertUnwindSafe(velo.shutdown(ShutdownPolicy::WaitForever))
         .catch_unwind()
         .await;
     assert!(first.is_err());
     let drains = transport.drain_calls.load(Ordering::Relaxed);
-    let retry = std::panic::AssertUnwindSafe(velo.graceful_shutdown(ShutdownPolicy::WaitForever))
+    let retry = std::panic::AssertUnwindSafe(velo.shutdown(ShutdownPolicy::WaitForever))
         .catch_unwind()
         .await;
     assert!(retry.is_err(), "a retry reported a failed teardown as done");
@@ -1114,7 +1013,6 @@ async fn velo_shutdown_retry_after_a_failed_hook_skips_the_drain() {
 /// waiter saw the failure, so the retry must look at the finished teardown
 /// itself, not at what an earlier waiter observed.
 #[tokio::test]
-#[allow(deprecated)] // tests the deprecated `Velo::graceful_shutdown` itself
 async fn velo_shutdown_retry_sees_a_failure_no_waiter_observed() {
     use futures::FutureExt;
     let mut transport = MockTransport::new("mock", true);
@@ -1131,7 +1029,7 @@ async fn velo_shutdown_retry_sees_a_failure_no_waiter_observed() {
         .await
         .unwrap();
     {
-        let first = velo.graceful_shutdown(ShutdownPolicy::WaitForever);
+        let first = velo.shutdown(ShutdownPolicy::WaitForever);
         tokio::pin!(first);
         tokio::select! {
             _ = &mut first => panic!("shutdown finished while its hook was blocked"),
@@ -1150,7 +1048,7 @@ async fn velo_shutdown_retry_sees_a_failure_no_waiter_observed() {
     .await
     .expect("the teardown thread never finished");
     let drains = transport.drain_calls.load(Ordering::Relaxed);
-    let retry = std::panic::AssertUnwindSafe(velo.graceful_shutdown(ShutdownPolicy::WaitForever))
+    let retry = std::panic::AssertUnwindSafe(velo.shutdown(ShutdownPolicy::WaitForever))
         .catch_unwind()
         .await;
     assert!(retry.is_err());
@@ -1379,7 +1277,7 @@ async fn a_delayed_unregister_does_not_erase_a_new_stream_registration() {
         let bound = crate::streaming::FrameTransport::bind(remote.as_ref(), 1, 1)
             .await
             .unwrap();
-        let connected = erased.connect(id.worker_id(), 1, 1).await;
+        let connected = erased.connect(id.worker_id(), 1, 1, None).await;
         let error = connected.as_ref().err().map(|error| format!("{error:#}"));
         drop(connected);
         drop(bound);
@@ -1531,10 +1429,16 @@ async fn a_hello_queued_at_startup_reaches_the_stream_table() {
             None
         } else {
             Some(
-                crate::streaming::FrameTransport::connect(stream.as_ref(), id.worker_id(), 1, 1)
-                    .await
-                    .unwrap_err()
-                    .to_string(),
+                crate::streaming::FrameTransport::connect(
+                    stream.as_ref(),
+                    id.worker_id(),
+                    1,
+                    1,
+                    None,
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
             )
         };
         node.shutdown(ShutdownPolicy::WaitForever).await;

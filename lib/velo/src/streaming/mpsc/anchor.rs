@@ -103,7 +103,7 @@ pub struct MpscStreamController {
 
 impl MpscStreamController {
     /// Close the anchor. Removes it from the MPSC registry, cancels every
-    /// attached sender (same-worker via [`crate::streaming::control::SenderRegistry`]
+    /// attached sender (same-worker via the sender registry
     /// cancellation, cross-worker via fire-and-forget `_stream_cancel` AM), and
     /// cancels the anchor's parent [`CancellationToken`] (which in turn
     /// cancels every remote pump).
@@ -192,7 +192,7 @@ impl<T> MpscStreamAnchor<T> {
     }
 
     /// Return the anchor handle; pass to senders to attach via
-    /// [`crate::AnchorManager::attach_mpsc_stream_anchor`].
+    /// [`Velo::attach_mpsc_anchor`](crate::Velo::attach_mpsc_anchor).
     pub fn handle(&self) -> StreamAnchorHandle {
         self.handle
     }

@@ -93,14 +93,12 @@ async fn the_kill_switch_turns_the_default_mux_off() {
     // Both nodes, not just one: negotiation picks the per-stream key whenever
     // either side lacks the mux, so the attach below alone would pass with a
     // producer that kept it.
-    // The transport registry has no `Velo` form; this test reads it on purpose.
-    #[allow(deprecated)]
     for node in [&consumer, &producer] {
         assert!(
             !node
-                .anchor_manager()
-                .transport_registry
-                .contains_key(velo::streaming::MESSENGER_MUX_KEY),
+                .stream_transport_keys()
+                .iter()
+                .any(|key| key == velo::streaming::MESSENGER_MUX_KEY),
             "the kill switch must keep the mux out of every registry"
         );
     }

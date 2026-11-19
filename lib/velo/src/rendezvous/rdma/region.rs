@@ -269,7 +269,7 @@ impl Drop for RegionInner {
     /// Leak the owned buffer unless the registration is confirmed gone.
     ///
     /// Plain drop glue here would be a use-after-free with extra steps. Drop a
-    /// `Velo` without `graceful_shutdown` — a panic, a forgotten teardown, a
+    /// `Velo` without `shutdown` — a panic, a forgotten teardown, a
     /// test that just lets it fall out of scope — and the registry map drops,
     /// which drops these, which would hand the allocator back pages the NIC
     /// still has pinned and a peer still holds a key for. The peer then reads,
@@ -277,7 +277,7 @@ impl Drop for RegionInner {
     ///
     /// So the same discipline as `PageMemory`: leak unless the deregistration
     /// was confirmed. A leak costs memory; the alternative corrupts it. The
-    /// gate also opens for free at the end of `Velo::graceful_shutdown`, where
+    /// gate also opens for free at the end of `Velo::shutdown`, where
     /// `latch_all_deregistered` marks every survivor released once transport
     /// teardown has force-unmapped everything — so an orderly shutdown frees
     /// these buffers normally and only a genuinely abandoned runtime leaks.
@@ -461,7 +461,7 @@ impl RegionGuard {
     /// The shutdown half is what makes it dependable. A region whose unmap
     /// could not be confirmed — a wedged backend, a transport that went down
     /// first — is nonetheless genuinely released once
-    /// `Velo::graceful_shutdown` returns, because transport teardown
+    /// `Velo::shutdown` returns, because transport teardown
     /// force-unmaps everything the progress thread still holds, and that is
     /// where the latch is closed for any survivor.
     ///

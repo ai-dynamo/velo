@@ -55,7 +55,10 @@ use bytes::Bytes;
 use prometheus::Registry;
 use velo::observability::VeloMetrics;
 use velo::rendezvous::RdmaTestHook;
-use velo::rendezvous::protocol::AcquireResponse;
+use velo::rendezvous::rdma::{
+    Deregistered, RdmaConfig, RdmaError, RdmaPoolConfig, RdmaRendezvousConfig,
+};
+use velo::test_helpers::AcquireResponse;
 use velo::transports::ucx::UcxTransportBuilder;
 use velo::*;
 
@@ -305,15 +308,13 @@ where
     panic!("{what} never became true; observed: {}", describe());
 }
 
-/// Whether the owner has freed a slot. Local, so it reflects the owner's own
-/// state rather than a round trip that might race with it.
-/// Arm a fault hook on `velo`'s rendezvous manager. The hook is test-only
-/// and has no `Velo` form.
-#[allow(deprecated)]
+/// Arm a fault hook on `velo`'s rendezvous manager. The hook is test-only.
 fn arm_rdma_hook(velo: &Velo, hook: RdmaTestHook) {
-    velo.rendezvous_manager().arm_rdma_hook(hook);
+    velo.arm_rdma_hook(hook);
 }
 
+/// Whether the owner has freed a slot. Local, so it reflects the owner's own
+/// state rather than a round trip that might race with it.
 async fn slot_is_gone(node: &Node, handle: DataHandle) -> bool {
     node.velo.metadata(handle).await.is_err()
 }
@@ -1662,7 +1663,6 @@ async fn a_cancelled_transfer_does_not_release_its_destination() {
 /// transfer is observed in flight — the same counter shutdown drains on —
 /// before the caller is dropped.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(deprecated)] // times the deprecated `Velo::graceful_shutdown` sweep itself
 async fn shutdown_waits_for_a_live_transfer_before_unmapping_its_arena() {
     let pair = Pair::new().await;
 
@@ -1693,7 +1693,7 @@ async fn shutdown_waits_for_a_live_transfer_before_unmapping_its_arena() {
     let started = std::time::Instant::now();
     pair.consumer
         .velo
-        .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_secs(10)))
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(10)))
         .await;
     let waited = started.elapsed();
 
@@ -1719,7 +1719,6 @@ async fn shutdown_waits_for_a_live_transfer_before_unmapping_its_arena() {
 /// nothing. Dropping pinned slots before the sweep is what makes the drains
 /// finish normally instead.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(deprecated)] // times the deprecated `Velo::graceful_shutdown` sweep itself
 async fn a_staged_anchor_does_not_starve_the_shutdown_sweep() {
     let node = Node::start(None).await;
 
@@ -1739,7 +1738,7 @@ async fn a_staged_anchor_does_not_starve_the_shutdown_sweep() {
 
     let started = std::time::Instant::now();
     node.velo
-        .graceful_shutdown(ShutdownPolicy::Timeout(Duration::from_secs(10)))
+        .shutdown(ShutdownPolicy::Timeout(Duration::from_secs(10)))
         .await;
     let took = started.elapsed();
 

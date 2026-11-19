@@ -10,7 +10,7 @@ Runnable examples for the `velo` facade crate. This is a standalone crate
 |--------------|------------------------------------------------------------------------------|
 | `ping_pong`  | Round-trip latency for unary messages between two `Velo` instances.          |
 | `throughput` | msgs/sec + MiB/s + p50/p95/p99 across sequential, concurrent, pipeline, and stream. |
-| `mpsc_fanin` | MPSC streaming: many producers fan into one consumer via `LoopbackTransport`.|
+| `mpsc_fanin` | MPSC streaming: many producers fan into one consumer on one `Velo` node.     |
 | `hub`        | A `velo-hub` service from two bundles (`greeter` requires `counter`), configured by `hub.json`; `--demo` runs a client against it. |
 
 ## Run

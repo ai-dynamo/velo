@@ -509,7 +509,7 @@ impl Drop for Suballoc {
 /// the runtime going away — a task dropped mid-await drops its hold, releasing
 /// the space while the NIC may still be writing.
 ///
-/// That is not a hole velo leaves open on its own account. `graceful_shutdown`
+/// That is not a hole velo leaves open on its own account. `Velo::shutdown`
 /// orders the registration sweep so transfers are waited for before their arena
 /// is unmapped, and the arena's pages are not freed until after that. The case
 /// this cannot reach is a caller dropping the runtime out from under live
@@ -1286,7 +1286,7 @@ impl ArenaSet {
     /// Unmap every arena, each bounded by `deadline`.
     ///
     /// The deadline is not decoration: this runs inside
-    /// `Velo::graceful_shutdown`, and a backend whose unmap never answers would
+    /// `Velo::shutdown`, and a backend whose unmap never answers would
     /// otherwise park shutdown forever even under a `Timeout` policy — this was
     /// the one step of the sweep with no bound. On timeout the arena joins the
     /// unconfirmed list and the sweep moves on; the transport's own force-unmap

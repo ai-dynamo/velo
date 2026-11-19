@@ -33,7 +33,7 @@ use velo_ext::{TransportKey, WorkerId};
 
 use super::messenger_mux::flow_control::{NegotiatedLimits, NegotiationError};
 use super::messenger_mux::{LaneReservation, MESSENGER_MUX_KEY, MessengerMuxTransport};
-use super::transport::FrameTransport;
+use super::transport::{Bound, FrameTransport};
 
 /// The streaming-transport registry an [`AnchorManager`] resolves keys against.
 ///
@@ -92,12 +92,18 @@ impl Selection {
         self,
         anchor_id: u64,
         session_id: u64,
-    ) -> anyhow::Result<(flume::Receiver<Vec<u8>>, Terms)> {
-        let receiver = match self.target {
-            Target::Mux(mux, lane) => mux.bind_on_lane(anchor_id, session_id, lane)?,
+    ) -> anyhow::Result<(Bound, Terms)> {
+        let bound = match self.target {
+            Target::Mux(mux, lane) => {
+                let (rx, drain) = mux.bind_on_lane(anchor_id, session_id, lane)?;
+                Bound {
+                    rx,
+                    drain: Some(drain),
+                }
+            }
             Target::Other(transport) => transport.bind(anchor_id, session_id).await?,
         };
-        Ok((receiver, self.terms))
+        Ok((bound, self.terms))
     }
 }
 
