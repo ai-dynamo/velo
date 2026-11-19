@@ -67,7 +67,7 @@ impl FrameTransport for PausedConnect {
         &self,
         _: u64,
         _: u64,
-    ) -> futures::future::BoxFuture<'_, anyhow::Result<flume::Receiver<Vec<u8>>>> {
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<crate::streaming::transport::Bound>> {
         Box::pin(async { anyhow::bail!("sender-only test transport") })
     }
 
@@ -76,10 +76,15 @@ impl FrameTransport for PausedConnect {
         _: WorkerId,
         _: u64,
         _: u64,
-    ) -> futures::future::BoxFuture<'_, anyhow::Result<flume::Sender<Vec<u8>>>> {
+        _: Option<crate::streaming::control::SenderClosed>,
+    ) -> futures::future::BoxFuture<'_, anyhow::Result<crate::streaming::transport::Connected>>
+    {
         Box::pin(async {
             self.entered.send_async(()).await?;
-            self.result.recv_async().await?
+            self.result
+                .recv_async()
+                .await?
+                .map(crate::streaming::transport::Connected::queued)
         })
     }
 }

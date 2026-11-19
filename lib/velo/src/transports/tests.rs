@@ -1277,7 +1277,7 @@ async fn a_delayed_unregister_does_not_erase_a_new_stream_registration() {
         let bound = crate::streaming::FrameTransport::bind(remote.as_ref(), 1, 1)
             .await
             .unwrap();
-        let connected = erased.connect(id.worker_id(), 1, 1).await;
+        let connected = erased.connect(id.worker_id(), 1, 1, None).await;
         let error = connected.as_ref().err().map(|error| format!("{error:#}"));
         drop(connected);
         drop(bound);
@@ -1429,10 +1429,16 @@ async fn a_hello_queued_at_startup_reaches_the_stream_table() {
             None
         } else {
             Some(
-                crate::streaming::FrameTransport::connect(stream.as_ref(), id.worker_id(), 1, 1)
-                    .await
-                    .unwrap_err()
-                    .to_string(),
+                crate::streaming::FrameTransport::connect(
+                    stream.as_ref(),
+                    id.worker_id(),
+                    1,
+                    1,
+                    None,
+                )
+                .await
+                .unwrap_err()
+                .to_string(),
             )
         };
         node.shutdown(ShutdownPolicy::WaitForever).await;

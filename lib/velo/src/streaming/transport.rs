@@ -27,6 +27,12 @@ use anyhow::Result;
 use futures::future::BoxFuture;
 use velo_ext::{InstanceId, PeerInfo, TransportKey, WorkerAddress, WorkerId};
 
+use std::sync::Arc;
+
+use crate::streaming::control::SenderClosed;
+use crate::streaming::messenger_mux::ingress::DrainSignal;
+use crate::streaming::sender::RetiresOn;
+
 /// A transport that carries one stream's frames in order.
 ///
 /// # Ordered delivery
@@ -70,21 +76,66 @@ pub(crate) trait FrameTransport: Send + Sync {
     /// Bind the receive end of one attachment of `anchor_id`. `session_id`
     /// tells successive attachments of one anchor apart, so a stale frame
     /// from an earlier session is never delivered. Returns the receiver of
-    /// the attachment's frames.
-    fn bind(
-        &self,
-        anchor_id: u64,
-        session_id: u64,
-    ) -> BoxFuture<'_, Result<flume::Receiver<Vec<u8>>>>;
+    /// the attachment's frames, and the drain signal of a transport that
+    /// issues credit.
+    fn bind(&self, anchor_id: u64, session_id: u64) -> BoxFuture<'_, Result<Bound>>;
 
     /// Connect the send end to `peer`'s bound `anchor_id` and `session_id`,
     /// at the address [`register`](Self::register) cached for `peer`.
+    ///
+    /// `retire` is the stream's retirement, for a transport that can say when
+    /// the terminal left. The returned [`Connected`] says whether this one
+    /// took it. `None` where no sender waits on the stream's retirement.
     fn connect(
         &self,
         peer: WorkerId,
         anchor_id: u64,
         session_id: u64,
-    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>>;
+        retire: Option<SenderClosed>,
+    ) -> BoxFuture<'_, Result<Connected>>;
+}
+
+/// What [`FrameTransport::bind`] hands back.
+pub(crate) struct Bound {
+    /// The attachment's frames.
+    pub(crate) rx: flume::Receiver<Vec<u8>>,
+    /// What the consumer tells for each record it takes out of `rx`, so the
+    /// mux returns the sender's credit. `None` for a per-stream transport,
+    /// which issues no credit.
+    pub(crate) drain: Option<Arc<DrainSignal>>,
+}
+
+impl Bound {
+    /// A receiver whose transport issues no credit.
+    pub(crate) fn uncredited(rx: flume::Receiver<Vec<u8>>) -> Self {
+        Self { rx, drain: None }
+    }
+}
+
+/// What [`FrameTransport::connect`] hands back: the stream's egress channel,
+/// who reports the stream's retirement, and the transport's item limit.
+#[derive(Debug)]
+pub(crate) struct Connected {
+    /// The stream's egress channel.
+    pub(crate) tx: flume::Sender<Vec<u8>>,
+    /// Who reports the stream's retirement once the terminal is in `tx`.
+    pub(crate) retires_on: RetiresOn,
+    /// The largest encoded item the transport carries in one frame, when
+    /// the producer should refuse a larger one at `send` rather than let the
+    /// transport fail the stream.
+    pub(crate) item_limit: Option<usize>,
+}
+
+impl Connected {
+    /// A channel whose transport cannot say when a frame left, and has no
+    /// item limit: the sender reports `Sent` as the terminal enters `tx`.
+    pub(crate) fn queued(tx: flume::Sender<Vec<u8>>) -> Self {
+        Self {
+            tx,
+            retires_on: RetiresOn::Queue,
+            item_limit: None,
+        }
+    }
 }
 
 /// The largest encoded item the per-stream transports of this crate carry in
@@ -94,27 +145,3 @@ pub(crate) trait FrameTransport: Send + Sync {
 /// (`SendError::ItemTooLarge`). The gRPC server decodes, and its client
 /// encodes, with this value plus the message envelope.
 pub const MAX_ITEM_BYTES: usize = crate::transports::tcp::framing::DEFAULT_MAX_FRAME_SIZE as usize;
-
-/// A frame transport of this crate that reports a stream's retirement itself:
-/// `Sent` once its pump has written the terminal, `Discarded` when the write
-/// fails or the connection ends first. A transport that is only a
-/// [`FrameTransport`] cannot say when a frame left, so its sender reports
-/// `Sent` when the terminal enters the egress channel.
-pub(crate) trait RetiringFrameTransport: FrameTransport {
-    /// As [`FrameTransport::connect`], with the stream's retirement for the
-    /// pump to report through.
-    fn connect_retiring(
-        &self,
-        peer: WorkerId,
-        anchor_id: u64,
-        session_id: u64,
-        closed: crate::streaming::control::SenderClosed,
-    ) -> BoxFuture<'_, Result<flume::Sender<Vec<u8>>>>;
-
-    /// The largest encoded item this transport carries in one frame, when
-    /// the producer should refuse a larger one at `send` rather than let the
-    /// transport fail the stream.
-    fn item_limit(&self) -> Option<usize> {
-        None
-    }
-}

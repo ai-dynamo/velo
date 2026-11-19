@@ -884,7 +884,6 @@ async fn an_attach_that_fails_after_its_bind_gives_its_lane_back() {
                 .map(|lane| mux.pending_binds_on(Some(peer), LaneIndex::new(lane)))
                 .sum::<usize>(),
             mux.pending_binds(),
-            mux.parked_drains(),
         )
     };
 
@@ -896,8 +895,8 @@ async fn an_attach_that_fails_after_its_bind_gives_its_lane_back() {
     assert!(attached.is_err(), "the anchor was removed during the bind");
     assert_eq!(
         counted(),
-        (0, 0, 0),
-        "a failed SPSC attach must give back its lane count, its bind and its drain signal"
+        (0, 0),
+        "a failed SPSC attach must give back its lane count and its bind"
     );
 
     let anchor = consumer.velo.create_mpsc_anchor::<u32>();
@@ -908,8 +907,8 @@ async fn an_attach_that_fails_after_its_bind_gives_its_lane_back() {
     assert!(attached.is_err(), "the anchor was removed during the bind");
     assert_eq!(
         counted(),
-        (0, 0, 0),
-        "a failed MPSC attach must give back its lane count, its bind and its drain signal"
+        (0, 0),
+        "a failed MPSC attach must give back its lane count and its bind"
     );
 }
 
@@ -1148,9 +1147,8 @@ async fn a_lane_that_refuses_admission_fails_only_its_own_streams() {
 /// it does not panic.
 ///
 /// `prebind_anchor` is a public sync call an application can make on any
-/// thread. Mux shutdown clears the parked drain signals, so one can vanish
-/// between the pre-bind's bind and its take. The bind hook plays that
-/// shutdown.
+/// thread. Mux shutdown can land between the pre-bind's bind and the ticket:
+/// it drops every unclaimed bind. The bind hook plays that shutdown.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_prebind_racing_shutdown_returns_none() {
     use crate::observability::test_helpers::MetricSnapshot;
@@ -1181,7 +1179,7 @@ async fn a_prebind_racing_shutdown_returns_none() {
             .bind_hook
             .set(Box::new(move |_| {
                 if let Some(core) = core.upgrade() {
-                    core.drains.clear();
+                    core.ingress.shutdown();
                 }
             }))
             .is_ok()
