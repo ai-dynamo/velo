@@ -282,11 +282,21 @@ about 1 run in 125 finished the transfer first and failed the precondition.
 Over the tcp lane a GET needs the owner's progress thread, so the test now
 holds that thread with the `progress_hold` seam until the scan has run.
 
+A short timeout is the same mistake. The UCX GET-cancel test cancelled a
+32 MiB GET with a 1 ms timeout and expected the GET to still be running then.
+`tokio::time::timeout` polls the inner future before its timer. So if the
+test thread is descheduled just after the GET is posted, the GET finishes,
+and the next poll returns its result, not the timeout. This failed once in CI.
+A stall forced after the first poll fails it every time. The test now holds
+the owner's progress thread, aborts the GET task, and asserts that the task
+was cancelled and the GET is still in flight.
+
 **Test.** Put the gate in the code under test as a `#[cfg(test)]` seam if it
 has none. Hold it, check that the state is in place, run the check, then
 release it. Run the test in a loop with many copies at once, for example 16.
 
-Test: `transports::ucx::transport::tests::an_endpoint_with_an_inflight_get_is_not_reaped`
+Tests: `transports::ucx::transport::tests::an_endpoint_with_an_inflight_get_is_not_reaped`
+and `transports::ucx::transport::tests::get_cancel_still_releases_the_region`
 (`lib/velo/src/transports/ucx/tests.rs`).
 
 ## Count the failure, not the time it costs
