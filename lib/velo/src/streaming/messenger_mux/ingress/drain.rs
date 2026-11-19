@@ -77,6 +77,13 @@ pub(crate) struct DrainSignal {
     /// unclaimed bind before its consumer notices anything.
     closed: tokio_util::sync::CancellationToken,
     wake: flume::Sender<PeerLane>,
+    /// Test seam: while set, the bind's watchdog judges no window, so a test
+    /// can set up a stream on a loaded host before the watchdog may fire.
+    #[cfg(test)]
+    watchdog_hold: AtomicBool,
+    /// Test seam: windows the bind's watchdog has judged.
+    #[cfg(test)]
+    watchdog_windows: AtomicU64,
 }
 
 /// What an `OpenSlot` tells a bind's [`DrainSignal`] when it claims it.
@@ -104,7 +111,35 @@ impl DrainSignal {
             released: AtomicBool::new(false),
             closed: tokio_util::sync::CancellationToken::new(),
             wake,
+            #[cfg(test)]
+            watchdog_hold: AtomicBool::new(false),
+            #[cfg(test)]
+            watchdog_windows: AtomicU64::new(0),
         }
+    }
+
+    /// Hold or release the bind's watchdog: while held, it judges no window.
+    #[cfg(test)]
+    pub(crate) fn hold_watchdog(&self, hold: bool) {
+        self.watchdog_hold.store(hold, Ordering::Release);
+    }
+
+    /// Whether a test holds the bind's watchdog.
+    #[cfg(test)]
+    pub(crate) fn watchdog_held(&self) -> bool {
+        self.watchdog_hold.load(Ordering::Acquire)
+    }
+
+    /// Count a window the watchdog judged.
+    #[cfg(test)]
+    pub(crate) fn note_watchdog_window(&self) {
+        self.watchdog_windows.fetch_add(1, Ordering::Release);
+    }
+
+    /// Windows the bind's watchdog has judged so far. Only grows.
+    #[cfg(test)]
+    pub(crate) fn watchdog_windows(&self) -> u64 {
+        self.watchdog_windows.load(Ordering::Acquire)
     }
 
     /// Name the (peer, lane) this bind turned out to belong to, its slot

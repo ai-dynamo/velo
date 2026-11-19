@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use clap::ValueEnum;
-use velo::transports::Transport;
+use velo::Transport;
 
 /// Transport backends selectable at the CLI.
 ///

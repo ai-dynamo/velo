@@ -16,7 +16,7 @@ use velo_hub::protocol::{HubDescriptor, paths};
 use velo_hub::store::testing::FaultStore;
 use velo_hub::store::{HubStore, Removal};
 #[allow(unused_imports)]
-use velo_hub::velo::PeerDiscovery;
+use velo_hub::velo::discovery::PeerDiscovery;
 use velo_hub::{
     AttachContext, Bundle, BundleInstaller, Committed, Extension, GraphError, Hub, Rejection,
     StartContext, Txn,
