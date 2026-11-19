@@ -2769,29 +2769,36 @@ async fn the_watchdog_does_not_fire_while_its_sender_is_parked() {
 /// sent. The watchdog used to treat any unread record as proof of life, so a
 /// dead worker behind a slow client -- an HTTP reader that is connected but
 /// behind -- kept its anchor, slot and peer batcher until the client drained.
+///
+/// The watchdog is held until the records are in the buffer. On a loaded host
+/// the sender used to stall for three 50 ms windows between its attach and
+/// its sends: the watchdog then fired before the records arrived, which is
+/// correct, and the test failed on a send or on waiting to see the slot live,
+/// a state the watchdog ends by itself.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_silent_sender_with_credit_is_reaped_while_records_wait_unread() {
     let heartbeat = Duration::from_millis(50);
-    let (pair, manager, anchor, local_id, tx) =
-        watched_anchor::<u32>(test_config(), heartbeat, false).await;
+    let (pair, manager, anchor, local_id, session_id, drain) =
+        watched_anchor_unconnected::<u32>(test_config(), heartbeat, false).await;
+    drain.hold_watchdog(true);
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, local_id, session_id)
+        .await
+        .expect("connect");
     for n in 0..3 {
         tx.send_async(item(n)).await.expect("send item");
     }
-    eventually(|| {
+    eventually(|| drain.arrivals() == 3).await;
+    assert_eq!(
         pair.consumer
-            .live_ingress_slots(lane0(pair.producer_worker))
-            == 1
-    })
-    .await;
+            .live_ingress_slots(lane0(pair.producer_worker)),
+        1
+    );
 
-    // Nobody reads. Detection is three windows, plus one of clock skew.
-    tokio::time::timeout(heartbeat * 20, async {
-        while manager.registry.contains_key(&local_id) {
-            tokio::time::sleep(heartbeat / 5).await;
-        }
-    })
-    .await
-    .expect("a silent sender that holds credit must be reaped with records unread");
+    // Nobody reads, and the sender sends nothing more.
+    drain.hold_watchdog(false);
+    eventually(|| !manager.registry.contains_key(&local_id)).await;
     // The records the dead sender left in the buffer are not delivered: the
     // consumer's next frame is the end of the stream.
     let mut anchor = anchor;
@@ -2812,6 +2819,12 @@ async fn a_silent_sender_with_credit_is_reaped_while_records_wait_unread() {
 /// leave its sender with no credit and fewer than `C` records buffered. That
 /// sender cannot heartbeat either, and the silence is still the consumer's. A
 /// watchdog that looked only at the record count would reap it.
+///
+/// The watchdog is held until the window is read, then the test waits for it
+/// to judge more windows than a firing needs. The test used to let it run
+/// from the attach: a sender that stalled for three 50 ms windows before its
+/// last send held credit and was silent, so it was rightly reaped, and the
+/// test failed on a send or on waiting for the window to arrive.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_sender_starved_by_the_byte_budget_is_not_reaped() {
     const CREDIT: u32 = 8;
@@ -2822,8 +2835,14 @@ async fn a_sender_starved_by_the_byte_budget_is_not_reaped() {
         slot_byte_budget: 1024,
         ..test_config()
     };
-    let (_pair, manager, mut anchor, local_id, tx) =
-        watched_anchor::<Vec<u8>>(config, heartbeat, false).await;
+    let (pair, manager, mut anchor, local_id, session_id, drain) =
+        watched_anchor_unconnected::<Vec<u8>>(config, heartbeat, false).await;
+    drain.hold_watchdog(true);
+    let tx = pair
+        .producer
+        .connect(pair.consumer_worker, local_id, session_id)
+        .await
+        .expect("connect");
     let big =
         |n: u32| rmp_serde::to_vec(&StreamFrame::Item(vec![n as u8; RECORD])).expect("encode item");
     for n in 0..CREDIT {
@@ -2832,14 +2851,7 @@ async fn a_sender_starved_by_the_byte_budget_is_not_reaped() {
     // All of them, not just the slot: a read while the window is still
     // arriving finds the buffer under the byte budget and grants credit back,
     // and a sender that holds credit and sends nothing is rightly reaped.
-    eventually(|| {
-        manager
-            .registry
-            .get(&local_id)
-            .and_then(|entry| entry.feed.current())
-            .is_some_and(|feed| feed.drain.arrivals() == u64::from(CREDIT))
-    })
-    .await;
+    eventually(|| drain.arrivals() == u64::from(CREDIT)).await;
     // Read all but two. Two large records still hold the byte budget, so the
     // credit this read earns is withheld.
     for _ in 0..CREDIT - 2 {
@@ -2850,7 +2862,18 @@ async fn a_sender_starved_by_the_byte_budget_is_not_reaped() {
             .expect("record decodes");
     }
 
-    tokio::time::sleep(heartbeat * 20).await;
+    drain.hold_watchdog(false);
+    let judged = drain.watchdog_windows();
+    // A window is counted before it is judged, and the first one after the
+    // release can only refresh what the watchdog has seen, if an arrival
+    // landed after the last held window. So a firing can come at window
+    // `DETECTION_MULTIPLIER + 1`; counting the window after it shows that one
+    // was judged.
+    eventually(|| {
+        drain.watchdog_windows()
+            > judged + u64::from(crate::streaming::control::DETECTION_MULTIPLIER) + 1
+    })
+    .await;
     assert!(
         manager.registry.contains_key(&local_id),
         "the byte budget withholds the sender's credit, so the silence is the consumer's"

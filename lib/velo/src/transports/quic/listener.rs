@@ -657,6 +657,9 @@ mod tests {
     /// frame and the FIN, and let the connection task observe the peer's close.
     /// Resuming the reader must deliver all eight frames. The control resumes
     /// it before the peer closes.
+    ///
+    /// The pause waits in `block_in_place`; see the comment in `record_frame`.
+    /// With one worker thread and a plain wait, this test hangs every run.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_peer_close_preserves_acknowledged_frames() {
         struct PausedReader {
@@ -669,10 +672,18 @@ mod tests {
             fn record_frame(&self, _: velo_ext::Direction, _: &str, _: usize) {
                 if !self.first.swap(true, Ordering::SeqCst) {
                     self.entered.notify_one();
-                    let mut released = self.released.lock();
-                    while !*released {
-                        self.release.wait(&mut released);
-                    }
+                    // The wait holds this worker thread. Tasks the reader woke
+                    // just before, such as quinn's connection driver, can sit
+                    // in this worker's LIFO slot, which no other worker takes:
+                    // with no ACK from the driver, `send.stopped()` below
+                    // timed out. `block_in_place` hands the worker's queue to
+                    // a new thread for the wait.
+                    tokio::task::block_in_place(|| {
+                        let mut released = self.released.lock();
+                        while !*released {
+                            self.release.wait(&mut released);
+                        }
+                    });
                 }
             }
             fn record_rejection(&self, _: velo_ext::TransportRejection) {}
