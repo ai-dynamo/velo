@@ -2815,9 +2815,10 @@ async fn a_silent_sender_with_credit_is_reaped_while_records_wait_unread() {
     drain.hold_watchdog(true);
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, local_id, session_id)
+        .connect(pair.consumer_worker, local_id, session_id, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     for n in 0..3 {
         tx.send_async(item(n)).await.expect("send item");
     }
@@ -2872,9 +2873,10 @@ async fn a_sender_starved_by_the_byte_budget_is_not_reaped() {
     drain.hold_watchdog(true);
     let tx = pair
         .producer
-        .connect(pair.consumer_worker, local_id, session_id)
+        .connect(pair.consumer_worker, local_id, session_id, None)
         .await
-        .expect("connect");
+        .expect("connect")
+        .tx;
     let big =
         |n: u32| rmp_serde::to_vec(&StreamFrame::Item(vec![n as u8; RECORD])).expect("encode item");
     for n in 0..CREDIT {
