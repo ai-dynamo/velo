@@ -71,12 +71,17 @@ fn transport(kind: Kind, dir: &tempfile::TempDir) -> Arc<dyn Transport> {
 }
 
 async fn node(dir: &tempfile::TempDir, kinds: &[Kind]) -> Node {
+    node_with(kinds.iter().map(|kind| transport(*kind, dir)).collect()).await
+}
+
+/// A node over `transports`, in that order, with the test handlers.
+async fn node_with(transports: Vec<Arc<dyn Transport>>) -> Node {
     let reg = Registry::new();
     let mut builder = Velo::builder()
         .mux_only()
         .metrics(Arc::new(VeloMetrics::register(&reg).unwrap()));
-    for kind in kinds {
-        builder = builder.add_transport(transport(*kind, dir));
+    for transport in transports {
+        builder = builder.add_transport(transport);
     }
     let velo = builder.build().await.unwrap();
     let notes = Arc::new(AtomicU64::new(0));

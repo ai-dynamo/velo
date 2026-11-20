@@ -47,8 +47,7 @@ let reply = node_a.unary("ping")?.route(uds).raw_payload(Bytes::new()).instance(
 Everything the call sends goes over the named transport:
 
 - **The handshake.** A call to a peer whose handlers are not known yet sends `_hello` first, over the same transport.
-- **A staged payload.** A payload over the staging threshold is fetched by the receiver, over the transport the message came in on and no other. The fetch does not fall back like a reply: when the receiver is not registered on that transport for the sender, the fetch fails, the handler does not run, and the caller gets an error reply. The sender marks a staged payload whose send named a transport with the `_rv_pinned` header. The receiver offers RDMA for such a fetch only when the named transport is UCX. A send that named nothing may still be fetched by RDMA. A receiver from before this header passes it to the handler.
-- **Chunk size.** The owner of a staged payload sizes its chunks so that one `_rv_pull` reply fits the transport that reply takes: that transport's capacity, less the reply header. The fetch names its transport in the acquire, so the owner knows it. A transport that cannot carry one byte past the header fails the fetch with `TransportChoiceError::CapacityTooSmall`. The fetch never moves to another transport.
+- **A staged payload.** Every frame of the transfer keeps to the call's route. See [Every frame keeps to the call's route](rendezvous.md#every-frame-keeps-to-the-calls-route).
 - **The frame size check.** Each transport checks its own frames, so the named transport's limit applies. The staging decision compares the payload with the staging threshold only, for every send.
 
 Two calls let a caller check an edge before it sends:

@@ -14,6 +14,29 @@
 //! release(handle, lease)  release the lock and one reference; freed at zero
 //! ```
 //!
+//! # Every frame of a transfer keeps to the call's route
+//!
+//! One rule, for every message below:
+//!
+//! * Each request of a transfer (`_rv_acquire`, `_rv_pull`, `_rv_detach`,
+//!   `_rv_release`, `_rv_lease_renew`, `_rv_metadata`, `_rv_ref`) goes over
+//!   the transfer's route: the transport the staged message came in on for
+//!   the messenger's fetch, and the consumer's primary for a caller's own
+//!   `get`. It never falls back to another transport.
+//! * Each reply, data or error, goes over the transport its request came in
+//!   on. The `_rv_*` handlers are staged-transfer handlers
+//!   ([`ReplyRoute`](crate::transports::choice::ReplyRoute) is strict): a
+//!   reply that cannot use that transport is not sent.
+//! * Each chunk is sized by the capacity of the transport that carries its
+//!   reply: the acquire's arrival transport, less the reply header, and each
+//!   pull checks it again against its own arrival transport.
+//! * A frame that cannot keep to the rule fails with
+//!   [`TransportChoiceError`](crate::TransportChoiceError) and is not sent
+//!   elsewhere. Only the messenger's final reply to the caller of a staged
+//!   call may take another transport.
+//! * The RDMA read is the one exception, and only where the call allows it:
+//!   a call that named no transport, or named UCX.
+//!
 //! # Two ways the bytes move
 //!
 //! `_rv_acquire` takes the read lock and, in the same round trip, decides how

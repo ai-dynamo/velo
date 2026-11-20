@@ -511,49 +511,61 @@ async fn a_re_registration_replaces_the_served_transports() {
 }
 
 /// The owner sizes the chunks of a staged fetch so that one `_rv_pull` reply
-/// fits the transport the reply takes: that transport's capacity less the
-/// reply header. When the fetcher is not registered on the named transport
-/// the reply takes the primary, and the primary's capacity sizes them. A
-/// transport that cannot carry one byte past the header is refused with the
-/// typed error, with no fallback.
+/// fits the transport that carries it, the one the request came in on: that
+/// transport's capacity less the reply header. A peer not registered on that
+/// transport, or a transport that cannot carry one byte past the header, is
+/// refused with the typed error. Nothing falls back to another transport.
 #[tokio::test]
-async fn staged_chunks_are_sized_to_the_transport_the_pull_reply_takes() {
+async fn staged_chunks_are_sized_to_the_transport_the_pull_came_in_on() {
     use crate::rendezvous::handlers::pull_chunk_limit;
     use crate::rendezvous::store::DEFAULT_CHUNK_SIZE;
     // Response header with no headers: 16-byte id, outcome, 2-byte length.
     const HEADER: usize = 19;
+    fn origin(node: &Node, key: &str) -> Option<velo_ext::TransportOrigin> {
+        Some(
+            node.messenger
+                .backend()
+                .transport_route(&key.into())
+                .unwrap()
+                .origin,
+        )
+    }
 
     let node = node(&["wide", "narrow"]).await;
     let backend = node.messenger.backend();
     let worker = node.peer.worker_id();
     assert_eq!(
-        pull_chunk_limit(backend, worker, Some("narrow"), None).unwrap() as usize,
+        pull_chunk_limit(backend, worker, origin(&node, "narrow"), None).unwrap() as usize,
         NARROW - HEADER
     );
     assert_eq!(
-        pull_chunk_limit(backend, worker, Some("wide"), None).unwrap(),
+        pull_chunk_limit(backend, worker, origin(&node, "wide"), None).unwrap(),
         DEFAULT_CHUNK_SIZE,
         "a wide transport keeps the default chunk"
     );
 
     let only_wide = node_with_narrow(&["wide"], NARROW).await;
+    let error = pull_chunk_limit(
+        only_wide.messenger.backend(),
+        only_wide.peer.worker_id(),
+        origin(&only_wide, "narrow"),
+        None,
+    )
+    .unwrap_err();
     assert_eq!(
-        pull_chunk_limit(
-            only_wide.messenger.backend(),
-            only_wide.peer.worker_id(),
-            Some("narrow"),
-            None
-        )
-        .unwrap(),
-        DEFAULT_CHUNK_SIZE,
-        "the reply takes the primary, so the primary sizes the chunk"
+        error.downcast_ref::<TransportChoiceError>(),
+        Some(&TransportChoiceError::NotServedByPeer {
+            peer: only_wide.peer,
+            transport: "narrow".into(),
+        }),
+        "a strict reply has no primary to fall back to"
     );
 
     let tiny = node_with_narrow(&["wide", "narrow"], HEADER).await;
     let error = pull_chunk_limit(
         tiny.messenger.backend(),
         tiny.peer.worker_id(),
-        Some("narrow"),
+        origin(&tiny, "narrow"),
         None,
     )
     .unwrap_err();

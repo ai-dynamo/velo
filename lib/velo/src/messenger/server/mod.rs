@@ -364,7 +364,7 @@ async fn create_message_handler(
                                     &backend,
                                     &handler_name,
                                     message_id,
-                                    origin,
+                                    crate::transports::choice::ReplyRoute::follow(origin),
                                     "Rendezvous resolver not configured on receiver".to_string(),
                                 )
                                 .await;
@@ -545,7 +545,8 @@ async fn resolve_and_dispatch(job: ResolveJob) {
                     &backend,
                     &handler_name,
                     message_id,
-                    origin,
+                    // The caller's final reply: it may take the primary.
+                    crate::transports::choice::ReplyRoute::follow(origin),
                     format!("Failed to resolve large payload: {e}"),
                 )
                 .await;

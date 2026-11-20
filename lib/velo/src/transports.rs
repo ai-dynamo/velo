@@ -759,7 +759,9 @@ impl VeloBackend {
 
     /// Send a reply to a worker, over the transport its request came in on.
     ///
-    /// `origin` is the request's [`InboundMessage::origin`]. When the worker
+    /// `reply.origin` is the request's [`InboundMessage::origin`]. A strict
+    /// reply goes over that transport or fails with
+    /// [`TransportChoiceError::NotServedByPeer`]. Otherwise, when the worker
     /// is not registered on that transport, the reply goes over this node's
     /// primary for the worker and `velo_transport_reply_reroutes_total`
     /// counts it. `None` (a request
@@ -767,12 +769,12 @@ impl VeloBackend {
     pub(crate) fn send_reply_to_worker(
         &self,
         worker_id: WorkerId,
-        origin: Option<TransportOrigin>,
+        reply: choice::ReplyRoute,
         frame: OutboundFrame,
         on_error: Arc<dyn TransportErrorHandler>,
     ) -> anyhow::Result<SendOutcome> {
         let instance_id = self.try_translate_worker_id(worker_id)?;
-        self.send_routed(instance_id, Route::Reply(origin), 0, frame, on_error)
+        self.send_routed(instance_id, reply.route(), 0, frame, on_error)
     }
 
     /// The route for this node's transport `key`, to name on sends.
@@ -846,17 +848,17 @@ impl VeloBackend {
         Ok(transport.max_message_size(target))
     }
 
-    /// The transport a reply to `worker` takes, given the key of the
-    /// transport its request came in on, and that transport's capacity to
-    /// the worker. The same choice [`Route::Reply`] makes: the request's
-    /// transport when the worker is registered on it, the primary otherwise.
-    pub(crate) fn reply_capacity(
+    /// The transport a strict reply to `worker` takes, the one its request
+    /// came in on (`origin`), and that transport's capacity to the worker.
+    /// Fails with [`TransportChoiceError::NotServedByPeer`] when the worker
+    /// is not registered on it: a strict reply has no fallback. `None` (an
+    /// adapter nobody numbered) reads the primary.
+    pub(crate) fn strict_reply_capacity(
         &self,
         worker: WorkerId,
-        request_transport: Option<&str>,
+        origin: Option<TransportOrigin>,
     ) -> anyhow::Result<(TransportKey, Option<usize>)> {
         let target = self.try_translate_worker_id(worker)?;
-        let origin = request_transport.and_then(|key| self.index_of.get(key).copied());
         let transport = {
             let peer = self
                 .primary_transport
@@ -866,7 +868,14 @@ impl VeloBackend {
                 Some(origin) if peer.serves(origin) => {
                     Arc::clone(&self.by_index[origin_slot(origin)])
                 }
-                _ => Arc::clone(&peer.primary),
+                Some(origin) => {
+                    return Err(TransportChoiceError::NotServedByPeer {
+                        peer: target,
+                        transport: self.key_of(origin),
+                    }
+                    .into());
+                }
+                None => Arc::clone(&peer.primary),
             }
         };
         Ok((transport.key(), transport.max_message_size(target)))

@@ -166,7 +166,16 @@ impl Consumer {
                     abandon(fetch, handle, lease_id, &refused).await;
                     return Err(refused);
                 }
-                match rdma_pull(manager, handle, lease_id, &descriptor, lease_timeout_ms).await {
+                match rdma_pull(
+                    manager,
+                    handle,
+                    lease_id,
+                    &descriptor,
+                    lease_timeout_ms,
+                    route,
+                )
+                .await
+                {
                     // One copy out of registered memory, so the caller holds an
                     // ordinary `Bytes` with no relationship to the pool and the
                     // space goes back immediately. `get_pinned` is the version
@@ -227,7 +236,16 @@ impl Consumer {
                 lease_timeout_ms,
             } => {
                 let descriptor = with_descriptor_hook(manager, descriptor);
-                match rdma_pull(manager, handle, lease_id, &descriptor, lease_timeout_ms).await {
+                match rdma_pull(
+                    manager,
+                    handle,
+                    lease_id,
+                    &descriptor,
+                    lease_timeout_ms,
+                    Route::Primary,
+                )
+                .await
+                {
                     Ok(buf) => Ok((buf, lease_id)),
                     Err(reason) => {
                         // The fallback returns a *fresh* lease, and the copy
@@ -490,11 +508,6 @@ async fn acquire(
     .payload(&RvAcquireRequest {
         handle: RvHandleWire::from_handle(handle),
         rdma: offer,
-        route: fetch
-            .client
-            .backend
-            .route_key(fetch.route)
-            .map(|key| key.as_str().to_string()),
     })?
     .worker(handle.worker_id())
     .via(fetch.route);
@@ -649,6 +662,7 @@ async fn rdma_pull(
     lease_id: u64,
     descriptor: &[u8],
     lease_timeout_ms: u64,
+    route: Route,
 ) -> Result<crate::rendezvous::rdma::PinnedBuf, RdmaFallback> {
     use crate::rendezvous::rdma::RdmaError;
 
@@ -680,7 +694,16 @@ async fn rdma_pull(
         // the backend has finished writing into it.
         buf.hold(),
     );
-    run_get(manager, handle, lease_id, &desc, dest, lease_timeout_ms).await?;
+    run_get(
+        manager,
+        handle,
+        lease_id,
+        &desc,
+        dest,
+        lease_timeout_ms,
+        route,
+    )
+    .await?;
     Ok(buf)
 }
 
@@ -695,6 +718,8 @@ async fn rdma_pull_into(
     lease_timeout_ms: u64,
     dest: &mut impl RendezvousWrite,
 ) -> Result<(), RdmaFallback> {
+    // A caller's own get: its renewals take the primary.
+    let route = Route::Primary;
     let (_ctx, desc) = decode_for(manager, descriptor)?;
     let len = usize::try_from(desc.len).map_err(|_| {
         RdmaFallback::new(
@@ -719,7 +744,16 @@ async fn rdma_pull_into(
                 ),
             ));
         }
-        return run_get(manager, handle, lease_id, &desc, target, lease_timeout_ms).await;
+        return run_get(
+            manager,
+            handle,
+            lease_id,
+            &desc,
+            target,
+            lease_timeout_ms,
+            route,
+        )
+        .await;
     }
 
     // Otherwise the GET lands in a pooled buffer and is copied once. This is
@@ -735,7 +769,15 @@ async fn rdma_pull_into(
     // nothing about whether the write would have succeeded. The registered
     // branch above does need its check, because the NIC writes without asking.
     let _ = len;
-    let buf = rdma_pull(manager, handle, lease_id, descriptor, lease_timeout_ms).await?;
+    let buf = rdma_pull(
+        manager,
+        handle,
+        lease_id,
+        descriptor,
+        lease_timeout_ms,
+        route,
+    )
+    .await?;
     // A destination that refuses the write refuses it on the chunked path too,
     // so this reaches the caller as an error either way — one extra round trip
     // for a destination that was never going to work.
@@ -793,6 +835,7 @@ async fn run_get(
     desc: &crate::rendezvous::descriptor::RdmaDescriptor,
     mut dest: crate::rendezvous::write::RdmaDestination<'_>,
     lease_timeout_ms: u64,
+    route: Route,
 ) -> Result<(), RdmaFallback> {
     let store = manager.data_store();
     let ctx = store.rdma().ok_or_else(|| {
@@ -862,17 +905,24 @@ async fn run_get(
     });
 
     let started = std::time::Instant::now();
-    let outcome = with_lease_renewal(manager, handle, lease_id, lease_timeout_ms, async move {
-        match transfer.await {
-            Ok(outcome) => outcome,
-            // The task panicked or the runtime is going down. The reservation
-            // went with it either way, so this is a failed transfer and not a
-            // leak.
-            Err(join) => Err(crate::rendezvous::rdma::RdmaError::Backend(format!(
-                "rdma transfer task: {join}"
-            ))),
-        }
-    })
+    let outcome = with_lease_renewal(
+        manager,
+        handle,
+        lease_id,
+        lease_timeout_ms,
+        route,
+        async move {
+            match transfer.await {
+                Ok(outcome) => outcome,
+                // The task panicked or the runtime is going down. The reservation
+                // went with it either way, so this is a failed transfer and not a
+                // leak.
+                Err(join) => Err(crate::rendezvous::rdma::RdmaError::Backend(format!(
+                    "rdma transfer task: {join}"
+                ))),
+            }
+        },
+    )
     .await;
 
     match outcome {
@@ -910,6 +960,7 @@ async fn with_lease_renewal<F, T>(
     handle: DataHandle,
     lease_id: u64,
     lease_timeout_ms: u64,
+    route: Route,
     transfer: F,
 ) -> T
 where
@@ -928,7 +979,7 @@ where
         tokio::select! {
             out = &mut transfer => return out,
             _ = tokio::time::sleep(period) => {
-                send_lease_renewal(manager, handle, lease_id).await;
+                send_lease_renewal(manager, handle, lease_id, route).await;
             }
         }
     }
@@ -938,7 +989,15 @@ where
 /// applies and the next tick is half a deadline away — so a failure is a debug
 /// line rather than something that interrupts the transfer.
 #[cfg(all(target_os = "linux", feature = "ucx"))]
-async fn send_lease_renewal(manager: &RendezvousManager, handle: DataHandle, lease_id: u64) {
+///
+/// `route` is the route of the get it renews for: the fetch of a staged
+/// payload renews over the call's transport.
+async fn send_lease_renewal(
+    manager: &RendezvousManager,
+    handle: DataHandle,
+    lease_id: u64,
+    route: Route,
+) {
     let payload = match serde_json::to_vec(&RvLeaseRenewRequest {
         handle: RvHandleWire::from_handle(handle),
         lease_id,
@@ -953,6 +1012,7 @@ async fn send_lease_renewal(manager: &RendezvousManager, handle: DataHandle, lea
         AmSendBuilder::new_unchecked(manager.client()?, "_rv_lease_renew")
             .raw_payload(Bytes::from(payload))
             .worker(handle.worker_id())
+            .via(route)
             .send()
             .await
     }
