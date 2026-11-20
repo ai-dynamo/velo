@@ -52,9 +52,10 @@ pub enum TransportChoiceError {
         /// The transport the send named.
         transport: TransportKey,
     },
-    /// The payload is over the staging threshold. A send that names its
-    /// transport is never staged: the staged payload would be fetched
-    /// apart from the call's route, maybe by RDMA.
+    /// The payload is over the staging threshold, or the send's headers
+    /// carry staging metadata (`_rv`). A send that names its transport is
+    /// never staged: the staged payload would be fetched apart from the
+    /// call's route, maybe by RDMA. `threshold` is 0 with no stager.
     #[error(
         "a payload of {len} bytes is over the staging threshold of {threshold} bytes; \
          a send named on transport {transport} is not staged"

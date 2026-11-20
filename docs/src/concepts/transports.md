@@ -34,7 +34,7 @@ A send can name a transport: `.transport("uds")` on an `am_send`, `am_sync`, `un
 - `NotInstalled`: this node has no transport with that key.
 - `NotServedByPeer`: the peer is registered, but not on that transport. Its address has no entry for it, or the transport refused the entry.
 - `ForeignRoute`: the route was made by another node.
-- `WouldStage`: the payload is over the staging threshold. A named send is never staged, because the receiver would fetch the staged payload apart from the call's route, maybe by RDMA. So a named call never moves its data off its route.
+- `WouldStage`: the payload is over the staging threshold, or the send's headers carry staging metadata (`_rv`). A named send is never staged, because the receiver would fetch the staged payload apart from the call's route, maybe by RDMA. So a named call never moves its data off its route.
 
 A refused send takes no response slot and sends nothing, on every path. A send to a worker that discovery must find first runs the discovery, checks the route against the peer it found, and only then takes a slot. With every slot taken, a refused route still reports `NotServedByPeer`, not a full arena.
 

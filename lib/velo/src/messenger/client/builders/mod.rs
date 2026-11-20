@@ -973,12 +973,22 @@ impl MessageBuilder {
         if let Route::Named(origin) = route {
             // A named call keeps its payload on its route: staging would move
             // the bytes in a fetch the call does not route, maybe by RDMA.
+            // Staging metadata the caller wrote is a second way into the
+            // staged path: a named send carries none, whatever its size.
             let len = self.payload.as_ref().map_or(0, Bytes::len);
-            if let Some(stager) = self.client.stager_for(len) {
+            let staged_by_header = self.headers.as_ref().is_some_and(|headers| {
+                headers.contains_key(crate::messenger::large_payload::RV_HEADER_KEY)
+            });
+            if staged_by_header || self.client.stager_for(len).is_some() {
+                let threshold = self
+                    .client
+                    .large_payload_stager
+                    .get()
+                    .map_or(0, |stager| stager.threshold());
                 return SendStage::refused(TransportChoiceError::WouldStage {
                     transport: self.client.backend.transport_key(origin),
                     len,
-                    threshold: stager.threshold(),
+                    threshold,
                 });
             }
 

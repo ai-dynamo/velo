@@ -459,3 +459,36 @@ async fn a_discovered_peer_missing_the_named_transport_takes_no_slot() {
 
 #[path = "transport_choice/capped_fetch.rs"]
 mod capped_fetch;
+
+#[tokio::test]
+async fn a_named_send_cannot_request_staging_through_its_headers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sender, receiver) = pair(&dir, &[Kind::Tcp, Kind::Uds], &[Kind::Tcp, Kind::Uds]).await;
+    let len = 300 * 1024;
+    let handle = sender.velo.register_data(Bytes::from(vec![1; len]));
+    let mut response = None;
+    let seen = traffic(&sender, &receiver, async {
+        response = Some(
+            sender
+                .velo
+                .unary("echo_len")
+                .unwrap()
+                .headers(std::collections::HashMap::from([(
+                    "_rv".to_string(),
+                    handle.as_u128().to_string(),
+                )]))
+                .raw_payload(Bytes::from_static(b"inline"))
+                .transport("uds")
+                .instance(receiver.velo.instance_id())
+                .timeout(DEADLINE)
+                .send()
+                .await,
+        );
+    })
+    .await;
+    assert!(
+        !seen.transports().contains(&"tcp".to_string()),
+        "the named UDS call fetched a payload over TCP; response: {response:?}",
+    );
+    shutdown([&sender, &receiver]).await;
+}
