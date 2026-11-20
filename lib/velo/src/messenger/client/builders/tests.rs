@@ -327,7 +327,7 @@ async fn a_detached_failure_keeps_its_wording() {
     let mut result = fire_result(Dispatched::detached(report_rx, awaiter));
 
     report_tx
-        .send(Err("Handshake failed: nope".to_string()))
+        .send(Err("Handshake failed: nope".to_string().into()))
         .expect("the receiver is alive");
 
     let err = tokio::time::timeout(RESOLVES, result.admitted())

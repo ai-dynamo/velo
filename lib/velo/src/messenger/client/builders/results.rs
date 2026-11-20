@@ -36,16 +36,38 @@ use tokio::time::{Instant, Sleep};
 use super::super::ActiveMessageClient;
 use crate::messenger::common::responses::{ResponseAwaiter, ResponseId};
 use crate::observability::ClientResolution;
+use crate::transports::choice::TransportChoiceError;
 use crate::transports::{AdmissionState, SendAdmission, SendOutcome};
 
 /// What a detached send task reports when it finishes.
 ///
 /// `Ok(())` once the frame has reached the transport's send channel, otherwise
-/// the message to hand the caller. A `String` rather than an `anyhow::Error`
-/// because it crosses a task boundary and because the same failure has to be
-/// reportable more than once — `admitted()` and a later `.await` of the result
-/// must both surface it.
-pub(super) type AdmissionReport = std::result::Result<(), String>;
+/// what to hand the caller. Not an `anyhow::Error`, because it crosses a task
+/// boundary and because the same failure has to be reportable more than once:
+/// `admitted()` and a later `.await` of the result must both surface it. A
+/// refused transport choice stays typed; anything else is text.
+pub(super) type AdmissionReport = std::result::Result<(), ReportError>;
+
+/// Why a detached send did not reach the transport.
+#[derive(Debug)]
+pub(super) enum ReportError {
+    /// Any failure the caller only reads as text.
+    Message(String),
+    /// The send named a transport it could not use. Kept typed, so the caller
+    /// can downcast to it.
+    Choice(TransportChoiceError),
+}
+
+impl From<String> for ReportError {
+    fn from(reason: String) -> Self {
+        Self::Message(reason)
+    }
+}
+
+/// The [`TransportChoiceError`] inside `error`, if that is what it is.
+pub(super) fn choice_error(error: &anyhow::Error) -> Option<TransportChoiceError> {
+    error.downcast_ref::<TransportChoiceError>().cloned()
+}
 
 /// The error a request resolves to when its `.timeout` runs out first.
 ///
@@ -119,6 +141,9 @@ enum AdmissionStage {
     Admitted,
     /// Terminal: the frame will never get there.
     Failed(String),
+    /// Terminal: the send named a transport it could not use. Not sent.
+    /// Boxed, so the stage every send moves stays as small as before.
+    Refused(Box<TransportChoiceError>),
     /// The target's admission gate holds the frame behind its predecessors.
     /// The gate delivers it whether or not this is ever polled.
     Gated(SendAdmission),
@@ -133,7 +158,7 @@ impl AdmissionStage {
     fn state(&self) -> AdmissionState {
         match self {
             Self::Admitted => AdmissionState::Admitted,
-            Self::Failed(_) => AdmissionState::Failed,
+            Self::Failed(_) | Self::Refused(_) => AdmissionState::Failed,
             // The gate resolves tickets whether or not anyone polls, so its own
             // view of the ticket is fresher than any we could cache.
             Self::Gated(admission) => admission.state(),
@@ -149,6 +174,12 @@ impl AdmissionStage {
             match self {
                 Self::Admitted => return Poll::Ready(Ok(())),
                 Self::Failed(reason) => return Poll::Ready(Err(anyhow!("{reason}"))),
+                // `Error::new`, not `anyhow!`, so callers can downcast to it.
+                Self::Refused(error) => {
+                    return Poll::Ready(Err(anyhow::Error::new(TransportChoiceError::clone(
+                        error,
+                    ))));
+                }
                 Self::Gated(admission) => match Pin::new(admission).poll(cx) {
                     Poll::Ready(Ok(())) => *self = Self::Admitted,
                     Poll::Ready(Err(error)) => {
@@ -160,7 +191,8 @@ impl AdmissionStage {
                     Poll::Ready(Ok(report)) => {
                         *self = match report {
                             Ok(()) => Self::Admitted,
-                            Err(reason) => Self::Failed(reason),
+                            Err(ReportError::Message(reason)) => Self::Failed(reason),
+                            Err(ReportError::Choice(error)) => Self::Refused(Box::new(error)),
                         }
                     }
                     // The task dropped its sender without reporting: it
@@ -219,6 +251,15 @@ impl Dispatched {
     pub(super) fn failed(error: impl std::fmt::Display) -> Self {
         Self {
             admission: AdmissionStage::Failed(error.to_string()),
+            awaiter: None,
+        }
+    }
+
+    /// A send refused before it reached a transport, for its named
+    /// transport. Holds no response slot.
+    pub(super) fn refused(error: TransportChoiceError) -> Self {
+        Self {
+            admission: AdmissionStage::Refused(Box::new(error)),
             awaiter: None,
         }
     }
@@ -296,6 +337,10 @@ impl SendStage {
     /// A send that failed before any transport saw it.
     pub(super) fn failed(error: impl std::fmt::Display) -> Self {
         SendStage::Dispatched(Dispatched::failed(error))
+    }
+
+    pub(super) fn refused(error: TransportChoiceError) -> Self {
+        SendStage::Dispatched(Dispatched::refused(error))
     }
 
     fn admission_state(&self) -> AdmissionState {
@@ -584,5 +629,8 @@ pub(super) async fn drive_send_outcome(
     let _ = client
         .response_manager
         .complete_outcome(response_id, Err(reason.clone()));
-    Err(reason)
+    match choice_error(&error) {
+        Some(choice) => Err(ReportError::Choice(choice)),
+        None => Err(ReportError::Message(reason)),
+    }
 }

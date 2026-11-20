@@ -43,6 +43,7 @@ use std::sync::Arc;
 
 use crate::messenger::ActiveMessageClient;
 use crate::messenger::large_payload::PayloadTooLarge;
+use crate::transports::choice::Route;
 use crate::{AmSendBuilder, TypedUnaryBuilder, UnaryBuilder};
 use anyhow::Result;
 use bytes::{Bytes, BytesMut};
@@ -100,11 +101,13 @@ impl Consumer {
         handle: DataHandle,
         limit: u64,
         lease_timeout: Option<std::time::Duration>,
+        route: Route,
     ) -> Result<(Bytes, u64)> {
         let client = &manager.client()?;
+        let fetch = Fetch { client, route };
         let target_worker = handle.worker_id();
         let response = acquire(
-            client,
+            fetch,
             handle,
             rdma_offer(manager, target_worker),
             lease_timeout,
@@ -120,7 +123,7 @@ impl Consumer {
                 chunk_count,
             } => {
                 match pull_chunks(
-                    client,
+                    fetch,
                     target_worker,
                     transfer_id,
                     total_len,
@@ -132,7 +135,7 @@ impl Consumer {
                 {
                     Ok(data) => Ok((data.freeze(), lease_id)),
                     Err(e) => {
-                        abandon(client, handle, lease_id, &e).await;
+                        abandon(fetch, handle, lease_id, &e).await;
                         Err(e)
                     }
                 }
@@ -152,7 +155,7 @@ impl Consumer {
                     && len > limit
                 {
                     let refused = PayloadTooLarge { len, limit }.into();
-                    abandon(client, handle, lease_id, &refused).await;
+                    abandon(fetch, handle, lease_id, &refused).await;
                     return Err(refused);
                 }
                 match rdma_pull(manager, handle, lease_id, &descriptor, lease_timeout_ms).await {
@@ -164,7 +167,7 @@ impl Consumer {
                     Err(reason) => {
                         fallback_chunked(
                             manager,
-                            client,
+                            fetch,
                             handle,
                             lease_id,
                             reason,
@@ -177,7 +180,7 @@ impl Consumer {
             }
             #[cfg(not(all(target_os = "linux", feature = "ucx")))]
             AcquireResponse::Rdma { lease_id, .. } => {
-                unsolicited_rdma(client, handle, lease_id, limit).await
+                unsolicited_rdma(fetch, handle, lease_id, limit).await
             }
         }
     }
@@ -196,8 +199,12 @@ impl Consumer {
         handle: DataHandle,
     ) -> Result<(crate::rendezvous::rdma::PinnedBuf, u64)> {
         let client = &manager.client()?;
+        let fetch = Fetch {
+            client,
+            route: Route::Primary,
+        };
         let target_worker = handle.worker_id();
-        let response = acquire(client, handle, rdma_offer(manager, target_worker), None).await?;
+        let response = acquire(fetch, handle, rdma_offer(manager, target_worker), None).await?;
 
         match response {
             AcquireResponse::Rdma {
@@ -215,7 +222,7 @@ impl Consumer {
                         // strands a chunked lease the reaper cannot reclaim.
                         let (data, lease_id) = fallback_chunked(
                             manager,
-                            client,
+                            fetch,
                             handle,
                             lease_id,
                             reason,
@@ -237,7 +244,7 @@ impl Consumer {
                 chunk_count,
             } => {
                 match pull_chunks(
-                    client,
+                    fetch,
                     target_worker,
                     transfer_id,
                     total_len,
@@ -253,7 +260,7 @@ impl Consumer {
                         Ok((buf, lease.disarm()))
                     }
                     Err(e) => {
-                        if let Err(cleanup_err) = detach(client, handle, lease_id).await {
+                        if let Err(cleanup_err) = detach(fetch, handle, lease_id).await {
                             tracing::warn!(
                                 "Failed to detach lease {lease_id} after pull failure: {cleanup_err}"
                             );
@@ -275,8 +282,12 @@ impl Consumer {
         dest: &mut impl RendezvousWrite,
     ) -> Result<u64> {
         let client = &manager.client()?;
+        let fetch = Fetch {
+            client,
+            route: Route::Primary,
+        };
         let target_worker = handle.worker_id();
-        let response = acquire(client, handle, rdma_offer(manager, target_worker), None).await?;
+        let response = acquire(fetch, handle, rdma_offer(manager, target_worker), None).await?;
 
         match response {
             AcquireResponse::Ready {
@@ -300,7 +311,7 @@ impl Consumer {
                     Ok(()) => Ok(lease_id),
                     Err(e) => {
                         // Best-effort cleanup: release read lock to prevent owner-side leak
-                        if let Err(cleanup_err) = detach(client, handle, lease_id).await {
+                        if let Err(cleanup_err) = detach(fetch, handle, lease_id).await {
                             tracing::warn!(
                                 "Failed to detach lease {lease_id} after pull failure: {cleanup_err}"
                             );
@@ -330,7 +341,7 @@ impl Consumer {
                     Err(reason) => {
                         let (data, lease_id) = fallback_chunked(
                             manager,
-                            client,
+                            fetch,
                             handle,
                             lease_id,
                             reason,
@@ -349,7 +360,7 @@ impl Consumer {
             }
             #[cfg(not(all(target_os = "linux", feature = "ucx")))]
             AcquireResponse::Rdma { lease_id, .. } => {
-                let (data, lease_id) = unsolicited_rdma(client, handle, lease_id, u64::MAX).await?;
+                let (data, lease_id) = unsolicited_rdma(fetch, handle, lease_id, u64::MAX).await?;
                 let lease = manager.lease_guard(handle, lease_id, Some(client));
                 dest.write_chunk(0, &data)?;
                 Ok(lease.disarm())
@@ -404,13 +415,21 @@ impl Consumer {
     }
 }
 
+/// What a fetch sends with: the client, and the route its messages take.
+///
+/// The messenger fetches a staged payload over the transport its message
+/// came in on, so that the payload's bytes stay on the transport the caller
+/// chose. Every other fetch uses the primary.
+#[derive(Clone, Copy)]
+struct Fetch<'a> {
+    client: &'a Arc<ActiveMessageClient>,
+    route: Route,
+}
+
 /// Detach a lease through the client alone.
-async fn detach(
-    client: &Arc<ActiveMessageClient>,
-    handle: DataHandle,
-    lease_id: u64,
-) -> Result<()> {
-    Consumer::detach_request(client, handle, lease_id)?
+async fn detach(fetch: Fetch<'_>, handle: DataHandle, lease_id: u64) -> Result<()> {
+    Consumer::detach_request(fetch.client, handle, lease_id)?
+        .via(fetch.route)
         .send()
         .await
 }
@@ -422,19 +441,14 @@ async fn detach(
 /// detached one would keep the payload on its owner with nobody left to take
 /// it. Any other failure detaches, so the read lock does not leak on the
 /// owner. Best effort: a failure to send is logged.
-async fn abandon(
-    client: &Arc<ActiveMessageClient>,
-    handle: DataHandle,
-    lease_id: u64,
-    error: &anyhow::Error,
-) {
+async fn abandon(fetch: Fetch<'_>, handle: DataHandle, lease_id: u64, error: &anyhow::Error) {
     let sent = if error.downcast_ref::<PayloadTooLarge>().is_some() {
-        match Consumer::release_request(client, handle, lease_id) {
-            Ok(release) => release.send().await,
+        match Consumer::release_request(fetch.client, handle, lease_id) {
+            Ok(release) => release.via(fetch.route).send().await,
             Err(e) => Err(e),
         }
     } else {
-        detach(client, handle, lease_id).await
+        detach(fetch, handle, lease_id).await
     };
     if let Err(e) = sent {
         tracing::warn!(%handle, lease = lease_id, error = %e, "rendezvous: could not give up a lease after a failed pull");
@@ -444,18 +458,21 @@ async fn abandon(
 /// Send one `_rv_acquire`, carrying `offer` if there is one, and asking for a
 /// chunked lease deadline of `lease_timeout` if there is one.
 async fn acquire(
-    client: &Arc<ActiveMessageClient>,
+    fetch: Fetch<'_>,
     handle: DataHandle,
     offer: Option<RdmaOffer>,
     lease_timeout: Option<std::time::Duration>,
 ) -> Result<AcquireResponse> {
-    let mut call =
-        TypedUnaryBuilder::<AcquireResponse>::new_unchecked(Arc::clone(client), "_rv_acquire")
-            .payload(&RvAcquireRequest {
-                handle: RvHandleWire::from_handle(handle),
-                rdma: offer,
-            })?
-            .worker(handle.worker_id());
+    let mut call = TypedUnaryBuilder::<AcquireResponse>::new_unchecked(
+        Arc::clone(fetch.client),
+        "_rv_acquire",
+    )
+    .payload(&RvAcquireRequest {
+        handle: RvHandleWire::from_handle(handle),
+        rdma: offer,
+    })?
+    .worker(handle.worker_id())
+    .via(fetch.route);
     if let Some(timeout) = lease_timeout {
         call = call.headers(crate::rendezvous::protocol::lease_timeout_headers(timeout));
     }
@@ -910,7 +927,7 @@ async fn send_lease_renewal(manager: &RendezvousManager, handle: DataHandle, lea
 #[cfg(all(target_os = "linux", feature = "ucx"))]
 async fn fallback_chunked(
     manager: &RendezvousManager,
-    client: &Arc<ActiveMessageClient>,
+    fetch: Fetch<'_>,
     handle: DataHandle,
     lease_id: u64,
     fallback: RdmaFallback,
@@ -930,10 +947,10 @@ async fn fallback_chunked(
     // The owner's lease is tied to a transfer that will never happen. Detach it
     // before asking for another, or the slot carries two read locks and the
     // first is released only when its deadline passes.
-    if let Err(e) = detach(client, handle, lease_id).await {
+    if let Err(e) = detach(fetch, handle, lease_id).await {
         tracing::warn!(%handle, error = %e, "rendezvous: could not detach before falling back");
     }
-    chunked_only(client, handle, limit, lease_timeout).await
+    chunked_only(fetch, handle, limit, lease_timeout).await
 }
 
 /// An owner answered `Rdma` to an acquire that carried no offer.
@@ -943,7 +960,7 @@ async fn fallback_chunked(
 /// cannot perform.
 #[cfg(not(all(target_os = "linux", feature = "ucx")))]
 async fn unsolicited_rdma(
-    client: &Arc<ActiveMessageClient>,
+    fetch: Fetch<'_>,
     handle: DataHandle,
     lease_id: u64,
     limit: u64,
@@ -953,10 +970,10 @@ async fn unsolicited_rdma(
         "rendezvous: owner answered with an RDMA descriptor for an acquire that offered \
          nothing; falling back to the chunked path"
     );
-    if let Err(e) = detach(client, handle, lease_id).await {
+    if let Err(e) = detach(fetch, handle, lease_id).await {
         tracing::warn!(%handle, error = %e, "rendezvous: could not detach before falling back");
     }
-    chunked_only(client, handle, limit, None).await
+    chunked_only(fetch, handle, limit, None).await
 }
 
 /// Acquire with no offer and pull the chunks.
@@ -966,13 +983,13 @@ async fn unsolicited_rdma(
 /// than recursing — a retry loop here would turn one such owner into an
 /// unbounded storm of round trips.
 async fn chunked_only(
-    client: &Arc<ActiveMessageClient>,
+    fetch: Fetch<'_>,
     handle: DataHandle,
     limit: u64,
     lease_timeout: Option<std::time::Duration>,
 ) -> Result<(Bytes, u64)> {
     let target_worker = handle.worker_id();
-    match acquire(client, handle, None, lease_timeout).await? {
+    match acquire(fetch, handle, None, lease_timeout).await? {
         AcquireResponse::Ready {
             lease_id,
             transfer_id,
@@ -981,7 +998,7 @@ async fn chunked_only(
             chunk_count,
         } => {
             match pull_chunks(
-                client,
+                fetch,
                 target_worker,
                 transfer_id,
                 total_len,
@@ -993,13 +1010,13 @@ async fn chunked_only(
             {
                 Ok(data) => Ok((data.freeze(), lease_id)),
                 Err(e) => {
-                    abandon(client, handle, lease_id, &e).await;
+                    abandon(fetch, handle, lease_id, &e).await;
                     Err(e)
                 }
             }
         }
         AcquireResponse::Rdma { lease_id, .. } => {
-            if let Err(e) = detach(client, handle, lease_id).await {
+            if let Err(e) = detach(fetch, handle, lease_id).await {
                 tracing::warn!(
                     %handle,
                     error = %e,
@@ -1067,7 +1084,7 @@ fn check_chunk(total_len: u64, chunk_size: u32, chunk_index: u32, len: usize) ->
 }
 
 async fn pull_chunks(
-    client: &Arc<ActiveMessageClient>,
+    fetch: Fetch<'_>,
     target_worker: WorkerId,
     transfer_id: u64,
     total_len: u64,
@@ -1094,9 +1111,10 @@ async fn pull_chunks(
         };
         let payload = serde_json::to_vec(&req)?;
 
-        let chunk_bytes: Bytes = UnaryBuilder::new_unchecked(Arc::clone(client), "_rv_pull")
+        let chunk_bytes: Bytes = UnaryBuilder::new_unchecked(Arc::clone(fetch.client), "_rv_pull")
             .raw_payload(Bytes::from(payload))
             .worker(target_worker)
+            .via(fetch.route)
             .send()
             .await?;
 

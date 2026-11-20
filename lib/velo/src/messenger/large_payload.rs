@@ -65,7 +65,15 @@ pub trait LargePayloadResolver: Send + Sync {
     /// `within` is the fetch's bound, if it has one. The caller drops the
     /// future when it runs out and tells the owner nothing, so the owner
     /// should be asked to end, by then, whatever the fetch leaves behind.
-    fn resolve(&self, handle_str: &str, within: Option<Duration>) -> BoxFuture<'_, Result<Bytes>>;
+    /// `origin` is the transport the staged message came in on: the fetch
+    /// goes over it, so that a call pinned to a transport keeps its bytes
+    /// there.
+    fn resolve(
+        &self,
+        handle_str: &str,
+        within: Option<Duration>,
+        origin: Option<velo_ext::TransportOrigin>,
+    ) -> BoxFuture<'_, Result<Bytes>>;
 
     /// The longest this receiver lets one fetch run, whatever the sender
     /// asked for. `None` sets no bound of its own.

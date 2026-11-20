@@ -38,7 +38,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "distributed-tracing")]
 use tracing::Instrument;
 use tracing::{debug, error};
-use velo_ext::{InstanceId, WorkerId};
+use velo_ext::{InstanceId, TransportOrigin, WorkerId};
 
 use crate::messenger::common::events::{EventType, Outcome, encode_event_header};
 use crate::messenger::common::messages::ResponseType;
@@ -47,7 +47,7 @@ use crate::messenger::server::dispatcher::{
     ActiveMessageDispatcher, ActiveMessageHandler, HandlerContext, OrderedDispatcher,
     SpawnedDispatcher,
 };
-use crate::transports::{MessageType, SendOutcome, VeloBackend};
+use crate::transports::{MessageType, OutboundFrame, SendOutcome, VeloBackend};
 use derive_getters::Dissolve;
 
 /// Wait for a queued frame to reach the send channel.
@@ -504,6 +504,7 @@ where
 
         let backend = ctx.system.backend().clone();
         let response_id = ctx.message_id;
+        let origin = ctx.origin;
         let response_type = ctx.response_type;
         let headers = ctx.headers.clone();
         #[cfg(feature = "distributed-tracing")]
@@ -538,12 +539,12 @@ where
                 }
                 ResponseType::AckNack => {
                     let send_result = match result {
-                        Ok(()) => send_ack(backend, response_id).await,
+                        Ok(()) => send_ack(backend, origin, response_id).await,
                         Err(err) => {
                             error!("AM handler '{}' failed: {}", name, err);
                             response_bytes = err.to_string().len();
                             outcome = HandlerOutcome::Error;
-                            send_nack(backend, response_id, err.to_string()).await
+                            send_nack(backend, origin, response_id, err.to_string()).await
                         }
                     };
                     if let Err(e) = send_result {
@@ -569,7 +570,8 @@ where
                     outcome = HandlerOutcome::Error;
                     response_bytes = error_message.len();
                     let send_result =
-                        send_response_error(backend, response_id, headers, error_message).await;
+                        send_response_error(backend, origin, response_id, headers, error_message)
+                            .await;
                     if let Err(e) = send_result {
                         if let Some(metrics) = observability.as_ref() {
                             metrics
@@ -644,6 +646,7 @@ where
         let executor = self.executor.clone();
         let backend = ctx.system.backend().clone();
         let response_id = ctx.message_id;
+        let origin = ctx.origin;
         let response_type = ctx.response_type;
         let headers = ctx.headers.clone();
         #[cfg(feature = "distributed-tracing")]
@@ -676,29 +679,30 @@ where
             let mut response_bytes = 0usize;
 
             let send_result = match (response_type, result) {
-                (ResponseType::AckNack, Ok(None)) => send_ack(backend, response_id).await,
+                (ResponseType::AckNack, Ok(None)) => send_ack(backend, origin, response_id).await,
                 (ResponseType::AckNack, Ok(Some(_))) => {
                     // AckNack response carries no payload on wire.
-                    send_ack(backend, response_id).await
+                    send_ack(backend, origin, response_id).await
                 }
                 (ResponseType::AckNack, Err(err)) => {
                     let error_msg = err.to_string();
                     outcome = HandlerOutcome::Error;
                     response_bytes = error_msg.len();
-                    send_nack(backend, response_id, error_msg).await
+                    send_nack(backend, origin, response_id, error_msg).await
                 }
                 (ResponseType::Unary, Ok(None)) => {
-                    send_response_ok(backend, response_id, headers.clone()).await
+                    send_response_ok(backend, origin, response_id, headers.clone()).await
                 }
                 (ResponseType::Unary, Ok(Some(bytes))) => {
                     response_bytes = bytes.len();
-                    send_response(backend, response_id, headers.clone(), bytes).await
+                    send_response(backend, origin, response_id, headers.clone(), bytes).await
                 }
                 (ResponseType::Unary, Err(err)) => {
                     let error_msg = err.to_string();
                     outcome = HandlerOutcome::Error;
                     response_bytes = error_msg.len();
-                    send_response_error(backend, response_id, headers.clone(), error_msg).await
+                    send_response_error(backend, origin, response_id, headers.clone(), error_msg)
+                        .await
                 }
                 (ResponseType::FireAndForget, _) => {
                     outcome = HandlerOutcome::Error;
@@ -780,6 +784,7 @@ where
         let trace_headers = headers.clone();
         let backend = ctx.system.backend().clone();
         let response_id = ctx.message_id;
+        let origin = ctx.origin;
         let response_type = ctx.response_type;
         let executor = self.executor.clone();
         let handler_name = self.name.clone();
@@ -822,10 +827,18 @@ where
                         metrics.record_dispatch_failure(DispatchFailure::DeserializeTypedInput);
                     }
                     let send_result = match response_type {
-                        ResponseType::AckNack => send_nack(backend, response_id, error_msg).await,
+                        ResponseType::AckNack => {
+                            send_nack(backend, origin, response_id, error_msg).await
+                        }
                         ResponseType::Unary => {
-                            send_response_error(backend, response_id, headers.clone(), error_msg)
-                                .await
+                            send_response_error(
+                                backend,
+                                origin,
+                                response_id,
+                                headers.clone(),
+                                error_msg,
+                            )
+                            .await
                         }
                         ResponseType::FireAndForget => Ok(()),
                     };
@@ -862,18 +875,20 @@ where
             let mut response_bytes = 0usize;
 
             let send_result = match (response_type, result) {
-                (ResponseType::AckNack, Ok(_output)) => send_ack(backend, response_id).await,
+                (ResponseType::AckNack, Ok(_output)) => {
+                    send_ack(backend, origin, response_id).await
+                }
                 (ResponseType::AckNack, Err(err)) => {
                     let error_msg = err.to_string();
                     outcome = HandlerOutcome::Error;
                     response_bytes = error_msg.len();
-                    send_nack(backend, response_id, error_msg).await
+                    send_nack(backend, origin, response_id, error_msg).await
                 }
                 (ResponseType::Unary, Ok(output)) => match serde_json::to_vec(&output) {
                     Ok(serialized) => {
                         let bytes = Bytes::from(serialized);
                         response_bytes = bytes.len();
-                        send_response(backend, response_id, headers.clone(), bytes).await
+                        send_response(backend, origin, response_id, headers.clone(), bytes).await
                     }
                     Err(e) => {
                         let error_msg = format!("Failed to serialize output: {}", e);
@@ -882,14 +897,22 @@ where
                         }
                         outcome = HandlerOutcome::Error;
                         response_bytes = error_msg.len();
-                        send_response_error(backend, response_id, headers.clone(), error_msg).await
+                        send_response_error(
+                            backend,
+                            origin,
+                            response_id,
+                            headers.clone(),
+                            error_msg,
+                        )
+                        .await
                     }
                 },
                 (ResponseType::Unary, Err(err)) => {
                     let error_msg = err.to_string();
                     outcome = HandlerOutcome::Error;
                     response_bytes = error_msg.len();
-                    send_response_error(backend, response_id, headers.clone(), error_msg).await
+                    send_response_error(backend, origin, response_id, headers.clone(), error_msg)
+                        .await
                 }
                 (ResponseType::FireAndForget, _) => {
                     outcome = HandlerOutcome::Error;
@@ -991,14 +1014,21 @@ fn get_response_error_handler() -> Arc<dyn crate::transports::TransportErrorHand
         .clone()
 }
 
-async fn send_ack(backend: Arc<VeloBackend>, response_id: ResponseId) -> Result<()> {
+async fn send_ack(
+    backend: Arc<VeloBackend>,
+    origin: Option<TransportOrigin>,
+    response_id: ResponseId,
+) -> Result<()> {
     let header = encode_event_header(EventType::Ack(response_id, Outcome::Ok));
 
-    let outcome = backend.send_message_to_worker(
+    let outcome = backend.send_reply_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
-        header,
-        Bytes::new(),
-        MessageType::Ack,
+        origin,
+        OutboundFrame {
+            header,
+            payload: Bytes::new(),
+            message_type: MessageType::Ack,
+        },
         get_ack_error_handler(),
     )?;
     await_admission(outcome).await?;
@@ -1025,17 +1055,21 @@ fn handler_response_type(response_type: ResponseType) -> HandlerResponseType {
 
 async fn send_nack(
     backend: Arc<VeloBackend>,
+    origin: Option<TransportOrigin>,
     response_id: ResponseId,
     error_message: String,
 ) -> Result<()> {
     let header = encode_event_header(EventType::Ack(response_id, Outcome::Error));
     let payload = Bytes::from(error_message.into_bytes());
 
-    let outcome = backend.send_message_to_worker(
+    let outcome = backend.send_reply_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
-        header,
-        payload,
-        MessageType::Ack,
+        origin,
+        OutboundFrame {
+            header,
+            payload,
+            message_type: MessageType::Ack,
+        },
         get_nack_error_handler(),
     )?;
     await_admission(outcome).await?;
@@ -1045,17 +1079,21 @@ async fn send_nack(
 
 async fn send_response_ok(
     backend: Arc<VeloBackend>,
+    origin: Option<TransportOrigin>,
     response_id: ResponseId,
     headers: Option<std::collections::HashMap<String, String>>,
 ) -> Result<()> {
     let header = encode_response_header(response_id, Outcome::Ok, headers)
         .map_err(|e| anyhow::anyhow!("Failed to encode response header: {}", e))?;
 
-    let outcome = backend.send_message_to_worker(
+    let outcome = backend.send_reply_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
-        header,
-        Bytes::new(),
-        MessageType::Response,
+        origin,
+        OutboundFrame {
+            header,
+            payload: Bytes::new(),
+            message_type: MessageType::Response,
+        },
         get_response_error_handler(),
     )?;
     await_admission(outcome).await?;
@@ -1065,6 +1103,7 @@ async fn send_response_ok(
 
 async fn send_response(
     backend: Arc<VeloBackend>,
+    origin: Option<TransportOrigin>,
     response_id: ResponseId,
     headers: Option<std::collections::HashMap<String, String>>,
     payload: Bytes,
@@ -1072,11 +1111,14 @@ async fn send_response(
     let header = encode_response_header(response_id, Outcome::Ok, headers)
         .map_err(|e| anyhow::anyhow!("Failed to encode response header: {}", e))?;
 
-    let outcome = backend.send_message_to_worker(
+    let outcome = backend.send_reply_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
-        header,
-        payload,
-        MessageType::Response,
+        origin,
+        OutboundFrame {
+            header,
+            payload,
+            message_type: MessageType::Response,
+        },
         get_response_error_handler(),
     )?;
     await_admission(outcome).await?;
@@ -1086,6 +1128,7 @@ async fn send_response(
 
 async fn send_response_error(
     backend: Arc<VeloBackend>,
+    origin: Option<TransportOrigin>,
     response_id: ResponseId,
     headers: Option<std::collections::HashMap<String, String>>,
     error_message: String,
@@ -1094,11 +1137,14 @@ async fn send_response_error(
         .map_err(|e| anyhow::anyhow!("Failed to encode response header: {}", e))?;
     let payload = Bytes::from(error_message.into_bytes());
 
-    let outcome = backend.send_message_to_worker(
+    let outcome = backend.send_reply_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
-        header,
-        payload,
-        MessageType::Response,
+        origin,
+        OutboundFrame {
+            header,
+            payload,
+            message_type: MessageType::Response,
+        },
         get_response_error_handler(),
     )?;
     await_admission(outcome).await?;

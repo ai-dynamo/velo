@@ -717,6 +717,7 @@ async fn a_singleton_at_the_eager_frame_limit_reaches_its_peer() {
     let (inlet, id) = harness.open_credited(1, 1, 2).await;
     let budget = harness._sender.effective_eager_payload(
         harness._capture.instance_id(),
+        crate::transports::choice::Route::Primary,
         LaneIndex::ZERO.handler_name(),
         None,
     );
@@ -801,8 +802,12 @@ async fn an_inline_singleton_allocates_no_refusal_headers() {
     let frame = item.finish().unwrap().into_vec();
     assert!(frame.len() > config.max_batch_bytes);
     assert!(
-        sender.effective_eager_payload(capture.instance_id(), key.lane.handler_name(), None)
-            > frame.len() + 64
+        sender.effective_eager_payload(
+            capture.instance_id(),
+            crate::transports::choice::Route::Primary,
+            key.lane.handler_name(),
+            None
+        ) > frame.len() + 64
     );
 
     let mut counts = Vec::new();

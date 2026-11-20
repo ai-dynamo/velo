@@ -25,7 +25,47 @@ The `http` feature exists, but the HTTP messenger transport is not built at this
 
 ## Peer routing
 
-Velo registers each peer with every transport that the peer and the local instance both support. For each peer, Velo selects a primary transport: the compatible transport with the highest priority. Messages to that peer go on the primary transport.
+Velo registers each peer with every transport that the peer and the local instance both support. For each peer, Velo selects a primary transport: the first transport, in the order the builder added them, that accepted the peer's address. The peer's own order does not count. A message that names no transport goes on the primary transport. `Velo::peer_transports(instance)` lists the transports a peer is registered on, primary first. `Velo::transport_keys()` lists this node's own transports.
+
+### Choose the transport for a send
+
+A send can name a transport: `.transport("uds")` on an `am_send`, `am_sync`, `unary`, or `typed_unary` builder. The send then uses that transport or fails. It never falls back to another transport, so a caller that keeps an edge on one transport can rely on it. The error is `TransportChoiceError`, found with `error.downcast_ref::<TransportChoiceError>()`:
+
+- `NotInstalled`: this node has no transport with that key.
+- `NotServedByPeer`: the peer is registered, but not on that transport. Its address has no entry for it, or the transport refused the entry.
+- `ForeignRoute`: the route was made by another node.
+
+A refused send takes no response slot and sends nothing.
+
+To send many times over one transport, resolve the key once with `Velo::transport_route(key)`, and give the `TransportRoute` it returns to `.route(route)`. A send with a route hashes nothing. It checks one bit in the peer's route, which the send reads anyway to find the primary.
+
+```rust,ignore
+let uds = node_a.transport_route("uds")?;
+let reply = node_a.unary("ping")?.route(uds).raw_payload(Bytes::new()).instance(b).send().await?;
+```
+
+Everything the call sends goes over the named transport:
+
+- **The handshake.** A call to a peer whose handlers are not known yet sends `_hello` first, over the same transport.
+- **A staged payload.** A payload over the staging threshold is fetched by the receiver. The receiver sends the fetch, and the release, over the transport the message came in on, so the payload's bytes stay on it.
+- **The frame size check.** Each transport checks its own frames, so the named transport's limit applies. The staging decision compares the payload with the staging threshold only, for every send.
+
+Two calls let a caller check an edge before it sends:
+
+- `Velo::route_capacity(instance, route)` returns the largest frame the transport says it carries to the peer, or `None` when the transport cannot say. A unary reply is one frame and is never staged, so this bounds the reply of a call over that route.
+- `Velo::probe_peer(instance, route, timeout)` runs the transport's health check for the peer.
+
+### Replies follow the request
+
+A reply goes back over the transport its request came in on: `Response`, `Ack`, and `Nack`, also the error replies of a failed or unknown handler. This holds for requests that name no transport too. Two nodes that added their transports in different orders therefore still keep each edge on one transport: the caller's primary carries the requests and the replies. Before velo 0.23.0, a reply went over the responder's own primary, so in that case requests and replies used different transports. The test `replies_follow_the_request_when_the_ends_disagree_on_the_primary` in `lib/velo/tests/transport_choice.rs` pins this.
+
+Each transport tags the frames it admits with its index, `TransportOrigin`, through the adapter that the runtime numbered for it with `TransportAdapter::with_origin`. The reply reads the tag and sends on the transport with that index. Two other designs were rejected. A `TransportKey` in each message costs a reference count per frame, and the reply would look the key up in a map. One set of inbound channels per transport would make the server loop wait on several receivers for every frame.
+
+A responder can have the caller registered without the request's transport. For example, it registered an address with that entry cut out, and no `_hello` has replaced it since. The reply then goes over the caller's primary, and `velo_transport_reply_reroutes_total{wanted,used}` counts it. A non-zero count on an edge kept on one transport means that its replies leave it. A dropped reply would leave the caller waiting with no word of why, so the reply is sent.
+
+Each node dials its own connection, so an edge that carries traffic both ways has two connections, one from each end. `velo_transport_active_connections` counts the connections a node dialed, not the ones it accepted.
+
+A node can hold one NATS transport. Two would both write the literal `nats` key into the node's address.
 
 `Velo::unregister_peer` undoes this. It removes the peer's routes, and then each transport drops the peer's address and closes its connections. See [Forget a peer](discovery.md#forget-a-peer). Dropping a connection's map entry does not close it: the writer task holds a sender of its own channel, so it would wait for frames forever. So TCP, UDS, QUIC, and gRPC give each connection its own cancel token, a child of the transport's token. UCX closes the endpoint on its progress thread, at the next point in the loop where closing one is safe. ZMQ closes the DEALER socket on its sender thread. NATS keeps no connection per peer.
 

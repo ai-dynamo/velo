@@ -1146,6 +1146,7 @@ pub struct VeloMetrics {
     transport_rejections_total: CounterVec,
     transport_send_backpressure_total: CounterVec,
     transport_unacknowledged_closes_total: CounterVec,
+    transport_reply_reroutes_total: CounterVec,
     transport_registered_peers: GaugeVec,
     transport_active_connections: GaugeVec,
     messenger_handler_requests_total: CounterVec,
@@ -1338,6 +1339,20 @@ impl VeloMetrics {
                      much of a stream the peer acknowledged.",
                 ),
                 &["transport"],
+            )?,
+        )?;
+        let transport_reply_reroutes_total = register_collector(
+            registry,
+            CounterVec::new(
+                Opts::new(
+                    "velo_transport_reply_reroutes_total",
+                    "Replies that could not go back over the transport their request came in on, \
+                     because this node has the caller registered without that transport, and \
+                     went over the caller's primary instead. `wanted` is the request's \
+                     transport, `used` the one the reply took. Non-zero on an edge pinned to \
+                     one transport means replies leave it.",
+                ),
+                &["wanted", "used"],
             )?,
         )?;
         let transport_registered_peers = register_collector(
@@ -2043,6 +2058,7 @@ impl VeloMetrics {
             transport_rejections_total,
             transport_send_backpressure_total,
             transport_unacknowledged_closes_total,
+            transport_reply_reroutes_total,
             transport_registered_peers,
             transport_active_connections,
             messenger_handler_requests_total,
@@ -2313,6 +2329,14 @@ impl VeloMetrics {
             records_sent,
             batcher_wakes,
         }
+    }
+
+    /// Record a reply that went over the caller's primary transport, not
+    /// over the transport its request came in on.
+    pub(crate) fn record_reply_reroute(&self, wanted: &str, used: &str) {
+        self.transport_reply_reroutes_total
+            .with_label_values(&[wanted, used])
+            .inc();
     }
 
     /// Record a messenger dispatch failure.

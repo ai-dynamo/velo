@@ -318,6 +318,10 @@ path = "tests/observability_scenarios.rs"
 required-features = ["test-helpers"]
 
 [[test]]
+name = "transport_choice"
+path = "tests/transport_choice.rs"
+
+[[test]]
 name = "transports_grpc"
 path = "tests/transports/grpc_integration.rs"
 required-features = ["grpc"]

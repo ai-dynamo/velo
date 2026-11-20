@@ -19,7 +19,8 @@ use crate::messenger::common::messages::{EncodeError, envelope_overhead};
 use crate::messenger::common::{ActiveMessage, responses::ResponseManager};
 
 use crate::observability::{ClientResolution, VeloMetrics};
-use crate::transports::{SendOutcome, TransportErrorHandler, VeloBackend};
+use crate::transports::choice::Route;
+use crate::transports::{OutboundFrame, SendOutcome, TransportErrorHandler, VeloBackend};
 use peer_registry::PeerRegistry;
 use velo_ext::InstanceId;
 
@@ -164,6 +165,7 @@ impl ActiveMessageClient {
         target: InstanceId,
         mut message: ActiveMessage,
         lane: u16,
+        route: Route,
         fetch_by: Option<tokio::time::Instant>,
     ) -> Result<SendOutcome> {
         // Transparent large payload staging: a payload over the threshold is
@@ -191,23 +193,29 @@ impl ActiveMessageClient {
                 bytes = header.len() + payload.len()
             );
             let _entered = span.enter();
-            self.backend.send_message_on_lane(
+            self.backend.send_routed(
                 target,
+                route,
                 lane,
-                header,
-                payload,
-                message_type,
+                OutboundFrame {
+                    header,
+                    payload,
+                    message_type,
+                },
                 self.error_handler.clone(),
             )
         }
 
         #[cfg(not(feature = "distributed-tracing"))]
-        self.backend.send_message_on_lane(
+        self.backend.send_routed(
             target,
+            route,
             lane,
-            header,
-            payload,
-            message_type,
+            OutboundFrame {
+                header,
+                payload,
+                message_type,
+            },
             self.error_handler.clone(),
         )
     }
@@ -241,13 +249,14 @@ impl ActiveMessageClient {
     pub(crate) fn effective_eager_payload(
         &self,
         target: InstanceId,
+        route: Route,
         handler_name: &str,
         headers: Option<&HashMap<String, String>>,
     ) -> usize {
         let mut injected = None;
         finalize_outbound_headers(&mut injected);
         eager_payload_budget(
-            self.backend.max_message_size(target),
+            self.backend.max_message_size(target, route),
             self.large_payload_stager
                 .get()
                 .map(|stager| stager.threshold()),
@@ -322,7 +331,10 @@ impl ActiveMessageClient {
     }
 
     /// Perform handshake with a peer to exchange handler information
-    async fn handshake_with_peer(&self, target: InstanceId) -> Result<()> {
+    ///
+    /// `route` is the route of the call that needs the handshake, so that a
+    /// call pinned to a transport sends its `_hello` over that transport too.
+    async fn handshake_with_peer(&self, target: InstanceId, route: Route) -> Result<()> {
         use crate::messenger::server::system_handlers::{HandlersResponse, HelloRequest};
 
         tracing::debug!(
@@ -356,7 +368,7 @@ impl ActiveMessageClient {
             payload: bytes::Bytes::from(payload),
         };
 
-        let send_outcome = self.send_message(target, message, 0, None)?;
+        let send_outcome = self.send_message(target, message, 0, route, None)?;
 
         // Share a single handshake_timeout budget across both the admission
         // wait (if the frame was queued) and the response receive. A failed
@@ -408,7 +420,12 @@ impl ActiveMessageClient {
     }
 
     /// Ensure a peer is ready for communication (performs handshake if needed)
-    pub(crate) async fn ensure_peer_ready(&self, target: InstanceId, handler: &str) -> Result<()> {
+    pub(crate) async fn ensure_peer_ready(
+        &self,
+        target: InstanceId,
+        handler: &str,
+        route: Route,
+    ) -> Result<()> {
         // 1. Check if peer is registered
         if !self.is_peer_registered(target) {
             anyhow::bail!(
@@ -424,14 +441,14 @@ impl ActiveMessageClient {
 
         // 3. Ensure we have handler list (perform handshake if needed)
         if !self.has_handler_info(target) {
-            self.handshake_with_peer(target).await?;
+            self.handshake_with_peer(target, route).await?;
         }
 
         // 4. Verify handler exists. If the peer already had cached handler
         // info but this specific handler is missing, refresh once in case the
         // remote instance registered it after our earlier handshake.
         if !self.peer_registry.handler_exists(target, handler) {
-            self.handshake_with_peer(target).await?;
+            self.handshake_with_peer(target, route).await?;
         }
 
         if !self.peer_registry.handler_exists(target, handler) {
@@ -449,7 +466,8 @@ impl ActiveMessageClient {
     /// Get the list of handlers for a peer (may trigger handshake)
     pub(crate) async fn get_peer_handlers(&self, instance_id: InstanceId) -> Result<Vec<String>> {
         if !self.has_handler_info(instance_id) {
-            self.handshake_with_peer(instance_id).await?;
+            self.handshake_with_peer(instance_id, Route::Primary)
+                .await?;
         }
 
         self.peer_registry
@@ -459,7 +477,7 @@ impl ActiveMessageClient {
 
     /// Refresh the handler list for a peer
     pub(crate) async fn refresh_handler_list(&self, instance_id: InstanceId) -> Result<()> {
-        self.handshake_with_peer(instance_id).await
+        self.handshake_with_peer(instance_id, Route::Primary).await
     }
 
     /// Resolve a peer via discovery and perform registration

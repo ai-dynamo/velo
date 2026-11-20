@@ -482,18 +482,18 @@ impl Messenger {
     ///   nothing here rejects the send. Whether the frame arrives is between
     ///   the caller and whatever limits that transport enforces further down.
     ///
-    /// The transport term is the peer's *primary* transport — the one
-    /// [`Messenger`] sends through. It says nothing about an alternative
-    /// transport reached by some other route, which may have a different
-    /// limit.
+    /// The transport term is the transport `route` sends on: the peer's
+    /// primary for [`Route::Primary`](crate::transports::choice::Route), and
+    /// the named transport for a named route.
     pub(crate) fn effective_eager_payload(
         &self,
         target: InstanceId,
+        route: crate::transports::choice::Route,
         handler_name: &str,
         headers: Option<&std::collections::HashMap<String, String>>,
     ) -> usize {
         self.client
-            .effective_eager_payload(target, handler_name, headers)
+            .effective_eager_payload(target, route, handler_name, headers)
     }
 
     /// Register a peer with every transport and the client's peer registry.

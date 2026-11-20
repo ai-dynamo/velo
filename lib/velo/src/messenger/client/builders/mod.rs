@@ -18,13 +18,16 @@ use crate::messenger::common::responses::{ResponseAwaiter, ResponseId, SlotBackp
 use crate::messenger::common::{ActiveMessage, MessageMetadata};
 use crate::observability::ClientResolution;
 use crate::transports::SendOutcome;
-use velo_ext::{InstanceId, WorkerId};
+use crate::transports::choice::{Route, TransportChoiceError, TransportRoute};
+use velo_ext::{InstanceId, TransportKey, WorkerId};
 
 mod results;
 #[cfg(test)]
 mod tests;
 
-use results::{AdmissionReport, Deadline, Dispatched, SendStage, drive_send_outcome};
+use results::{
+    AdmissionReport, Deadline, Dispatched, ReportError, SendStage, choice_error, drive_send_outcome,
+};
 pub use results::{
     Admitted, FireResult, RequestTimeout, SyncResult, TypedUnaryResult, UnaryResult,
 };
@@ -74,6 +77,35 @@ impl AmSendBuilder {
 
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
         self.inner = self.inner.headers(headers);
+        self
+    }
+
+    /// Send over this node's transport `key`, or fail.
+    ///
+    /// The send never falls back to another transport. It fails with
+    /// [`TransportChoiceError::NotInstalled`] when this node has no such
+    /// transport, and with [`TransportChoiceError::NotServedByPeer`] when the
+    /// peer is not registered on it; neither takes a response slot. The
+    /// reply comes back over the same transport. To send many times over one
+    /// transport, resolve it once with
+    /// [`Velo::transport_route`](crate::Velo::transport_route) and use
+    /// [`route`](Self::route).
+    pub fn transport(mut self, key: impl Into<TransportKey>) -> Self {
+        self.inner = self.inner.transport(key.into());
+        self
+    }
+
+    /// Send over the transport `route` names, or fail. Like
+    /// [`transport`](Self::transport), with the key already resolved.
+    pub fn route(mut self, route: TransportRoute) -> Self {
+        self.inner = self.inner.route(route);
+        self
+    }
+
+    /// Send on a route the runtime already chose: the rendezvous fetch of a
+    /// staged payload goes back over the transport its message came in on.
+    pub(crate) fn via(mut self, route: Route) -> Self {
+        self.inner = self.inner.via(route);
         self
     }
 
@@ -151,6 +183,28 @@ impl AmSyncBuilder {
         self
     }
 
+    /// Send over this node's transport `key`, or fail.
+    ///
+    /// The send never falls back to another transport. It fails with
+    /// [`TransportChoiceError::NotInstalled`] when this node has no such
+    /// transport, and with [`TransportChoiceError::NotServedByPeer`] when the
+    /// peer is not registered on it; neither takes a response slot. The
+    /// reply comes back over the same transport. To send many times over one
+    /// transport, resolve it once with
+    /// [`Velo::transport_route`](crate::Velo::transport_route) and use
+    /// [`route`](Self::route).
+    pub fn transport(mut self, key: impl Into<TransportKey>) -> Self {
+        self.inner = self.inner.transport(key.into());
+        self
+    }
+
+    /// Send over the transport `route` names, or fail. Like
+    /// [`transport`](Self::transport), with the key already resolved.
+    pub fn route(mut self, route: TransportRoute) -> Self {
+        self.inner = self.inner.route(route);
+        self
+    }
+
     /// Await a free response slot if the arena is at capacity (default:
     /// fail fast with `ResponseRegistrationError::Exhausted`).
     pub fn await_capacity(mut self) -> Self {
@@ -214,6 +268,35 @@ impl UnaryBuilder {
 
     pub fn headers(mut self, headers: HashMap<String, String>) -> Self {
         self.inner = self.inner.headers(headers);
+        self
+    }
+
+    /// Send over this node's transport `key`, or fail.
+    ///
+    /// The send never falls back to another transport. It fails with
+    /// [`TransportChoiceError::NotInstalled`] when this node has no such
+    /// transport, and with [`TransportChoiceError::NotServedByPeer`] when the
+    /// peer is not registered on it; neither takes a response slot. The
+    /// reply comes back over the same transport. To send many times over one
+    /// transport, resolve it once with
+    /// [`Velo::transport_route`](crate::Velo::transport_route) and use
+    /// [`route`](Self::route).
+    pub fn transport(mut self, key: impl Into<TransportKey>) -> Self {
+        self.inner = self.inner.transport(key.into());
+        self
+    }
+
+    /// Send over the transport `route` names, or fail. Like
+    /// [`transport`](Self::transport), with the key already resolved.
+    pub fn route(mut self, route: TransportRoute) -> Self {
+        self.inner = self.inner.route(route);
+        self
+    }
+
+    /// Send on a route the runtime already chose: the rendezvous fetch of a
+    /// staged payload goes back over the transport its message came in on.
+    pub(crate) fn via(mut self, route: Route) -> Self {
+        self.inner = self.inner.via(route);
         self
     }
 
@@ -311,6 +394,35 @@ where
         self
     }
 
+    /// Send over this node's transport `key`, or fail.
+    ///
+    /// The send never falls back to another transport. It fails with
+    /// [`TransportChoiceError::NotInstalled`] when this node has no such
+    /// transport, and with [`TransportChoiceError::NotServedByPeer`] when the
+    /// peer is not registered on it; neither takes a response slot. The
+    /// reply comes back over the same transport. To send many times over one
+    /// transport, resolve it once with
+    /// [`Velo::transport_route`](crate::Velo::transport_route) and use
+    /// [`route`](Self::route).
+    pub fn transport(mut self, key: impl Into<TransportKey>) -> Self {
+        self.inner = self.inner.transport(key.into());
+        self
+    }
+
+    /// Send over the transport `route` names, or fail. Like
+    /// [`transport`](Self::transport), with the key already resolved.
+    pub fn route(mut self, route: TransportRoute) -> Self {
+        self.inner = self.inner.route(route);
+        self
+    }
+
+    /// Send on a route the runtime already chose: the rendezvous fetch of a
+    /// staged payload goes back over the transport its message came in on.
+    pub(crate) fn via(mut self, route: Route) -> Self {
+        self.inner = self.inner.via(route);
+        self
+    }
+
     /// Await a free response slot if the arena is at capacity (default:
     /// fail fast with `ResponseRegistrationError::Exhausted`).
     pub fn await_capacity(mut self) -> Self {
@@ -390,6 +502,21 @@ pub struct MessageBuilder {
     // How long a sync or unary call may wait for its answer. `None` waits
     // until the remote answers or the send fails. Fire sends ignore it.
     timeout: Option<Duration>,
+    // The transport the caller named, if any. Resolved in `make_stage`.
+    choice: Choice,
+}
+
+/// The transport a builder was told to use, resolved when it was told.
+///
+/// Small on purpose: every send moves its builder, and a send that names
+/// nothing pays for the size of this field.
+enum Choice {
+    /// None named: the peer's primary.
+    Primary,
+    /// A named transport of this node.
+    Resolved(Route),
+    /// A choice this node cannot meet. The send fails with it.
+    Refused(Box<TransportChoiceError>),
 }
 
 /// Translate a synchronous fast-path `send_message` result into a
@@ -403,6 +530,11 @@ fn stage_from_send(send_result: Result<SendOutcome>, awaiter: ResponseAwaiter) -
     match send_result {
         Ok(outcome) => Dispatched::issued(outcome, awaiter),
         Err(e) => {
+            // A peer re-registered without the named transport between the
+            // check in `make_stage` and the send.
+            if let Some(choice) = choice_error(&e) {
+                return Dispatched::refused(choice);
+            }
             tracing::error!(
                 target: "crate::messenger::client",
                 error = %e,
@@ -451,6 +583,7 @@ struct SlowPath {
     response_id: ResponseId,
     message_type: MsgType,
     lane: u16,
+    route: Route,
     fetch_by: Option<tokio::time::Instant>,
 }
 
@@ -485,14 +618,27 @@ impl SlowPath {
 
     /// Stage 2 — exchange handler lists if we have not already.
     async fn handshake(&self, target: InstanceId) -> AdmissionReport {
-        if let Err(e) = self.client.ensure_peer_ready(target, &self.handler).await {
+        // A worker found by discovery is checked here, now that it is known.
+        if let Err(choice) = self.client.backend.check_served(target, self.route) {
+            let _ = self.fail(choice.to_string());
+            return Err(ReportError::Choice(choice));
+        }
+        if let Err(e) = self
+            .client
+            .ensure_peer_ready(target, &self.handler, self.route)
+            .await
+        {
             self.record(ClientResolution::HandshakeError);
             tracing::error!(
                 target: "crate::messenger::client",
                 error = %e,
                 "Failed to prepare peer in slow path"
             );
-            return Err(self.fail(format!("Handshake failed: {}", e)));
+            if let Some(choice) = choice_error(&e) {
+                let _ = self.fail(choice.to_string());
+                return Err(ReportError::Choice(choice));
+            }
+            return Err(self.fail(format!("Handshake failed: {}", e)).into());
         }
         Ok(())
     }
@@ -512,7 +658,7 @@ impl SlowPath {
         drive_send_outcome(
             &self.client,
             self.client
-                .send_message(target, message, self.lane, self.fetch_by),
+                .send_message(target, message, self.lane, self.route, self.fetch_by),
             self.response_id,
             "slow-path",
         )
@@ -557,6 +703,7 @@ impl MessageBuilder {
             await_capacity: false,
             lane: 0,
             timeout: None,
+            choice: Choice::Primary,
         }
     }
 
@@ -590,6 +737,36 @@ impl MessageBuilder {
     /// Send on transport lane `lane`. See [`AmSendBuilder::lane`].
     pub(crate) fn lane(mut self, lane: u16) -> Self {
         self.lane = lane;
+        self
+    }
+
+    /// Send over this node's transport `key`. See [`UnaryBuilder::transport`].
+    pub fn transport(mut self, key: TransportKey) -> Self {
+        let backend = &self.client.backend;
+        let choice = backend
+            .transport_route(&key)
+            .and_then(|route| backend.named_route(route));
+        self.choice = Self::choose(choice);
+        self
+    }
+
+    /// Send over `route`'s transport. See [`UnaryBuilder::route`].
+    pub fn route(mut self, route: TransportRoute) -> Self {
+        let choice = self.client.backend.named_route(route);
+        self.choice = Self::choose(choice);
+        self
+    }
+
+    fn choose(choice: Result<Route, TransportChoiceError>) -> Choice {
+        match choice {
+            Ok(route) => Choice::Resolved(route),
+            Err(refused) => Choice::Refused(Box::new(refused)),
+        }
+    }
+
+    /// Send on a route the runtime already chose. See [`AmSendBuilder::via`].
+    pub(crate) fn via(mut self, route: Route) -> Self {
+        self.choice = Choice::Resolved(route);
         self
     }
 
@@ -685,6 +862,7 @@ impl MessageBuilder {
         kind: SlowPathKind,
         response_id: ResponseId,
         message_type: MsgType,
+        route: Route,
         fetch_by: Option<tokio::time::Instant>,
     ) -> oneshot::Receiver<AdmissionReport> {
         let (report_tx, report_rx) = oneshot::channel();
@@ -697,6 +875,7 @@ impl MessageBuilder {
             response_id,
             message_type,
             lane: self.lane,
+            route,
             fetch_by,
         };
 
@@ -721,6 +900,7 @@ impl MessageBuilder {
         target_result: Result<InstanceId, ResolveError>,
         awaiter: ResponseAwaiter,
         message_type: MsgType,
+        route: Route,
         fetch_by: Option<tokio::time::Instant>,
     ) -> Dispatched {
         let worker_id = self.target_worker;
@@ -738,7 +918,7 @@ impl MessageBuilder {
                 };
                 stage_from_send(
                     self.client
-                        .send_message(target, message, self.lane, fetch_by),
+                        .send_message(target, message, self.lane, route, fetch_by),
                     awaiter,
                 )
             }
@@ -747,6 +927,7 @@ impl MessageBuilder {
                     SlowPathKind::Handshake(target),
                     response_id,
                     message_type,
+                    route,
                     fetch_by,
                 ),
                 awaiter,
@@ -764,6 +945,7 @@ impl MessageBuilder {
                         SlowPathKind::Discovery(worker_id),
                         response_id,
                         message_type,
+                        route,
                         fetch_by,
                     ),
                     awaiter,
@@ -794,7 +976,7 @@ impl MessageBuilder {
     /// `fetch_by` is the call's deadline, if it has one. A staged payload
     /// carries what is left of it to the receiver.
     fn make_stage(
-        self,
+        mut self,
         message_type: MsgType,
         fetch_by: Option<tokio::time::Instant>,
     ) -> SendStage {
@@ -802,15 +984,34 @@ impl MessageBuilder {
             Err(ResolveError::Other(e)) => return SendStage::failed(e),
             other => other,
         };
+        // A transport choice that cannot be met fails here, before a slot is
+        // taken: a caller that refuses edges up front must not drain the
+        // arena doing it.
+        let route = match std::mem::replace(&mut self.choice, Choice::Primary) {
+            // The default send: nothing to resolve or check.
+            Choice::Primary => Route::Primary,
+            Choice::Resolved(route) => route,
+            Choice::Refused(refused) => return SendStage::refused(*refused),
+        };
+        if route != Route::Primary
+            && let Ok(target) = &target_result
+            && let Err(choice) = self.client.backend.check_served(*target, route)
+        {
+            return SendStage::refused(choice);
+        }
 
         match self.acquire() {
-            Acquisition::Allocated(awaiter) => {
-                SendStage::Dispatched(self.dispatch(target_result, awaiter, message_type, fetch_by))
-            }
+            Acquisition::Allocated(awaiter) => SendStage::Dispatched(self.dispatch(
+                target_result,
+                awaiter,
+                message_type,
+                route,
+                fetch_by,
+            )),
             Acquisition::Deferred(backpressure) => {
                 let deferred = Box::pin(async move {
                     let awaiter = backpressure.await;
-                    self.dispatch(target_result, awaiter, message_type, fetch_by)
+                    self.dispatch(target_result, awaiter, message_type, route, fetch_by)
                 });
                 SendStage::Acquiring(deferred)
             }

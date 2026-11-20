@@ -69,6 +69,8 @@ pub mod zmq;
 #[cfg(feature = "quic")]
 pub mod quic;
 
+/// Choosing the transport for one send.
+pub(crate) mod choice;
 pub(crate) mod teardown;
 mod transport;
 
@@ -83,7 +85,9 @@ use parking_lot::Mutex;
 // Identity / address types from velo-ext are reachable as `velo::InstanceId`,
 // `velo::PeerInfo`, etc. and via the `velo_ext` crate root. Pulling them in
 // here too is just noise.
-use velo_ext::{InstanceId, PeerInfo, TransportKey, WorkerAddress, WorkerId};
+use velo_ext::{InstanceId, PeerInfo, TransportKey, TransportOrigin, WorkerAddress, WorkerId};
+
+use choice::{MAX_TRANSPORTS, PeerRoute, Route, TransportChoiceError, TransportRoute};
 
 // Internal builder for address construction
 use address::WorkerAddressBuilder;
@@ -132,8 +136,15 @@ pub(crate) struct VeloBackend {
     address: WorkerAddress,
     priorities: Mutex<Vec<TransportKey>>,
     transports: HashMap<TransportKey, Arc<dyn Transport>>,
+    /// The transports in the order they were added. A transport's index here
+    /// is its [`TransportOrigin`]: the number on the frames it admits, and
+    /// its bit in a [`PeerRoute`]. Never changes after `new`, so a send reads
+    /// it with no lock.
+    by_index: Box<[Arc<dyn Transport>]>,
+    /// Each transport's index in `by_index`, for a send that names a key.
+    index_of: HashMap<TransportKey, TransportOrigin>,
     transport_metrics: HashMap<TransportKey, Arc<crate::observability::TransportMetricsHandle>>,
-    primary_transport: DashMap<InstanceId, Arc<dyn Transport>>,
+    primary_transport: DashMap<InstanceId, PeerRoute>,
     alternative_transports: DashMap<InstanceId, Vec<TransportKey>>,
     workers: DashMap<WorkerId, InstanceId>,
     shutdown_state: ShutdownState,
@@ -259,8 +270,13 @@ impl VeloBackend {
 
         let runtime = tokio::runtime::Handle::current();
 
+        anyhow::ensure!(
+            backend_transports.len() <= MAX_TRANSPORTS,
+            "A node can have at most {MAX_TRANSPORTS} transports, not {}",
+            backend_transports.len()
+        );
         let startup = async {
-            for transport in backend_transports {
+            for (index, transport) in backend_transports.into_iter().enumerate() {
                 let key = transport.key();
                 anyhow::ensure!(
                     !started.transports.contains_key(&key),
@@ -273,8 +289,15 @@ impl VeloBackend {
                     );
                     transport_metrics.insert(key.clone(), handle);
                 }
+                // Numbered, so a reply can go back over the transport its
+                // request came in on. The bound above keeps the cast exact.
+                let origin = TransportOrigin::new(index as u16);
                 transport
-                    .start(instance_id, adapter.clone(), runtime.clone())
+                    .start(
+                        instance_id,
+                        adapter.clone().with_origin(origin),
+                        runtime.clone(),
+                    )
                     .await?;
                 started
                     .transports
@@ -299,11 +322,24 @@ impl VeloBackend {
             }
         };
 
+        let transports = started.finish();
+        // `priorities` still holds the add order here.
+        let by_index: Box<[Arc<dyn Transport>]> = priorities
+            .iter()
+            .map(|key| Arc::clone(&transports[key]))
+            .collect();
+        let index_of = priorities
+            .iter()
+            .enumerate()
+            .map(|(index, key)| (key.clone(), TransportOrigin::new(index as u16)))
+            .collect();
         Ok((
             Self {
                 instance_id,
                 address,
-                transports: started.finish(),
+                transports,
+                by_index,
+                index_of,
                 transport_metrics,
                 priorities: Mutex::new(priorities),
                 primary_transport: DashMap::new(),
@@ -428,7 +464,7 @@ impl VeloBackend {
     pub fn primary_transport_key(&self, target: InstanceId) -> Option<TransportKey> {
         self.primary_transport
             .get(&target)
-            .map(|entry| entry.value().key())
+            .map(|entry| entry.value().primary.key())
     }
 
     /// Probe the selected transport without changing its priority or fallback.
@@ -440,13 +476,41 @@ impl VeloBackend {
         let transport = self
             .primary_transport
             .get(&target)
-            .map(|entry| entry.value().clone())
+            .map(|entry| entry.value().primary.clone())
             .ok_or(transport::HealthCheckError::PeerNotRegistered)?;
         transport.check_health(target, timeout).await
     }
 
-    /// Largest `header + payload` the peer's primary transport will carry to
-    /// `target` in one send, or `None` when that cannot be established.
+    /// Probe `target` over `route`'s transport, with no fallback to another.
+    pub(crate) async fn probe_peer(
+        &self,
+        target: InstanceId,
+        route: TransportRoute,
+        timeout: std::time::Duration,
+    ) -> Result<(), choice::PeerProbeError> {
+        let Route::Named(origin) = self.named_route(route)? else {
+            unreachable!("named_route returns a named route");
+        };
+        // The guard drops here: the probe can wait for `timeout`.
+        let transport = {
+            let peer = self
+                .primary_transport
+                .get(&target)
+                .ok_or(transport::HealthCheckError::PeerNotRegistered)?;
+            if !peer.serves(origin) {
+                return Err(TransportChoiceError::NotServedByPeer {
+                    peer: target,
+                    transport: self.key_of(origin),
+                }
+                .into());
+            }
+            Arc::clone(&self.by_index[origin_slot(origin)])
+        };
+        Ok(transport.check_health(target, timeout).await?)
+    }
+
+    /// Largest `header + payload` the transport `route` sends on will carry
+    /// to `target` in one send, or `None` when that cannot be established.
     ///
     /// `None` covers two cases that are the same answer to a caller: the
     /// transport does not know its own limit, and `target` was never
@@ -454,13 +518,22 @@ impl VeloBackend {
     /// capacity to plan against and the caller falls back to its own
     /// conservative budget.
     ///
-    /// Reported for the *primary* transport only, the one every send in the
-    /// library goes through. An alternative transport can have a different
-    /// limit.
-    pub(crate) fn max_message_size(&self, target: InstanceId) -> Option<usize> {
-        self.primary_transport
-            .get(&target)
-            .and_then(|transport| transport.value().max_message_size(target))
+    /// [`Route::Primary`] reads the peer's primary transport, and a named or
+    /// reply route the transport it names.
+    pub(crate) fn max_message_size(&self, target: InstanceId, route: Route) -> Option<usize> {
+        match route {
+            Route::Primary | Route::Reply(None) => self
+                .primary_transport
+                .get(&target)
+                .and_then(|peer| peer.value().primary.max_message_size(target)),
+            // The transport the send will use: no peer lookup, so the named
+            // path reads an index. A send to a peer not registered on it
+            // fails at the send, not here.
+            Route::Named(origin) | Route::Reply(Some(origin)) => self
+                .by_index
+                .get(origin_slot(origin))
+                .and_then(|transport| transport.max_message_size(target)),
+        }
     }
 
     /// Returns the ordered list of alternative [`TransportKey`]s for `target`,
@@ -503,7 +576,7 @@ impl VeloBackend {
             .primary_transport
             .get(&target)
             .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
-        Ok(transport.value().lanes(target))
+        Ok(transport.value().primary.lanes(target))
     }
 
     /// The most lanes any installed transport keeps, for a choice made before
@@ -539,11 +612,65 @@ impl VeloBackend {
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
     ) -> anyhow::Result<SendOutcome> {
-        let transport = self
+        self.send_routed(
+            target,
+            Route::Primary,
+            lane,
+            OutboundFrame {
+                header,
+                payload,
+                message_type,
+            },
+            on_error,
+        )
+    }
+
+    /// Send on the transport `route` picks. See
+    /// [`send_message_on_lane`](Self::send_message_on_lane) for the rest.
+    ///
+    /// A [`Route::Named`] transport the peer is not registered on fails with
+    /// [`TransportChoiceError::NotServedByPeer`]. A [`Route::Reply`]
+    /// transport the peer is not registered on falls back to the primary and
+    /// is counted, because a reply that could not be sent would leave its
+    /// caller waiting with no word of why.
+    pub(crate) fn send_routed(
+        &self,
+        target: InstanceId,
+        route: Route,
+        lane: u16,
+        frame: OutboundFrame,
+        on_error: Arc<dyn TransportErrorHandler>,
+    ) -> anyhow::Result<SendOutcome> {
+        let OutboundFrame {
+            header,
+            payload,
+            message_type,
+        } = frame;
+        let entry = self
             .primary_transport
             .get(&target)
             .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
-        let transport_key = transport.value().key();
+        let peer = entry.value();
+        let transport: &Arc<dyn Transport> = match route {
+            Route::Primary => &peer.primary,
+            Route::Named(origin) if peer.serves(origin) => &self.by_index[origin_slot(origin)],
+            Route::Named(origin) => {
+                return Err(TransportChoiceError::NotServedByPeer {
+                    peer: target,
+                    transport: self.key_of(origin),
+                }
+                .into());
+            }
+            Route::Reply(Some(origin)) if peer.serves(origin) => {
+                &self.by_index[origin_slot(origin)]
+            }
+            Route::Reply(Some(origin)) => {
+                self.note_reply_reroute(target, origin, &peer.primary);
+                &peer.primary
+            }
+            Route::Reply(None) => &peer.primary,
+        };
+        let transport_key = transport.key();
         // Only the span below needs this; `finalize_send_outcome` recomputes it
         // from the report's own frame handles.
         #[cfg(feature = "distributed-tracing")]
@@ -625,6 +752,144 @@ impl VeloBackend {
         self.send_message(instance_id, header, payload, message_type, on_error)
     }
 
+    /// Send a reply to a worker, over the transport its request came in on.
+    ///
+    /// `origin` is the request's [`InboundMessage::origin`]. When the worker
+    /// is not registered on that transport, the reply goes over its primary
+    /// and `velo_transport_reply_reroutes_total` counts it. `None` (a request
+    /// from an adapter nobody numbered) uses the primary.
+    pub(crate) fn send_reply_to_worker(
+        &self,
+        worker_id: WorkerId,
+        origin: Option<TransportOrigin>,
+        frame: OutboundFrame,
+        on_error: Arc<dyn TransportErrorHandler>,
+    ) -> anyhow::Result<SendOutcome> {
+        let instance_id = self.try_translate_worker_id(worker_id)?;
+        self.send_routed(instance_id, Route::Reply(origin), 0, frame, on_error)
+    }
+
+    /// The route for this node's transport `key`, to name on sends.
+    pub(crate) fn transport_route(
+        &self,
+        key: &TransportKey,
+    ) -> Result<TransportRoute, TransportChoiceError> {
+        self.index_of
+            .get(key)
+            .map(|origin| TransportRoute {
+                owner: self.instance_id,
+                origin: *origin,
+            })
+            .ok_or_else(|| TransportChoiceError::NotInstalled {
+                transport: key.clone(),
+            })
+    }
+
+    /// The send route for `route`, if this node made it.
+    pub(crate) fn named_route(&self, route: TransportRoute) -> Result<Route, TransportChoiceError> {
+        if route.owner != self.instance_id {
+            return Err(TransportChoiceError::ForeignRoute { owner: route.owner });
+        }
+        Ok(Route::Named(route.origin))
+    }
+
+    /// Fail now if `target` is registered but not on `route`'s transport, so
+    /// that the caller learns it before it takes a response slot. A peer that
+    /// is not registered passes: the send reports that as it does today.
+    pub(crate) fn check_served(
+        &self,
+        target: InstanceId,
+        route: Route,
+    ) -> Result<(), TransportChoiceError> {
+        let Route::Named(origin) = route else {
+            return Ok(());
+        };
+        match self.primary_transport.get(&target) {
+            Some(peer) if !peer.serves(origin) => Err(TransportChoiceError::NotServedByPeer {
+                peer: target,
+                transport: self.key_of(origin),
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// The largest frame `route`'s transport reports it carries to `target`:
+    /// [`Transport::max_message_size`]. `Ok(None)` when the transport cannot
+    /// say.
+    pub(crate) fn route_capacity(
+        &self,
+        target: InstanceId,
+        route: TransportRoute,
+    ) -> Result<Option<usize>, TransportChoiceError> {
+        let Route::Named(origin) = self.named_route(route)? else {
+            unreachable!("named_route returns a named route");
+        };
+        let transport = {
+            let peer = self
+                .primary_transport
+                .get(&target)
+                .ok_or(TransportChoiceError::PeerNotRegistered { peer: target })?;
+            if !peer.serves(origin) {
+                return Err(TransportChoiceError::NotServedByPeer {
+                    peer: target,
+                    transport: self.key_of(origin),
+                });
+            }
+            Arc::clone(&self.by_index[origin_slot(origin)])
+        };
+        Ok(transport.max_message_size(target))
+    }
+
+    /// The transports `target` is registered on, primary first and then in
+    /// this node's priority order, or `None` when it is not registered.
+    pub(crate) fn peer_transports(&self, target: InstanceId) -> Option<Vec<TransportKey>> {
+        let served = self.primary_transport.get(&target)?.served;
+        Some(
+            self.priorities
+                .lock()
+                .iter()
+                .filter(|key| {
+                    self.index_of
+                        .get(*key)
+                        .is_some_and(|origin| choice::serves(served, *origin))
+                })
+                .cloned()
+                .collect(),
+        )
+    }
+
+    /// This node's transports, in its priority order.
+    pub(crate) fn transport_keys(&self) -> Vec<TransportKey> {
+        self.priorities.lock().clone()
+    }
+
+    /// The key of the transport with this origin.
+    fn key_of(&self, origin: TransportOrigin) -> TransportKey {
+        self.by_index[origin_slot(origin)].key()
+    }
+
+    /// Count and log a reply that could not go back over its request's
+    /// transport.
+    #[cold]
+    fn note_reply_reroute(
+        &self,
+        target: InstanceId,
+        wanted: TransportOrigin,
+        used: &Arc<dyn Transport>,
+    ) {
+        let wanted = self.key_of(wanted);
+        let used = used.key();
+        tracing::debug!(
+            peer = %target,
+            wanted = %wanted,
+            used = %used,
+            "Reply sent over the primary: the peer is not registered on the request's transport"
+        );
+        if let Some(metrics) = self.observability.as_ref() {
+            metrics.record_reply_reroute(wanted.as_str(), used.as_str());
+        }
+    }
+
     /// Register a remote peer with all compatible transports.
     ///
     /// The highest-priority compatible transport becomes the peer's *primary*.
@@ -664,14 +929,18 @@ impl VeloBackend {
         tracing::debug!(peer = %instance_id, transport = %primary_transport_key, "Registered peer");
 
         let primary_transport = self.transports.get(&primary_transport_key).unwrap();
+        let served = compatible_transports
+            .iter()
+            .filter_map(|key| self.index_of.get(key))
+            .fold(0u32, |bits, origin| bits | (1 << origin.index()));
 
         // The route's entry orders this against an unregister of the same
         // peer, so the observer's table ends as the route does. No lock of
         // the backend's own: a send's error handler can register a peer.
-        let route = self
-            .primary_transport
-            .entry(instance_id)
-            .insert(primary_transport.clone());
+        let route = self.primary_transport.entry(instance_id).insert(PeerRoute {
+            primary: primary_transport.clone(),
+            served,
+        });
         self.peers.insert(instance_id, peer.clone());
         if let Some(observer) = self.peer_observer.get() {
             observer.registered(&peer);
@@ -893,6 +1162,19 @@ fn instrument_transport_error_handler(
 /// The frame handles are `Bytes` clones taken before the transport consumed
 /// them — two refcount bumps, so that an admission that fails can still hand
 /// the original frame to `on_error` the way a wire failure does.
+/// One frame to send: what [`VeloBackend::send_routed`] hands the transport.
+pub(crate) struct OutboundFrame {
+    pub(crate) header: Bytes,
+    pub(crate) payload: Bytes,
+    pub(crate) message_type: MessageType,
+}
+
+/// `origin`'s slot in `VeloBackend::by_index`.
+#[inline]
+fn origin_slot(origin: TransportOrigin) -> usize {
+    usize::from(origin.index())
+}
+
 struct SendReport {
     metrics: Option<Arc<crate::observability::TransportMetricsHandle>>,
     on_error: Arc<dyn TransportErrorHandler>,
