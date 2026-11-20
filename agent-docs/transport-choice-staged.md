@@ -21,6 +21,7 @@ Every frame of a staged transfer keeps to the call's route:
 1. **RDMA gate compares against a literal key.** With `ucx` for messaging and `ucx-rma` via `add_ucx_transport`, a call named `ucx` did a GET on `ucx-rma`, and a call named `ucx-rma` skipped RMA. Compare the named transport with the transport instance whose endpoint the RDMA registry owns, not with the backend kind `"ucx"`. Test: "Test RDMA with two named UCX transports".
 2. **An active get reselects its route per frame.** `Route::Primary` picks the current primary for each frame, so a registration change after the acquire moved the pulls to TCP. Fix the transfer's route at its first frame and keep it for every later frame. Test: "Test a route change during an active get".
 3. (Fixed on the messenger branch.) A timed-out discovery held a response slot. Test: "Test timeout before discovery publishes its send".
+4. **Caller-set staging headers get around the named-send guard** (from the bounded confirmation of the messenger change). A named send with a few inline bytes and a caller-supplied `_rv` header (from `register_data` and `.headers()`) passed the `WouldStage` check, which reads only the inline length, and the receiver fetched the 300 KiB payload over its TCP primary. On a named send, treat caller `_rv*` headers as staging: refuse them, or strip them. Red test on this branch.
 
 ## The habit that caught the last class
 
