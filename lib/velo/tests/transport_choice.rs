@@ -488,3 +488,6 @@ async fn a_discovered_peer_missing_the_named_transport_takes_no_slot() {
     );
     assert_eq!(slots, 0, "the route refusal held a slot during discovery");
 }
+
+#[path = "transport_choice/capped_fetch.rs"]
+mod capped_fetch;
