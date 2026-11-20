@@ -623,3 +623,91 @@ async fn a_refused_route_is_reported_with_the_slot_arena_exhausted() {
     }
     assert_eq!(node.wide.sent_count() + node.narrow.sent_count(), 0);
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_timed_out_named_send_waiting_for_a_slot_stays_unsent() {
+    use futures::future::BoxFuture;
+    use tokio::sync::Notify;
+    use velo_ext::{PeerDiscovery, WorkerId};
+
+    struct Discovery {
+        peer: PeerInfo,
+        entered: Notify,
+        release: Notify,
+    }
+
+    impl PeerDiscovery for Discovery {
+        fn discover_by_worker_id(
+            &self,
+            worker: WorkerId,
+        ) -> BoxFuture<'_, anyhow::Result<PeerInfo>> {
+            Box::pin(async move {
+                assert_eq!(worker, self.peer.instance_id().worker_id());
+                self.entered.notify_one();
+                self.release.notified().await;
+                Ok(self.peer.clone())
+            })
+        }
+
+        fn discover_by_instance_id(
+            &self,
+            _: InstanceId,
+        ) -> BoxFuture<'_, anyhow::Result<PeerInfo>> {
+            unreachable!("the send resolves a worker ID");
+        }
+    }
+
+    let peer = InstanceId::new_v4();
+    let worker = peer.worker_id();
+    let discovery = Arc::new(Discovery {
+        peer: PeerInfo::new(peer, address(&["narrow"])),
+        entered: Notify::new(),
+        release: Notify::new(),
+    });
+    let narrow = Recording::new("narrow", NARROW);
+    let messenger = crate::messenger::MessengerParts::new()
+        .discovery(discovery.clone())
+        .add_transport(narrow.clone())
+        .build()
+        .await
+        .unwrap();
+    let client = messenger.client();
+    let mut held = Vec::new();
+    while let Ok(awaiter) = client.register_outcome() {
+        held.push(awaiter);
+    }
+    assert!(!held.is_empty());
+
+    let deadline = Duration::from_secs(10);
+    let mut call = messenger
+        .unary("sized")
+        .unwrap()
+        .transport("narrow")
+        .worker(worker)
+        .await_capacity()
+        .timeout(deadline)
+        .send();
+    discovery.entered.notified().await;
+    discovery.release.notify_one();
+    reaches(
+        || usize::from(messenger.backend().try_translate_worker_id(worker).is_ok()),
+        1,
+    )
+    .await;
+    let error = (&mut call).await.unwrap_err();
+    assert!(error.is::<crate::RequestTimeout>());
+    assert_eq!(call.admission_state(), velo_ext::AdmissionState::Failed);
+    assert_eq!(narrow.sent_count(), 0);
+
+    held.clear();
+    let sent = tokio::time::timeout(Duration::from_millis(100), async {
+        while narrow.sent_count() == 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await;
+    assert!(
+        sent.is_err(),
+        "the timed-out call sent a frame after a slot freed"
+    );
+}
