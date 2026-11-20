@@ -137,3 +137,38 @@ async fn staged_chunks_fit_the_named_transport() {
     };
     assert_eq!(&reply[..], &len.to_le_bytes());
 }
+
+#[tokio::test]
+async fn an_unnamed_get_sizes_chunks_for_the_consumers_primary() {
+    let dir = tempfile::tempdir().unwrap();
+    let consumer = node(&dir, &[Kind::Uds, Kind::Tcp]).await;
+    let narrow = 128 * 1024;
+    let cap = Arc::new(CappedUds {
+        inner: transport(Kind::Uds, &dir),
+        capacity: AtomicUsize::new(narrow),
+        rejected_bytes: AtomicUsize::new(0),
+        rejected: Notify::new(),
+    });
+    let owner = Velo::builder()
+        .mux_only()
+        .add_transport(transport(Kind::Tcp, &dir))
+        .add_transport(cap.clone())
+        .build()
+        .await
+        .unwrap();
+    owner.register_peer(consumer.velo.peer_info()).unwrap();
+    consumer.velo.register_peer(owner.peer_info()).unwrap();
+
+    let data = Bytes::from(vec![1; 300 * 1024]);
+    let handle = owner.register_data(data.clone());
+    let (fetched, _) = tokio::select! {
+        fetched = tokio::time::timeout(DEADLINE, consumer.velo.get(handle)) => {
+            fetched.unwrap().unwrap()
+        }
+        _ = cap.rejected.notified() => {
+            let size = cap.rejected_bytes.load(Ordering::Relaxed);
+            panic!("get tried to send a {size}-byte frame over a {narrow}-byte reply route");
+        }
+    };
+    assert!(fetched == data);
+}
