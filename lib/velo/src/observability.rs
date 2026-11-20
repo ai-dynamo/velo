@@ -2331,12 +2331,12 @@ impl VeloMetrics {
         }
     }
 
-    /// Record a reply that went over the caller's primary transport, not
-    /// over the transport its request came in on.
-    pub(crate) fn record_reply_reroute(&self, wanted: &str, used: &str) {
+    /// The reroute counter for one (wanted, used) pair, for the backend to
+    /// bind once and keep: a reply that went over this node's primary for the
+    /// caller, not over the transport its request came in on.
+    pub(crate) fn reply_reroute_counter(&self, wanted: &str, used: &str) -> prometheus::Counter {
         self.transport_reply_reroutes_total
             .with_label_values(&[wanted, used])
-            .inc();
     }
 
     /// Record a messenger dispatch failure.

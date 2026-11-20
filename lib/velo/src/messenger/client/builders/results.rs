@@ -341,47 +341,73 @@ pub(super) enum SendStage {
     Dispatched(Dispatched),
 }
 
-/// Orders a discovery task's send against its result giving up.
+/// Orders a discovery task's send against its result giving up, and holds
+/// the send once it is made.
 ///
-/// The task sends only while it holds the gate in [`GatePhase::Open`], and
-/// marks it sent. A result that times out closes the gate first, and only
-/// then reports the send failed. So no send starts after a reported failure,
-/// and a send that started is not reported as failed.
+/// The task sends only while the gate is open, under the gate's lock, and
+/// leaves the issued send in the gate. A result that times out takes the
+/// gate's lock too: before a send it closes the gate, so no send starts
+/// after the result reports a failure; after one it takes the issued send
+/// and releases its response slot at once, though the task has not yet
+/// handed anything back.
 #[derive(Default)]
 pub(super) struct SendGate(parking_lot::Mutex<GatePhase>);
 
-#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Default)]
 enum GatePhase {
     /// The send may still start.
     #[default]
     Open,
     /// The result gave up: the send must not start.
     Closed,
-    /// The send started.
-    Sent,
+    /// The send was issued. `None` once the result took it.
+    Sent(Option<Dispatched>),
+}
+
+/// What closing a gate found.
+enum Closed {
+    /// No send had started; none will.
+    BeforeSend,
+    /// The send was issued, and here it is.
+    AfterSend(Dispatched),
 }
 
 impl SendGate {
-    /// Run `send` unless the result gave up. `None` when it did.
-    pub(super) fn send_if_open<T>(&self, send: impl FnOnce() -> T) -> Option<T> {
+    /// Issue the send with `send` unless the result gave up, and keep it in
+    /// the gate. Whether it was issued.
+    pub(super) fn send_if_open(&self, send: impl FnOnce() -> Dispatched) -> bool {
         let mut phase = self.0.lock();
-        if *phase == GatePhase::Closed {
-            return None;
+        if matches!(*phase, GatePhase::Closed) {
+            return false;
         }
-        *phase = GatePhase::Sent;
         // Under the lock, so a give-up cannot fall between the check and the
         // send. The send is synchronous and takes no lock of this gate.
-        Some(send())
+        *phase = GatePhase::Sent(Some(send()));
+        true
     }
 
-    /// Give up, unless the send already started. Whether it did.
-    fn close(&self) -> bool {
-        let mut phase = self.0.lock();
-        if *phase == GatePhase::Sent {
-            return true;
+    /// The issued send, for the result's own future.
+    pub(super) fn take(&self) -> Option<Dispatched> {
+        match &mut *self.0.lock() {
+            GatePhase::Sent(dispatched) => dispatched.take(),
+            _ => None,
         }
-        *phase = GatePhase::Closed;
-        false
+    }
+
+    fn close(&self) -> Closed {
+        let mut phase = self.0.lock();
+        match &mut *phase {
+            GatePhase::Open | GatePhase::Closed => {
+                *phase = GatePhase::Closed;
+                Closed::BeforeSend
+            }
+            GatePhase::Sent(dispatched) => match dispatched.take() {
+                Some(dispatched) => Closed::AfterSend(dispatched),
+                // The result's future took it, so the stage is no longer
+                // `Discovering`; nothing to release here.
+                None => Closed::BeforeSend,
+            },
+        }
     }
 }
 
@@ -470,14 +496,18 @@ impl SendStage {
             SendStage::Acquiring(_) => {
                 *self = SendStage::failed("timed out before a response slot was free")
             }
-            // A send that already started stays as it is: it may reach the
-            // wire, so it is not reported as failed, and its slot goes back
-            // with the result. One that has not started never will.
-            SendStage::Discovering { gate, .. } => {
-                if !gate.close() {
+            // A send that was issued may reach the wire, so it is not
+            // reported as failed; its slot goes back now. One that has not
+            // started never will.
+            SendStage::Discovering { gate, .. } => match gate.close() {
+                Closed::AfterSend(mut dispatched) => {
+                    dispatched.awaiter = None;
+                    *self = SendStage::Dispatched(dispatched);
+                }
+                Closed::BeforeSend => {
                     *self = SendStage::failed("timed out before the send started")
                 }
-            }
+            },
             SendStage::Dispatched(dispatched) => dispatched.awaiter = None,
         }
     }

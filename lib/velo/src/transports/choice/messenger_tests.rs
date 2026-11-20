@@ -654,3 +654,68 @@ async fn a_timed_out_named_send_waiting_for_a_slot_stays_unsent() {
         "the timed-out call sent a frame after a slot freed"
     );
 }
+
+/// A named send whose payload the stager would take is refused before it
+/// takes a slot. Staging would move the payload's bytes in a fetch the call
+/// does not route, possibly by RDMA, so a call that keeps to one transport
+/// cannot stage. One byte under the threshold goes out on the named
+/// transport; the unnamed send of the same large payload stages as before.
+#[tokio::test]
+async fn a_named_send_that_would_stage_is_refused_before_a_slot() {
+    const THRESHOLD: usize = 1024;
+    let node = node(&["wide", "narrow"]).await;
+    let manager = Arc::new(crate::rendezvous::RendezvousManager::new(
+        velo_ext::WorkerId::from_u64(7),
+    ));
+    node.messenger.set_large_payload_support(
+        Arc::new(
+            crate::rendezvous::transparent::RendezvousStager::new(manager.clone())
+                .with_threshold(THRESHOLD),
+        ),
+        Arc::new(crate::rendezvous::transparent::RendezvousResolver::new(
+            manager,
+        )),
+    );
+    let send = |len: usize, named: bool| {
+        let mut builder = node
+            .messenger
+            .am_send_streaming("_sink")
+            .unwrap()
+            .raw_payload(Bytes::from(vec![0u8; len]))
+            .instance(node.peer);
+        if named {
+            builder = builder.transport("narrow");
+        }
+        builder.send()
+    };
+
+    let error = send(THRESHOLD + 1, true).await.unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<TransportChoiceError>(),
+        Some(&TransportChoiceError::WouldStage {
+            transport: "narrow".into(),
+            len: THRESHOLD + 1,
+            threshold: THRESHOLD,
+        })
+    );
+    assert_eq!(
+        node.messenger
+            .client()
+            .response_manager
+            .pending_outcome_count(),
+        0
+    );
+    assert_eq!(node.wide.sent_count() + node.narrow.sent_count(), 0);
+
+    send(THRESHOLD, true)
+        .await
+        .expect("at the threshold it is not staged");
+    assert_eq!(node.narrow.sent_count(), 1);
+
+    send(THRESHOLD + 1, false)
+        .await
+        .expect("an unnamed send stages");
+    let (_, header, payload) = node.wide.sent.lock().unwrap()[0].clone();
+    assert!(payload.is_empty(), "staging leaves no payload to carry");
+    assert!(header.len() < THRESHOLD);
+}

@@ -383,7 +383,7 @@ See [Shutdown and drain](shutdown.md) for the messenger half.
 |---|---|---|---|
 | `DEFAULT_THRESHOLD` | constant (the `Velo` builder uses it) | 256 KiB | Messenger payloads above this go through rendezvous. |
 | `staged_fetch_timeout` | `VeloBuilder` | `None` | The longest the receiver fetches a staged payload. A call's `.timeout` bounds it too. Stream items are exempt. |
-| `DEFAULT_CHUNK_SIZE` | constant | 512 KiB | Chunk size of the chunked path. |
+| `DEFAULT_CHUNK_SIZE` | constant | 512 KiB | Largest chunk of the chunked path. The owner makes the chunks smaller when the transport that carries the `_rv_pull` replies, the one the acquire came in on, reports less: its capacity less the reply header. |
 | `staged_payload_max` | `VeloBuilder` | `None` | The largest payload this node takes from a peer by rendezvous. Checked before anything of its size is allocated. |
 | `rdma_min_bytes` | `RdmaRendezvousConfig` | 64 KiB | Pinned slots below this answer chunked. |
 | `enabled` | `RdmaRendezvousConfig` | `true` | The kill switch. |

@@ -152,6 +152,10 @@ pub(crate) struct VeloBackend {
     teardown_outcome: teardown::Outcome,
     runtime: tokio::runtime::Handle,
     observability: Option<Arc<VeloMetrics>>,
+    /// `velo_transport_reply_reroutes_total`, one child per (wanted, used)
+    /// pair of transport indices, bound on its first reroute. Empty without
+    /// metrics.
+    reroutes: Box<[OnceLock<prometheus::Counter>]>,
     /// Each registered peer's `PeerInfo`, so that an observer installed
     /// late hears of it. Written under the peer's `primary_transport` entry.
     peers: DashMap<InstanceId, PeerInfo>,
@@ -333,6 +337,12 @@ impl VeloBackend {
             .enumerate()
             .map(|(index, key)| (key.clone(), TransportOrigin::new(index as u16)))
             .collect();
+        let reroutes = match observability {
+            Some(_) => (0..by_index.len() * by_index.len())
+                .map(|_| OnceLock::new())
+                .collect(),
+            None => Box::default(),
+        };
         Ok((
             Self {
                 instance_id,
@@ -350,6 +360,7 @@ impl VeloBackend {
                 teardown_outcome: Default::default(),
                 runtime,
                 observability,
+                reroutes,
                 peers: DashMap::new(),
                 peer_observer: OnceLock::new(),
                 advertised: OnceLock::new(),
@@ -669,7 +680,7 @@ impl VeloBackend {
                 &self.by_index[origin_slot(origin)]
             }
             Route::Reply(Some(origin)) => {
-                self.note_reply_reroute(target, origin, &peer.primary);
+                self.note_reply_reroute(target, origin, peer.primary_origin);
                 &peer.primary
             }
             Route::Reply(None) => &peer.primary,
@@ -846,6 +857,31 @@ impl VeloBackend {
         Ok(transport.max_message_size(target))
     }
 
+    /// The transport a reply to `worker` takes, given the transport its
+    /// request came in on, and that transport's capacity to the worker. The
+    /// choice [`Route::Reply`] makes: the request's transport when the worker
+    /// is registered on it, the primary otherwise.
+    pub(crate) fn reply_capacity(
+        &self,
+        worker: WorkerId,
+        origin: Option<TransportOrigin>,
+    ) -> anyhow::Result<(TransportKey, Option<usize>)> {
+        let target = self.try_translate_worker_id(worker)?;
+        let transport = {
+            let peer = self
+                .primary_transport
+                .get(&target)
+                .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
+            match origin {
+                Some(origin) if peer.serves(origin) => {
+                    Arc::clone(&self.by_index[origin_slot(origin)])
+                }
+                _ => Arc::clone(&peer.primary),
+            }
+        };
+        Ok((transport.key(), transport.max_message_size(target)))
+    }
+
     /// The transports `target` is registered on, primary first and then in
     /// this node's priority order, or `None` when it is not registered.
     pub(crate) fn peer_transports(&self, target: InstanceId) -> Option<Vec<TransportKey>> {
@@ -870,6 +906,10 @@ impl VeloBackend {
     }
 
     /// The key of the transport with this origin.
+    pub(crate) fn transport_key(&self, origin: TransportOrigin) -> TransportKey {
+        self.key_of(origin)
+    }
+
     fn key_of(&self, origin: TransportOrigin) -> TransportKey {
         self.by_index[origin_slot(origin)].key()
     }
@@ -881,18 +921,26 @@ impl VeloBackend {
         &self,
         target: InstanceId,
         wanted: TransportOrigin,
-        used: &Arc<dyn Transport>,
+        used: TransportOrigin,
     ) {
-        let wanted = self.key_of(wanted);
-        let used = used.key();
         tracing::debug!(
             peer = %target,
-            wanted = %wanted,
-            used = %used,
+            wanted = %self.key_of(wanted),
+            used = %self.key_of(used),
             "Reply sent over the primary: the peer is not registered on the request's transport"
         );
-        if let Some(metrics) = self.observability.as_ref() {
-            metrics.record_reply_reroute(wanted.as_str(), used.as_str());
+        let cell = origin_slot(wanted) * self.by_index.len() + origin_slot(used);
+        if let (Some(metrics), Some(counter)) =
+            (self.observability.as_ref(), self.reroutes.get(cell))
+        {
+            counter
+                .get_or_init(|| {
+                    metrics.reply_reroute_counter(
+                        self.key_of(wanted).as_str(),
+                        self.key_of(used).as_str(),
+                    )
+                })
+                .inc();
         }
     }
 
@@ -945,6 +993,7 @@ impl VeloBackend {
         // the backend's own: a send's error handler can register a peer.
         let route = self.primary_transport.entry(instance_id).insert(PeerRoute {
             primary: primary_transport.clone(),
+            primary_origin: self.index_of[&primary_transport_key],
             served,
         });
         self.peers.insert(instance_id, peer.clone());

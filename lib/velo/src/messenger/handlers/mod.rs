@@ -754,15 +754,19 @@ struct TypedUnaryExecutorAdapter<E, I, O> {
     executor: Arc<E>,
     name: Arc<str>,
     metrics: OnceLock<Option<crate::observability::HandlerMetricsHandle>>,
+    /// The handler reads its request's arrival transport
+    /// ([`request_origin`](crate::transports::choice::request_origin)).
+    reads_origin: bool,
     _phantom: PhantomData<fn(I) -> O>,
 }
 
 impl<E, I, O> TypedUnaryExecutorAdapter<E, I, O> {
-    fn new(executor: E, name: String) -> Self {
+    fn new(executor: E, name: String, reads_origin: bool) -> Self {
         Self {
             executor: Arc::new(executor),
             name: Arc::from(name),
             metrics: OnceLock::new(),
+            reads_origin,
             _phantom: PhantomData,
         }
     }
@@ -785,6 +789,8 @@ where
         let backend = ctx.system.backend().clone();
         let response_id = ctx.message_id;
         let origin = ctx.origin;
+        let request_origin = ctx.origin;
+        let reads_origin = self.reads_origin;
         let response_type = ctx.response_type;
         let executor = self.executor.clone();
         let handler_name = self.name.clone();
@@ -870,7 +876,16 @@ where
                 msg: system,
             };
 
-            let result = executor.execute(typed_ctx).await;
+            // Made inside the scope: a sync executor runs the handler when it
+            // makes the future.
+            let result = if reads_origin {
+                crate::transports::choice::with_request_origin(request_origin, async move {
+                    executor.execute(typed_ctx).await
+                })
+                .await
+            } else {
+                executor.execute(typed_ctx).await
+            };
             let mut outcome = HandlerOutcome::Success;
             let mut response_bytes = 0usize;
 
@@ -1292,6 +1307,7 @@ pub struct TypedUnaryHandlerBuilder<E, I, O> {
     executor: E,
     name: String,
     ordered: Option<OrderedConfig>,
+    reads_origin: bool,
     _phantom: PhantomData<fn(I) -> O>,
 }
 
@@ -1306,12 +1322,20 @@ where
             executor,
             name,
             ordered: None,
+            reads_origin: false,
             _phantom: PhantomData,
         }
     }
 
+    /// Let the handler read the transport its request came in on, with
+    /// [`request_origin`](crate::transports::choice::request_origin).
+    pub(crate) fn reads_origin(mut self) -> Self {
+        self.reads_origin = true;
+        self
+    }
+
     pub fn build(self) -> Handler {
-        let adapter = TypedUnaryExecutorAdapter::new(self.executor, self.name);
+        let adapter = TypedUnaryExecutorAdapter::new(self.executor, self.name, self.reads_origin);
         let dispatcher = make_dispatcher(adapter, self.ordered);
         Handler { dispatcher }
     }

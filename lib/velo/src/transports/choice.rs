@@ -52,6 +52,21 @@ pub enum TransportChoiceError {
         /// The transport the send named.
         transport: TransportKey,
     },
+    /// The payload is over the staging threshold. A send that names its
+    /// transport is never staged: the staged payload would be fetched
+    /// apart from the call's route, maybe by RDMA.
+    #[error(
+        "a payload of {len} bytes is over the staging threshold of {threshold} bytes; \
+         a send named on transport {transport} is not staged"
+    )]
+    WouldStage {
+        /// The transport the send named.
+        transport: TransportKey,
+        /// The payload's length.
+        len: usize,
+        /// The staging threshold.
+        threshold: usize,
+    },
     /// The peer is not registered on this node.
     #[error("peer {peer} is not registered")]
     PeerNotRegistered {
@@ -91,11 +106,33 @@ pub(crate) enum Route {
     Reply(Option<TransportOrigin>),
 }
 
+tokio::task_local! {
+    /// The transport the request a handler is serving came in on. Set only
+    /// around a handler built to read it.
+    static REQUEST_ORIGIN: Option<TransportOrigin>;
+}
+
+/// Run `future` with `origin` readable through [`request_origin`].
+pub(crate) async fn with_request_origin<F: std::future::Future>(
+    origin: Option<TransportOrigin>,
+    future: F,
+) -> F::Output {
+    REQUEST_ORIGIN.scope(origin, future).await
+}
+
+/// The transport the request being served came in on, inside a handler
+/// built to read it. `None` elsewhere, and for an unnumbered adapter.
+pub(crate) fn request_origin() -> Option<TransportOrigin> {
+    REQUEST_ORIGIN.try_with(|origin| *origin).ok().flatten()
+}
+
 /// How a node reaches one registered peer.
 pub(crate) struct PeerRoute {
     /// The first transport, in this node's priority order, that accepted the
     /// peer. Every send that names no transport uses it.
     pub(crate) primary: Arc<dyn Transport>,
+    /// `primary`'s index.
+    pub(crate) primary_origin: TransportOrigin,
     /// One bit per transport index that accepted the peer.
     pub(crate) served: u32,
 }

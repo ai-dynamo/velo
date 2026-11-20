@@ -481,21 +481,13 @@ pub struct MessageBuilder {
     // How long a sync or unary call may wait for its answer. `None` waits
     // until the remote answers or the send fails. Fire sends ignore it.
     timeout: Option<Duration>,
-    // The transport the caller named, if any. Resolved in `make_stage`.
-    choice: Choice,
-}
-
-/// The transport a builder was told to use, resolved when it was told.
-///
-/// Small on purpose: every send moves its builder, and a send that names
-/// nothing pays for the size of this field.
-enum Choice {
-    /// None named: the peer's primary.
-    Primary,
-    /// A named transport of this node.
-    Resolved(Route),
-    /// A choice this node cannot meet. The send fails with it.
-    Refused(Box<TransportChoiceError>),
+    // The route the send takes, resolved when the caller named it.
+    // `Route::Primary` when it named nothing.
+    route: Route,
+    // A transport the caller named that this node cannot use. The send fails
+    // with it. Boxed and apart from `route`, so that a send that names
+    // nothing moves a null pointer and drops nothing.
+    refused: Option<Box<TransportChoiceError>>,
 }
 
 /// Translate a synchronous fast-path `send_message` result into a
@@ -540,8 +532,10 @@ fn build_metadata(
 
 /// What a discovery task hands back to its result.
 enum Discovered {
-    /// The send was issued, refused or failed.
+    /// The send was refused or failed.
     Done(Dispatched),
+    /// The send was issued and waits in the gate.
+    InGate,
     /// No slot was free: the result's own future waits for one, then sends.
     NeedsSlot(Box<MessageBuilder>, SlotBackpressure, InstanceId),
 }
@@ -690,7 +684,8 @@ impl MessageBuilder {
             await_capacity: false,
             lane: 0,
             timeout: None,
-            choice: Choice::Primary,
+            route: Route::Primary,
+            refused: None,
         }
     }
 
@@ -733,21 +728,24 @@ impl MessageBuilder {
         let choice = backend
             .transport_route(&key)
             .and_then(|route| backend.named_route(route));
-        self.choice = Self::choose(choice);
+        self.choose(choice);
         self
     }
 
     /// Send over `route`'s transport. See [`UnaryBuilder::route`].
     pub fn route(mut self, route: TransportRoute) -> Self {
         let choice = self.client.backend.named_route(route);
-        self.choice = Self::choose(choice);
+        self.choose(choice);
         self
     }
 
-    fn choose(choice: Result<Route, TransportChoiceError>) -> Choice {
+    fn choose(&mut self, choice: Result<Route, TransportChoiceError>) {
         match choice {
-            Ok(route) => Choice::Resolved(route),
-            Err(refused) => Choice::Refused(Box::new(refused)),
+            Ok(route) => {
+                self.route = route;
+                self.refused = None;
+            }
+            Err(refused) => self.refused = Some(Box::new(refused)),
         }
     }
 
@@ -968,13 +966,22 @@ impl MessageBuilder {
         // A transport choice that cannot be met fails here, before a slot is
         // taken: a caller that refuses edges up front must not drain the
         // arena doing it.
-        let route = match std::mem::replace(&mut self.choice, Choice::Primary) {
-            // The default send: nothing to resolve or check.
-            Choice::Primary => Route::Primary,
-            Choice::Resolved(route) => route,
-            Choice::Refused(refused) => return SendStage::refused(*refused),
-        };
-        if route != Route::Primary {
+        if let Some(refused) = self.refused.take() {
+            return SendStage::refused(*refused);
+        }
+        let route = self.route;
+        if let Route::Named(origin) = route {
+            // A named call keeps its payload on its route: staging would move
+            // the bytes in a fetch the call does not route, maybe by RDMA.
+            let len = self.payload.as_ref().map_or(0, Bytes::len);
+            if let Some(stager) = self.client.stager_for(len) {
+                return SendStage::refused(TransportChoiceError::WouldStage {
+                    transport: self.client.backend.transport_key(origin),
+                    len,
+                    threshold: stager.threshold(),
+                });
+            }
+
             match &target_result {
                 Ok(target) => {
                     if let Err(choice) = self.client.backend.check_served(*target, route) {
@@ -1044,23 +1051,28 @@ impl MessageBuilder {
                 return Discovered::Done(Dispatched::refused(choice));
             }
             match self.acquire() {
-                Acquisition::Allocated(awaiter) => match task_gate.send_if_open(|| {
-                    self.dispatch(Ok(target), awaiter, message_type, route, fetch_by)
-                }) {
-                    Some(dispatched) => Discovered::Done(dispatched),
-                    None => {
+                Acquisition::Allocated(awaiter) => {
+                    if task_gate.send_if_open(|| {
+                        self.dispatch(Ok(target), awaiter, message_type, route, fetch_by)
+                    }) {
+                        Discovered::InGate
+                    } else {
                         Discovered::Done(Dispatched::failed("timed out before the send started"))
                     }
-                },
+                }
                 Acquisition::Deferred(backpressure) => {
                     Discovered::NeedsSlot(Box::new(self), backpressure, target)
                 }
                 Acquisition::Exhausted(e) => Discovered::Done(Dispatched::failed(e)),
             }
         });
+        let future_gate = Arc::clone(&gate);
         let future = Box::pin(async move {
             match task.await {
                 Ok(Discovered::Done(dispatched)) => dispatched,
+                Ok(Discovered::InGate) => future_gate.take().unwrap_or_else(|| {
+                    Dispatched::failed("Send failed: the issued send was already taken")
+                }),
                 Ok(Discovered::NeedsSlot(builder, backpressure, target)) => {
                     let awaiter = backpressure.await;
                     builder.dispatch(Ok(target), awaiter, message_type, route, fetch_by)
