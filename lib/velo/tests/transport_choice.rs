@@ -409,3 +409,82 @@ async fn a_caller_can_refuse_an_edge_before_it_sends() {
     ));
     shutdown([&a, &b]).await;
 }
+
+#[cfg(feature = "test-helpers")]
+#[tokio::test]
+async fn a_discovered_peer_missing_the_named_transport_takes_no_slot() {
+    use futures::future::BoxFuture;
+    use tokio::sync::Notify;
+    use velo::ext::discovery::PeerDiscovery;
+    use velo::{InstanceId, PeerInfo, WorkerId};
+
+    struct Discovery {
+        peer: PeerInfo,
+        entered: Notify,
+        released: Notify,
+    }
+
+    impl PeerDiscovery for Discovery {
+        fn discover_by_worker_id(
+            &self,
+            worker: WorkerId,
+        ) -> BoxFuture<'_, anyhow::Result<PeerInfo>> {
+            Box::pin(async move {
+                assert_eq!(worker, self.peer.instance_id().worker_id());
+                self.entered.notify_one();
+                self.released.notified().await;
+                Ok(self.peer.clone())
+            })
+        }
+
+        fn discover_by_instance_id(
+            &self,
+            _: InstanceId,
+        ) -> BoxFuture<'_, anyhow::Result<PeerInfo>> {
+            unreachable!("the call resolves a worker ID");
+        }
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let peer = node(&dir, &[Kind::Tcp]).await;
+    let id = peer.velo.instance_id();
+    let discovery = Arc::new(Discovery {
+        peer: peer.velo.peer_info(),
+        entered: Notify::new(),
+        released: Notify::new(),
+    });
+    let sender = Velo::builder()
+        .mux_only()
+        .add_transport(transport(Kind::Tcp, &dir))
+        .add_transport(transport(Kind::Uds, &dir))
+        .discovery(discovery.clone())
+        .build()
+        .await
+        .unwrap();
+    let call = sender
+        .unary("echo_len")
+        .unwrap()
+        .transport("uds")
+        .worker(id.worker_id())
+        .send();
+    tokio::pin!(call);
+    tokio::select! {
+        _ = discovery.entered.notified() => {}
+        result = &mut call => panic!("call ended before discovery: {result:?}"),
+        _ = tokio::time::sleep(DEADLINE) => panic!("discovery did not start"),
+    }
+    let slots = sender.response_slots_in_use();
+    discovery.released.notify_one();
+    let error = tokio::time::timeout(DEADLINE, call)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<TransportChoiceError>(),
+        Some(&TransportChoiceError::NotServedByPeer {
+            peer: id,
+            transport: TransportKey::from("uds"),
+        }),
+    );
+    assert_eq!(slots, 0, "the route refusal held a slot during discovery");
+}
