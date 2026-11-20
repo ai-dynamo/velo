@@ -47,7 +47,6 @@ let reply = node_a.unary("ping")?.route(uds).raw_payload(Bytes::new()).instance(
 Everything the call sends goes over the named transport:
 
 - **The handshake.** A call to a peer whose handlers are not known yet sends `_hello` first, over the same transport.
-- **A staged payload.** Every frame of the transfer keeps to the call's route. See [Every frame keeps to the call's route](rendezvous.md#every-frame-keeps-to-the-calls-route).
 - **The frame size check.** Each transport checks its own frames, so the named transport's limit applies. The staging decision compares the payload with the staging threshold only, for every send.
 
 Two calls let a caller check an edge before it sends:

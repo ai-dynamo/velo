@@ -14,29 +14,6 @@
 //! release(handle, lease)  release the lock and one reference; freed at zero
 //! ```
 //!
-//! # Every frame of a transfer keeps to the call's route
-//!
-//! One rule, for every message below:
-//!
-//! * Each request of a transfer (`_rv_acquire`, `_rv_pull`, `_rv_detach`,
-//!   `_rv_release`, `_rv_lease_renew`, `_rv_metadata`, `_rv_ref`) goes over
-//!   the transfer's route: the transport the staged message came in on for
-//!   the messenger's fetch, and the consumer's primary for a caller's own
-//!   `get`. It never falls back to another transport.
-//! * Each reply, data or error, goes over the transport its request came in
-//!   on. The `_rv_*` handlers are staged-transfer handlers
-//!   ([`ReplyRoute`](crate::transports::choice::ReplyRoute) is strict): a
-//!   reply that cannot use that transport is not sent.
-//! * Each chunk is sized by the capacity of the transport that carries its
-//!   reply: the acquire's arrival transport, less the reply header, and each
-//!   pull checks it again against its own arrival transport.
-//! * A frame that cannot keep to the rule fails with
-//!   [`TransportChoiceError`](crate::TransportChoiceError) and is not sent
-//!   elsewhere. Only the messenger's final reply to the caller of a staged
-//!   call may take another transport.
-//! * The RDMA read is the one exception, and only where the call allows it:
-//!   a call that named no transport, or named UCX.
-//!
 //! # Two ways the bytes move
 //!
 //! `_rv_acquire` takes the read lock and, in the same round trip, decides how
@@ -739,14 +716,7 @@ impl RendezvousManager {
     /// For local handles: DashMap lookup + `Bytes::clone()` (cheap refcount bump).
     /// For remote handles: receiver-driven pull via `_rv_acquire` + `_rv_pull` AMs.
     pub async fn get(&self, handle: DataHandle) -> Result<(Bytes, u64)> {
-        self.get_within(
-            handle,
-            u64::MAX,
-            None,
-            crate::transports::choice::Route::Primary,
-            false,
-        )
-        .await
+        self.get_within(handle, u64::MAX, None).await
     }
 
     /// As [`get`](Self::get), for the messenger's resolver: refuse a remote
@@ -755,16 +725,11 @@ impl RendezvousManager {
     /// `lease_timeout`. See
     /// [`Consumer::get_within`](consumer::Consumer::get_within). A local
     /// handle is not checked: its bytes are already in this process.
-    ///
-    /// `route` is the route of the fetch's messages: the messenger's resolver
-    /// fetches over the transport the staged message came in on.
     pub(crate) async fn get_within(
         &self,
         handle: DataHandle,
         limit: u64,
         lease_timeout: Option<std::time::Duration>,
-        route: crate::transports::choice::Route,
-        pinned: bool,
     ) -> Result<(Bytes, u64)> {
         let started = Instant::now();
         let (target_worker, local_id) = handle.unpack();
@@ -781,7 +746,7 @@ impl RendezvousManager {
                 .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
             Ok((data, lease.disarm()))
         } else {
-            consumer::Consumer::get_within(self, handle, limit, lease_timeout, route, pinned).await
+            consumer::Consumer::get_within(self, handle, limit, lease_timeout).await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {
@@ -990,17 +955,6 @@ impl RendezvousManager {
     /// Release the read lock AND decrement refcount. Data is freed when both
     /// refcount and read_lock_count reach zero.
     pub async fn release(&self, handle: DataHandle, lease_id: u64) -> Result<()> {
-        self.release_via(handle, lease_id, crate::transports::choice::Route::Primary)
-            .await
-    }
-
-    /// As [`release`](Self::release), with the release message on `route`.
-    pub(crate) async fn release_via(
-        &self,
-        handle: DataHandle,
-        lease_id: u64,
-        route: crate::transports::choice::Route,
-    ) -> Result<()> {
         let started = Instant::now();
         let (target_worker, local_id) = handle.unpack();
         let result = if target_worker == self.worker_id {
@@ -1018,8 +972,7 @@ impl RendezvousManager {
         } else {
             // Built in its own statement so the Messenger is dropped before the wait.
             let send =
-                consumer::Consumer::release_request(self.messenger()?.client(), handle, lease_id)?
-                    .via(route);
+                consumer::Consumer::release_request(self.messenger()?.client(), handle, lease_id)?;
             send.send().await
         };
         if let Some(m) = &self.metrics {

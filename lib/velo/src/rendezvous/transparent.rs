@@ -134,31 +134,16 @@ impl LargePayloadResolver for RendezvousResolver {
     /// With a bound, the owner is asked to end the lease once no pull renews
     /// it within that bound: the fetch is dropped at the bound with no word
     /// to the owner, which would otherwise keep the payload staged.
-    fn resolve(
-        &self,
-        handle_str: &str,
-        within: Option<Duration>,
-        from: crate::messenger::large_payload::StagedFrom,
-    ) -> BoxFuture<'_, Result<Bytes>> {
+    fn resolve(&self, handle_str: &str, within: Option<Duration>) -> BoxFuture<'_, Result<Bytes>> {
         let handle_str = handle_str.to_string();
-        // The fetch goes back over the staged message's transport and no
-        // other. Unlike a reply it does not fall back to the primary: a fetch
-        // that cannot use the transport fails, and the caller hears why.
-        let route = match from.origin {
-            Some(origin) => crate::transports::choice::Route::Named(origin),
-            None => crate::transports::choice::Route::Primary,
-        };
         Box::pin(async move {
             let raw: u128 = handle_str
                 .parse()
                 .map_err(|e| anyhow::anyhow!("invalid rendezvous handle: {e}"))?;
             let handle = crate::DataHandle::from_u128(raw);
-            let (data, lease_id) = self
-                .manager
-                .get_within(handle, self.limit, within, route, from.pinned)
-                .await?;
+            let (data, lease_id) = self.manager.get_within(handle, self.limit, within).await?;
             // Auto-release: transparent staging uses refcount=1
-            self.manager.release_via(handle, lease_id, route).await?;
+            self.manager.release(handle, lease_id).await?;
             Ok(data)
         })
     }

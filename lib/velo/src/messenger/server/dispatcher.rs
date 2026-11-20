@@ -101,12 +101,6 @@ pub(crate) trait ActiveMessageHandler: Send + Sync {
 
     /// Get the handler name
     fn name(&self) -> &str;
-
-    /// Whether the handler serves a staged transfer, whose replies are
-    /// strict. See [`ReplyRoute`](crate::transports::choice::ReplyRoute).
-    fn staged_transfer(&self) -> bool {
-        false
-    }
 }
 
 /// Trait for dispatching messages to handlers.
@@ -132,10 +126,7 @@ async fn run_handler<H: ActiveMessageHandler + 'static>(
     // its final drop, and so its transport teardown, from ever happening.
     let backend = Arc::clone(ctx.system.backend());
     let in_flight = ctx.in_flight.clone();
-    let origin = crate::transports::choice::ReplyRoute {
-        origin: ctx.origin,
-        strict: handler.staged_transfer(),
-    };
+    let origin = ctx.origin;
     trace!(target: "crate::messenger::dispatcher", handler = %handler.name(), "Handler task started");
     let outcome = AssertUnwindSafe(async { handler.handle(ctx).await })
         .catch_unwind()
@@ -180,7 +171,7 @@ async fn fail_fast(
     backend: &VeloBackend,
     handler: &str,
     message_id: ResponseId,
-    origin: crate::transports::choice::ReplyRoute,
+    origin: Option<velo_ext::TransportOrigin>,
     response_type: ResponseType,
     reason: &'static str,
     in_flight: Option<Arc<velo_ext::InFlightGuard>>,
@@ -205,7 +196,7 @@ pub(crate) async fn send_error_reply(
     backend: &VeloBackend,
     handler: &str,
     message_id: ResponseId,
-    origin: crate::transports::choice::ReplyRoute,
+    origin: Option<velo_ext::TransportOrigin>,
     message: String,
 ) {
     if let Err(e) =
@@ -513,7 +504,7 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
                 let backend = Arc::clone(system.backend());
                 let handler_name = self.handler.name().to_string();
                 let in_flight = shed.call.in_flight;
-                let origin = crate::transports::choice::ReplyRoute::follow(shed.call.origin);
+                let origin = shed.call.origin;
                 system.tracker().clone().spawn(async move {
                     fail_fast(
                         &backend,
@@ -658,7 +649,7 @@ impl DispatcherHub {
                         &backend,
                         &handler_name,
                         message_id,
-                        crate::transports::choice::ReplyRoute::follow(ctx.origin),
+                        ctx.origin,
                         error_message,
                     )
                     .await;
@@ -678,7 +669,7 @@ impl DispatcherHub {
     async fn send_error_response_static(
         backend: &VeloBackend,
         response_id: ResponseId,
-        origin: crate::transports::choice::ReplyRoute,
+        origin: Option<velo_ext::TransportOrigin>,
         error_message: String,
     ) -> anyhow::Result<()> {
         use crate::transports::MessageType;

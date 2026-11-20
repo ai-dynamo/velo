@@ -58,19 +58,6 @@ pub enum TransportChoiceError {
         /// The peer the call named.
         peer: InstanceId,
     },
-    /// The transport cannot carry one frame of the reply: its capacity to
-    /// the peer is at most the reply's header.
-    #[error(
-        "transport {transport} carries {capacity} bytes to the peer, not more than the reply header of {header} bytes"
-    )]
-    CapacityTooSmall {
-        /// The transport the reply would take.
-        transport: TransportKey,
-        /// What the transport reports it carries to the peer.
-        capacity: usize,
-        /// The reply's header.
-        header: usize,
-    },
     /// The route was made by another node.
     #[error("the transport route was made by node {owner}, not by this node")]
     ForeignRoute {
@@ -102,61 +89,6 @@ pub(crate) enum Route {
     /// registered on it, and the primary otherwise. The fallback is counted
     /// in `velo_transport_reply_reroutes_total`.
     Reply(Option<TransportOrigin>),
-}
-
-/// Where a handler's reply goes: back over the transport its request came
-/// in on.
-///
-/// A reply of an ordinary handler falls back to the primary when the caller
-/// is not registered on that transport ([`Route::Reply`]). A reply that is
-/// part of a staged transfer is `strict`: it goes over that transport or is
-/// not sent, so a staged payload's bytes never leave the call's route.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct ReplyRoute {
-    pub(crate) origin: Option<TransportOrigin>,
-    pub(crate) strict: bool,
-}
-
-impl ReplyRoute {
-    /// The reply of an ordinary handler.
-    pub(crate) fn follow(origin: Option<TransportOrigin>) -> Self {
-        Self {
-            origin,
-            strict: false,
-        }
-    }
-
-    /// The route a send of this reply takes.
-    pub(crate) fn route(self) -> Route {
-        match (self.strict, self.origin) {
-            (true, Some(origin)) => Route::Named(origin),
-            // An adapter nobody numbered: there is no arrival transport to
-            // keep to, only the primary.
-            (true, None) => Route::Primary,
-            (false, origin) => Route::Reply(origin),
-        }
-    }
-}
-
-tokio::task_local! {
-    /// The arrival transport of the request a staged-transfer handler is
-    /// serving. Set only around such a handler, so that it can size what it
-    /// sends to the transport that carries it.
-    static STAGED_ORIGIN: Option<TransportOrigin>;
-}
-
-/// Run `future` with `origin` readable through [`staged_origin`].
-pub(crate) async fn with_staged_origin<F: std::future::Future>(
-    origin: Option<TransportOrigin>,
-    future: F,
-) -> F::Output {
-    STAGED_ORIGIN.scope(origin, future).await
-}
-
-/// The arrival transport of the staged-transfer request being served, or
-/// `None` outside such a handler.
-pub(crate) fn staged_origin() -> Option<Option<TransportOrigin>> {
-    STAGED_ORIGIN.try_with(|origin| *origin).ok()
 }
 
 /// How a node reaches one registered peer.

@@ -38,9 +38,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "distributed-tracing")]
 use tracing::Instrument;
 use tracing::{debug, error};
-use velo_ext::{InstanceId, WorkerId};
-
-use crate::transports::choice::ReplyRoute;
+use velo_ext::{InstanceId, TransportOrigin, WorkerId};
 
 use crate::messenger::common::events::{EventType, Outcome, encode_event_header};
 use crate::messenger::common::messages::ResponseType;
@@ -474,17 +472,14 @@ struct AmExecutorAdapter<E> {
     executor: Arc<E>,
     name: Arc<str>,
     metrics: OnceLock<Option<crate::observability::HandlerMetricsHandle>>,
-    /// Serves a staged transfer: replies are strict. See [`ReplyRoute`].
-    staged: bool,
 }
 
 impl<E> AmExecutorAdapter<E> {
-    fn new(executor: E, name: String, staged: bool) -> Self {
+    fn new(executor: E, name: String) -> Self {
         Self {
             executor: Arc::new(executor),
             name: Arc::from(name),
             metrics: OnceLock::new(),
-            staged,
         }
     }
 }
@@ -509,10 +504,7 @@ where
 
         let backend = ctx.system.backend().clone();
         let response_id = ctx.message_id;
-        let origin = ReplyRoute {
-            origin: ctx.origin,
-            strict: self.staged,
-        };
+        let origin = ctx.origin;
         let response_type = ctx.response_type;
         let headers = ctx.headers.clone();
         #[cfg(feature = "distributed-tracing")]
@@ -534,7 +526,7 @@ where
             let _drain_guard = drain_guard;
             let _in_flight = handler_metrics.as_ref().map(|m| m.start());
             let started = Instant::now();
-            let result = run_handler_body(origin, || executor.execute(am_ctx)).await;
+            let result = executor.execute(am_ctx).await;
             let mut outcome = HandlerOutcome::Success;
             let mut response_bytes = 0usize;
 
@@ -620,27 +612,20 @@ where
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn staged_transfer(&self) -> bool {
-        self.staged
-    }
 }
 
 struct UnaryExecutorAdapter<E> {
     executor: Arc<E>,
     name: Arc<str>,
     metrics: OnceLock<Option<crate::observability::HandlerMetricsHandle>>,
-    /// Serves a staged transfer: replies are strict. See [`ReplyRoute`].
-    staged: bool,
 }
 
 impl<E> UnaryExecutorAdapter<E> {
-    fn new(executor: E, name: String, staged: bool) -> Self {
+    fn new(executor: E, name: String) -> Self {
         Self {
             executor: Arc::new(executor),
             name: Arc::from(name),
             metrics: OnceLock::new(),
-            staged,
         }
     }
 }
@@ -661,10 +646,7 @@ where
         let executor = self.executor.clone();
         let backend = ctx.system.backend().clone();
         let response_id = ctx.message_id;
-        let origin = ReplyRoute {
-            origin: ctx.origin,
-            strict: self.staged,
-        };
+        let origin = ctx.origin;
         let response_type = ctx.response_type;
         let headers = ctx.headers.clone();
         #[cfg(feature = "distributed-tracing")]
@@ -692,7 +674,7 @@ where
             let _drain_guard = drain_guard;
             let _in_flight = handler_metrics.as_ref().map(|m| m.start());
             let started = Instant::now();
-            let result = run_handler_body(origin, || executor.execute(unary_ctx)).await;
+            let result = executor.execute(unary_ctx).await;
             let mut outcome = HandlerOutcome::Success;
             let mut response_bytes = 0usize;
 
@@ -766,28 +748,21 @@ where
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn staged_transfer(&self) -> bool {
-        self.staged
-    }
 }
 
 struct TypedUnaryExecutorAdapter<E, I, O> {
     executor: Arc<E>,
     name: Arc<str>,
     metrics: OnceLock<Option<crate::observability::HandlerMetricsHandle>>,
-    /// Serves a staged transfer: replies are strict. See [`ReplyRoute`].
-    staged: bool,
     _phantom: PhantomData<fn(I) -> O>,
 }
 
 impl<E, I, O> TypedUnaryExecutorAdapter<E, I, O> {
-    fn new(executor: E, name: String, staged: bool) -> Self {
+    fn new(executor: E, name: String) -> Self {
         Self {
             executor: Arc::new(executor),
             name: Arc::from(name),
             metrics: OnceLock::new(),
-            staged,
             _phantom: PhantomData,
         }
     }
@@ -809,10 +784,7 @@ where
         let trace_headers = headers.clone();
         let backend = ctx.system.backend().clone();
         let response_id = ctx.message_id;
-        let origin = ReplyRoute {
-            origin: ctx.origin,
-            strict: self.staged,
-        };
+        let origin = ctx.origin;
         let response_type = ctx.response_type;
         let executor = self.executor.clone();
         let handler_name = self.name.clone();
@@ -898,7 +870,7 @@ where
                 msg: system,
             };
 
-            let result = run_handler_body(origin, || executor.execute(typed_ctx)).await;
+            let result = executor.execute(typed_ctx).await;
             let mut outcome = HandlerOutcome::Success;
             let mut response_bytes = 0usize;
 
@@ -986,10 +958,6 @@ where
     fn name(&self) -> &str {
         &self.name
     }
-
-    fn staged_transfer(&self) -> bool {
-        self.staged
-    }
 }
 
 // ============================================================================
@@ -1014,21 +982,6 @@ struct ResponseErrorHandler;
 impl crate::transports::TransportErrorHandler for ResponseErrorHandler {
     fn on_error(&self, _header: Bytes, _payload: Bytes, error: String) {
         error!("Failed to send response: {}", error);
-    }
-}
-
-/// Run a handler's body. The body of a staged-transfer handler runs with
-/// its request's arrival transport readable, so that it can size what it
-/// sends to the transport that carries it.
-///
-/// `body` makes the future, because a sync executor runs the handler when it
-/// makes it: made inside the scope, the handler sees the origin.
-async fn run_handler_body<F: Future>(reply: ReplyRoute, body: impl FnOnce() -> F) -> F::Output {
-    if reply.strict {
-        crate::transports::choice::with_staged_origin(reply.origin, async move { body().await })
-            .await
-    } else {
-        body().await
     }
 }
 
@@ -1063,14 +1016,14 @@ fn get_response_error_handler() -> Arc<dyn crate::transports::TransportErrorHand
 
 async fn send_ack(
     backend: Arc<VeloBackend>,
-    reply: ReplyRoute,
+    origin: Option<TransportOrigin>,
     response_id: ResponseId,
 ) -> Result<()> {
     let header = encode_event_header(EventType::Ack(response_id, Outcome::Ok));
 
     let outcome = backend.send_reply_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
-        reply,
+        origin,
         OutboundFrame {
             header,
             payload: Bytes::new(),
@@ -1102,7 +1055,7 @@ fn handler_response_type(response_type: ResponseType) -> HandlerResponseType {
 
 async fn send_nack(
     backend: Arc<VeloBackend>,
-    reply: ReplyRoute,
+    origin: Option<TransportOrigin>,
     response_id: ResponseId,
     error_message: String,
 ) -> Result<()> {
@@ -1111,7 +1064,7 @@ async fn send_nack(
 
     let outcome = backend.send_reply_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
-        reply,
+        origin,
         OutboundFrame {
             header,
             payload,
@@ -1126,7 +1079,7 @@ async fn send_nack(
 
 async fn send_response_ok(
     backend: Arc<VeloBackend>,
-    reply: ReplyRoute,
+    origin: Option<TransportOrigin>,
     response_id: ResponseId,
     headers: Option<std::collections::HashMap<String, String>>,
 ) -> Result<()> {
@@ -1135,7 +1088,7 @@ async fn send_response_ok(
 
     let outcome = backend.send_reply_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
-        reply,
+        origin,
         OutboundFrame {
             header,
             payload: Bytes::new(),
@@ -1150,7 +1103,7 @@ async fn send_response_ok(
 
 async fn send_response(
     backend: Arc<VeloBackend>,
-    reply: ReplyRoute,
+    origin: Option<TransportOrigin>,
     response_id: ResponseId,
     headers: Option<std::collections::HashMap<String, String>>,
     payload: Bytes,
@@ -1160,7 +1113,7 @@ async fn send_response(
 
     let outcome = backend.send_reply_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
-        reply,
+        origin,
         OutboundFrame {
             header,
             payload,
@@ -1175,7 +1128,7 @@ async fn send_response(
 
 async fn send_response_error(
     backend: Arc<VeloBackend>,
-    reply: ReplyRoute,
+    origin: Option<TransportOrigin>,
     response_id: ResponseId,
     headers: Option<std::collections::HashMap<String, String>>,
     error_message: String,
@@ -1186,7 +1139,7 @@ async fn send_response_error(
 
     let outcome = backend.send_reply_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
-        reply,
+        origin,
         OutboundFrame {
             header,
             payload,
@@ -1285,7 +1238,6 @@ pub struct AmHandlerBuilder<E> {
     executor: E,
     name: String,
     ordered: Option<OrderedConfig>,
-    staged: bool,
 }
 
 impl<E> AmHandlerBuilder<E>
@@ -1297,22 +1249,11 @@ where
             executor,
             name,
             ordered: None,
-            staged: false,
         }
     }
 
-    /// Mark the handler as part of a staged transfer: its replies go over
-    /// the transport its request came in on or are not sent, and its body
-    /// can read that transport with [`staged_origin`].
-    ///
-    /// [`staged_origin`]: crate::transports::choice::staged_origin
-    pub(crate) fn staged_transfer(mut self) -> Self {
-        self.staged = true;
-        self
-    }
-
     pub fn build(self) -> Handler {
-        let adapter = AmExecutorAdapter::new(self.executor, self.name, self.staged);
+        let adapter = AmExecutorAdapter::new(self.executor, self.name);
         let dispatcher = make_dispatcher(adapter, self.ordered);
         Handler { dispatcher }
     }
@@ -1324,7 +1265,6 @@ pub struct UnaryHandlerBuilder<E> {
     executor: E,
     name: String,
     ordered: Option<OrderedConfig>,
-    staged: bool,
 }
 
 impl<E> UnaryHandlerBuilder<E>
@@ -1336,22 +1276,11 @@ where
             executor,
             name,
             ordered: None,
-            staged: false,
         }
     }
 
-    /// Mark the handler as part of a staged transfer: its replies go over
-    /// the transport its request came in on or are not sent, and its body
-    /// can read that transport with [`staged_origin`].
-    ///
-    /// [`staged_origin`]: crate::transports::choice::staged_origin
-    pub(crate) fn staged_transfer(mut self) -> Self {
-        self.staged = true;
-        self
-    }
-
     pub fn build(self) -> Handler {
-        let adapter = UnaryExecutorAdapter::new(self.executor, self.name, self.staged);
+        let adapter = UnaryExecutorAdapter::new(self.executor, self.name);
         let dispatcher = make_dispatcher(adapter, self.ordered);
         Handler { dispatcher }
     }
@@ -1363,7 +1292,6 @@ pub struct TypedUnaryHandlerBuilder<E, I, O> {
     executor: E,
     name: String,
     ordered: Option<OrderedConfig>,
-    staged: bool,
     _phantom: PhantomData<fn(I) -> O>,
 }
 
@@ -1378,23 +1306,12 @@ where
             executor,
             name,
             ordered: None,
-            staged: false,
             _phantom: PhantomData,
         }
     }
 
-    /// Mark the handler as part of a staged transfer: its replies go over
-    /// the transport its request came in on or are not sent, and its body
-    /// can read that transport with [`staged_origin`].
-    ///
-    /// [`staged_origin`]: crate::transports::choice::staged_origin
-    pub(crate) fn staged_transfer(mut self) -> Self {
-        self.staged = true;
-        self
-    }
-
     pub fn build(self) -> Handler {
-        let adapter = TypedUnaryExecutorAdapter::new(self.executor, self.name, self.staged);
+        let adapter = TypedUnaryExecutorAdapter::new(self.executor, self.name);
         let dispatcher = make_dispatcher(adapter, self.ordered);
         Handler { dispatcher }
     }

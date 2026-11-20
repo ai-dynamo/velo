@@ -3726,7 +3726,6 @@ mod tests {
             &self,
             _: &str,
             _: Option<std::time::Duration>,
-            _: crate::messenger::large_payload::StagedFrom,
         ) -> futures::future::BoxFuture<'_, anyhow::Result<bytes::Bytes>> {
             self.called.store(true, std::sync::atomic::Ordering::SeqCst);
             Box::pin(std::future::pending())

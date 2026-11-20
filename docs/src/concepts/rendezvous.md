@@ -126,33 +126,6 @@ The fallback happens **exactly once**. The second acquire carries no offer, so a
 
 **A pinned slot is never RDMA-only.** Old consumers, consumers without UCX, consumers below the threshold, and consumers whose GET failed all read the same slot by chunks. The owner does not need to know in advance which kind of consumer it talks to.
 
-## Every frame keeps to the call's route
-
-A staged payload is part of the call that staged it, so its transfer keeps to that call's route. One rule covers every message of a transfer:
-
-- A request of the transfer goes over the transfer's route. For the messenger's fetch of a staged payload, that is the transport the staged message came in on. For a caller's own `get`, it is the consumer's primary transport for the owner. A request never falls back to another transport.
-- A reply, data or error, goes over the transport its request came in on. The `_rv_*` handlers reply over that transport or not at all.
-- A chunk is sized by the capacity of the transport that carries its reply. The owner reads the capacity of the transport the acquire came in on, less the reply header, and caps the chunk at 512 KiB. Each pull checks its chunk again against the transport it came in on.
-- A frame that cannot keep to the rule fails with `TransportChoiceError` and goes nowhere else: `NotServedByPeer` when the peer is not registered on the transport, `CapacityTooSmall` when the transport cannot carry one byte past the reply header.
-- Only the messenger's final reply to the caller of a staged call may take another transport, as any reply may.
-
-The RDMA read is the one exception, and only where the call allows it. The sender marks a staged payload whose send named a transport with the `_rv_pinned` header. The receiver offers RDMA for it only when that transport is UCX. A send that named nothing may still be read by RDMA. A receiver from before the header passes it to the handler.
-
-| Message | Sender | Receiver | Route | Size bound |
-|---|---|---|---|---|
-| The staged call | caller | receiver | the call's route | the handle only, in headers |
-| `_rv_acquire` | receiver | owner (the caller) | the transfer's route | small |
-| `_rv_acquire` reply | owner | receiver | the acquire's arrival transport, strict | small |
-| `_rv_pull` | receiver | owner | the transfer's route | small |
-| `_rv_pull` reply | owner | receiver | the pull's arrival transport, strict | the chunk, sized by that transport's capacity |
-| `_rv_release`, `_rv_detach` | receiver | owner | the transfer's route | small |
-| `_rv_lease_renew` | receiver | owner | the transfer's route | small |
-| `_rv_metadata`, `_rv_ref` and their replies | consumer | owner | the consumer's primary; the reply is strict | small |
-| RDMA read | receiver's NIC | owner's memory | UCX, only for an unnamed call or one named on UCX | the payload |
-| The final reply or error | receiver | caller | the call's arrival transport; may take the primary | the reply |
-
-A reply that cannot use its request's transport is not sent, so its request waits for its bound: the call's deadline, or the receiver's own fetch timeout. This happens only when a node registers a peer without the transport it calls in on, between the call and its fetch.
-
 ## Staging on the owner
 
 ### `register_data_pinned`

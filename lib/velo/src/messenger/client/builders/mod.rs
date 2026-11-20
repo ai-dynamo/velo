@@ -102,13 +102,6 @@ impl AmSendBuilder {
         self
     }
 
-    /// Send on a route the runtime already chose: the rendezvous fetch of a
-    /// staged payload goes back over the transport its message came in on.
-    pub(crate) fn via(mut self, route: Route) -> Self {
-        self.inner = self.inner.via(route);
-        self
-    }
-
     /// Send on transport lane `lane` instead of lane 0.
     ///
     /// Frames on one lane to one peer arrive in order; nothing is ordered
@@ -293,13 +286,6 @@ impl UnaryBuilder {
         self
     }
 
-    /// Send on a route the runtime already chose: the rendezvous fetch of a
-    /// staged payload goes back over the transport its message came in on.
-    pub(crate) fn via(mut self, route: Route) -> Self {
-        self.inner = self.inner.via(route);
-        self
-    }
-
     /// Await a free response slot if the arena is at capacity (default:
     /// fail fast with `ResponseRegistrationError::Exhausted`).
     pub fn await_capacity(mut self) -> Self {
@@ -413,13 +399,6 @@ where
     /// [`transport`](Self::transport), with the key already resolved.
     pub fn route(mut self, route: TransportRoute) -> Self {
         self.inner = self.inner.route(route);
-        self
-    }
-
-    /// Send on a route the runtime already chose: the rendezvous fetch of a
-    /// staged payload goes back over the transport its message came in on.
-    pub(crate) fn via(mut self, route: Route) -> Self {
-        self.inner = self.inner.via(route);
         self
     }
 
@@ -770,12 +749,6 @@ impl MessageBuilder {
             Ok(route) => Choice::Resolved(route),
             Err(refused) => Choice::Refused(Box::new(refused)),
         }
-    }
-
-    /// Send on a route the runtime already chose. See [`AmSendBuilder::via`].
-    pub(crate) fn via(mut self, route: Route) -> Self {
-        self.choice = Choice::Resolved(route);
-        self
     }
 
     /// Opt into backpressure on response-slot exhaustion.

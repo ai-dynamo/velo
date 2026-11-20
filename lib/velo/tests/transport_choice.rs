@@ -4,10 +4,10 @@
 //! Which transport carries each frame between two nodes that both have TCP
 //! and UDS, read from `velo_transport_frames_total` on both nodes.
 //!
-//! A send that names a transport uses it for the request, the reply, the
-//! `_hello` before it, and the fetch of a staged payload. A send that names
-//! none uses the sender's primary, the first transport it added, and its
-//! reply comes back over the transport the request came in on.
+//! A send that names a transport uses it for the request, the reply, and
+//! the `_hello` before it. A send that names none uses the sender's primary,
+//! the first transport it added, and its reply comes back over the transport
+//! the request came in on.
 //!
 //! The wait after a call is on the counts: every frame one node counted out
 //! must be counted in by the other, per transport and message type.
@@ -71,17 +71,12 @@ fn transport(kind: Kind, dir: &tempfile::TempDir) -> Arc<dyn Transport> {
 }
 
 async fn node(dir: &tempfile::TempDir, kinds: &[Kind]) -> Node {
-    node_with(kinds.iter().map(|kind| transport(*kind, dir)).collect()).await
-}
-
-/// A node over `transports`, in that order, with the test handlers.
-async fn node_with(transports: Vec<Arc<dyn Transport>>) -> Node {
     let reg = Registry::new();
     let mut builder = Velo::builder()
         .mux_only()
         .metrics(Arc::new(VeloMetrics::register(&reg).unwrap()));
-    for transport in transports {
-        builder = builder.add_transport(transport);
+    for kind in kinds {
+        builder = builder.add_transport(transport(*kind, dir));
     }
     let velo = builder.build().await.unwrap();
     let notes = Arc::new(AtomicU64::new(0));
@@ -315,38 +310,6 @@ async fn replies_follow_the_request_when_the_ends_disagree_on_the_primary() {
     shutdown([&a, &b]).await;
 }
 
-/// A payload over the staging threshold (256 KiB) is staged by the sender
-/// and fetched by the receiver. On a named call the fetch and its chunks go
-/// over the named transport too, so the payload's bytes never leave it.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_staged_payload_is_fetched_over_the_named_transport() {
-    let dir = tempfile::tempdir().unwrap();
-    let (a, b) = pair(&dir, &[Kind::Tcp, Kind::Uds], &[Kind::Tcp, Kind::Uds]).await;
-    let id = b.velo.instance_id();
-    let len = 300 * 1024;
-    let seen = traffic(&a, &b, async {
-        let reply = a
-            .velo
-            .unary("echo_len")
-            .unwrap()
-            .transport("uds")
-            .raw_payload(Bytes::from(vec![1u8; len]))
-            .instance(id)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(&reply[..], &len.to_le_bytes());
-    })
-    .await;
-    assert_eq!(seen.transports(), vec!["uds".to_string()]);
-    let fetches = seen.b_to_a.get(&("uds".into(), "message".into())).copied();
-    assert!(
-        fetches.is_some_and(|n| n >= 2),
-        "the receiver's acquire and pull go to the sender: {fetches:?}"
-    );
-    shutdown([&a, &b]).await;
-}
-
 /// What a caller can learn before it sends, and the typed errors of a choice
 /// that cannot be met. None of them falls back to another transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -492,126 +455,4 @@ async fn a_discovered_peer_missing_the_named_transport_takes_no_slot() {
         }),
     );
     assert_eq!(slots, 0, "the route refusal held a slot during discovery");
-}
-
-#[path = "transport_choice/capped_fetch.rs"]
-mod capped_fetch;
-
-#[tokio::test]
-async fn a_staged_fetch_does_not_leave_a_named_route() {
-    use velo::{PeerInfo, WorkerAddress};
-
-    let dir = tempfile::tempdir().unwrap();
-    let (a, b) = pair(&dir, &[Kind::Tcp, Kind::Uds], &[Kind::Tcp, Kind::Uds]).await;
-    let a_id = a.velo.instance_id();
-    let b_id = b.velo.instance_id();
-    a.velo.available_handlers(b_id).await.unwrap();
-    b.velo.available_handlers(a_id).await.unwrap();
-
-    let info = a.velo.peer_info();
-    let tcp = info.worker_address().get_entry("tcp").unwrap().unwrap();
-    let filtered = rmp_serde::to_vec(&BTreeMap::from([("tcp", tcp)])).unwrap();
-    b.velo
-        .register_peer(PeerInfo::new(
-            a_id,
-            WorkerAddress::from_encoded(Bytes::from(filtered)),
-        ))
-        .unwrap();
-    assert_eq!(b.velo.peer_transports(a_id), Some(vec!["tcp".into()]));
-
-    let mut response = None;
-    let seen = traffic(&a, &b, async {
-        response = Some(
-            a.velo
-                .unary("echo_len")
-                .unwrap()
-                .transport("uds")
-                .raw_payload(Bytes::from(vec![1; 300 * 1024]))
-                .instance(b_id)
-                .timeout(DEADLINE)
-                .send()
-                .await,
-        );
-    })
-    .await;
-    assert_eq!(seen.a_to_b.get(&("uds".into(), "message".into())), Some(&1));
-    assert_eq!(
-        seen.b_to_a.get(&("tcp".into(), "message".into())),
-        None,
-        "TCP carried fetch requests for a staged UDS call. Result: {response:?}",
-    );
-    shutdown([&a, &b]).await;
-}
-
-#[tokio::test]
-async fn staged_bytes_do_not_reroute_after_the_owner_loses_the_named_route() {
-    use velo::{PeerInfo, WorkerAddress};
-
-    let dir = tempfile::tempdir().unwrap();
-    let (owner, consumer) = pair(&dir, &[Kind::Tcp, Kind::Uds], &[Kind::Tcp, Kind::Uds]).await;
-    let owner_id = owner.velo.instance_id();
-    let consumer_id = consumer.velo.instance_id();
-    owner.velo.available_handlers(consumer_id).await.unwrap();
-    consumer.velo.available_handlers(owner_id).await.unwrap();
-
-    let info = consumer.velo.peer_info();
-    let tcp = info.worker_address().get_entry("tcp").unwrap().unwrap();
-    let filtered = rmp_serde::to_vec(&BTreeMap::from([("tcp", tcp)])).unwrap();
-    let filtered_peer = PeerInfo::new(
-        consumer_id,
-        WorkerAddress::from_encoded(Bytes::from(filtered)),
-    );
-    let tcp_response_bytes = || {
-        owner
-            .reg
-            .gather()
-            .into_iter()
-            .find(|f| f.name() == "velo_transport_frame_bytes_total")
-            .unwrap()
-            .get_metric()
-            .iter()
-            .filter(|m| {
-                [
-                    ("transport", "tcp"),
-                    ("direction", "outbound"),
-                    ("message_type", "response"),
-                ]
-                .into_iter()
-                .all(|(name, value)| {
-                    m.get_label()
-                        .iter()
-                        .any(|label| label.name() == name && label.value() == value)
-                })
-            })
-            .map(|m| m.get_counter().value() as u64)
-            .sum::<u64>()
-    };
-    let before = tcp_response_bytes();
-    let len = 300 * 1024;
-    let mut response = None;
-    let seen = traffic(&owner, &consumer, async {
-        let call = owner
-            .velo
-            .unary("echo_len")
-            .unwrap()
-            .transport("uds")
-            .raw_payload(Bytes::from(vec![1; len]))
-            .instance(consumer_id)
-            .timeout(DEADLINE)
-            .send();
-        // The current-thread runtime cannot run the consumer until this task yields.
-        owner.velo.register_peer(filtered_peer).unwrap();
-        assert_eq!(
-            owner.velo.peer_transports(consumer_id),
-            Some(vec!["tcp".into()])
-        );
-        response = Some(call.await);
-    })
-    .await;
-    assert_eq!(seen.a_to_b.get(&("uds".into(), "message".into())), Some(&1));
-    let rerouted_bytes = tcp_response_bytes() - before;
-    assert!(
-        rerouted_bytes < len as u64,
-        "TCP carried {rerouted_bytes} response bytes for a staged UDS call. Result: {response:?}",
-    );
 }

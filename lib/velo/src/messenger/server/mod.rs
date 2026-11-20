@@ -340,7 +340,6 @@ async fn create_message_handler(
                             in_flight,
                             backend,
                             origin,
-                            pinned: staging.pinned,
                         });
                         continue;
                     } else {
@@ -364,7 +363,7 @@ async fn create_message_handler(
                                     &backend,
                                     &handler_name,
                                     message_id,
-                                    crate::transports::choice::ReplyRoute::follow(origin),
+                                    origin,
                                     "Rendezvous resolver not configured on receiver".to_string(),
                                 )
                                 .await;
@@ -443,11 +442,9 @@ struct ResolveJob {
     fetch_bound: Option<crate::messenger::large_payload::FetchBound>,
     in_flight: Option<Arc<velo_ext::InFlightGuard>>,
     backend: Arc<VeloBackend>,
-    /// The transport the message came in on: the fetch and the reply go
-    /// back over it.
+    /// The transport the message came in on: an error reply goes back over
+    /// it.
     origin: Option<velo_ext::TransportOrigin>,
-    /// The send named its transport.
-    pinned: bool,
 }
 
 /// Resolve a large payload off the receive loop, then dispatch it.
@@ -485,12 +482,9 @@ async fn resolve_and_dispatch(job: ResolveJob) {
         in_flight,
         backend,
         origin,
-        pinned,
     } = job;
     let within = fetch_bound.map(|bound| bound.within);
-    let from = crate::messenger::large_payload::StagedFrom { origin, pinned };
-    let Some(resolved) =
-        resolve_within(resolver.resolve(&handle_str, within, from), fetch_bound).await
+    let Some(resolved) = resolve_within(resolver.resolve(&handle_str, within), fetch_bound).await
     else {
         tracing::debug!(
             target: "crate::messenger::server",
@@ -545,8 +539,7 @@ async fn resolve_and_dispatch(job: ResolveJob) {
                     &backend,
                     &handler_name,
                     message_id,
-                    // The caller's final reply: it may take the primary.
-                    crate::transports::choice::ReplyRoute::follow(origin),
+                    origin,
                     format!("Failed to resolve large payload: {e}"),
                 )
                 .await;
@@ -750,7 +743,6 @@ mod tests {
             &self,
             _: &str,
             _: Option<std::time::Duration>,
-            _: crate::messenger::large_payload::StagedFrom,
         ) -> futures::future::BoxFuture<'_, anyhow::Result<Bytes>> {
             Box::pin(std::future::pending())
         }
@@ -782,7 +774,6 @@ mod tests {
             in_flight: None,
             backend: Arc::clone(&backend),
             origin: None,
-            pinned: false,
         });
         tokio::task::yield_now().await;
         backend.shutdown_state().teardown_token().cancel();

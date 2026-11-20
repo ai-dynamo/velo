@@ -38,7 +38,6 @@ pub fn create_rv_metadata_handler(store: Arc<DataStore>) -> crate::Handler {
             }
         },
     )
-    .staged_transfer()
     .build()
 }
 
@@ -53,22 +52,11 @@ pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::Handler {
     crate::Handler::typed_unary(
         "_rv_acquire",
         move |ctx: crate::TypedContext<RvAcquireRequest>| {
-            let backend = ctx.msg.backend();
-            let draining = backend.shutdown_state().is_draining();
+            let draining = ctx.msg.backend().shutdown_state().is_draining();
             let lease_timeout = requested_lease_timeout(ctx.headers.as_ref());
-            // Sized before the read lock, so a refusal leaves nothing held.
-            // The pulls come in on the transport this acquire came in on, and
-            // their replies go back over it.
-            let max_chunk = pull_chunk_limit(
-                backend,
-                ctx.sender_worker_id(),
-                crate::transports::choice::staged_origin().flatten(),
-                ctx.headers.as_ref(),
-            )?;
-            serve_acquire(&store, &ctx.input, lease_timeout, draining, max_chunk)
+            serve_acquire(&store, &ctx.input, lease_timeout, draining)
         },
     )
-    .staged_transfer()
     .build()
 }
 
@@ -82,57 +70,7 @@ pub fn acquire_lease(
     request: &RvAcquireRequest,
     headers: Option<&std::collections::HashMap<String, String>>,
 ) -> anyhow::Result<AcquireResponse> {
-    serve_acquire(
-        store,
-        request,
-        requested_lease_timeout(headers),
-        false,
-        DEFAULT_CHUNK_SIZE,
-    )
-}
-
-/// The largest chunk one `_rv_pull` reply to `worker` can carry over the
-/// transport the reply takes, the one the request came in on (`origin`):
-/// that transport's capacity, less the reply's header. The pull carries the
-/// fetch's headers back, which are at most the acquire's (tracing context,
-/// without the lease header), so the acquire's header bounds the pull's.
-/// With no capacity reported, the default chunk.
-///
-/// Fails with [`TransportChoiceError::NotServedByPeer`] when the worker is
-/// not registered on that transport, and with
-/// [`TransportChoiceError::CapacityTooSmall`] when the transport cannot carry
-/// one byte of a chunk. There is no fallback to another transport.
-///
-/// [`TransportChoiceError::NotServedByPeer`]: crate::TransportChoiceError::NotServedByPeer
-///
-/// [`TransportChoiceError::CapacityTooSmall`]: crate::TransportChoiceError::CapacityTooSmall
-pub(crate) fn pull_chunk_limit(
-    backend: &crate::transports::VeloBackend,
-    worker: crate::WorkerId,
-    origin: Option<velo_ext::TransportOrigin>,
-    headers: Option<&std::collections::HashMap<String, String>>,
-) -> anyhow::Result<u32> {
-    let (transport, capacity) = backend.strict_reply_capacity(worker, origin)?;
-    let Some(capacity) = capacity else {
-        return Ok(DEFAULT_CHUNK_SIZE);
-    };
-    let header = crate::messenger::common::responses::encode_response_header(
-        crate::messenger::common::responses::ResponseId::from_u128(0),
-        crate::messenger::common::events::Outcome::Ok,
-        headers.cloned(),
-    )?
-    .len();
-    if capacity <= header {
-        return Err(crate::TransportChoiceError::CapacityTooSmall {
-            transport,
-            capacity,
-            header,
-        }
-        .into());
-    }
-    Ok(u32::try_from(capacity - header)
-        .unwrap_or(u32::MAX)
-        .min(DEFAULT_CHUNK_SIZE))
+    serve_acquire(store, request, requested_lease_timeout(headers), false)
 }
 
 fn serve_acquire(
@@ -140,7 +78,6 @@ fn serve_acquire(
     request: &RvAcquireRequest,
     lease_timeout: Option<Duration>,
     draining: bool,
-    max_chunk: u32,
 ) -> anyhow::Result<AcquireResponse> {
     let handle = request.handle.to_handle();
     let (_, local_id) = handle.unpack();
@@ -171,7 +108,7 @@ fn serve_acquire(
     // Always use chunked transfer (even for 1 chunk) to avoid
     // JSON-encoding binary data in the typed-unary response.
     let (transfer_id, chunk_size, chunk_count) = store
-        .create_transfer(local_id, lease_id, max_chunk)
+        .create_transfer(local_id, lease_id, DEFAULT_CHUNK_SIZE)
         .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
     // A consumer whose fetch has a bound gives up at it and says nothing.
     // Granted late, after it gave up, this lease would hold the slot until
@@ -311,10 +248,7 @@ pub fn create_rv_pull_handler(store: Arc<DataStore>) -> crate::Handler {
         move |ctx: crate::Context| -> crate::UnifiedResponse {
             let req: RvPullRequest = serde_json::from_slice(&ctx.payload)?;
             match store.pull_chunk(req.transfer_id, req.chunk_index) {
-                Some(chunk) => {
-                    check_chunk_fits(&ctx, chunk.len())?;
-                    Ok(Some(chunk))
-                }
+                Some(chunk) => Ok(Some(chunk)),
                 None => anyhow::bail!(
                     "chunk not found: transfer_id={}, chunk_index={}",
                     req.transfer_id,
@@ -323,40 +257,7 @@ pub fn create_rv_pull_handler(store: Arc<DataStore>) -> crate::Handler {
             }
         },
     )
-    .staged_transfer()
     .build()
-}
-
-/// Refuse a chunk that the transport its reply takes cannot carry.
-///
-/// The acquire sized the chunks for the transport it came in on, and the
-/// pulls of one fetch come in on the same one. A pull from another transport
-/// (the consumer re-registered between two pulls) can find its chunk too
-/// large; it fails with the typed error and sends nothing on another route.
-fn check_chunk_fits(ctx: &crate::Context, len: usize) -> anyhow::Result<()> {
-    let backend = ctx.msg.backend();
-    let (transport, capacity) = backend.strict_reply_capacity(
-        ctx.sender_worker_id(),
-        crate::transports::choice::staged_origin().flatten(),
-    )?;
-    let Some(capacity) = capacity else {
-        return Ok(());
-    };
-    let header = crate::messenger::common::responses::encode_response_header(
-        crate::messenger::common::responses::ResponseId::from_u128(0),
-        crate::messenger::common::events::Outcome::Ok,
-        ctx.headers.clone(),
-    )?
-    .len();
-    if header + len > capacity {
-        return Err(crate::TransportChoiceError::CapacityTooSmall {
-            transport,
-            capacity,
-            header,
-        }
-        .into());
-    }
-    Ok(())
 }
 
 /// Build the `_rv_ref` handler: increments refcount.
@@ -376,7 +277,6 @@ pub fn create_rv_ref_handler(store: Arc<DataStore>) -> crate::Handler {
             Ok(None)
         },
     )
-    .staged_transfer()
     .build()
 }
 
@@ -428,7 +328,6 @@ pub fn create_rv_lease_renew_handler(store: Arc<DataStore>) -> crate::Handler {
         }
         Ok(())
     })
-    .staged_transfer()
     .build()
 }
 
@@ -462,7 +361,6 @@ pub fn create_rv_detach_handler(store: Arc<DataStore>) -> crate::Handler {
         }
         Ok(())
     })
-    .staged_transfer()
     .build()
 }
 
@@ -493,6 +391,5 @@ pub fn create_rv_release_handler(store: Arc<DataStore>) -> crate::Handler {
         }
         Ok(())
     })
-    .staged_transfer()
     .build()
 }
