@@ -491,3 +491,49 @@ async fn a_discovered_peer_missing_the_named_transport_takes_no_slot() {
 
 #[path = "transport_choice/capped_fetch.rs"]
 mod capped_fetch;
+
+#[tokio::test]
+async fn a_staged_fetch_does_not_leave_a_named_route() {
+    use velo::{PeerInfo, WorkerAddress};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (a, b) = pair(&dir, &[Kind::Tcp, Kind::Uds], &[Kind::Tcp, Kind::Uds]).await;
+    let a_id = a.velo.instance_id();
+    let b_id = b.velo.instance_id();
+    a.velo.available_handlers(b_id).await.unwrap();
+    b.velo.available_handlers(a_id).await.unwrap();
+
+    let info = a.velo.peer_info();
+    let tcp = info.worker_address().get_entry("tcp").unwrap().unwrap();
+    let filtered = rmp_serde::to_vec(&BTreeMap::from([("tcp", tcp)])).unwrap();
+    b.velo
+        .register_peer(PeerInfo::new(
+            a_id,
+            WorkerAddress::from_encoded(Bytes::from(filtered)),
+        ))
+        .unwrap();
+    assert_eq!(b.velo.peer_transports(a_id), Some(vec!["tcp".into()]));
+
+    let mut response = None;
+    let seen = traffic(&a, &b, async {
+        response = Some(
+            a.velo
+                .unary("echo_len")
+                .unwrap()
+                .transport("uds")
+                .raw_payload(Bytes::from(vec![1; 300 * 1024]))
+                .instance(b_id)
+                .timeout(DEADLINE)
+                .send()
+                .await,
+        );
+    })
+    .await;
+    assert_eq!(seen.a_to_b.get(&("uds".into(), "message".into())), Some(&1));
+    assert_eq!(
+        seen.b_to_a.get(&("tcp".into(), "message".into())),
+        None,
+        "TCP carried fetch requests for a staged UDS call. Result: {response:?}",
+    );
+    shutdown([&a, &b]).await;
+}
