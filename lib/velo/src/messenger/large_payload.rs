@@ -65,14 +65,13 @@ pub trait LargePayloadResolver: Send + Sync {
     /// `within` is the fetch's bound, if it has one. The caller drops the
     /// future when it runs out and tells the owner nothing, so the owner
     /// should be asked to end, by then, whatever the fetch leaves behind.
-    /// `origin` is the transport the staged message came in on: the fetch
-    /// goes over it, so that a call pinned to a transport keeps its bytes
-    /// there.
+    /// `from` says how the staged message came in: the fetch goes back over
+    /// its transport and no other.
     fn resolve(
         &self,
         handle_str: &str,
         within: Option<Duration>,
-        origin: Option<velo_ext::TransportOrigin>,
+        from: StagedFrom,
     ) -> BoxFuture<'_, Result<Bytes>>;
 
     /// The longest this receiver lets one fetch run, whatever the sender
@@ -80,6 +79,17 @@ pub trait LargePayloadResolver: Send + Sync {
     fn fetch_timeout(&self) -> Option<Duration> {
         None
     }
+}
+
+/// How a staged message came in, for its fetch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StagedFrom {
+    /// The transport the message came in on. The fetch goes over it, and
+    /// fails when the owner is not registered on it.
+    pub(crate) origin: Option<velo_ext::TransportOrigin>,
+    /// The send named its transport ([`RV_PINNED_HEADER_KEY`]): the fetch
+    /// offers RDMA only when that transport is UCX.
+    pub(crate) pinned: bool,
 }
 
 /// Header key used to signal that the payload was staged via rendezvous.
@@ -129,6 +139,14 @@ pub(crate) type RefusalHook = std::sync::Arc<dyn Fn(&RefusedPayload<'_>) + Send 
 /// that does not set it) uses only its own bound.
 pub const RV_BUDGET_HEADER_KEY: &str = "_rv_budget_ms";
 
+/// Header key that marks a staged payload whose send named its transport.
+///
+/// The receiver then fetches the payload over the transport the message came
+/// in on and over no other: not by RDMA unless that transport is UCX. A send
+/// that named nothing leaves it out, and its fetch may use RDMA. A receiver
+/// that does not know the header passes it to the handler.
+pub const RV_PINNED_HEADER_KEY: &str = "_rv_pinned";
+
 /// The budget to send for a call that gives up `left` from now: whole
 /// milliseconds, rounded up from nanoseconds, so the receiver's bound cannot
 /// end before the caller's. Saturates at `u64::MAX` milliseconds, the most a
@@ -140,15 +158,22 @@ pub(crate) fn budget_ms(left: Duration) -> String {
 }
 
 /// Write the staging headers of a send that staged its payload: its handle,
-/// and its `budget` if the call has one. A budget already in `headers` is
-/// removed when the send has none, so only the send's own goes on the wire.
+/// its `budget` if the call has one, and the pin if the send named its
+/// transport. A budget or pin already in `headers` is removed when the send
+/// has none, so only the send's own goes on the wire.
 pub(crate) fn write_staging(
     headers: &mut Option<HashMap<String, String>>,
     handle: String,
     budget: Option<Duration>,
+    pinned: bool,
 ) {
     let headers = headers.get_or_insert_with(HashMap::new);
     headers.insert(RV_HEADER_KEY.to_string(), handle);
+    if pinned {
+        headers.insert(RV_PINNED_HEADER_KEY.to_string(), "1".to_string());
+    } else {
+        headers.remove(RV_PINNED_HEADER_KEY);
+    }
     match budget {
         Some(left) => {
             headers.insert(RV_BUDGET_HEADER_KEY.to_string(), budget_ms(left));
@@ -166,6 +191,8 @@ pub(crate) struct Staging {
     pub(crate) handle: String,
     /// The caller's budget as sent, read by [`fetch_bound`].
     pub(crate) budget: Option<String>,
+    /// The send named its transport. See [`RV_PINNED_HEADER_KEY`].
+    pub(crate) pinned: bool,
 }
 
 /// Take the staging headers out of an inbound message's `headers`.
@@ -179,10 +206,15 @@ pub(crate) fn take_staging(headers: &mut Option<HashMap<String, String>>) -> Opt
     let map = headers.as_mut()?;
     let handle = map.remove(RV_HEADER_KEY)?;
     let budget = map.remove(RV_BUDGET_HEADER_KEY);
+    let pinned = map.remove(RV_PINNED_HEADER_KEY).is_some();
     if map.is_empty() {
         *headers = None;
     }
-    Some(Staging { handle, budget })
+    Some(Staging {
+        handle,
+        budget,
+        pinned,
+    })
 }
 
 /// How long a receiver may fetch one staged payload, and whose bound it is.
@@ -310,6 +342,7 @@ mod tests {
             Some(Staging {
                 handle: "42".into(),
                 budget: Some("7".into()),
+                pinned: false,
             })
         );
         assert_eq!(headers, Some(map(&[("trace", "t")])));
@@ -320,6 +353,7 @@ mod tests {
             Some(Staging {
                 handle: "42".into(),
                 budget: None,
+                pinned: false,
             })
         );
         assert_eq!(
@@ -333,7 +367,7 @@ mod tests {
     #[test]
     fn write_staging_writes_only_the_sends_own() {
         let mut headers = None;
-        write_staging(&mut headers, "42".into(), None);
+        write_staging(&mut headers, "42".into(), None, false);
         assert_eq!(headers, Some(map(&[(RV_HEADER_KEY, "42")])));
 
         let inherited = map(&[
@@ -342,7 +376,7 @@ mod tests {
             ("trace", "t"),
         ]);
         let mut headers = Some(inherited.clone());
-        write_staging(&mut headers, "42".into(), None);
+        write_staging(&mut headers, "42".into(), None, false);
         assert_eq!(headers, Some(map(&[(RV_HEADER_KEY, "42"), ("trace", "t")])));
 
         let mut headers = Some(inherited);
@@ -350,14 +384,30 @@ mod tests {
             &mut headers,
             "42".into(),
             Some(Duration::from_micros(1_500)),
+            true,
         );
         assert_eq!(
             headers,
             Some(map(&[
                 (RV_HEADER_KEY, "42"),
                 (RV_BUDGET_HEADER_KEY, "2"),
+                (RV_PINNED_HEADER_KEY, "1"),
                 ("trace", "t")
             ]))
         );
+        // The receiver takes the pin out with the other staging headers.
+        assert_eq!(
+            take_staging(&mut headers),
+            Some(Staging {
+                handle: "42".into(),
+                budget: Some("2".into()),
+                pinned: true,
+            })
+        );
+        assert_eq!(headers, Some(map(&[("trace", "t")])));
+        // A pin the headers carried is removed when the send named nothing.
+        let mut headers = Some(map(&[(RV_PINNED_HEADER_KEY, "1")]));
+        write_staging(&mut headers, "42".into(), None, false);
+        assert_eq!(headers, Some(map(&[(RV_HEADER_KEY, "42")])));
     }
 }

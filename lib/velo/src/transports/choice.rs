@@ -58,6 +58,19 @@ pub enum TransportChoiceError {
         /// The peer the call named.
         peer: InstanceId,
     },
+    /// The transport cannot carry one frame of the reply: its capacity to
+    /// the peer is at most the reply's header.
+    #[error(
+        "transport {transport} carries {capacity} bytes to the peer, not more than the reply header of {header} bytes"
+    )]
+    CapacityTooSmall {
+        /// The transport the reply would take.
+        transport: TransportKey,
+        /// What the transport reports it carries to the peer.
+        capacity: usize,
+        /// The reply's header.
+        header: usize,
+    },
     /// The route was made by another node.
     #[error("the transport route was made by node {owner}, not by this node")]
     ForeignRoute {

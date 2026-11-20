@@ -148,6 +148,12 @@ pub struct RvAcquireRequest {
     /// module docs for the full skew story.
     #[serde(default)]
     pub rdma: Option<RdmaOffer>,
+    /// The key of the transport this fetch runs over, when the staged send
+    /// named one. The owner sizes chunks so that one `_rv_pull` reply fits
+    /// that transport. Absent from an older consumer and for an unnamed
+    /// fetch, and left off the wire then, so the request is the old shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
 }
 
 /// Response from `_rv_acquire`: transfer metadata with read lock.
@@ -343,6 +349,7 @@ mod tests {
             rdma: Some(RdmaOffer {
                 backends: vec!["ucx".to_string()],
             }),
+            route: Some("uds".to_string()),
         })
         .expect("serialize");
 

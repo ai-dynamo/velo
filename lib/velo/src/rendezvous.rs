@@ -721,6 +721,7 @@ impl RendezvousManager {
             u64::MAX,
             None,
             crate::transports::choice::Route::Primary,
+            false,
         )
         .await
     }
@@ -740,6 +741,7 @@ impl RendezvousManager {
         limit: u64,
         lease_timeout: Option<std::time::Duration>,
         route: crate::transports::choice::Route,
+        pinned: bool,
     ) -> Result<(Bytes, u64)> {
         let started = Instant::now();
         let (target_worker, local_id) = handle.unpack();
@@ -756,7 +758,7 @@ impl RendezvousManager {
                 .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
             Ok((data, lease.disarm()))
         } else {
-            consumer::Consumer::get_within(self, handle, limit, lease_timeout, route).await
+            consumer::Consumer::get_within(self, handle, limit, lease_timeout, route, pinned).await
         };
         if let Some(m) = &self.metrics {
             let outcome = if result.is_ok() {

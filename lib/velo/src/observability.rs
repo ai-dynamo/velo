@@ -1346,9 +1346,9 @@ impl VeloMetrics {
             CounterVec::new(
                 Opts::new(
                     "velo_transport_reply_reroutes_total",
-                    "Replies, and fetches of a staged payload, that could not go back over the \
-                     transport their request came in on, because this node has the caller \
-                     registered without that transport, and went over the caller's primary instead. `wanted` is the request's \
+                    "Replies that could not go back over the transport their request came in on, \
+                     because this node has the caller registered without that transport, and \
+                     went over this node's primary transport for the caller instead. `wanted` is the request's \
                      transport, `used` the one the reply took. Non-zero on an edge pinned to \
                      one transport means replies leave it.",
                 ),

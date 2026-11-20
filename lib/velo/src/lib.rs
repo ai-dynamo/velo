@@ -1153,12 +1153,13 @@ impl Velo {
         self.inner.messenger.backend().peer_transports(instance)
     }
 
-    /// The largest frame, header and payload, that `route`'s transport says
-    /// it carries to `instance`, or `None` when the transport cannot say.
+    /// The largest frame, header and payload, that this node's transport for
+    /// `route` says it carries to `instance`, or `None` when the transport
+    /// cannot say.
     ///
-    /// A unary reply is one frame and is never staged, so this bounds the
-    /// reply of a call sent over `route`. Fails when the route was made by
-    /// another node, or `instance` is not registered on its transport.
+    /// This is this node's outbound limit on the route, not the limit at the
+    /// peer's end. Fails when the route was made by another node, or
+    /// `instance` is not registered on its transport.
     pub fn route_capacity(
         &self,
         instance: InstanceId,
@@ -3725,7 +3726,7 @@ mod tests {
             &self,
             _: &str,
             _: Option<std::time::Duration>,
-            _: Option<velo_ext::TransportOrigin>,
+            _: crate::messenger::large_payload::StagedFrom,
         ) -> futures::future::BoxFuture<'_, anyhow::Result<bytes::Bytes>> {
             self.called.store(true, std::sync::atomic::Ordering::SeqCst);
             Box::pin(std::future::pending())

@@ -52,9 +52,17 @@ pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::Handler {
     crate::Handler::typed_unary(
         "_rv_acquire",
         move |ctx: crate::TypedContext<RvAcquireRequest>| {
-            let draining = ctx.msg.backend().shutdown_state().is_draining();
+            let backend = ctx.msg.backend();
+            let draining = backend.shutdown_state().is_draining();
             let lease_timeout = requested_lease_timeout(ctx.headers.as_ref());
-            serve_acquire(&store, &ctx.input, lease_timeout, draining)
+            // Sized before the read lock, so a refusal leaves nothing held.
+            let max_chunk = pull_chunk_limit(
+                backend,
+                ctx.sender_worker_id(),
+                ctx.input.route.as_deref(),
+                ctx.headers.as_ref(),
+            )?;
+            serve_acquire(&store, &ctx.input, lease_timeout, draining, max_chunk)
         },
     )
     .build()
@@ -70,7 +78,53 @@ pub fn acquire_lease(
     request: &RvAcquireRequest,
     headers: Option<&std::collections::HashMap<String, String>>,
 ) -> anyhow::Result<AcquireResponse> {
-    serve_acquire(store, request, requested_lease_timeout(headers), false)
+    serve_acquire(
+        store,
+        request,
+        requested_lease_timeout(headers),
+        false,
+        DEFAULT_CHUNK_SIZE,
+    )
+}
+
+/// The largest chunk one `_rv_pull` reply to `worker` can carry over the
+/// transport the reply takes: that transport's capacity, less the reply's
+/// header. The pull carries the fetch's headers back, which are at most the
+/// acquire's (tracing context, without the lease header), so the acquire's
+/// header bounds the pull's. With no capacity reported, the default chunk.
+///
+/// Fails with [`TransportChoiceError::CapacityTooSmall`] when the transport
+/// cannot carry one byte of a chunk. There is no fallback to another
+/// transport.
+///
+/// [`TransportChoiceError::CapacityTooSmall`]: crate::TransportChoiceError::CapacityTooSmall
+pub(crate) fn pull_chunk_limit(
+    backend: &crate::transports::VeloBackend,
+    worker: crate::WorkerId,
+    request_transport: Option<&str>,
+    headers: Option<&std::collections::HashMap<String, String>>,
+) -> anyhow::Result<u32> {
+    let (transport, capacity) = backend.reply_capacity(worker, request_transport)?;
+    let Some(capacity) = capacity else {
+        return Ok(DEFAULT_CHUNK_SIZE);
+    };
+    let header = crate::messenger::common::responses::encode_response_header(
+        crate::messenger::common::responses::ResponseId::from_u128(0),
+        crate::messenger::common::events::Outcome::Ok,
+        headers.cloned(),
+    )?
+    .len();
+    if capacity <= header {
+        return Err(crate::TransportChoiceError::CapacityTooSmall {
+            transport,
+            capacity,
+            header,
+        }
+        .into());
+    }
+    Ok(u32::try_from(capacity - header)
+        .unwrap_or(u32::MAX)
+        .min(DEFAULT_CHUNK_SIZE))
 }
 
 fn serve_acquire(
@@ -78,6 +132,7 @@ fn serve_acquire(
     request: &RvAcquireRequest,
     lease_timeout: Option<Duration>,
     draining: bool,
+    max_chunk: u32,
 ) -> anyhow::Result<AcquireResponse> {
     let handle = request.handle.to_handle();
     let (_, local_id) = handle.unpack();
@@ -108,7 +163,7 @@ fn serve_acquire(
     // Always use chunked transfer (even for 1 chunk) to avoid
     // JSON-encoding binary data in the typed-unary response.
     let (transfer_id, chunk_size, chunk_count) = store
-        .create_transfer(local_id, lease_id, DEFAULT_CHUNK_SIZE)
+        .create_transfer(local_id, lease_id, max_chunk)
         .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
     // A consumer whose fetch has a bound gives up at it and says nothing.
     // Granted late, after it gave up, this lease would hold the slot until

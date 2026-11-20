@@ -35,7 +35,7 @@ A send can name a transport: `.transport("uds")` on an `am_send`, `am_sync`, `un
 - `NotServedByPeer`: the peer is registered, but not on that transport. Its address has no entry for it, or the transport refused the entry.
 - `ForeignRoute`: the route was made by another node.
 
-A refused send takes no response slot and sends nothing.
+A refused send takes no response slot and sends nothing, on every path. A send to a worker that discovery must find first runs the discovery, checks the route against the peer it found, and only then takes a slot. With every slot taken, a refused route still reports `NotServedByPeer`, not a full arena.
 
 To send many times over one transport, resolve the key once with `Velo::transport_route(key)`, and give the `TransportRoute` it returns to `.route(route)`. A send with a route hashes nothing. It checks one bit in the peer's route, which the send reads anyway to find the primary.
 
@@ -47,12 +47,13 @@ let reply = node_a.unary("ping")?.route(uds).raw_payload(Bytes::new()).instance(
 Everything the call sends goes over the named transport:
 
 - **The handshake.** A call to a peer whose handlers are not known yet sends `_hello` first, over the same transport.
-- **A staged payload.** A payload over the staging threshold is fetched by the receiver. The receiver sends the fetch messages (`_rv_acquire`, `_rv_pull`, the release) over the transport the message came in on, so chunked bytes stay on it. With the `ucx` feature, the acquire can still offer RDMA when the owner is registered on UCX, whatever the route. The owner can then answer with a descriptor, and the bytes move by an RDMA read, not over the named transport.
+- **A staged payload.** A payload over the staging threshold is fetched by the receiver, over the transport the message came in on and no other. The fetch does not fall back like a reply: when the receiver is not registered on that transport for the sender, the fetch fails, the handler does not run, and the caller gets an error reply. The sender marks a staged payload whose send named a transport with the `_rv_pinned` header. The receiver offers RDMA for such a fetch only when the named transport is UCX. A send that named nothing may still be fetched by RDMA. A receiver from before this header passes it to the handler.
+- **Chunk size.** The owner of a staged payload sizes its chunks so that one `_rv_pull` reply fits the transport that reply takes: that transport's capacity, less the reply header. The fetch names its transport in the acquire, so the owner knows it. A transport that cannot carry one byte past the header fails the fetch with `TransportChoiceError::CapacityTooSmall`. The fetch never moves to another transport.
 - **The frame size check.** Each transport checks its own frames, so the named transport's limit applies. The staging decision compares the payload with the staging threshold only, for every send.
 
 Two calls let a caller check an edge before it sends:
 
-- `Velo::route_capacity(instance, route)` returns the largest frame the transport says it carries to the peer, or `None` when the transport cannot say. A unary reply is one frame and is never staged, so this bounds the reply of a call over that route.
+- `Velo::route_capacity(instance, route)` returns the largest frame that this node's transport says it carries to the peer, or `None` when the transport cannot say. It is this node's outbound limit on that route, not the limit at the peer's end. A unary reply is one frame and is never staged, so the peer's own limit on the same transport bounds the reply.
 - `Velo::probe_peer(instance, route, timeout)` runs the transport's health check for the peer.
 
 ### Replies follow the request
@@ -61,7 +62,7 @@ A reply goes back over the transport its request came in on: `Response`, `Ack`, 
 
 Each transport tags the frames it admits with its index, `TransportOrigin`, through the adapter that the runtime numbered for it with `TransportAdapter::with_origin`. The reply reads the tag and sends on the transport with that index. Two other designs were rejected. A `TransportKey` in each message costs a reference count per frame, and the reply would look the key up in a map. One set of inbound channels per transport would make the server loop wait on several receivers for every frame.
 
-A responder can have the caller registered without the request's transport. For example, it registered an address with that entry cut out, and no `_hello` has replaced it since. The reply then goes over the caller's primary, and `velo_transport_reply_reroutes_total{wanted,used}` counts it. The counter also counts the fetch messages of a staged payload that fall back the same way. A non-zero count on an edge kept on one transport means that its replies leave it. A dropped reply would leave the caller waiting with no word of why, so the reply is sent.
+A responder can have the caller registered without the request's transport. For example, it registered an address with that entry cut out, and no `_hello` has replaced it since. The reply then goes over the responder's primary transport for the caller, and `velo_transport_reply_reroutes_total{wanted,used}` counts it. A non-zero count on an edge kept on one transport means that its replies leave it. A dropped reply would leave the caller waiting with no word of why, so the reply is sent.
 
 Each node dials its own connection, so an edge that carries traffic both ways has two connections, one from each end. `velo_transport_active_connections` counts the connections a node dialed, not the ones it accepted.
 

@@ -162,8 +162,12 @@ struct Node {
 }
 
 async fn node(peer_keys: &[&str]) -> Node {
+    node_with_narrow(peer_keys, NARROW).await
+}
+
+async fn node_with_narrow(peer_keys: &[&str], narrow: usize) -> Node {
     let wide = Recording::new("wide", WIDE);
-    let narrow = Recording::new("narrow", NARROW);
+    let narrow = Recording::new("narrow", narrow);
     let registry = Registry::new();
     let messenger = crate::messenger::MessengerParts::new()
         .add_transport(wide.clone())
@@ -504,4 +508,118 @@ async fn a_re_registration_replaces_the_served_transports() {
             .check_served(node.peer, Route::Named(narrow.origin))
             .is_err()
     );
+}
+
+/// The owner sizes the chunks of a staged fetch so that one `_rv_pull` reply
+/// fits the transport the reply takes: that transport's capacity less the
+/// reply header. When the fetcher is not registered on the named transport
+/// the reply takes the primary, and the primary's capacity sizes them. A
+/// transport that cannot carry one byte past the header is refused with the
+/// typed error, with no fallback.
+#[tokio::test]
+async fn staged_chunks_are_sized_to_the_transport_the_pull_reply_takes() {
+    use crate::rendezvous::handlers::pull_chunk_limit;
+    use crate::rendezvous::store::DEFAULT_CHUNK_SIZE;
+    // Response header with no headers: 16-byte id, outcome, 2-byte length.
+    const HEADER: usize = 19;
+
+    let node = node(&["wide", "narrow"]).await;
+    let backend = node.messenger.backend();
+    let worker = node.peer.worker_id();
+    assert_eq!(
+        pull_chunk_limit(backend, worker, Some("narrow"), None).unwrap() as usize,
+        NARROW - HEADER
+    );
+    assert_eq!(
+        pull_chunk_limit(backend, worker, Some("wide"), None).unwrap(),
+        DEFAULT_CHUNK_SIZE,
+        "a wide transport keeps the default chunk"
+    );
+
+    let only_wide = node_with_narrow(&["wide"], NARROW).await;
+    assert_eq!(
+        pull_chunk_limit(
+            only_wide.messenger.backend(),
+            only_wide.peer.worker_id(),
+            Some("narrow"),
+            None
+        )
+        .unwrap(),
+        DEFAULT_CHUNK_SIZE,
+        "the reply takes the primary, so the primary sizes the chunk"
+    );
+
+    let tiny = node_with_narrow(&["wide", "narrow"], HEADER).await;
+    let error = pull_chunk_limit(
+        tiny.messenger.backend(),
+        tiny.peer.worker_id(),
+        Some("narrow"),
+        None,
+    )
+    .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<TransportChoiceError>(),
+        Some(&TransportChoiceError::CapacityTooSmall {
+            transport: "narrow".into(),
+            capacity: HEADER,
+            header: HEADER,
+        })
+    );
+}
+
+/// A named send that the peer cannot take is refused before slot
+/// acquisition, so it reports the route even with every slot taken: a
+/// caller that refuses edges learns why, not that the arena is full. The
+/// unnamed send is the control that the arena really is full.
+#[tokio::test]
+async fn a_refused_route_is_reported_with_the_slot_arena_exhausted() {
+    let node = node(&["wide"]).await;
+    let client = node.messenger.client();
+    let mut held = Vec::new();
+    while let Ok(awaiter) = client.register_outcome() {
+        held.push(awaiter);
+    }
+    assert!(!held.is_empty());
+
+    let unnamed = node
+        .messenger
+        .am_send("sized")
+        .unwrap()
+        .raw_payload(Bytes::new())
+        .instance(node.peer)
+        .send()
+        .await
+        .unwrap_err();
+    assert!(
+        unnamed.downcast_ref::<TransportChoiceError>().is_none(),
+        "the control send fails on the arena: {unnamed}"
+    );
+
+    for named in [
+        node.messenger
+            .am_send("sized")
+            .unwrap()
+            .transport("narrow")
+            .raw_payload(Bytes::new())
+            .instance(node.peer)
+            .send()
+            .await,
+        node.messenger
+            .am_send("sized")
+            .unwrap()
+            .transport("narrow")
+            .raw_payload(Bytes::new())
+            .worker(node.peer.worker_id())
+            .send()
+            .await,
+    ] {
+        assert_eq!(
+            named.unwrap_err().downcast_ref::<TransportChoiceError>(),
+            Some(&TransportChoiceError::NotServedByPeer {
+                peer: node.peer,
+                transport: "narrow".into()
+            })
+        );
+    }
+    assert_eq!(node.wide.sent_count() + node.narrow.sent_count(), 0);
 }

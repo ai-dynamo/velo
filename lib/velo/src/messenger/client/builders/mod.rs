@@ -993,11 +993,20 @@ impl MessageBuilder {
             Choice::Resolved(route) => route,
             Choice::Refused(refused) => return SendStage::refused(*refused),
         };
-        if route != Route::Primary
-            && let Ok(target) = &target_result
-            && let Err(choice) = self.client.backend.check_served(*target, route)
-        {
-            return SendStage::refused(choice);
+        if route != Route::Primary {
+            match &target_result {
+                Ok(target) => {
+                    if let Err(choice) = self.client.backend.check_served(*target, route) {
+                        return SendStage::refused(choice);
+                    }
+                }
+                // A worker discovery must find first: the route is checked
+                // against what it finds, before a slot is taken.
+                Err(ResolveError::UnresolvedPeer) => {
+                    return self.discover_then_send(message_type, route, fetch_by);
+                }
+                Err(ResolveError::Other(_)) => unreachable!("returned above"),
+            }
         }
 
         match self.acquire() {
@@ -1017,6 +1026,48 @@ impl MessageBuilder {
             }
             Acquisition::Exhausted(e) => SendStage::failed(e),
         }
+    }
+
+    /// A named send to a worker not yet known: discover it, check the route
+    /// against what discovery found, and only then take a response slot. So
+    /// a refused route takes no slot on this path either.
+    ///
+    /// The work runs on its own task, as the slow path does, so a result
+    /// dropped before it finishes does not withdraw the send.
+    fn discover_then_send(
+        self,
+        message_type: MsgType,
+        route: Route,
+        fetch_by: Option<tokio::time::Instant>,
+    ) -> SendStage {
+        let Some(worker) = self.target_worker else {
+            unreachable!("UnresolvedPeer is only returned for a worker target");
+        };
+        let task = tokio::spawn(async move {
+            let target = match self.client.resolve_peer_via_discovery(worker).await {
+                Ok(target) => target,
+                Err(e) => {
+                    if let Some(metrics) = self.client.observability.as_ref() {
+                        metrics.record_client_resolution(ClientResolution::DiscoveryError);
+                    }
+                    return Dispatched::failed(format!("Discovery failed: {e}"));
+                }
+            };
+            if let Err(choice) = self.client.backend.check_served(target, route) {
+                return Dispatched::refused(choice);
+            }
+            let awaiter = match self.acquire() {
+                Acquisition::Allocated(awaiter) => awaiter,
+                Acquisition::Deferred(backpressure) => backpressure.await,
+                Acquisition::Exhausted(e) => return Dispatched::failed(e),
+            };
+            self.dispatch(Ok(target), awaiter, message_type, route, fetch_by)
+        });
+        SendStage::Acquiring(Box::pin(async move {
+            task.await.unwrap_or_else(|_| {
+                Dispatched::failed("Send failed: the send task ended without reporting")
+            })
+        }))
     }
 
     /// Issue a fire-and-forget send.

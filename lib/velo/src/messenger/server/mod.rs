@@ -340,6 +340,7 @@ async fn create_message_handler(
                             in_flight,
                             backend,
                             origin,
+                            pinned: staging.pinned,
                         });
                         continue;
                     } else {
@@ -445,6 +446,8 @@ struct ResolveJob {
     /// The transport the message came in on: the fetch and the reply go
     /// back over it.
     origin: Option<velo_ext::TransportOrigin>,
+    /// The send named its transport.
+    pinned: bool,
 }
 
 /// Resolve a large payload off the receive loop, then dispatch it.
@@ -482,10 +485,12 @@ async fn resolve_and_dispatch(job: ResolveJob) {
         in_flight,
         backend,
         origin,
+        pinned,
     } = job;
     let within = fetch_bound.map(|bound| bound.within);
+    let from = crate::messenger::large_payload::StagedFrom { origin, pinned };
     let Some(resolved) =
-        resolve_within(resolver.resolve(&handle_str, within, origin), fetch_bound).await
+        resolve_within(resolver.resolve(&handle_str, within, from), fetch_bound).await
     else {
         tracing::debug!(
             target: "crate::messenger::server",
@@ -744,7 +749,7 @@ mod tests {
             &self,
             _: &str,
             _: Option<std::time::Duration>,
-            _: Option<velo_ext::TransportOrigin>,
+            _: crate::messenger::large_payload::StagedFrom,
         ) -> futures::future::BoxFuture<'_, anyhow::Result<Bytes>> {
             Box::pin(std::future::pending())
         }
@@ -776,6 +781,7 @@ mod tests {
             in_flight: None,
             backend: Arc::clone(&backend),
             origin: None,
+            pinned: false,
         });
         tokio::task::yield_now().await;
         backend.shutdown_state().teardown_token().cancel();

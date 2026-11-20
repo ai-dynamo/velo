@@ -102,14 +102,22 @@ impl Consumer {
         limit: u64,
         lease_timeout: Option<std::time::Duration>,
         route: Route,
+        pinned: bool,
     ) -> Result<(Bytes, u64)> {
         let client = &manager.client()?;
         let fetch = Fetch { client, route };
         let target_worker = handle.worker_id();
+        // A send that named its transport is fetched over that transport
+        // only: RDMA only when that transport is the RDMA backend.
+        let pinned_to = if pinned {
+            Some(client.backend.route_key(route))
+        } else {
+            None
+        };
         let response = acquire(
             fetch,
             handle,
-            rdma_offer(manager, target_worker),
+            rdma_offer(manager, target_worker, pinned_to.as_ref()),
             lease_timeout,
         )
         .await?;
@@ -204,7 +212,13 @@ impl Consumer {
             route: Route::Primary,
         };
         let target_worker = handle.worker_id();
-        let response = acquire(fetch, handle, rdma_offer(manager, target_worker), None).await?;
+        let response = acquire(
+            fetch,
+            handle,
+            rdma_offer(manager, target_worker, None),
+            None,
+        )
+        .await?;
 
         match response {
             AcquireResponse::Rdma {
@@ -287,7 +301,13 @@ impl Consumer {
             route: Route::Primary,
         };
         let target_worker = handle.worker_id();
-        let response = acquire(fetch, handle, rdma_offer(manager, target_worker), None).await?;
+        let response = acquire(
+            fetch,
+            handle,
+            rdma_offer(manager, target_worker, None),
+            None,
+        )
+        .await?;
 
         match response {
             AcquireResponse::Ready {
@@ -470,6 +490,11 @@ async fn acquire(
     .payload(&RvAcquireRequest {
         handle: RvHandleWire::from_handle(handle),
         rdma: offer,
+        route: fetch
+            .client
+            .backend
+            .route_key(fetch.route)
+            .map(|key| key.as_str().to_string()),
     })?
     .worker(handle.worker_id())
     .via(fetch.route);
@@ -483,7 +508,11 @@ async fn acquire(
 /// A build without the RDMA path never offers. The function exists so the call
 /// sites read the same either way.
 #[cfg(not(all(target_os = "linux", feature = "ucx")))]
-fn rdma_offer(_manager: &RendezvousManager, _target: WorkerId) -> Option<RdmaOffer> {
+fn rdma_offer(
+    _manager: &RendezvousManager,
+    _target: WorkerId,
+    _pinned_to: Option<&Option<velo_ext::TransportKey>>,
+) -> Option<RdmaOffer> {
     None
 }
 
@@ -493,8 +522,16 @@ fn rdma_offer(_manager: &RendezvousManager, _target: WorkerId) -> Option<RdmaOff
 /// process's life, and an offer that outlived the endpoint it was based on
 /// would send the owner down a path this side can no longer walk. See the
 /// module docs for why the three conditions are the whole of eligibility.
+///
+/// `pinned_to` is set for a fetch whose send named its transport: the key of
+/// that transport (`None` inside when the fetch has no named route). Such a
+/// fetch offers RDMA only when that transport is the RDMA backend.
 #[cfg(all(target_os = "linux", feature = "ucx"))]
-fn rdma_offer(manager: &RendezvousManager, target: WorkerId) -> Option<RdmaOffer> {
+fn rdma_offer(
+    manager: &RendezvousManager,
+    target: WorkerId,
+    pinned_to: Option<&Option<velo_ext::TransportKey>>,
+) -> Option<RdmaOffer> {
     let store = manager.data_store();
     let Some(ctx) = store.rdma() else {
         store.record_path(RdmaPathReason::NotConfigured);
@@ -505,6 +542,12 @@ fn rdma_offer(manager: &RendezvousManager, target: WorkerId) -> Option<RdmaOffer
         return None;
     }
     let key = ctx.backend.key();
+    if let Some(pinned) = pinned_to
+        && pinned.as_ref().is_none_or(|named| named.as_str() != key)
+    {
+        store.record_path(RdmaPathReason::NoOffer);
+        return None;
+    }
     let messenger = manager.messenger().ok()?;
     let backend = messenger.backend();
     // An owner this instance has never registered has no endpoint to GET over,

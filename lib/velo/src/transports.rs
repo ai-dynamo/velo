@@ -555,6 +555,9 @@ impl VeloBackend {
     /// lane 0
     /// ([`SendOutcome::Pending`]), where the frame is queued behind its
     /// predecessors and the contained [`SendAdmission`] reports when it lands.
+    // The messenger sends through `send_routed`. Events send through
+    // `send_message_to_worker`, and tests through these.
+    #[cfg(any(test, feature = "services"))]
     pub fn send_message(
         &self,
         target: InstanceId,
@@ -603,6 +606,7 @@ impl VeloBackend {
     /// [`Transport::send_message_on_lane`] for the contract, and
     /// [`send_message`](Self::send_message) for everything else, which is the
     /// same.
+    #[cfg(any(test, feature = "services"))]
     pub fn send_message_on_lane(
         &self,
         target: InstanceId,
@@ -740,6 +744,7 @@ impl VeloBackend {
     ///     }
     /// }
     /// ```
+    #[cfg(feature = "services")]
     pub fn send_message_to_worker(
         &self,
         worker_id: WorkerId,
@@ -755,8 +760,9 @@ impl VeloBackend {
     /// Send a reply to a worker, over the transport its request came in on.
     ///
     /// `origin` is the request's [`InboundMessage::origin`]. When the worker
-    /// is not registered on that transport, the reply goes over its primary
-    /// and `velo_transport_reply_reroutes_total` counts it. `None` (a request
+    /// is not registered on that transport, the reply goes over this node's
+    /// primary for the worker and `velo_transport_reply_reroutes_total`
+    /// counts it. `None` (a request
     /// from an adapter nobody numbered) uses the primary.
     pub(crate) fn send_reply_to_worker(
         &self,
@@ -838,6 +844,41 @@ impl VeloBackend {
             Arc::clone(&self.by_index[origin_slot(origin)])
         };
         Ok(transport.max_message_size(target))
+    }
+
+    /// The transport a reply to `worker` takes, given the key of the
+    /// transport its request came in on, and that transport's capacity to
+    /// the worker. The same choice [`Route::Reply`] makes: the request's
+    /// transport when the worker is registered on it, the primary otherwise.
+    pub(crate) fn reply_capacity(
+        &self,
+        worker: WorkerId,
+        request_transport: Option<&str>,
+    ) -> anyhow::Result<(TransportKey, Option<usize>)> {
+        let target = self.try_translate_worker_id(worker)?;
+        let origin = request_transport.and_then(|key| self.index_of.get(key).copied());
+        let transport = {
+            let peer = self
+                .primary_transport
+                .get(&target)
+                .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
+            match origin {
+                Some(origin) if peer.serves(origin) => {
+                    Arc::clone(&self.by_index[origin_slot(origin)])
+                }
+                _ => Arc::clone(&peer.primary),
+            }
+        };
+        Ok((transport.key(), transport.max_message_size(target)))
+    }
+
+    /// The key of the transport a named route sends on. `None` for any other
+    /// route.
+    pub(crate) fn route_key(&self, route: Route) -> Option<TransportKey> {
+        match route {
+            Route::Named(origin) => self.by_index.get(origin_slot(origin)).map(|t| t.key()),
+            _ => None,
+        }
     }
 
     /// The transports `target` is registered on, primary first and then in

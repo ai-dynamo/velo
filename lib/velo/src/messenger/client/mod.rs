@@ -94,8 +94,9 @@ pub(crate) fn finalize_outbound_headers(headers: &mut Option<HashMap<String, Str
     let _ = headers;
 }
 
-/// A staged payload's handle, and the budget its call has left, if any.
-pub(crate) type Staged = (String, Option<Duration>);
+/// A staged payload's handle, the budget its call has left, if any, and
+/// whether the send named its transport.
+pub(crate) type Staged = (String, Option<Duration>, bool);
 
 /// Turn an outbound message into wire bytes: finalize its headers, write its
 /// staging headers if its payload was staged, then encode.
@@ -109,11 +110,12 @@ pub(crate) fn encode_outbound(
     staged: Option<Staged>,
 ) -> Result<(bytes::Bytes, bytes::Bytes, crate::transports::MessageType), EncodeError> {
     finalize_outbound_headers(&mut message.metadata.headers);
-    if let Some((handle, budget)) = staged {
+    if let Some((handle, budget, pinned)) = staged {
         crate::messenger::large_payload::write_staging(
             &mut message.metadata.headers,
             handle,
             budget,
+            pinned,
         );
     }
     message.encode()
@@ -177,7 +179,8 @@ impl ActiveMessageClient {
                     fetch_by.map(|at| at.saturating_duration_since(tokio::time::Instant::now()));
                 // The budget is also the payload's time-to-live here: once
                 // the caller has given up, nobody waits for it.
-                Some((stager.stage(payload, budget), budget))
+                let pinned = matches!(route, Route::Named(_));
+                Some((stager.stage(payload, budget), budget, pinned))
             }
             None => None,
         };
