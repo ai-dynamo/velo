@@ -1992,3 +1992,73 @@ async fn a_staged_payload_named_on_another_transport_is_not_fetched_by_rdma() {
     );
     shutdown(pair).await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_named_fetch_uses_rdma_only_on_the_transport_that_owns_it() {
+    async fn node() -> Node {
+        let messenger = Arc::new(UcxTransportBuilder::new().tls("tcp").build().unwrap());
+        let rma = Arc::new(
+            ucx_with_software_get()
+                .key("ucx-rma".into())
+                .build()
+                .unwrap(),
+        );
+        let registry = Registry::new();
+        let velo = Velo::builder()
+            .mux_only()
+            .metrics(Arc::new(VeloMetrics::register(&registry).unwrap()))
+            .add_transport(messenger)
+            .add_ucx_transport(rma)
+            .build()
+            .await
+            .unwrap();
+        Node { velo, registry }
+    }
+
+    let pair = Pair {
+        owner: node().await,
+        consumer: node().await,
+    };
+    pair.owner
+        .velo
+        .register_peer(pair.consumer.velo.peer_info())
+        .unwrap();
+    pair.consumer
+        .velo
+        .register_peer(pair.owner.velo.peer_info())
+        .unwrap();
+    let receiver = pair.consumer.velo.instance_id();
+    pair.consumer
+        .velo
+        .register_handler(
+            Handler::unary_handler("len", |ctx| {
+                Ok(Some(Bytes::from(ctx.payload.len().to_le_bytes().to_vec())))
+            })
+            .build(),
+        )
+        .unwrap();
+    let warm = pair.owner.velo.register_data_pinned(&pattern(4096)).await;
+    assert!(pair.owner.velo.metadata(warm).await.unwrap().pinned);
+
+    let len = 600 * 1024;
+    let mut gets = Vec::new();
+    for key in ["ucx", "ucx-rma"] {
+        let before = pair.consumer.path_count("ok");
+        let reply = pair
+            .owner
+            .velo
+            .unary("len")
+            .unwrap()
+            .raw_payload(Bytes::from(pattern(len)))
+            .transport(key)
+            .instance(receiver)
+            .timeout(T)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(&reply[..], &len.to_le_bytes());
+        gets.push(pair.consumer.path_count("ok") - before);
+    }
+    shutdown(pair).await;
+    assert_eq!(gets, [0, 1], "only ucx-rma has an RDMA registry");
+}
