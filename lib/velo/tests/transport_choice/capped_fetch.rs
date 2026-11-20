@@ -4,8 +4,8 @@
 use super::{DEADLINE, Kind, node, node_with, shutdown, traffic, transport};
 use bytes::Bytes;
 use futures::future::BoxFuture;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
 use velo::Velo;
@@ -19,6 +19,7 @@ struct CappedUds {
     capacity: AtomicUsize,
     rejected_bytes: AtomicUsize,
     rejected: Notify,
+    before_response: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl Transport for CappedUds {
@@ -57,6 +58,12 @@ impl Transport for CappedUds {
                 format!("frame of {size} exceeds {capacity}"),
             );
             return SendOutcome::Admitted;
+        }
+        if message_type == MessageType::Response {
+            let action = self.before_response.lock().unwrap().take();
+            if let Some(action) = action {
+                action();
+            }
         }
         self.inner
             .send_message(instance, header, payload, message_type, on_error)
@@ -101,6 +108,7 @@ async fn staged_chunks_fit_the_named_transport() {
         capacity: AtomicUsize::new(1024 * 1024),
         rejected_bytes: AtomicUsize::new(0),
         rejected: Notify::new(),
+        before_response: Mutex::new(None),
     });
     let sender = Velo::builder()
         .mux_only()
@@ -152,6 +160,7 @@ async fn an_unnamed_get_sizes_chunks_for_the_consumers_primary() {
         capacity: AtomicUsize::new(narrow),
         rejected_bytes: AtomicUsize::new(0),
         rejected: Notify::new(),
+        before_response: Mutex::new(None),
     });
     let owner = Velo::builder()
         .mux_only()
@@ -212,6 +221,7 @@ async fn every_staged_frame_follows_the_call_route() {
                         capacity: AtomicUsize::new(capacity),
                         rejected_bytes: AtomicUsize::new(0),
                         rejected: Notify::new(),
+                        before_response: Mutex::new(None),
                     })
                 };
                 let (tcp, uds) = (wrap(Kind::Tcp, "tcp"), wrap(Kind::Uds, "uds"));
@@ -274,4 +284,52 @@ async fn every_staged_frame_follows_the_call_route() {
             }
         }
     }
+}
+
+#[tokio::test]
+async fn an_active_get_keeps_the_route_it_acquired_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let uds = Arc::new(CappedUds {
+        inner: transport(Kind::Uds, &dir),
+        capacity: AtomicUsize::new(1024 * 1024),
+        rejected_bytes: AtomicUsize::new(0),
+        rejected: Notify::new(),
+        before_response: Mutex::new(None),
+    });
+    let owner = node_with(vec![transport(Kind::Tcp, &dir), uds.clone()]).await;
+    let consumer = node(&dir, &[Kind::Uds, Kind::Tcp]).await;
+    let owner_id = owner.velo.instance_id();
+    owner.velo.register_peer(consumer.velo.peer_info()).unwrap();
+    consumer.velo.register_peer(owner.velo.peer_info()).unwrap();
+    consumer.velo.available_handlers(owner_id).await.unwrap();
+
+    let original = owner.velo.peer_info();
+    let tcp = original.worker_address().get_entry("tcp").unwrap().unwrap();
+    let encoded = rmp_serde::to_vec(&std::collections::BTreeMap::from([("tcp", tcp)])).unwrap();
+    let tcp_only_owner = PeerInfo::new(owner_id, WorkerAddress::from_encoded(encoded));
+    let peer = consumer.velo.clone();
+    *uds.before_response.lock().unwrap() = Some(Box::new(move || {
+        peer.register_peer(tcp_only_owner).unwrap();
+        assert_eq!(peer.peer_transports(owner_id), Some(vec!["tcp".into()]));
+    }));
+
+    let data = Bytes::from(vec![7; 300 * 1024]);
+    let handle = owner.velo.register_data(data.clone());
+    let mut fetched = false;
+    let seen = traffic(&consumer, &owner, async {
+        let result = tokio::time::timeout(DEADLINE, consumer.velo.get(handle))
+            .await
+            .expect("get reached no result before its deadline");
+        if let Ok((bytes, _)) = result {
+            assert!(bytes == data);
+            fetched = true;
+        }
+    })
+    .await;
+    assert_eq!(seen.a_to_b.get(&("uds".into(), "message".into())), Some(&1));
+    assert_eq!(
+        seen.a_to_b.get(&("tcp".into(), "message".into())),
+        None,
+        "the get sent a pull on TCP after acquiring on UDS; payload returned: {fetched}",
+    );
 }
