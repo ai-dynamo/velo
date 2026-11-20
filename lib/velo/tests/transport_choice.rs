@@ -537,3 +537,76 @@ async fn a_staged_fetch_does_not_leave_a_named_route() {
     );
     shutdown([&a, &b]).await;
 }
+
+#[tokio::test]
+async fn staged_bytes_do_not_reroute_after_the_owner_loses_the_named_route() {
+    use velo::{PeerInfo, WorkerAddress};
+
+    let dir = tempfile::tempdir().unwrap();
+    let (owner, consumer) = pair(&dir, &[Kind::Tcp, Kind::Uds], &[Kind::Tcp, Kind::Uds]).await;
+    let owner_id = owner.velo.instance_id();
+    let consumer_id = consumer.velo.instance_id();
+    owner.velo.available_handlers(consumer_id).await.unwrap();
+    consumer.velo.available_handlers(owner_id).await.unwrap();
+
+    let info = consumer.velo.peer_info();
+    let tcp = info.worker_address().get_entry("tcp").unwrap().unwrap();
+    let filtered = rmp_serde::to_vec(&BTreeMap::from([("tcp", tcp)])).unwrap();
+    let filtered_peer = PeerInfo::new(
+        consumer_id,
+        WorkerAddress::from_encoded(Bytes::from(filtered)),
+    );
+    let tcp_response_bytes = || {
+        owner
+            .reg
+            .gather()
+            .into_iter()
+            .find(|f| f.name() == "velo_transport_frame_bytes_total")
+            .unwrap()
+            .get_metric()
+            .iter()
+            .filter(|m| {
+                [
+                    ("transport", "tcp"),
+                    ("direction", "outbound"),
+                    ("message_type", "response"),
+                ]
+                .into_iter()
+                .all(|(name, value)| {
+                    m.get_label()
+                        .iter()
+                        .any(|label| label.name() == name && label.value() == value)
+                })
+            })
+            .map(|m| m.get_counter().value() as u64)
+            .sum::<u64>()
+    };
+    let before = tcp_response_bytes();
+    let len = 300 * 1024;
+    let mut response = None;
+    let seen = traffic(&owner, &consumer, async {
+        let call = owner
+            .velo
+            .unary("echo_len")
+            .unwrap()
+            .transport("uds")
+            .raw_payload(Bytes::from(vec![1; len]))
+            .instance(consumer_id)
+            .timeout(DEADLINE)
+            .send();
+        // The current-thread runtime cannot run the consumer until this task yields.
+        owner.velo.register_peer(filtered_peer).unwrap();
+        assert_eq!(
+            owner.velo.peer_transports(consumer_id),
+            Some(vec!["tcp".into()])
+        );
+        response = Some(call.await);
+    })
+    .await;
+    assert_eq!(seen.a_to_b.get(&("uds".into(), "message".into())), Some(&1));
+    let rerouted_bytes = tcp_response_bytes() - before;
+    assert!(
+        rerouted_bytes < len as u64,
+        "TCP carried {rerouted_bytes} response bytes for a staged UDS call. Result: {response:?}",
+    );
+}
