@@ -20,5 +20,8 @@ pub use hub::*;
 
 #[cfg(feature = "server")]
 pub use axum;
+/// The DER certificate and key types that [`HubTls`] takes.
+#[cfg(feature = "server")]
+pub use rustls::pki_types;
 pub use velo;
 pub use velo_hub_ext as protocol;

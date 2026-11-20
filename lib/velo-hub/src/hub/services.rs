@@ -415,6 +415,7 @@ mod tests {
                 epoch,
                 previous,
                 extensions: &extensions,
+                client: None,
             },
         );
         Lease { incarnation, epoch }

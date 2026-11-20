@@ -41,6 +41,7 @@ use velo::{InstanceId, PeerInfo};
 
 use super::authority::Lease;
 use super::context::{AttachContext, StartContext};
+use super::tls::ClientIdentity;
 use crate::protocol::{ErrorCode, RegistrationEpoch};
 use crate::store::{Incarnation, Removal};
 
@@ -268,6 +269,11 @@ pub struct RegistrationView<'a> {
     pub peer: &'a PeerInfo,
     /// Every payload in the request, keyed by extension name.
     pub extensions: &'a BTreeMap<String, serde_json::Value>,
+    /// The verified client certificate of the connection the request came
+    /// on, if the control listener takes client certificates and the client
+    /// presented one. An extension that admits only some identities refuses
+    /// in `admit`.
+    pub client: Option<&'a ClientIdentity>,
 }
 
 impl RegistrationView<'_> {
@@ -290,6 +296,8 @@ pub struct Txn<'a> {
     pub previous: Option<Lease>,
     /// Every payload in the request, keyed by extension name.
     pub extensions: &'a BTreeMap<String, serde_json::Value>,
+    /// The verified client certificate, as in [`RegistrationView::client`].
+    pub client: Option<&'a ClientIdentity>,
 }
 
 impl Txn<'_> {
@@ -315,6 +323,8 @@ pub struct Committed<'a> {
     pub previous: Option<Lease>,
     /// Every payload, keyed by extension name.
     pub extensions: &'a BTreeMap<String, serde_json::Value>,
+    /// The verified client certificate, as in [`RegistrationView::client`].
+    pub client: Option<&'a ClientIdentity>,
 }
 
 impl Committed<'_> {
