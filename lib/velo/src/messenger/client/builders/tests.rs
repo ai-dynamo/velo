@@ -790,3 +790,45 @@ fn validate_handler_name_rejects_system() {
             .contains("Cannot directly call system handler")
     );
 }
+
+#[tokio::test(start_paused = true)]
+async fn a_timed_out_discovery_releases_the_slot_before_its_result_is_dropped() {
+    use tokio::sync::Notify;
+
+    let manager = ResponseManager::with_capacity(1, 1, None);
+    let slot = manager.register_outcome().unwrap();
+    let gate = Arc::new(results::SendGate::default());
+    let started = Arc::new(Notify::new());
+    let publish = Arc::new(Notify::new());
+    let task = tokio::spawn({
+        let gate = gate.clone();
+        let started = started.clone();
+        let publish = publish.clone();
+        async move {
+            let dispatched = gate
+                .send_if_open(|| Dispatched::issued(SendOutcome::Admitted, slot))
+                .unwrap();
+            // Pause after dispatch commits the send and before the caller can
+            // see the task's result.
+            started.notify_one();
+            publish.notified().await;
+            dispatched
+        }
+    });
+    let mut result = UnaryResult {
+        stage: SendStage::Discovering {
+            gate,
+            future: Box::pin(async move { task.await.unwrap() }),
+        },
+        deadline: with_deadline(DEADLINE),
+    };
+    started.notified().await;
+    let error = (&mut result).await.unwrap_err();
+    timed_out(&error);
+    publish.notify_one();
+    assert_eq!(
+        manager.pending_outcome_count(),
+        0,
+        "RequestTimeout must release the slot even if the caller retains the result",
+    );
+}
