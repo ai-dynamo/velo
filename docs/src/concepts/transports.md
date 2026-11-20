@@ -47,7 +47,7 @@ let reply = node_a.unary("ping")?.route(uds).raw_payload(Bytes::new()).instance(
 Everything the call sends goes over the named transport:
 
 - **The handshake.** A call to a peer whose handlers are not known yet sends `_hello` first, over the same transport.
-- **A staged payload.** A payload over the staging threshold is fetched by the receiver. The receiver sends the fetch, and the release, over the transport the message came in on, so the payload's bytes stay on it.
+- **A staged payload.** A payload over the staging threshold is fetched by the receiver. The receiver sends the fetch messages (`_rv_acquire`, `_rv_pull`, the release) over the transport the message came in on, so chunked bytes stay on it. With the `ucx` feature, the acquire can still offer RDMA when the owner is registered on UCX, whatever the route. The owner can then answer with a descriptor, and the bytes move by an RDMA read, not over the named transport.
 - **The frame size check.** Each transport checks its own frames, so the named transport's limit applies. The staging decision compares the payload with the staging threshold only, for every send.
 
 Two calls let a caller check an edge before it sends:
@@ -61,7 +61,7 @@ A reply goes back over the transport its request came in on: `Response`, `Ack`, 
 
 Each transport tags the frames it admits with its index, `TransportOrigin`, through the adapter that the runtime numbered for it with `TransportAdapter::with_origin`. The reply reads the tag and sends on the transport with that index. Two other designs were rejected. A `TransportKey` in each message costs a reference count per frame, and the reply would look the key up in a map. One set of inbound channels per transport would make the server loop wait on several receivers for every frame.
 
-A responder can have the caller registered without the request's transport. For example, it registered an address with that entry cut out, and no `_hello` has replaced it since. The reply then goes over the caller's primary, and `velo_transport_reply_reroutes_total{wanted,used}` counts it. A non-zero count on an edge kept on one transport means that its replies leave it. A dropped reply would leave the caller waiting with no word of why, so the reply is sent.
+A responder can have the caller registered without the request's transport. For example, it registered an address with that entry cut out, and no `_hello` has replaced it since. The reply then goes over the caller's primary, and `velo_transport_reply_reroutes_total{wanted,used}` counts it. The counter also counts the fetch messages of a staged payload that fall back the same way. A non-zero count on an edge kept on one transport means that its replies leave it. A dropped reply would leave the caller waiting with no word of why, so the reply is sent.
 
 Each node dials its own connection, so an edge that carries traffic both ways has two connections, one from each end. `velo_transport_active_connections` counts the connections a node dialed, not the ones it accepted.
 
