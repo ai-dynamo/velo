@@ -1173,6 +1173,10 @@ impl Velo {
 
     /// Probe `instance` over `route`'s transport, with
     /// [`Transport::check_health`]. Never falls back to another transport.
+    ///
+    /// Fails with [`PeerProbeError::Choice`] before any probe runs when the
+    /// route cannot be used for `instance`, and with
+    /// [`PeerProbeError::Health`] when the probe fails.
     pub async fn probe_peer(
         &self,
         instance: InstanceId,

@@ -506,10 +506,12 @@ impl VeloBackend {
         };
         // The guard drops here: the probe can wait for `timeout`.
         let transport = {
+            // No probe runs for a peer that is not registered, so this is a
+            // route that cannot be used, as `route_capacity` reports it.
             let peer = self
                 .primary_transport
                 .get(&target)
-                .ok_or(transport::HealthCheckError::PeerNotRegistered)?;
+                .ok_or(TransportChoiceError::PeerNotRegistered { peer: target })?;
             if !peer.serves(origin) {
                 return Err(TransportChoiceError::NotServedByPeer {
                     peer: target,

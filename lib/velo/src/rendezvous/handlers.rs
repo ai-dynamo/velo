@@ -90,14 +90,24 @@ pub fn acquire_lease(
     )
 }
 
+/// The room an `_rv_acquire` answer needs after its reply header: the most
+/// bytes the chunked answer encodes to, which a test below pins. The RDMA
+/// answer is not counted: its lease always has a deadline.
+pub(crate) const ACQUIRE_ANSWER_ROOM: usize = 160;
+
 /// The largest chunk one `_rv_pull` reply to `worker` can carry over the
 /// transport that reply takes ([`VeloBackend::reply_capacity`]): its
 /// capacity, less the reply header. The pull carries the fetch's headers
 /// back, which are at most the acquire's, so the acquire's header bounds the
 /// pull's. With no capacity reported, the default chunk.
 ///
+/// A transport with less than [`ACQUIRE_ANSWER_ROOM`] after the header is
+/// refused. The acquire's answer goes back over the same transport with the
+/// same header. An answer over the limit is replaced by an error reply that
+/// names no lease, and the consumer cannot end a lease it never saw.
+///
 /// [`VeloBackend::reply_capacity`]: crate::transports::VeloBackend::reply_capacity
-fn pull_chunk_limit(
+pub(crate) fn pull_chunk_limit(
     backend: &crate::transports::VeloBackend,
     worker: crate::WorkerId,
     origin: Option<velo_ext::TransportOrigin>,
@@ -114,8 +124,9 @@ fn pull_chunk_limit(
     )?
     .len();
     anyhow::ensure!(
-        capacity > header,
-        "transport {transport} carries {capacity} bytes, not more than the {header}-byte reply header"
+        capacity.saturating_sub(header) >= ACQUIRE_ANSWER_ROOM,
+        "transport {transport} carries {capacity} bytes: after the {header}-byte reply header \
+         that is less than the {ACQUIRE_ANSWER_ROOM} bytes the acquire answer can need"
     );
     Ok(u32::try_from(capacity - header)
         .unwrap_or(u32::MAX)
@@ -442,4 +453,29 @@ pub fn create_rv_release_handler(store: Arc<DataStore>) -> crate::Handler {
         Ok(())
     })
     .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`ACQUIRE_ANSWER_ROOM`] covers the chunked answer with every field at
+    /// its largest value, in the encoding a typed handler replies with. If a
+    /// field is added to the answer, this fails until the room grows with it.
+    #[test]
+    fn the_answer_room_covers_the_largest_chunked_answer() {
+        let largest = serde_json::to_vec(&AcquireResponse::Ready {
+            lease_id: u64::MAX,
+            transfer_id: u64::MAX,
+            total_len: u64::MAX,
+            chunk_size: u32::MAX,
+            chunk_count: u32::MAX,
+        })
+        .unwrap();
+        assert!(
+            largest.len() <= ACQUIRE_ANSWER_ROOM,
+            "the largest chunked answer is {} bytes",
+            largest.len()
+        );
+    }
 }

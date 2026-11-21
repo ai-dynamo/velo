@@ -458,6 +458,16 @@ async fn peer_transports_capacity_and_probe_read_the_named_transport() {
         backend.route_capacity(stranger, narrow),
         Err(TransportChoiceError::PeerNotRegistered { peer: stranger })
     );
+    // No probe ran, so this is a route that cannot be used, not a failed
+    // probe: the same error as `route_capacity` and a named send give.
+    assert!(matches!(
+        backend
+            .probe_peer(stranger, narrow, Duration::from_secs(1))
+            .await,
+        Err(PeerProbeError::Choice(TransportChoiceError::PeerNotRegistered { peer }))
+            if peer == stranger
+    ));
+    assert_eq!(node.narrow.probes.load(Ordering::SeqCst), 1);
 
     let only_wide = node_only_wide().await;
     let backend = only_wide.messenger.backend();
@@ -981,4 +991,190 @@ async fn a_reply_to_an_origin_that_is_no_transport_goes_over_the_primary() {
     reaches(|| node.wide.sent_count(), 1).await;
     assert_eq!(node.wide.sent_types(), vec![MessageType::Response]);
     assert_eq!(node.narrow.sent_count(), 0);
+}
+
+/// The error reply that takes the place of an oversized reply must fit the
+/// transport too. Its text names the transport and both sizes, about 100
+/// bytes. A transport that carries less would refuse it as well, and the
+/// caller would again wait for ever. So the text is cut to the room that
+/// the header leaves, and the frame fills the transport at most. The same
+/// holds for the short nack.
+#[tokio::test]
+async fn the_error_for_a_reply_too_large_is_cut_to_fit_the_transport() {
+    use crate::messenger::common::events::{EventType, Outcome, decode_event_header};
+    use crate::messenger::common::responses::decode_response_header;
+
+    const TINY: usize = 64;
+    let node = node_with_narrow(&["wide", "narrow"], TINY).await;
+    node.messenger
+        .register_handler(
+            Handler::am_handler("long_error", |_ctx| {
+                Err(anyhow::anyhow!("{}", "e".repeat(TINY + 1)))
+            })
+            .build(),
+        )
+        .unwrap();
+
+    node.narrow
+        .deliver(request_from(node.peer, (TINY + 1) as u32));
+    reaches(|| node.narrow.sent_count(), 1).await;
+    let (message_type, header, payload) = node.narrow.sent.lock().unwrap()[0].clone();
+    assert_eq!(message_type, MessageType::Response);
+    assert_eq!(header.len() + payload.len(), TINY, "cut to fill the frame");
+    let (id, outcome, _) = decode_response_header(header).unwrap();
+    assert_eq!(id, unary_id(node.peer));
+    assert!(matches!(outcome, Outcome::Error));
+    assert!(payload.starts_with(b"Reply not sent: "));
+
+    let (id, request) = sync_request_from(node.peer, "long_error");
+    node.narrow.deliver(request);
+    reaches(|| node.narrow.sent_count(), 2).await;
+    let (message_type, header, payload) = node.narrow.sent.lock().unwrap()[1].clone();
+    assert_eq!(message_type, MessageType::Ack);
+    assert_eq!(header.len() + payload.len(), TINY, "cut to fill the frame");
+    let Some(EventType::Ack(got, Outcome::Error)) = decode_event_header(header) else {
+        panic!("the reply is not a nack");
+    };
+    assert_eq!(got, id);
+
+    assert_eq!(node.narrow.refused.load(Ordering::SeqCst), 0);
+    assert_eq!(node.wide.sent_count(), 0, "no reply leaves on the primary");
+}
+
+/// The dispatcher's own error replies take the same path as a handler's
+/// replies. The error for an unknown handler carries the handler's name,
+/// which the caller chose. Over the transport's capacity, it is replaced by
+/// a short nack, so the caller is still answered. Before, the dispatcher
+/// sent these replies itself and only logged the refusal.
+#[tokio::test]
+async fn an_unknown_handler_error_over_the_capacity_is_answered_with_a_short_nack() {
+    use crate::messenger::common::events::{EventType, Outcome, decode_event_header};
+
+    let node = node(&["wide", "narrow"]).await;
+    let (id, request) = sync_request_from(node.peer, &"h".repeat(NARROW));
+    node.narrow.deliver(request);
+    reaches(|| node.narrow.sent_count(), 1).await;
+
+    let (message_type, header, payload) = node.narrow.sent.lock().unwrap()[0].clone();
+    assert_eq!(message_type, MessageType::Ack);
+    let Some(EventType::Ack(got, Outcome::Error)) = decode_event_header(header) else {
+        panic!("the reply is not a nack");
+    };
+    assert_eq!(got, id);
+    assert!(payload.starts_with(b"Reply not sent: "));
+    assert!(payload.len() < NARROW);
+    assert_eq!(node.narrow.refused.load(Ordering::SeqCst), 0);
+    assert_eq!(node.wide.sent_count(), 0, "no reply leaves on the primary");
+}
+
+/// A named call does not stage the `_hello` that goes before it. The
+/// `_hello` carries this node's address, and `send_message` stages any
+/// payload over the threshold: the peer would then fetch the address apart
+/// from the call's route. With the real threshold (256 KiB) only an address
+/// with a very large entry gets there, so the threshold here is small. The
+/// call is refused before the `_hello` takes a slot. The unnamed call
+/// stages its `_hello` as before.
+#[tokio::test]
+async fn a_named_call_whose_hello_would_stage_is_refused_before_a_slot() {
+    const THRESHOLD: usize = 16;
+    let node = node(&["wide", "narrow"]).await;
+    let manager = Arc::new(crate::rendezvous::RendezvousManager::new(
+        velo_ext::WorkerId::from_u64(7),
+    ));
+    node.messenger.set_large_payload_support(
+        Arc::new(
+            crate::rendezvous::transparent::RendezvousStager::new(manager.clone())
+                .with_threshold(THRESHOLD),
+        ),
+        Arc::new(crate::rendezvous::transparent::RendezvousResolver::new(
+            manager,
+        )),
+    );
+    let call = |named: bool| {
+        let mut builder = node
+            .messenger
+            .unary("sized")
+            .unwrap()
+            .raw_payload(Bytes::from_static(&[0, 0, 0, 0]))
+            .instance(node.peer);
+        if named {
+            builder = builder.transport("narrow");
+        }
+        builder.send()
+    };
+
+    let error = tokio::time::timeout(Duration::from_secs(5), call(true))
+        .await
+        .expect("the call is refused, not parked on a staged `_hello`")
+        .unwrap_err();
+    assert!(
+        matches!(
+            error.downcast_ref::<TransportChoiceError>(),
+            Some(TransportChoiceError::WouldStage { transport, len, threshold })
+                if transport.as_str() == "narrow" && *len > THRESHOLD && *threshold == THRESHOLD
+        ),
+        "{error:#}"
+    );
+    assert_eq!(
+        node.messenger
+            .client()
+            .response_manager
+            .pending_outcome_count(),
+        0
+    );
+    assert_eq!(node.wide.sent_count() + node.narrow.sent_count(), 0);
+
+    // Nobody answers the `_hello`; the unnamed call stays parked on it.
+    let pending = tokio::spawn(call(false));
+    reaches(|| node.wide.sent_count(), 1).await;
+    pending.abort();
+    let (_, header, payload) = node.wide.sent.lock().unwrap()[0].clone();
+    assert_eq!(
+        crate::messenger::common::messages::handler_name_from_request_header(&header),
+        Some(&b"_hello"[..])
+    );
+    assert!(payload.is_empty(), "staging leaves no payload to carry");
+}
+
+/// An acquire is refused when the transport its answer takes leaves less
+/// room than the chunked answer can need. The refusal comes before the read
+/// lock. Without it, an answer over the limit is replaced by an error reply
+/// that names no lease: the consumer cannot end a lease it never saw, and a
+/// chunked lease has no deadline unless the consumer asked for one, so the
+/// lease holds the payload until the owner tears down. At exactly that room,
+/// the acquire goes on, with chunks of that size.
+#[tokio::test]
+async fn an_acquire_needs_room_for_its_answer_on_the_reply_transport() {
+    use crate::rendezvous::handlers::{ACQUIRE_ANSWER_ROOM, pull_chunk_limit};
+
+    let header = crate::messenger::common::responses::encode_response_header(
+        ResponseId::from_u128(0),
+        crate::messenger::common::events::Outcome::Ok,
+        None,
+    )
+    .unwrap()
+    .len();
+    let narrow = Some(velo_ext::TransportOrigin::new(1));
+
+    let short = node_with_narrow(&["wide", "narrow"], header + ACQUIRE_ANSWER_ROOM - 1).await;
+    let error = pull_chunk_limit(
+        short.messenger.backend(),
+        short.peer.worker_id(),
+        narrow,
+        None,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("narrow"), "{error}");
+
+    let enough = node_with_narrow(&["wide", "narrow"], header + ACQUIRE_ANSWER_ROOM).await;
+    assert_eq!(
+        pull_chunk_limit(
+            enough.messenger.backend(),
+            enough.peer.worker_id(),
+            narrow,
+            None,
+        )
+        .unwrap(),
+        ACQUIRE_ANSWER_ROOM as u32
+    );
 }

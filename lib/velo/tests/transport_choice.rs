@@ -12,6 +12,8 @@
 //! The wait after a call is on the counts: every frame one node counted out
 //! must be counted in by the other, per transport and message type.
 
+#![cfg(unix)]
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

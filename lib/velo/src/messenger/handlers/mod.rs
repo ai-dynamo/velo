@@ -1042,7 +1042,7 @@ fn get_response_error_handler() -> Arc<dyn crate::transports::TransportErrorHand
 /// `on_error` makes the transport error handler, and is called again only
 /// for the error reply.
 #[inline]
-async fn send_reply(
+pub(crate) async fn send_reply(
     backend: &VeloBackend,
     origin: Option<TransportOrigin>,
     response_id: ResponseId,
@@ -1073,7 +1073,9 @@ async fn send_reply(
 
 /// The short error reply that takes the place of a reply its transport cannot
 /// carry. It echoes no request headers, so its size does not depend on the
-/// request. If it is refused too, nothing more is sent.
+/// request. Its text is cut to the room the header leaves under the same
+/// limit, so a transport that carries the bare header carries this reply.
+/// If it is refused too, nothing more is sent.
 #[cold]
 async fn send_too_large_reply(
     backend: &VeloBackend,
@@ -1088,12 +1090,15 @@ async fn send_too_large_reply(
             .map_err(|e| anyhow::anyhow!("Failed to encode response header: {}", e))?,
         _ => encode_event_header(EventType::Ack(response_id, Outcome::Error)),
     };
+    let mut text = format!("Reply not sent: {too_large}");
+    let room = too_large.capacity.saturating_sub(header.len());
+    text.truncate(text.floor_char_boundary(room));
     let outcome = backend.send_reply_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
         origin,
         OutboundFrame {
             header,
-            payload: Bytes::from(format!("Reply not sent: {too_large}")),
+            payload: Bytes::from(text),
             message_type,
         },
         on_error,

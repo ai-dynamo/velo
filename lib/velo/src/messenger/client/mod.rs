@@ -355,6 +355,21 @@ impl ActiveMessageClient {
         let payload = serde_json::to_vec(&request)
             .map_err(|e| anyhow::anyhow!("Failed to serialize _hello request: {}", e))?;
 
+        // A call that keeps to one transport does not stage its `_hello`
+        // either: the peer would fetch the address apart from the route.
+        // Refused before the slot, like the call's own payload.
+        if let Route::Named(origin) = route
+            && let Some(stager) = self.stager_for(payload.len())
+        {
+            let refused = crate::transports::choice::TransportChoiceError::WouldStage {
+                transport: self.backend.transport_key(origin),
+                len: payload.len(),
+                threshold: stager.threshold(),
+            };
+            return Err(anyhow::Error::new(refused)
+                .context("the `_hello` that goes before the call would be staged"));
+        }
+
         // Register response and send message
         let mut outcome = self.register_outcome()?;
         let response_id = outcome.response_id();

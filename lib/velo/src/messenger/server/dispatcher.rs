@@ -687,25 +687,24 @@ impl DispatcherHub {
         static ERROR_HANDLER: std::sync::OnceLock<
             Arc<dyn crate::transports::TransportErrorHandler>,
         > = std::sync::OnceLock::new();
-        let error_handler = ERROR_HANDLER
-            .get_or_init(|| Arc::new(DispatcherErrorHandler))
-            .clone();
-
-        let outcome = backend.send_reply_to_worker(
-            WorkerId::from_u64(response_id.worker_id()),
+        // The path a handler's replies take, so that an error over the
+        // transport's frame limit is replaced by a short one here too.
+        crate::messenger::handlers::send_reply(
+            backend,
             origin,
+            response_id,
             crate::transports::OutboundFrame {
                 header,
                 payload,
                 message_type: MessageType::Ack,
             },
-            error_handler,
-        )?;
-        if let crate::transports::SendOutcome::Pending(admission) = outcome {
-            admission.await?;
-        }
-
-        Ok(())
+            || {
+                ERROR_HANDLER
+                    .get_or_init(|| Arc::new(DispatcherErrorHandler))
+                    .clone()
+            },
+        )
+        .await
     }
 }
 

@@ -54,7 +54,8 @@ pub enum TransportChoiceError {
     },
     /// The payload is over the staging threshold. A send that names its
     /// transport is never staged: the staged payload would be fetched apart
-    /// from the call's route, maybe by RDMA.
+    /// from the call's route, maybe by RDMA. The `_hello` that goes before
+    /// a named call is held to the same rule, and `len` is then its length.
     #[error(
         "a payload of {len} bytes is over the staging threshold of {threshold} bytes; \
          a send named on transport {transport} is not staged"
@@ -96,7 +97,8 @@ pub enum TransportChoiceError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum PeerProbeError {
-    /// The route cannot be used for this peer.
+    /// The route cannot be used for this peer, so no probe ran: the peer is
+    /// not registered, or not on the route's transport.
     #[error(transparent)]
     Choice(#[from] TransportChoiceError),
     /// The transport's probe failed.
