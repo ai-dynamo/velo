@@ -672,10 +672,17 @@ impl VeloBackend {
             payload,
             message_type,
         } = frame;
+        // A named send whose peer was forgotten after `check_served` passed,
+        // for example during its `_hello`, still gets the typed error.
         let entry = self
             .primary_transport
             .get(&target)
-            .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
+            .ok_or_else(|| match route {
+                Route::Named(_) => {
+                    anyhow::Error::new(TransportChoiceError::PeerNotRegistered { peer: target })
+                }
+                _ => VeloBackendError::InstanceNotRegistered(target).into(),
+            })?;
         let peer = entry.value();
         let mut rerouted = None;
         let transport: &Arc<dyn Transport> = match route {

@@ -1136,6 +1136,109 @@ async fn a_named_call_whose_hello_would_stage_is_refused_before_a_slot() {
     assert!(payload.is_empty(), "staging leaves no payload to carry");
 }
 
+/// The same refusal with every response slot taken. The call reserves its
+/// own slot before the handshake runs, so a check made only in the handshake
+/// comes too late: the caller sees a full arena, or waits for a slot, and
+/// does not learn that the call can never be sent. So the builder makes the
+/// check before the slot, as it does for every other refused route.
+#[tokio::test]
+async fn a_named_handshake_that_would_stage_is_refused_with_a_full_arena() {
+    const THRESHOLD: usize = 16;
+    let node = node(&["wide", "narrow"]).await;
+    let manager = Arc::new(crate::rendezvous::RendezvousManager::new(
+        velo_ext::WorkerId::from_u64(7),
+    ));
+    node.messenger.set_large_payload_support(
+        Arc::new(
+            crate::rendezvous::transparent::RendezvousStager::new(manager.clone())
+                .with_threshold(THRESHOLD),
+        ),
+        Arc::new(crate::rendezvous::transparent::RendezvousResolver::new(
+            manager,
+        )),
+    );
+    let client = node.messenger.client();
+    let mut held = Vec::new();
+    while let Ok(awaiter) = client.register_outcome() {
+        held.push(awaiter);
+    }
+    assert!(!held.is_empty());
+
+    let error = node
+        .messenger
+        .unary("sized")
+        .unwrap()
+        .transport("narrow")
+        .raw_payload(Bytes::new())
+        .instance(node.peer)
+        .send()
+        .await
+        .unwrap_err();
+
+    assert!(
+        matches!(
+            error.downcast_ref::<TransportChoiceError>(),
+            Some(TransportChoiceError::WouldStage { transport, len, threshold })
+                if transport.as_str() == "narrow" && *len > THRESHOLD && *threshold == THRESHOLD
+        ),
+        "expected WouldStage for the handshake, got {error:#}"
+    );
+}
+
+/// A named call whose peer is forgotten while its `_hello` is in flight
+/// still fails with the typed error. `check_served` passed before the
+/// handshake, so the send after it is the first to see that the peer is
+/// gone. Route selection reports that as `PeerNotRegistered` for a named
+/// send, not as the backend's untyped error.
+#[tokio::test]
+async fn a_named_call_reports_an_unregistered_peer_after_its_handshake() {
+    use crate::messenger::common::events::Outcome;
+    use crate::messenger::common::messages::decode_response_id_from_request_header;
+    use crate::messenger::common::responses::encode_response_header;
+
+    let node = node(&["wide", "narrow"]).await;
+    let call = node
+        .messenger
+        .unary("sized")
+        .unwrap()
+        .transport("narrow")
+        .raw_payload(Bytes::new())
+        .instance(node.peer)
+        .send();
+    reaches(|| node.narrow.sent_count(), 1).await;
+    let (_, hello, _) = node.narrow.sent.lock().unwrap()[0].clone();
+    assert_eq!(
+        crate::messenger::common::messages::handler_name_from_request_header(&hello),
+        Some(&b"_hello"[..])
+    );
+    let hello_id = decode_response_id_from_request_header(&hello).unwrap();
+
+    // A handshake reply is already on its way when the application forgets the peer.
+    node.messenger.unregister_peer(node.peer);
+    node.narrow
+        .adapter
+        .get()
+        .unwrap()
+        .response_stream
+        .send((
+            encode_response_header(hello_id, Outcome::Ok, None).unwrap(),
+            Bytes::from_static(br#"{"handlers":["sized"]}"#),
+        ))
+        .unwrap();
+
+    let error = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(node.narrow.sent_count(), 1);
+    assert_eq!(node.wide.sent_count(), 0);
+    assert_eq!(
+        error.downcast_ref::<TransportChoiceError>(),
+        Some(&TransportChoiceError::PeerNotRegistered { peer: node.peer }),
+        "{error:#}"
+    );
+}
+
 /// An acquire is refused when the transport its answer takes leaves less
 /// room than the chunked answer can need. The refusal comes before the read
 /// lock. Without it, an answer over the limit is replaced by an error reply

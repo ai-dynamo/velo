@@ -146,6 +146,18 @@ time-to-live.
 payloads would lift it, but it would also fail a fetch that is slower than
 that time.
 
+## A reply that its transport refuses is not answered
+
+**What happens.** A responder's transport refuses a reply frame at the responder and tells only the send's error handler, which logs it. Nothing reaches the caller. A call without a `.timeout` then waits for ever. When the reply was the answer to an `_rv_acquire`, the lease it granted also stays, as in [A staged payload without a deadline can stay staged](#a-staged-payload-without-a-deadline-can-stay-staged).
+
+**When.** In two cases. The transport reports no frame limit (`Transport::max_message_size` returns `None`) and then refuses a frame for its size: HTTP, gRPC, and ZMQ report none. Or the transport's limit falls after the responder checked the reply against it: NATS reads a new limit from the server when it reconnects, and UCX takes a peer's limit from the peer's newest registration.
+
+**Why.** The responder checks each reply against the limit that the transport reports, just before the send ([Replies follow the request](../concepts/transports.md#replies-follow-the-request)). The check and the send are two calls. A refusal after the check comes back as text through the error handler, which cannot tell a size refusal from a lost connection, and holds nothing to answer the caller with.
+
+**Workaround.** Give calls a `.timeout`. Keep replies under the smallest frame limit of the transports that carry them.
+
+**Lifted by.** Not scheduled. A typed size refusal from the transport to the runtime would lift both cases: the runtime could then send the short error reply that it sends today for a reply over a reported limit.
+
 ## A task that holds its worker thread stalls velo's tasks
 
 **What happens.** An application task wakes a parked velo task, then holds its tokio worker thread without yielding. The velo task can then not run until the thread is free. For a stream over the mux, no record and no heartbeat leaves on that peer's lane, from this stream or any other (with the default single lane, that is every mux stream to the peer). While the sender holds data credit, the consumer's watchdog then ends the stream with `Dropped` after three to four heartbeat intervals of silence, though the producer is alive. For a unary or typed call, later messages to that peer on the same connection wait for the hold. A handler that returns its response and then holds its thread delays that connection's writer the same way. A consumer that reads items and then holds its thread delays the node-wide credit sweep, so credit returns that wait for the sweep are late for every peer; a batch that arrives can still return credit on its own.

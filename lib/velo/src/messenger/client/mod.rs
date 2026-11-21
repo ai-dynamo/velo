@@ -19,7 +19,7 @@ use crate::messenger::common::messages::{EncodeError, envelope_overhead};
 use crate::messenger::common::{ActiveMessage, responses::ResponseManager};
 
 use crate::observability::{ClientResolution, VeloMetrics};
-use crate::transports::choice::Route;
+use crate::transports::choice::{Route, TransportChoiceError};
 use crate::transports::{OutboundFrame, SendOutcome, TransportErrorHandler, VeloBackend};
 use peer_registry::PeerRegistry;
 use velo_ext::InstanceId;
@@ -130,6 +130,9 @@ pub(crate) struct ActiveMessageClient {
     /// Late-bound large payload stager for transparent rendezvous.
     pub(crate) large_payload_stager:
         Arc<std::sync::OnceLock<Arc<dyn crate::messenger::large_payload::LargePayloadStager>>>,
+    /// Length of this node's `_hello` payload, encoded once: a node's address
+    /// does not change once the node is built.
+    hello_len: std::sync::OnceLock<usize>,
 }
 
 impl ActiveMessageClient {
@@ -149,6 +152,7 @@ impl ActiveMessageClient {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             observability,
             large_payload_stager: Arc::new(std::sync::OnceLock::new()),
+            hello_len: std::sync::OnceLock::new(),
         }
     }
 
@@ -330,12 +334,53 @@ impl ActiveMessageClient {
         self.peer_registry.handler_exists(target, handler)
     }
 
+    /// The `_hello` payload: this node's address.
+    fn hello_payload(&self) -> Result<Vec<u8>> {
+        let request = crate::messenger::server::system_handlers::HelloRequest {
+            peer_info: self.backend.advertised_peer_info(),
+        };
+        serde_json::to_vec(&request)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize _hello request: {}", e))
+    }
+
+    /// Refuse a named send before it takes a slot, when it must send a
+    /// `_hello` first and that `_hello` would be staged. So the caller learns
+    /// it with the slot arena full too, like every other refused route.
+    ///
+    /// The length test comes first. It fails for every address under the
+    /// staging threshold, so a named send pays one load and one compare here.
+    /// [`handshake_with_peer`](Self::handshake_with_peer) checks the payload
+    /// it sends in any case, so a length cached too early costs only the
+    /// order of the errors.
+    pub(crate) fn named_hello_refusal(
+        &self,
+        target: InstanceId,
+        handler: &str,
+        route: Route,
+    ) -> Option<TransportChoiceError> {
+        let Route::Named(origin) = route else {
+            return None;
+        };
+        let stager = self.large_payload_stager.get()?;
+        let len = *self
+            .hello_len
+            .get_or_init(|| self.hello_payload().map_or(0, |payload| payload.len()));
+        if len <= stager.threshold() || self.can_send_directly(target, handler) {
+            return None;
+        }
+        Some(TransportChoiceError::WouldStage {
+            transport: self.backend.transport_key(origin),
+            len,
+            threshold: stager.threshold(),
+        })
+    }
+
     /// Perform handshake with a peer to exchange handler information
     ///
     /// `route` is the route of the call that needs the handshake, so that a
     /// call pinned to a transport sends its `_hello` over that transport too.
     async fn handshake_with_peer(&self, target: InstanceId, route: Route) -> Result<()> {
-        use crate::messenger::server::system_handlers::{HandlersResponse, HelloRequest};
+        use crate::messenger::server::system_handlers::HandlersResponse;
 
         tracing::debug!(
             target: "crate::messenger::client",
@@ -347,21 +392,16 @@ impl ActiveMessageClient {
         }
 
         // Send _hello with our peer info
-        let request = HelloRequest {
-            peer_info: self.backend.advertised_peer_info(),
-        };
-
-        // Serialize request
-        let payload = serde_json::to_vec(&request)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize _hello request: {}", e))?;
+        let payload = self.hello_payload()?;
 
         // A call that keeps to one transport does not stage its `_hello`
         // either: the peer would fetch the address apart from the route.
-        // Refused before the slot, like the call's own payload.
+        // `named_hello_refusal` refuses the call before its own slot; this
+        // check covers every other way here, before the `_hello`'s slot.
         if let Route::Named(origin) = route
             && let Some(stager) = self.stager_for(payload.len())
         {
-            let refused = crate::transports::choice::TransportChoiceError::WouldStage {
+            let refused = TransportChoiceError::WouldStage {
                 transport: self.backend.transport_key(origin),
                 len: payload.len(),
                 threshold: stager.threshold(),

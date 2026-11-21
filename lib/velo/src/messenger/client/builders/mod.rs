@@ -1021,6 +1021,12 @@ impl MessageBuilder {
                     if let Err(choice) = self.client.backend.check_served(*target, route) {
                         return SendStage::refused(choice);
                     }
+                    if let Some(choice) =
+                        self.client
+                            .named_hello_refusal(*target, &self.handler, route)
+                    {
+                        return SendStage::refused(choice);
+                    }
                 }
                 // A worker discovery must find first: the route is checked
                 // against what it finds, before a slot is taken.
@@ -1082,6 +1088,12 @@ impl MessageBuilder {
                 }
             };
             if let Err(choice) = self.client.backend.check_served(target, route) {
+                return Discovered::Done(Dispatched::refused(choice));
+            }
+            if let Some(choice) = self
+                .client
+                .named_hello_refusal(target, &self.handler, route)
+            {
                 return Discovered::Done(Dispatched::refused(choice));
             }
             match self.acquire() {
