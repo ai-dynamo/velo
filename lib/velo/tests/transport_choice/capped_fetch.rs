@@ -127,3 +127,64 @@ async fn an_unnamed_get_sizes_chunks_for_the_consumers_primary() {
     };
     assert!(fetched == data);
 }
+
+/// A unary call whose reply is over the limit of the transport it must take.
+/// The caller added UDS first, so its request goes over UDS, and the reply
+/// follows it. The responder's UDS carries 64 KiB, and its own primary, TCP,
+/// would have carried the reply.
+///
+/// The call has no timeout. It must end with an error that names the
+/// transport and its limit, not wait for a reply that the responder's
+/// transport dropped. The reply does not move to TCP, and the oversized
+/// frame is never offered to the transport.
+#[tokio::test]
+async fn a_reply_over_the_request_transports_limit_fails_the_call() {
+    let dir = tempfile::tempdir().unwrap();
+    let caller = node(&dir, &[Kind::Uds, Kind::Tcp]).await;
+    let narrow = 64 * 1024;
+    let cap = Arc::new(CappedUds {
+        inner: transport(Kind::Uds, &dir),
+        capacity: AtomicUsize::new(narrow),
+        rejected_bytes: AtomicUsize::new(0),
+        rejected: Notify::new(),
+    });
+    let responder = Velo::builder()
+        .mux_only()
+        .add_transport(transport(Kind::Tcp, &dir))
+        .add_transport(cap.clone())
+        .build()
+        .await
+        .unwrap();
+    responder
+        .register_handler(
+            velo::Handler::unary_handler("big", move |_| {
+                Ok(Some(Bytes::from(vec![7; narrow + 1])))
+            })
+            .build(),
+        )
+        .unwrap();
+    responder.register_peer(caller.velo.peer_info()).unwrap();
+    caller.velo.register_peer(responder.peer_info()).unwrap();
+
+    let call = caller
+        .velo
+        .unary("big")
+        .unwrap()
+        .raw_payload(Bytes::new())
+        .instance(responder.instance_id())
+        .send();
+    let error = tokio::select! {
+        result = tokio::time::timeout(DEADLINE, call) => result
+            .expect("the caller got no answer to its call")
+            .expect_err("a reply over the limit arrived"),
+        _ = cap.rejected.notified() => {
+            let size = cap.rejected_bytes.load(Ordering::Relaxed);
+            panic!("a {size}-byte reply was offered to a {narrow}-byte transport");
+        }
+    };
+    let text = error.to_string();
+    assert!(
+        text.contains("uds") && text.contains(&narrow.to_string()),
+        "the error names the transport and its limit: {text}"
+    );
+}

@@ -486,9 +486,17 @@ async fn a_named_send_cannot_request_staging_through_its_headers() {
         );
     })
     .await;
-    assert!(
-        !seen.transports().contains(&"tcp".to_string()),
-        "the named UDS call fetched a payload over TCP; response: {response:?}",
+    let error = response.unwrap().unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<TransportChoiceError>(),
+        Some(&TransportChoiceError::StagingHeader {
+            transport: TransportKey::from("uds"),
+        }),
+    );
+    assert_eq!(
+        seen.transports(),
+        Vec::<String>::new(),
+        "a refused send put frames on a transport",
     );
     shutdown([&sender, &receiver]).await;
 }

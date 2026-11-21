@@ -84,9 +84,15 @@ impl AmSendBuilder {
     ///
     /// The send never falls back to another transport. It fails with
     /// [`TransportChoiceError::NotInstalled`] when this node has no such
-    /// transport, and with [`TransportChoiceError::NotServedByPeer`] when the
-    /// peer is not registered on it; neither takes a response slot. The
-    /// reply comes back over the same transport. To send many times over one
+    /// transport, with [`TransportChoiceError::PeerNotRegistered`] when the
+    /// instance is not registered, and with
+    /// [`TransportChoiceError::NotServedByPeer`] when the peer is not
+    /// registered on the transport. None of them takes a response slot.
+    ///
+    /// The reply comes back over the same transport. One exception: a remote
+    /// that has this node registered without that transport replies over
+    /// its primary transport for this node, and counts the reply in
+    /// `velo_transport_reply_reroutes_total`. To send many times over one
     /// transport, resolve it once with
     /// [`Velo::transport_route`](crate::Velo::transport_route) and use
     /// [`route`](Self::route).
@@ -180,9 +186,15 @@ impl AmSyncBuilder {
     ///
     /// The send never falls back to another transport. It fails with
     /// [`TransportChoiceError::NotInstalled`] when this node has no such
-    /// transport, and with [`TransportChoiceError::NotServedByPeer`] when the
-    /// peer is not registered on it; neither takes a response slot. The
-    /// reply comes back over the same transport. To send many times over one
+    /// transport, with [`TransportChoiceError::PeerNotRegistered`] when the
+    /// instance is not registered, and with
+    /// [`TransportChoiceError::NotServedByPeer`] when the peer is not
+    /// registered on the transport. None of them takes a response slot.
+    ///
+    /// The reply comes back over the same transport. One exception: a remote
+    /// that has this node registered without that transport replies over
+    /// its primary transport for this node, and counts the reply in
+    /// `velo_transport_reply_reroutes_total`. To send many times over one
     /// transport, resolve it once with
     /// [`Velo::transport_route`](crate::Velo::transport_route) and use
     /// [`route`](Self::route).
@@ -268,9 +280,15 @@ impl UnaryBuilder {
     ///
     /// The send never falls back to another transport. It fails with
     /// [`TransportChoiceError::NotInstalled`] when this node has no such
-    /// transport, and with [`TransportChoiceError::NotServedByPeer`] when the
-    /// peer is not registered on it; neither takes a response slot. The
-    /// reply comes back over the same transport. To send many times over one
+    /// transport, with [`TransportChoiceError::PeerNotRegistered`] when the
+    /// instance is not registered, and with
+    /// [`TransportChoiceError::NotServedByPeer`] when the peer is not
+    /// registered on the transport. None of them takes a response slot.
+    ///
+    /// The reply comes back over the same transport. One exception: a remote
+    /// that has this node registered without that transport replies over
+    /// its primary transport for this node, and counts the reply in
+    /// `velo_transport_reply_reroutes_total`. To send many times over one
     /// transport, resolve it once with
     /// [`Velo::transport_route`](crate::Velo::transport_route) and use
     /// [`route`](Self::route).
@@ -384,9 +402,15 @@ where
     ///
     /// The send never falls back to another transport. It fails with
     /// [`TransportChoiceError::NotInstalled`] when this node has no such
-    /// transport, and with [`TransportChoiceError::NotServedByPeer`] when the
-    /// peer is not registered on it; neither takes a response slot. The
-    /// reply comes back over the same transport. To send many times over one
+    /// transport, with [`TransportChoiceError::PeerNotRegistered`] when the
+    /// instance is not registered, and with
+    /// [`TransportChoiceError::NotServedByPeer`] when the peer is not
+    /// registered on the transport. None of them takes a response slot.
+    ///
+    /// The reply comes back over the same transport. One exception: a remote
+    /// that has this node registered without that transport replies over
+    /// its primary transport for this node, and counts the reply in
+    /// `velo_transport_reply_reroutes_total`. To send many times over one
     /// transport, resolve it once with
     /// [`Velo::transport_route`](crate::Velo::transport_route) and use
     /// [`route`](Self::route).
@@ -975,20 +999,20 @@ impl MessageBuilder {
             // the bytes in a fetch the call does not route, maybe by RDMA.
             // Staging metadata the caller wrote is a second way into the
             // staged path: a named send carries none, whatever its size.
-            let len = self.payload.as_ref().map_or(0, Bytes::len);
             let staged_by_header = self.headers.as_ref().is_some_and(|headers| {
                 headers.contains_key(crate::messenger::large_payload::RV_HEADER_KEY)
             });
-            if staged_by_header || self.client.stager_for(len).is_some() {
-                let threshold = self
-                    .client
-                    .large_payload_stager
-                    .get()
-                    .map_or(0, |stager| stager.threshold());
+            if staged_by_header {
+                return SendStage::refused(TransportChoiceError::StagingHeader {
+                    transport: self.client.backend.transport_key(origin),
+                });
+            }
+            let len = self.payload.as_ref().map_or(0, Bytes::len);
+            if let Some(stager) = self.client.stager_for(len) {
                 return SendStage::refused(TransportChoiceError::WouldStage {
                     transport: self.client.backend.transport_key(origin),
                     len,
-                    threshold,
+                    threshold: stager.threshold(),
                 });
             }
 

@@ -52,10 +52,9 @@ pub enum TransportChoiceError {
         /// The transport the send named.
         transport: TransportKey,
     },
-    /// The payload is over the staging threshold, or the send's headers
-    /// carry staging metadata (`_rv`). A send that names its transport is
-    /// never staged: the staged payload would be fetched apart from the
-    /// call's route, maybe by RDMA. `threshold` is 0 with no stager.
+    /// The payload is over the staging threshold. A send that names its
+    /// transport is never staged: the staged payload would be fetched apart
+    /// from the call's route, maybe by RDMA.
     #[error(
         "a payload of {len} bytes is over the staging threshold of {threshold} bytes; \
          a send named on transport {transport} is not staged"
@@ -67,6 +66,17 @@ pub enum TransportChoiceError {
         len: usize,
         /// The staging threshold.
         threshold: usize,
+    },
+    /// The send's headers carry staging metadata (`_rv`), which asks the
+    /// receiver to fetch a staged payload. A send that names its transport
+    /// is never staged, whatever the size of its payload.
+    #[error(
+        "the headers carry staging metadata (`_rv`); \
+         a send named on transport {transport} is not staged"
+    )]
+    StagingHeader {
+        /// The transport the send named.
+        transport: TransportKey,
     },
     /// The peer is not registered on this node.
     #[error("peer {peer} is not registered")]
@@ -92,6 +102,19 @@ pub enum PeerProbeError {
     /// The transport's probe failed.
     #[error(transparent)]
     Health(#[from] velo_ext::HealthCheckError),
+}
+
+/// A reply over the frame limit of the transport it takes. The reply was not
+/// sent. See [`VeloBackend::send_routed`](super::VeloBackend::send_routed).
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("a reply of {len} bytes is over the {capacity}-byte frame limit of transport {transport}")]
+pub(crate) struct ReplyTooLarge {
+    /// The transport the reply takes.
+    pub(crate) transport: TransportKey,
+    /// The reply's header and payload.
+    pub(crate) len: usize,
+    /// What the transport reports it carries in one frame.
+    pub(crate) capacity: usize,
 }
 
 /// Which transport one send goes out on.

@@ -287,9 +287,10 @@ async fn the_named_budget_is_exact_at_the_named_transports_capacity() {
 }
 
 /// A reply goes back over the transport its request came in on, and that
-/// transport's capacity bounds it: one frame under the narrow capacity is
-/// sent on the narrow transport, one over is refused there and never sent on
-/// the primary.
+/// transport's capacity bounds it: a frame that fills the narrow capacity is
+/// sent on the narrow transport, and one byte more is never sent on the
+/// primary. The narrow transport then carries an error reply in its place
+/// (`a_reply_over_its_transports_capacity_is_answered_with_an_error`).
 #[tokio::test]
 async fn a_reply_follows_its_request_and_that_transports_capacity() {
     let node = node(&["wide", "narrow"]).await;
@@ -310,7 +311,10 @@ async fn a_reply_follows_its_request_and_that_transports_capacity() {
     assert_eq!(header.len() + payload.len(), NARROW);
 
     node.narrow.deliver(request_from(node.peer, fits + 1));
-    reaches(|| node.narrow.refused.load(Ordering::SeqCst), 1).await;
+    reaches(|| node.narrow.sent_count(), 3).await;
+    let (_, header, payload) = node.narrow.sent.lock().unwrap()[2].clone();
+    assert!(header.len() + payload.len() < NARROW, "the error reply");
+    assert_eq!(node.narrow.refused.load(Ordering::SeqCst), 0);
     assert_eq!(node.wide.sent_count(), 0, "no reply leaves on the primary");
     assert_eq!(reroutes(&node.registry, "narrow", "wide"), 0.0);
 
@@ -718,4 +722,263 @@ async fn a_named_send_that_would_stage_is_refused_before_a_slot() {
     let (_, header, payload) = node.wide.sent.lock().unwrap()[0].clone();
     assert!(payload.is_empty(), "staging leaves no payload to carry");
     assert!(header.len() < THRESHOLD);
+}
+
+/// A sync (ack or nack) request from `peer` for handler `handler`.
+fn sync_request_from(peer: InstanceId, handler: &str) -> (ResponseId, (Bytes, Bytes)) {
+    let id = ResponseId::from_u128(u128::from(peer.worker_id().as_u64()) | (2u128 << 64));
+    let message = ActiveMessage {
+        metadata: MessageMetadata::new_sync(id, handler.to_string(), None),
+        payload: Bytes::new(),
+    };
+    let (header, payload, _) = crate::messenger::client::encode_outbound(message, None).unwrap();
+    (id, (header, payload))
+}
+
+/// The id `request_from` puts on its request.
+fn unary_id(peer: InstanceId) -> ResponseId {
+    ResponseId::from_u128(u128::from(peer.worker_id().as_u64()) | (1u128 << 64))
+}
+
+/// A reply that its transport cannot carry must still end the call. The
+/// transport refuses an oversized frame at this node, through the send's
+/// error handler, and nothing reaches the caller: a caller with no timeout
+/// then waits for ever. This was so before replies followed the request, for
+/// a reply over the primary's limit. Replies that follow the request made it
+/// worse: a reply that fits the responder's primary can be over the limit of
+/// the transport the request came in on.
+///
+/// So the responder checks the reply against the transport it takes, before
+/// the send. A reply that is too large is not offered to the transport. The
+/// caller gets a short error reply in its place, over the same transport,
+/// that names the transport and both sizes. The reply never moves to the
+/// primary: a caller that keeps an edge on one transport must be able to
+/// rely on that for the reply too.
+#[tokio::test]
+async fn a_reply_over_its_transports_capacity_is_answered_with_an_error() {
+    use crate::messenger::common::events::Outcome;
+    use crate::messenger::common::responses::decode_response_header;
+
+    let node = node(&["wide", "narrow"]).await;
+    node.narrow
+        .deliver(request_from(node.peer, (NARROW + 1) as u32));
+    reaches(|| node.narrow.sent_count(), 1).await;
+
+    let (message_type, header, payload) = node.narrow.sent.lock().unwrap()[0].clone();
+    assert_eq!(message_type, MessageType::Response);
+    let (id, outcome, _) = decode_response_header(header).unwrap();
+    assert_eq!(id, unary_id(node.peer), "the error names the caller's call");
+    assert!(matches!(outcome, Outcome::Error));
+    let text = String::from_utf8(payload.to_vec()).unwrap();
+    assert!(
+        text.contains("narrow") && text.contains(&NARROW.to_string()),
+        "the error names the transport and its limit: {text}"
+    );
+    assert_eq!(
+        node.narrow.refused.load(Ordering::SeqCst),
+        0,
+        "the oversized reply was offered to the transport"
+    );
+    assert_eq!(node.wide.sent_count(), 0, "no reply leaves on the primary");
+    assert_eq!(reroutes(&node.registry, "narrow", "wide"), 0.0);
+    // The handler's own reply is counted as not sent. The count is made
+    // after the error reply is handed on, so wait for it.
+    reaches(
+        || {
+            crate::observability::test_helpers::MetricSnapshot::from_registry(&node.registry)
+                .counter(
+                    "velo_messenger_dispatch_failures_total",
+                    &[("stage", "response_send"), ("reason", "unary")],
+                ) as usize
+        },
+        1,
+    )
+    .await;
+}
+
+/// The same for a nack. Its payload is the handler's error text, which has
+/// no bound. A nack over the transport's capacity is replaced by a short
+/// nack, so an `am_sync` caller is answered too.
+#[tokio::test]
+async fn a_nack_over_its_transports_capacity_is_answered_with_a_short_nack() {
+    use crate::messenger::common::events::{EventType, Outcome, decode_event_header};
+
+    let node = node(&["wide", "narrow"]).await;
+    node.messenger
+        .register_handler(
+            Handler::am_handler("long_error", |_ctx| {
+                Err(anyhow::anyhow!("{}", "e".repeat(NARROW + 1)))
+            })
+            .build(),
+        )
+        .unwrap();
+    let (id, request) = sync_request_from(node.peer, "long_error");
+    node.narrow.deliver(request);
+    reaches(|| node.narrow.sent_count(), 1).await;
+
+    let (message_type, header, payload) = node.narrow.sent.lock().unwrap()[0].clone();
+    assert_eq!(message_type, MessageType::Ack);
+    let Some(EventType::Ack(got, Outcome::Error)) = decode_event_header(header) else {
+        panic!("the reply is not a nack");
+    };
+    assert_eq!(got, id);
+    assert!(payload.len() < NARROW);
+    assert_eq!(node.narrow.refused.load(Ordering::SeqCst), 0);
+    assert_eq!(node.wide.sent_count(), 0, "no reply leaves on the primary");
+}
+
+/// A named send to an instance that is not registered is refused before slot
+/// acquisition, like a named send to a peer that is not on the transport.
+/// With every slot taken it reports the peer, not a full arena, and with
+/// `await_capacity` it does not wait for a slot to learn that it cannot
+/// send. The unnamed send keeps its old behavior: it fails on the arena.
+#[tokio::test]
+async fn a_named_send_to_an_unregistered_instance_is_refused_before_a_slot() {
+    let node = node(&["wide"]).await;
+    let stranger = InstanceId::new_v4();
+    let client = node.messenger.client();
+    let mut held = Vec::new();
+    while let Ok(awaiter) = client.register_outcome() {
+        held.push(awaiter);
+    }
+    assert!(!held.is_empty());
+
+    let unnamed = node
+        .messenger
+        .am_send("sized")
+        .unwrap()
+        .raw_payload(Bytes::new())
+        .instance(stranger)
+        .send()
+        .await
+        .unwrap_err();
+    assert!(
+        unnamed.downcast_ref::<TransportChoiceError>().is_none(),
+        "the control send fails on the arena: {unnamed}"
+    );
+
+    let refused = TransportChoiceError::PeerNotRegistered { peer: stranger };
+    let named = node
+        .messenger
+        .am_send("sized")
+        .unwrap()
+        .transport("wide")
+        .raw_payload(Bytes::new())
+        .instance(stranger)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(named.downcast_ref::<TransportChoiceError>(), Some(&refused));
+
+    // With `await_capacity` the send would wait for a slot that never comes.
+    let waiting = tokio::time::timeout(
+        Duration::from_secs(5),
+        node.messenger
+            .unary("sized")
+            .unwrap()
+            .transport("wide")
+            .raw_payload(Bytes::new())
+            .instance(stranger)
+            .await_capacity()
+            .send(),
+    )
+    .await
+    .expect("the named send waited for a response slot")
+    .unwrap_err();
+    assert_eq!(
+        waiting.downcast_ref::<TransportChoiceError>(),
+        Some(&refused)
+    );
+    assert_eq!(node.wide.sent_count() + node.narrow.sent_count(), 0);
+}
+
+/// A named send refused for a staging header says so. Its payload can be
+/// one byte, so an error that reports a payload over the staging threshold
+/// would send the caller to shorten a payload that is not the cause.
+#[tokio::test]
+async fn a_named_send_refused_for_a_staging_header_names_the_header() {
+    let node = node(&["wide", "narrow"]).await;
+    let error = node
+        .messenger
+        .am_send("sized")
+        .unwrap()
+        .headers(std::collections::HashMap::from([(
+            crate::messenger::large_payload::RV_HEADER_KEY.to_string(),
+            "1".to_string(),
+        )]))
+        .raw_payload(Bytes::from_static(b"x"))
+        .transport("narrow")
+        .instance(node.peer)
+        .send()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.downcast_ref::<TransportChoiceError>(),
+        Some(&TransportChoiceError::StagingHeader {
+            transport: "narrow".into()
+        })
+    );
+    let text = error.to_string();
+    assert!(text.contains("_rv"), "{text}");
+    assert!(!text.contains("threshold"), "{text}");
+    assert_eq!(node.wide.sent_count() + node.narrow.sent_count(), 0);
+}
+
+/// A request tagged with a number that is no transport of this node is
+/// still answered, over the primary. Only the runtime numbers adapters, but
+/// `TransportAdapter::with_origin` is public, so a transport can number its
+/// own by mistake. Its replies must not panic the handler task.
+///
+/// The panic was in the arguments of a `debug!` line, which run only when a
+/// subscriber wants that line. So the test runs again in a child process,
+/// alone, with a global subscriber at the debug level: a per-thread
+/// subscriber in this shared binary may never see the line (see "A test
+/// that checks a log line runs in its own process" in the coding gotchas).
+#[tokio::test]
+async fn a_reply_to_an_origin_that_is_no_transport_goes_over_the_primary() {
+    const CHILD: &str = "VELO_TEST_UNKNOWN_ORIGIN_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let test = "transports::choice::messenger_tests::\
+                    a_reply_to_an_origin_that_is_no_transport_goes_over_the_primary";
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture", "--test-threads=1"])
+            .env(CHILD, "1")
+            .output()
+            .expect("run the test in a child process");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "the test failed in its child process:\n{stdout}\n{stderr}"
+        );
+        assert!(
+            stdout.contains("1 passed"),
+            "the child process ran no test named {test}:\n{stdout}"
+        );
+        return;
+    }
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_writer(std::io::sink)
+            .with_max_level(tracing::Level::DEBUG)
+            .finish(),
+    )
+    .expect("the child process sets the only global subscriber");
+
+    let node = node(&["wide", "narrow"]).await;
+    let unknown = node
+        .narrow
+        .adapter
+        .get()
+        .unwrap()
+        .clone()
+        .with_origin(velo_ext::TransportOrigin::new(7));
+    let (header, payload) = request_from(node.peer, 8);
+    assert!(matches!(
+        unknown.admit_message(header, payload),
+        velo_ext::AdmitOutcome::Admitted
+    ));
+    reaches(|| node.wide.sent_count(), 1).await;
+    assert_eq!(node.wide.sent_types(), vec![MessageType::Response]);
+    assert_eq!(node.narrow.sent_count(), 0);
 }

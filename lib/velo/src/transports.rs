@@ -87,7 +87,9 @@ use parking_lot::Mutex;
 // here too is just noise.
 use velo_ext::{InstanceId, PeerInfo, TransportKey, TransportOrigin, WorkerAddress, WorkerId};
 
-use choice::{MAX_TRANSPORTS, PeerRoute, Route, TransportChoiceError, TransportRoute};
+use choice::{
+    MAX_TRANSPORTS, PeerRoute, ReplyTooLarge, Route, TransportChoiceError, TransportRoute,
+};
 
 // Internal builder for address construction
 use address::WorkerAddressBuilder;
@@ -648,6 +650,13 @@ impl VeloBackend {
     /// transport the peer is not registered on falls back to the primary and
     /// is counted, because a reply that could not be sent would leave its
     /// caller waiting with no word of why.
+    ///
+    /// For the same reason a [`Route::Reply`] frame over its transport's
+    /// [`Transport::max_message_size`] fails here with [`ReplyTooLarge`], and
+    /// is not offered to the transport. The transport would refuse it through
+    /// `on_error`, which cannot tell the caller. The error lets the reply's
+    /// sender put a short error reply in its place. A transport that reports
+    /// no limit gets every frame, as before.
     pub(crate) fn send_routed(
         &self,
         target: InstanceId,
@@ -666,6 +675,7 @@ impl VeloBackend {
             .get(&target)
             .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
         let peer = entry.value();
+        let mut rerouted = None;
         let transport: &Arc<dyn Transport> = match route {
             Route::Primary => &peer.primary,
             Route::Named(origin) if peer.serves(origin) => &self.by_index[origin_slot(origin)],
@@ -680,11 +690,29 @@ impl VeloBackend {
                 &self.by_index[origin_slot(origin)]
             }
             Route::Reply(Some(origin)) => {
-                self.note_reply_reroute(target, origin, peer.primary_origin);
+                rerouted = Some(origin);
                 &peer.primary
             }
             Route::Reply(None) => &peer.primary,
         };
+        if let Route::Reply(_) = route {
+            let len = header.len() + payload.len();
+            if let Some(capacity) = transport.max_message_size(target)
+                && len > capacity
+            {
+                return Err(ReplyTooLarge {
+                    transport: transport.key(),
+                    len,
+                    capacity,
+                }
+                .into());
+            }
+            // Counted once the reply will be sent, so that a reply refused
+            // above counts only its error reply.
+            if let Some(wanted) = rerouted {
+                self.note_reply_reroute(target, wanted, peer.primary_origin);
+            }
+        }
         let transport_key = transport.key();
         // Only the span below needs this; `finalize_send_outcome` recomputes it
         // from the report's own frame handles.
@@ -810,9 +838,10 @@ impl VeloBackend {
         Ok(Route::Named(route.origin))
     }
 
-    /// Fail now if `target` is registered but not on `route`'s transport, so
-    /// that the caller learns it before it takes a response slot. A peer that
-    /// is not registered passes: the send reports that as it does today.
+    /// Fail now if a named `route` cannot reach `target`: it is not
+    /// registered, or not on the route's transport. The caller then learns
+    /// it before it takes a response slot. A send that names no transport
+    /// passes, and reports a peer that is not registered at the send.
     pub(crate) fn check_served(
         &self,
         target: InstanceId,
@@ -822,11 +851,12 @@ impl VeloBackend {
             return Ok(());
         };
         match self.primary_transport.get(&target) {
-            Some(peer) if !peer.serves(origin) => Err(TransportChoiceError::NotServedByPeer {
+            Some(peer) if peer.serves(origin) => Ok(()),
+            Some(_) => Err(TransportChoiceError::NotServedByPeer {
                 peer: target,
                 transport: self.key_of(origin),
             }),
-            _ => Ok(()),
+            None => Err(TransportChoiceError::PeerNotRegistered { peer: target }),
         }
     }
 
@@ -923,6 +953,18 @@ impl VeloBackend {
         wanted: TransportOrigin,
         used: TransportOrigin,
     ) {
+        // A number that is no transport of this node has no key to report:
+        // a transport numbered its own adapter. Not counted, for the same
+        // reason.
+        if origin_slot(wanted) >= self.by_index.len() {
+            tracing::debug!(
+                peer = %target,
+                origin = wanted.index(),
+                used = %self.key_of(used),
+                "Reply sent over the primary: the request's origin is no transport of this node"
+            );
+            return;
+        }
         tracing::debug!(
             peer = %target,
             wanted = %self.key_of(wanted),
@@ -1212,11 +1254,6 @@ fn instrument_transport_error_handler(
     }
 }
 
-/// What [`finalize_send_outcome`] needs to close the loop on one send.
-///
-/// The frame handles are `Bytes` clones taken before the transport consumed
-/// them — two refcount bumps, so that an admission that fails can still hand
-/// the original frame to `on_error` the way a wire failure does.
 /// One frame to send: what [`VeloBackend::send_routed`] hands the transport.
 pub(crate) struct OutboundFrame {
     pub(crate) header: Bytes,
@@ -1230,6 +1267,11 @@ fn origin_slot(origin: TransportOrigin) -> usize {
     usize::from(origin.index())
 }
 
+/// What [`finalize_send_outcome`] needs to close the loop on one send.
+///
+/// The frame handles are `Bytes` clones taken before the transport consumed
+/// them — two refcount bumps, so that an admission that fails can still hand
+/// the original frame to `on_error` the way a wire failure does.
 struct SendReport {
     metrics: Option<Arc<crate::observability::TransportMetricsHandle>>,
     on_error: Arc<dyn TransportErrorHandler>,

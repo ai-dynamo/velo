@@ -47,6 +47,7 @@ use crate::messenger::server::dispatcher::{
     ActiveMessageDispatcher, ActiveMessageHandler, HandlerContext, OrderedDispatcher,
     SpawnedDispatcher,
 };
+use crate::transports::choice::ReplyTooLarge;
 use crate::transports::{MessageType, OutboundFrame, SendOutcome, VeloBackend};
 use derive_getters::Dissolve;
 
@@ -1029,26 +1030,88 @@ fn get_response_error_handler() -> Arc<dyn crate::transports::TransportErrorHand
         .clone()
 }
 
-async fn send_ack(
-    backend: Arc<VeloBackend>,
+/// Send one reply frame over the transport its request came in on.
+///
+/// A reply over that transport's frame limit is not sent: the backend
+/// refuses it with [`ReplyTooLarge`] before the transport sees it. The caller
+/// then gets a short error reply in its place, over the same transport, so
+/// its call ends with the reason. Without it the caller would wait for a
+/// reply that the transport dropped at this node. The first error is still
+/// returned, so the handler counts the reply as not sent.
+///
+/// `on_error` makes the transport error handler, and is called again only
+/// for the error reply.
+#[inline]
+async fn send_reply(
+    backend: &VeloBackend,
     origin: Option<TransportOrigin>,
     response_id: ResponseId,
+    frame: OutboundFrame,
+    on_error: impl Fn() -> Arc<dyn crate::transports::TransportErrorHandler>,
 ) -> Result<()> {
-    let header = encode_event_header(EventType::Ack(response_id, Outcome::Ok));
+    let worker = WorkerId::from_u64(response_id.worker_id());
+    let message_type = frame.message_type;
+    let error = match backend.send_reply_to_worker(worker, origin, frame, on_error()) {
+        Ok(outcome) => return await_admission(outcome).await,
+        Err(error) => error,
+    };
+    if let Some(too_large) = error.downcast_ref::<ReplyTooLarge>()
+        && let Err(second) = send_too_large_reply(
+            backend,
+            origin,
+            response_id,
+            message_type,
+            too_large,
+            on_error(),
+        )
+        .await
+    {
+        error!("Failed to tell the caller that its reply was not sent: {second}");
+    }
+    Err(error)
+}
 
+/// The short error reply that takes the place of a reply its transport cannot
+/// carry. It echoes no request headers, so its size does not depend on the
+/// request. If it is refused too, nothing more is sent.
+#[cold]
+async fn send_too_large_reply(
+    backend: &VeloBackend,
+    origin: Option<TransportOrigin>,
+    response_id: ResponseId,
+    message_type: MessageType,
+    too_large: &ReplyTooLarge,
+    on_error: Arc<dyn crate::transports::TransportErrorHandler>,
+) -> Result<()> {
+    let header = match message_type {
+        MessageType::Response => encode_response_header(response_id, Outcome::Error, None)
+            .map_err(|e| anyhow::anyhow!("Failed to encode response header: {}", e))?,
+        _ => encode_event_header(EventType::Ack(response_id, Outcome::Error)),
+    };
     let outcome = backend.send_reply_to_worker(
         WorkerId::from_u64(response_id.worker_id()),
         origin,
         OutboundFrame {
             header,
-            payload: Bytes::new(),
-            message_type: MessageType::Ack,
+            payload: Bytes::from(format!("Reply not sent: {too_large}")),
+            message_type,
         },
-        get_ack_error_handler(),
+        on_error,
     )?;
-    await_admission(outcome).await?;
+    await_admission(outcome).await
+}
 
-    Ok(())
+async fn send_ack(
+    backend: Arc<VeloBackend>,
+    origin: Option<TransportOrigin>,
+    response_id: ResponseId,
+) -> Result<()> {
+    let frame = OutboundFrame {
+        header: encode_event_header(EventType::Ack(response_id, Outcome::Ok)),
+        payload: Bytes::new(),
+        message_type: MessageType::Ack,
+    };
+    send_reply(&backend, origin, response_id, frame, get_ack_error_handler).await
 }
 
 #[cfg(feature = "distributed-tracing")]
@@ -1074,22 +1137,12 @@ async fn send_nack(
     response_id: ResponseId,
     error_message: String,
 ) -> Result<()> {
-    let header = encode_event_header(EventType::Ack(response_id, Outcome::Error));
-    let payload = Bytes::from(error_message.into_bytes());
-
-    let outcome = backend.send_reply_to_worker(
-        WorkerId::from_u64(response_id.worker_id()),
-        origin,
-        OutboundFrame {
-            header,
-            payload,
-            message_type: MessageType::Ack,
-        },
-        get_nack_error_handler(),
-    )?;
-    await_admission(outcome).await?;
-
-    Ok(())
+    let frame = OutboundFrame {
+        header: encode_event_header(EventType::Ack(response_id, Outcome::Error)),
+        payload: Bytes::from(error_message.into_bytes()),
+        message_type: MessageType::Ack,
+    };
+    send_reply(&backend, origin, response_id, frame, get_nack_error_handler).await
 }
 
 async fn send_response_ok(
@@ -1100,20 +1153,19 @@ async fn send_response_ok(
 ) -> Result<()> {
     let header = encode_response_header(response_id, Outcome::Ok, headers)
         .map_err(|e| anyhow::anyhow!("Failed to encode response header: {}", e))?;
-
-    let outcome = backend.send_reply_to_worker(
-        WorkerId::from_u64(response_id.worker_id()),
+    let frame = OutboundFrame {
+        header,
+        payload: Bytes::new(),
+        message_type: MessageType::Response,
+    };
+    send_reply(
+        &backend,
         origin,
-        OutboundFrame {
-            header,
-            payload: Bytes::new(),
-            message_type: MessageType::Response,
-        },
-        get_response_error_handler(),
-    )?;
-    await_admission(outcome).await?;
-
-    Ok(())
+        response_id,
+        frame,
+        get_response_error_handler,
+    )
+    .await
 }
 
 async fn send_response(
@@ -1125,20 +1177,19 @@ async fn send_response(
 ) -> Result<()> {
     let header = encode_response_header(response_id, Outcome::Ok, headers)
         .map_err(|e| anyhow::anyhow!("Failed to encode response header: {}", e))?;
-
-    let outcome = backend.send_reply_to_worker(
-        WorkerId::from_u64(response_id.worker_id()),
+    let frame = OutboundFrame {
+        header,
+        payload,
+        message_type: MessageType::Response,
+    };
+    send_reply(
+        &backend,
         origin,
-        OutboundFrame {
-            header,
-            payload,
-            message_type: MessageType::Response,
-        },
-        get_response_error_handler(),
-    )?;
-    await_admission(outcome).await?;
-
-    Ok(())
+        response_id,
+        frame,
+        get_response_error_handler,
+    )
+    .await
 }
 
 async fn send_response_error(
@@ -1150,21 +1201,19 @@ async fn send_response_error(
 ) -> Result<()> {
     let header = encode_response_header(response_id, Outcome::Error, headers)
         .map_err(|e| anyhow::anyhow!("Failed to encode response header: {}", e))?;
-    let payload = Bytes::from(error_message.into_bytes());
-
-    let outcome = backend.send_reply_to_worker(
-        WorkerId::from_u64(response_id.worker_id()),
+    let frame = OutboundFrame {
+        header,
+        payload: Bytes::from(error_message.into_bytes()),
+        message_type: MessageType::Response,
+    };
+    send_reply(
+        &backend,
         origin,
-        OutboundFrame {
-            header,
-            payload,
-            message_type: MessageType::Response,
-        },
-        get_response_error_handler(),
-    )?;
-    await_admission(outcome).await?;
-
-    Ok(())
+        response_id,
+        frame,
+        get_response_error_handler,
+    )
+    .await
 }
 
 // ============================================================================

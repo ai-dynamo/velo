@@ -56,6 +56,8 @@ When the request's payload is staged, the timeout also bounds the receiver's fet
 
 A remote that forgot the caller never answers. The remote sends a reply through its own peer table, over the transport the request came in on but not over the connection of the request. So a call to a remote that called `unregister_peer` on the caller waits until its timeout, and without a timeout it waits for ever.
 
+A reply over the frame limit of the transport it takes fails the call with an error. See [Replies follow the request](transports.md#replies-follow-the-request).
+
 ## Handlers
 
 You register a handler by name. Each handler kind has a sync form and an async form.
