@@ -1239,6 +1239,96 @@ async fn a_named_call_reports_an_unregistered_peer_after_its_handshake() {
     );
 }
 
+/// A peer forgotten between the route check and the `_hello` check is
+/// reported as not registered. The `_hello` check asks whether the peer's
+/// handler is known, and a peer that is gone has no known handler: read
+/// alone, that says the call needs a `_hello`, and the caller would get
+/// `WouldStage` for a peer that no longer exists. The stager here forgets
+/// the peer inside its `threshold` call, which runs between the two checks.
+#[tokio::test]
+async fn a_peer_forgotten_during_the_hello_preflight_is_reported_as_unregistered() {
+    use crate::messenger::common::events::Outcome;
+    use crate::messenger::common::messages::decode_response_id_from_request_header;
+    use crate::messenger::common::responses::encode_response_header;
+    use crate::messenger::large_payload::LargePayloadStager;
+
+    struct ForgetPeer {
+        messenger: std::sync::Weak<Messenger>,
+        peer: InstanceId,
+        checks: AtomicUsize,
+    }
+
+    impl LargePayloadStager for ForgetPeer {
+        fn threshold(&self) -> usize {
+            // The payload check comes first. Forget the peer after the route check.
+            if self.checks.fetch_add(1, Ordering::Relaxed) == 1 {
+                self.messenger.upgrade().unwrap().unregister_peer(self.peer);
+            }
+            16
+        }
+
+        fn stage(&self, _: Bytes, _: Option<Duration>) -> String {
+            panic!("the request payload is empty");
+        }
+    }
+
+    let node = node(&["wide", "narrow"]).await;
+    let refresh = tokio::spawn({
+        let messenger = node.messenger.clone();
+        let peer = node.peer;
+        async move { messenger.refresh_handlers(peer).await }
+    });
+    reaches(|| node.wide.sent_count(), 1).await;
+    let (_, hello, _) = node.wide.sent.lock().unwrap()[0].clone();
+    let hello_id = decode_response_id_from_request_header(&hello).unwrap();
+    node.wide
+        .adapter
+        .get()
+        .unwrap()
+        .response_stream
+        .send((
+            encode_response_header(hello_id, Outcome::Ok, None).unwrap(),
+            Bytes::from_static(br#"{"handlers":["sized"]}"#),
+        ))
+        .unwrap();
+    refresh.await.unwrap().unwrap();
+    assert!(
+        node.messenger
+            .client()
+            .can_send_directly(node.peer, "sized")
+    );
+
+    let manager = Arc::new(crate::rendezvous::RendezvousManager::new(
+        velo_ext::WorkerId::from_u64(7),
+    ));
+    node.messenger.set_large_payload_support(
+        Arc::new(ForgetPeer {
+            messenger: Arc::downgrade(&node.messenger),
+            peer: node.peer,
+            checks: AtomicUsize::new(0),
+        }),
+        Arc::new(crate::rendezvous::RendezvousResolver::new(manager)),
+    );
+    let error = node
+        .messenger
+        .unary("sized")
+        .unwrap()
+        .transport("narrow")
+        .raw_payload(Bytes::new())
+        .instance(node.peer)
+        .send()
+        .await
+        .unwrap_err();
+
+    assert!(!node.messenger.backend().is_registered(node.peer));
+    assert_eq!(node.narrow.sent_count(), 0);
+    assert_eq!(
+        error.downcast_ref::<TransportChoiceError>(),
+        Some(&TransportChoiceError::PeerNotRegistered { peer: node.peer }),
+        "{error:#}"
+    );
+}
+
 /// An acquire is refused when the transport its answer takes leaves less
 /// room than the chunked answer can need. The refusal comes before the read
 /// lock. Without it, an answer over the limit is replaced by an error reply

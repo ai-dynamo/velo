@@ -365,7 +365,17 @@ impl ActiveMessageClient {
         let len = *self
             .hello_len
             .get_or_init(|| self.hello_payload().map_or(0, |payload| payload.len()));
-        if len <= stager.threshold() || self.can_send_directly(target, handler) {
+        if len <= stager.threshold() {
+            return None;
+        }
+        // Read the handler first and the registration last. A peer forgotten
+        // at any point before this is then reported as not registered, not
+        // as a peer that needs a `_hello`.
+        let known = handler.starts_with('_') || self.peer_registry.handler_exists(target, handler);
+        if !self.is_peer_registered(target) {
+            return Some(TransportChoiceError::PeerNotRegistered { peer: target });
+        }
+        if known {
             return None;
         }
         Some(TransportChoiceError::WouldStage {
