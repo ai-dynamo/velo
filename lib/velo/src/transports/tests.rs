@@ -309,7 +309,7 @@ async fn test_register_peer_selects_primary_by_priority() {
     assert!(backend.is_registered(peer_id));
     // Primary should be "tcp" (first in priority)
     let primary = backend.primary_transport.get(&peer_id).unwrap();
-    assert_eq!(primary.value().key(), TransportKey::from("tcp"));
+    assert_eq!(primary.value().primary.key(), TransportKey::from("tcp"));
 }
 
 #[tokio::test]

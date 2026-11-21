@@ -23,6 +23,7 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 use std::time::Duration;
 
@@ -36,16 +37,38 @@ use tokio::time::{Instant, Sleep};
 use super::super::ActiveMessageClient;
 use crate::messenger::common::responses::{ResponseAwaiter, ResponseId};
 use crate::observability::ClientResolution;
+use crate::transports::choice::TransportChoiceError;
 use crate::transports::{AdmissionState, SendAdmission, SendOutcome};
 
 /// What a detached send task reports when it finishes.
 ///
 /// `Ok(())` once the frame has reached the transport's send channel, otherwise
-/// the message to hand the caller. A `String` rather than an `anyhow::Error`
-/// because it crosses a task boundary and because the same failure has to be
-/// reportable more than once — `admitted()` and a later `.await` of the result
-/// must both surface it.
-pub(super) type AdmissionReport = std::result::Result<(), String>;
+/// what to hand the caller. Not an `anyhow::Error`, because it crosses a task
+/// boundary and because the same failure has to be reportable more than once:
+/// `admitted()` and a later `.await` of the result must both surface it. A
+/// refused transport choice stays typed; anything else is text.
+pub(super) type AdmissionReport = std::result::Result<(), ReportError>;
+
+/// Why a detached send did not reach the transport.
+#[derive(Debug)]
+pub(super) enum ReportError {
+    /// Any failure the caller only reads as text.
+    Message(String),
+    /// The send named a transport it could not use. Kept typed, so the caller
+    /// can downcast to it.
+    Choice(TransportChoiceError),
+}
+
+impl From<String> for ReportError {
+    fn from(reason: String) -> Self {
+        Self::Message(reason)
+    }
+}
+
+/// The [`TransportChoiceError`] inside `error`, if that is what it is.
+pub(super) fn choice_error(error: &anyhow::Error) -> Option<TransportChoiceError> {
+    error.downcast_ref::<TransportChoiceError>().cloned()
+}
 
 /// The error a request resolves to when its `.timeout` runs out first.
 ///
@@ -119,6 +142,9 @@ enum AdmissionStage {
     Admitted,
     /// Terminal: the frame will never get there.
     Failed(String),
+    /// Terminal: the send named a transport it could not use. Not sent.
+    /// Boxed, so the stage every send moves stays as small as before.
+    Refused(Box<TransportChoiceError>),
     /// The target's admission gate holds the frame behind its predecessors.
     /// The gate delivers it whether or not this is ever polled.
     Gated(SendAdmission),
@@ -133,7 +159,7 @@ impl AdmissionStage {
     fn state(&self) -> AdmissionState {
         match self {
             Self::Admitted => AdmissionState::Admitted,
-            Self::Failed(_) => AdmissionState::Failed,
+            Self::Failed(_) | Self::Refused(_) => AdmissionState::Failed,
             // The gate resolves tickets whether or not anyone polls, so its own
             // view of the ticket is fresher than any we could cache.
             Self::Gated(admission) => admission.state(),
@@ -149,6 +175,12 @@ impl AdmissionStage {
             match self {
                 Self::Admitted => return Poll::Ready(Ok(())),
                 Self::Failed(reason) => return Poll::Ready(Err(anyhow!("{reason}"))),
+                // `Error::new`, not `anyhow!`, so callers can downcast to it.
+                Self::Refused(error) => {
+                    return Poll::Ready(Err(anyhow::Error::new(TransportChoiceError::clone(
+                        error,
+                    ))));
+                }
                 Self::Gated(admission) => match Pin::new(admission).poll(cx) {
                     Poll::Ready(Ok(())) => *self = Self::Admitted,
                     Poll::Ready(Err(error)) => {
@@ -160,7 +192,8 @@ impl AdmissionStage {
                     Poll::Ready(Ok(report)) => {
                         *self = match report {
                             Ok(()) => Self::Admitted,
-                            Err(reason) => Self::Failed(reason),
+                            Err(ReportError::Message(reason)) => Self::Failed(reason),
+                            Err(ReportError::Choice(error)) => Self::Refused(Box::new(error)),
                         }
                     }
                     // The task dropped its sender without reporting: it
@@ -219,6 +252,15 @@ impl Dispatched {
     pub(super) fn failed(error: impl std::fmt::Display) -> Self {
         Self {
             admission: AdmissionStage::Failed(error.to_string()),
+            awaiter: None,
+        }
+    }
+
+    /// A send refused before it reached a transport, for its named
+    /// transport. Holds no response slot.
+    pub(super) fn refused(error: TransportChoiceError) -> Self {
+        Self {
+            admission: AdmissionStage::Refused(Box::new(error)),
             awaiter: None,
         }
     }
@@ -288,8 +330,85 @@ impl Dispatched {
 pub(super) enum SendStage {
     /// Slot acquisition — and the send behind it — run on the first poll.
     Acquiring(futures::future::BoxFuture<'static, Dispatched>),
+    /// A named send to a worker that discovery must find first. A task runs
+    /// the discovery and may send through `gate`. The future completes the
+    /// send, or waits for a slot when none was free.
+    Discovering {
+        gate: Arc<SendGate>,
+        future: futures::future::BoxFuture<'static, Dispatched>,
+    },
     /// The send has been issued.
     Dispatched(Dispatched),
+}
+
+/// Orders a discovery task's send against its result giving up, and holds
+/// the send once it is made.
+///
+/// The task sends only while the gate is open, under the gate's lock, and
+/// leaves the issued send in the gate. A result that times out takes the
+/// gate's lock too: before a send it closes the gate, so no send starts
+/// after the result reports a failure; after one it takes the issued send
+/// and releases its response slot at once, though the task has not yet
+/// handed anything back.
+#[derive(Default)]
+pub(super) struct SendGate(parking_lot::Mutex<GatePhase>);
+
+#[derive(Default)]
+enum GatePhase {
+    /// The send may still start.
+    #[default]
+    Open,
+    /// The result gave up: the send must not start.
+    Closed,
+    /// The send was issued. `None` once the result took it.
+    Sent(Option<Dispatched>),
+}
+
+/// What closing a gate found.
+enum Closed {
+    /// No send had started; none will.
+    BeforeSend,
+    /// The send was issued, and here it is.
+    AfterSend(Dispatched),
+}
+
+impl SendGate {
+    /// Issue the send with `send` unless the result gave up, and keep it in
+    /// the gate. Whether it was issued.
+    pub(super) fn send_if_open(&self, send: impl FnOnce() -> Dispatched) -> bool {
+        let mut phase = self.0.lock();
+        if matches!(*phase, GatePhase::Closed) {
+            return false;
+        }
+        // Under the lock, so a give-up cannot fall between the check and the
+        // send. The send is synchronous and takes no lock of this gate.
+        *phase = GatePhase::Sent(Some(send()));
+        true
+    }
+
+    /// The issued send, for the result's own future.
+    pub(super) fn take(&self) -> Option<Dispatched> {
+        match &mut *self.0.lock() {
+            GatePhase::Sent(dispatched) => dispatched.take(),
+            _ => None,
+        }
+    }
+
+    fn close(&self) -> Closed {
+        let mut phase = self.0.lock();
+        match &mut *phase {
+            GatePhase::Open | GatePhase::Closed => {
+                *phase = GatePhase::Closed;
+                Closed::BeforeSend
+            }
+            GatePhase::Sent(dispatched) => match dispatched.take() {
+                Some(dispatched) => Closed::AfterSend(dispatched),
+                // The result's future took it, so the stage is no longer
+                // `Discovering`; nothing to release here.
+                None => Closed::BeforeSend,
+            },
+        }
+    }
 }
 
 impl SendStage {
@@ -298,10 +417,14 @@ impl SendStage {
         SendStage::Dispatched(Dispatched::failed(error))
     }
 
+    pub(super) fn refused(error: TransportChoiceError) -> Self {
+        SendStage::Dispatched(Dispatched::refused(error))
+    }
+
     fn admission_state(&self) -> AdmissionState {
         match self {
             // Nothing has been offered to a transport yet.
-            SendStage::Acquiring(_) => AdmissionState::Pending,
+            SendStage::Acquiring(_) | SendStage::Discovering { .. } => AdmissionState::Pending,
             SendStage::Dispatched(dispatched) => dispatched.admission.state(),
         }
     }
@@ -311,7 +434,7 @@ impl SendStage {
     /// Two matches rather than one loop: the borrow checker will not let a
     /// reference into `self` escape a match arm that also reassigns `self`.
     fn poll_dispatched(&mut self, cx: &mut Context<'_>) -> Poll<&mut Dispatched> {
-        if let SendStage::Acquiring(fut) = self {
+        if let SendStage::Acquiring(fut) | SendStage::Discovering { future: fut, .. } = self {
             match fut.as_mut().poll(cx) {
                 Poll::Ready(dispatched) => *self = SendStage::Dispatched(dispatched),
                 Poll::Pending => return Poll::Pending,
@@ -319,7 +442,9 @@ impl SendStage {
         }
         match self {
             SendStage::Dispatched(dispatched) => Poll::Ready(dispatched),
-            SendStage::Acquiring(_) => unreachable!("the branch above replaced Acquiring"),
+            SendStage::Acquiring(_) | SendStage::Discovering { .. } => {
+                unreachable!("the branch above replaced the stage")
+            }
         }
     }
 
@@ -371,6 +496,18 @@ impl SendStage {
             SendStage::Acquiring(_) => {
                 *self = SendStage::failed("timed out before a response slot was free")
             }
+            // A send that was issued may reach the wire, so it is not
+            // reported as failed; its slot goes back now. One that has not
+            // started never will.
+            SendStage::Discovering { gate, .. } => match gate.close() {
+                Closed::AfterSend(mut dispatched) => {
+                    dispatched.awaiter = None;
+                    *self = SendStage::Dispatched(dispatched);
+                }
+                Closed::BeforeSend => {
+                    *self = SendStage::failed("timed out before the send started")
+                }
+            },
             SendStage::Dispatched(dispatched) => dispatched.awaiter = None,
         }
     }
@@ -584,5 +721,8 @@ pub(super) async fn drive_send_outcome(
     let _ = client
         .response_manager
         .complete_outcome(response_id, Err(reason.clone()));
-    Err(reason)
+    match choice_error(&error) {
+        Some(choice) => Err(ReportError::Choice(choice)),
+        None => Err(ReportError::Message(reason)),
+    }
 }

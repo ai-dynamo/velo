@@ -49,6 +49,9 @@ pub(crate) struct HandlerContext {
     /// `ShutdownState::wait_for_drain` waits on. `Arc` so the derived `Clone`
     /// counts a message once, not once per context clone.
     pub in_flight: Option<Arc<velo_ext::InFlightGuard>>,
+
+    /// The transport the request came in on. The reply goes back over it.
+    pub origin: Option<velo_ext::TransportOrigin>,
 }
 
 /// A decoded inbound message, before it is bound to the Messenger.
@@ -69,6 +72,8 @@ pub(crate) struct InboundCall {
     pub staged: bool,
     /// See [`HandlerContext::in_flight`].
     pub in_flight: Option<Arc<velo_ext::InFlightGuard>>,
+    /// The transport the request came in on. The reply goes back over it.
+    pub origin: Option<velo_ext::TransportOrigin>,
 }
 
 impl InboundCall {
@@ -81,6 +86,7 @@ impl InboundCall {
             headers: self.headers,
             system,
             in_flight: self.in_flight,
+            origin: self.origin,
         }
     }
 }
@@ -120,6 +126,7 @@ async fn run_handler<H: ActiveMessageHandler + 'static>(
     // its final drop, and so its transport teardown, from ever happening.
     let backend = Arc::clone(ctx.system.backend());
     let in_flight = ctx.in_flight.clone();
+    let origin = ctx.origin;
     trace!(target: "crate::messenger::dispatcher", handler = %handler.name(), "Handler task started");
     let outcome = AssertUnwindSafe(async { handler.handle(ctx).await })
         .catch_unwind()
@@ -146,6 +153,7 @@ async fn run_handler<H: ActiveMessageHandler + 'static>(
             &backend,
             handler.name(),
             message_id,
+            origin,
             response_type,
             "handler panicked",
             in_flight,
@@ -163,6 +171,7 @@ async fn fail_fast(
     backend: &VeloBackend,
     handler: &str,
     message_id: ResponseId,
+    origin: Option<velo_ext::TransportOrigin>,
     response_type: ResponseType,
     reason: &'static str,
     in_flight: Option<Arc<velo_ext::InFlightGuard>>,
@@ -175,6 +184,7 @@ async fn fail_fast(
         backend,
         handler,
         message_id,
+        origin,
         format!("Handler failed: {reason}"),
     )
     .await;
@@ -186,9 +196,11 @@ pub(crate) async fn send_error_reply(
     backend: &VeloBackend,
     handler: &str,
     message_id: ResponseId,
+    origin: Option<velo_ext::TransportOrigin>,
     message: String,
 ) {
-    if let Err(e) = DispatcherHub::send_error_response_static(backend, message_id, message).await
+    if let Err(e) =
+        DispatcherHub::send_error_response_static(backend, message_id, origin, message).await
         && !e.is::<crate::transports::AdmissionError>()
     {
         error!(
@@ -492,11 +504,13 @@ impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispa
                 let backend = Arc::clone(system.backend());
                 let handler_name = self.handler.name().to_string();
                 let in_flight = shed.call.in_flight;
+                let origin = shed.call.origin;
                 system.tracker().clone().spawn(async move {
                     fail_fast(
                         &backend,
                         &handler_name,
                         message_id,
+                        origin,
                         response_type,
                         "ordered lane queue full",
                         in_flight,
@@ -631,7 +645,14 @@ impl DispatcherHub {
                 let error_message = format!("Handler '{}' not found", handler_name);
                 tokio::spawn(async move {
                     let _in_flight = ctx.in_flight;
-                    send_error_reply(&backend, &handler_name, message_id, error_message).await;
+                    send_error_reply(
+                        &backend,
+                        &handler_name,
+                        message_id,
+                        ctx.origin,
+                        error_message,
+                    )
+                    .await;
                 });
             }
             ResponseType::FireAndForget => {
@@ -648,6 +669,7 @@ impl DispatcherHub {
     async fn send_error_response_static(
         backend: &VeloBackend,
         response_id: ResponseId,
+        origin: Option<velo_ext::TransportOrigin>,
         error_message: String,
     ) -> anyhow::Result<()> {
         use crate::transports::MessageType;
@@ -665,22 +687,24 @@ impl DispatcherHub {
         static ERROR_HANDLER: std::sync::OnceLock<
             Arc<dyn crate::transports::TransportErrorHandler>,
         > = std::sync::OnceLock::new();
-        let error_handler = ERROR_HANDLER
-            .get_or_init(|| Arc::new(DispatcherErrorHandler))
-            .clone();
-
-        let outcome = backend.send_message_to_worker(
-            WorkerId::from_u64(response_id.worker_id()),
-            header,
-            payload,
-            MessageType::Ack,
-            error_handler,
-        )?;
-        if let crate::transports::SendOutcome::Pending(admission) = outcome {
-            admission.await?;
-        }
-
-        Ok(())
+        // The path a handler's replies take, so that an error over the
+        // transport's frame limit is replaced by a short one here too.
+        crate::messenger::handlers::send_reply(
+            backend,
+            origin,
+            response_id,
+            crate::transports::OutboundFrame {
+                header,
+                payload,
+                message_type: MessageType::Ack,
+            },
+            || {
+                ERROR_HANDLER
+                    .get_or_init(|| Arc::new(DispatcherErrorHandler))
+                    .clone()
+            },
+        )
+        .await
     }
 }
 
@@ -803,6 +827,7 @@ mod tests {
             headers: None,
             system: Arc::clone(&messenger),
             in_flight: None,
+            origin: None,
         };
         let task = tokio::spawn(async move {
             run_handler(&PendingHandler, ctx, DispatchFailure::HandlerPanic).await;
@@ -850,6 +875,7 @@ mod tests {
             headers: None,
             staged: false,
             in_flight: None,
+            origin: None,
         };
 
         dispatcher.dispatch(call(1), &messenger);

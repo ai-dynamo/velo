@@ -52,11 +52,22 @@ pub fn create_rv_acquire_handler(store: Arc<DataStore>) -> crate::Handler {
     crate::Handler::typed_unary(
         "_rv_acquire",
         move |ctx: crate::TypedContext<RvAcquireRequest>| {
-            let draining = ctx.msg.backend().shutdown_state().is_draining();
+            let backend = ctx.msg.backend();
+            let draining = backend.shutdown_state().is_draining();
             let lease_timeout = requested_lease_timeout(ctx.headers.as_ref());
-            serve_acquire(&store, &ctx.input, lease_timeout, draining)
+            // The pulls come in on the transport this acquire came in on, and
+            // their replies go back over it: size the chunks for it. Before
+            // the read lock, so a refusal leaves nothing held.
+            let max_chunk = pull_chunk_limit(
+                backend,
+                ctx.sender_worker_id(),
+                crate::transports::choice::request_origin(),
+                ctx.headers.as_ref(),
+            )?;
+            serve_acquire(&store, &ctx.input, lease_timeout, draining, max_chunk)
         },
     )
+    .reads_origin()
     .build()
 }
 
@@ -70,7 +81,56 @@ pub fn acquire_lease(
     request: &RvAcquireRequest,
     headers: Option<&std::collections::HashMap<String, String>>,
 ) -> anyhow::Result<AcquireResponse> {
-    serve_acquire(store, request, requested_lease_timeout(headers), false)
+    serve_acquire(
+        store,
+        request,
+        requested_lease_timeout(headers),
+        false,
+        DEFAULT_CHUNK_SIZE,
+    )
+}
+
+/// The room an `_rv_acquire` answer needs after its reply header: the most
+/// bytes the chunked answer encodes to, which a test below pins. The RDMA
+/// answer is not counted: its lease always has a deadline.
+pub(crate) const ACQUIRE_ANSWER_ROOM: usize = 160;
+
+/// The largest chunk one `_rv_pull` reply to `worker` can carry over the
+/// transport that reply takes ([`VeloBackend::reply_capacity`]): its
+/// capacity, less the reply header. The pull carries the fetch's headers
+/// back, which are at most the acquire's, so the acquire's header bounds the
+/// pull's. With no capacity reported, the default chunk.
+///
+/// A transport with less than [`ACQUIRE_ANSWER_ROOM`] after the header is
+/// refused. The acquire's answer goes back over the same transport with the
+/// same header. An answer over the limit is replaced by an error reply that
+/// names no lease, and the consumer cannot end a lease it never saw.
+///
+/// [`VeloBackend::reply_capacity`]: crate::transports::VeloBackend::reply_capacity
+pub(crate) fn pull_chunk_limit(
+    backend: &crate::transports::VeloBackend,
+    worker: crate::WorkerId,
+    origin: Option<velo_ext::TransportOrigin>,
+    headers: Option<&std::collections::HashMap<String, String>>,
+) -> anyhow::Result<u32> {
+    let (transport, capacity) = backend.reply_capacity(worker, origin)?;
+    let Some(capacity) = capacity else {
+        return Ok(DEFAULT_CHUNK_SIZE);
+    };
+    let header = crate::messenger::common::responses::encode_response_header(
+        crate::messenger::common::responses::ResponseId::from_u128(0),
+        crate::messenger::common::events::Outcome::Ok,
+        headers.cloned(),
+    )?
+    .len();
+    anyhow::ensure!(
+        capacity.saturating_sub(header) >= ACQUIRE_ANSWER_ROOM,
+        "transport {transport} carries {capacity} bytes: after the {header}-byte reply header \
+         that is less than the {ACQUIRE_ANSWER_ROOM} bytes the acquire answer can need"
+    );
+    Ok(u32::try_from(capacity - header)
+        .unwrap_or(u32::MAX)
+        .min(DEFAULT_CHUNK_SIZE))
 }
 
 fn serve_acquire(
@@ -78,6 +138,7 @@ fn serve_acquire(
     request: &RvAcquireRequest,
     lease_timeout: Option<Duration>,
     draining: bool,
+    max_chunk: u32,
 ) -> anyhow::Result<AcquireResponse> {
     let handle = request.handle.to_handle();
     let (_, local_id) = handle.unpack();
@@ -108,7 +169,7 @@ fn serve_acquire(
     // Always use chunked transfer (even for 1 chunk) to avoid
     // JSON-encoding binary data in the typed-unary response.
     let (transfer_id, chunk_size, chunk_count) = store
-        .create_transfer(local_id, lease_id, DEFAULT_CHUNK_SIZE)
+        .create_transfer(local_id, lease_id, max_chunk)
         .ok_or_else(|| anyhow::anyhow!("slot vanished after lock acquire"))?;
     // A consumer whose fetch has a bound gives up at it and says nothing.
     // Granted late, after it gave up, this lease would hold the slot until
@@ -392,4 +453,29 @@ pub fn create_rv_release_handler(store: Arc<DataStore>) -> crate::Handler {
         Ok(())
     })
     .build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// [`ACQUIRE_ANSWER_ROOM`] covers the chunked answer with every field at
+    /// its largest value, in the encoding a typed handler replies with. If a
+    /// field is added to the answer, this fails until the room grows with it.
+    #[test]
+    fn the_answer_room_covers_the_largest_chunked_answer() {
+        let largest = serde_json::to_vec(&AcquireResponse::Ready {
+            lease_id: u64::MAX,
+            transfer_id: u64::MAX,
+            total_len: u64::MAX,
+            chunk_size: u32::MAX,
+            chunk_count: u32::MAX,
+        })
+        .unwrap();
+        assert!(
+            largest.len() <= ACQUIRE_ANSWER_ROOM,
+            "the largest chunked answer is {} bytes",
+            largest.len()
+        );
+    }
 }

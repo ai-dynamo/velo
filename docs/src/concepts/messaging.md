@@ -29,6 +29,8 @@ let reply: Bytes = node_a.unary("ping")?.raw_payload(Bytes::new()).instance(b).s
 let reply: MyResponse = node_a.typed_unary::<MyResponse>("rpc")?.payload(&req)?.instance(b).send().await?;
 ```
 
+To send over one transport and no other, name it with `.transport(key)`, or with `.route(route)` from `Velo::transport_route`. See [Choose the transport for a send](transports.md#choose-the-transport-for-a-send).
+
 A payload that is larger than the large-payload threshold does not travel in the message. The messenger stages it with [rendezvous](rendezvous.md) and sends a handle. The receiver pulls the bytes before the handler runs.
 
 ## Timeouts
@@ -52,7 +54,9 @@ At expiry, the call gives back its response slot, also when the caller keeps the
 
 When the request's payload is staged, the timeout also bounds the receiver's fetch of it. At expiry the receiver gives up the fetch and its response slot, the handler does not run, and the sender frees the payload. See [Transparent staging](rendezvous.md#the-fetch-has-a-deadline).
 
-A remote that forgot the caller never answers. The remote sends a reply through its own peer table, not back over the connection of the request. So a call to a remote that called `unregister_peer` on the caller waits until its timeout, and without a timeout it waits for ever.
+A remote that forgot the caller never answers. The remote sends a reply through its own peer table, over the transport the request came in on but not over the connection of the request. So a call to a remote that called `unregister_peer` on the caller waits until its timeout, and without a timeout it waits for ever.
+
+A reply over the frame limit of the transport it takes fails the call with an error. See [Replies follow the request](transports.md#replies-follow-the-request).
 
 ## Handlers
 

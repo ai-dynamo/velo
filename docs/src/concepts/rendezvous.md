@@ -110,6 +110,14 @@ The rule has a cold-start effect. A peer that is not registered yet translates t
 
 One more fact can stop the offer: a GET to the owner was refused because UCX has no native GET to it, as over a TCP-only lane (`no_native_get`). See [No RDMA rendezvous over a TCP-only lane](../appendix/limitations.md#no-rdma-rendezvous-over-a-tcp-only-lane).
 
+### Which transport carries the chunks
+
+The consumer sends the acquire, each pull, and the release on its primary transport for the owner: the first transport the consumer added that the owner also has. Each answer comes back on the transport its request came in on. A staged stream item is fetched the same way.
+
+So a node with QUIC alone fetches, and is fetched from, over QUIC, and no RDMA offer is made to or by it. Two nodes beside it that each add TCP before QUIC use TCP between them, and RDMA if both have UCX. Each node uses its own order, so both must add TCP first. The test `a_quic_only_node_stages_over_quic_while_its_peers_use_rdma_between_them` in `lib/velo/tests/rendezvous_long_haul.rs` pins this.
+
+A send that names a transport is never staged, because this fetch does not follow its route. See `WouldStage` in [Transports](transports.md).
+
 ## Fallback is a routing decision
 
 After the owner sends a descriptor, four failures can occur on the consumer. They map to three reason labels:
@@ -383,7 +391,7 @@ See [Shutdown and drain](shutdown.md) for the messenger half.
 |---|---|---|---|
 | `DEFAULT_THRESHOLD` | constant (the `Velo` builder uses it) | 256 KiB | Messenger payloads above this go through rendezvous. |
 | `staged_fetch_timeout` | `VeloBuilder` | `None` | The longest the receiver fetches a staged payload. A call's `.timeout` bounds it too. Stream items are exempt. |
-| `DEFAULT_CHUNK_SIZE` | constant | 512 KiB | Chunk size of the chunked path. |
+| `DEFAULT_CHUNK_SIZE` | constant | 512 KiB | Largest chunk of the chunked path. The owner makes the chunks smaller when the transport that carries the `_rv_pull` replies, the one the acquire came in on, reports less: its capacity less the reply header. With less than 160 bytes left after the header, the owner refuses the acquire before it takes the read lock. The acquire's answer goes back over the same transport, and an answer that does not fit would leave a lease that the consumer never saw. |
 | `staged_payload_max` | `VeloBuilder` | `None` | The largest payload this node takes from a peer by rendezvous. Checked before anything of its size is allocated. |
 | `rdma_min_bytes` | `RdmaRendezvousConfig` | 64 KiB | Pinned slots below this answer chunked. |
 | `enabled` | `RdmaRendezvousConfig` | `true` | The kill switch. |

@@ -14,6 +14,7 @@ This page lists every Prometheus metric family that `VeloMetrics` registers. The
 | `velo_transport_rejections_total` | counter | `transport`, `reason` | Transport-level rejections and drops observed by Velo. |
 | `velo_transport_send_backpressure_total` | counter | `transport` | Sends that found the bounded channel for a target (and lane) full and were queued in its admission gate. |
 | `velo_transport_unacknowledged_closes_total` | counter | `transport` | Connections a writer closed before the peer acknowledged everything written, so frames written on them can be lost. QUIC only: the writer's wait for the acknowledgement at close ran out, or the connection ended another way than a close by the peer. Counts closes, not frames, because quinn does not say how much of a stream the peer acknowledged. |
+| `velo_transport_reply_reroutes_total` | counter | `wanted`, `used` | Replies that could not go back over the transport their request came in on, because this node has the caller registered without that transport, and went over this node's primary transport for the caller instead. `wanted` is the request's transport, `used` the one the reply took. Non-zero on an edge pinned to one transport means replies leave it. |
 | `velo_transport_registered_peers` | gauge | `transport` | Registered peer count per transport. |
 | `velo_transport_active_connections` | gauge | `transport` | Active connection count per transport. |
 

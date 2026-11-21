@@ -55,8 +55,12 @@ mod velo_methods_tests;
 // Identity / address types live in velo-ext but are re-exported here so the
 // vast majority of consumers depend only on `velo`.
 pub use velo_ext::{
-    AdmissionState, InstanceId, PeerInfo, ShutdownPolicy, Transport, WorkerAddress, WorkerId,
+    AdmissionState, InstanceId, PeerInfo, ShutdownPolicy, Transport, TransportKey, WorkerAddress,
+    WorkerId,
 };
+
+// Choosing the transport for one send.
+pub use crate::transports::choice::{PeerProbeError, TransportChoiceError, TransportRoute};
 
 // Public re-exports for the velo-ext crate.
 pub use velo_ext as ext;
@@ -1124,6 +1128,72 @@ impl Velo {
     /// Get the instance ID of this system.
     pub fn instance_id(&self) -> InstanceId {
         self.inner.messenger.instance_id()
+    }
+
+    /// The route for this node's transport `key`, to name on sends with
+    /// `.route(...)`.
+    ///
+    /// Resolve it once and reuse it: a send with a route hashes nothing.
+    /// Fails with [`TransportChoiceError::NotInstalled`] when this node has
+    /// no transport with that key.
+    pub fn transport_route(
+        &self,
+        key: impl Into<TransportKey>,
+    ) -> Result<TransportRoute, TransportChoiceError> {
+        self.inner.messenger.backend().transport_route(&key.into())
+    }
+
+    /// The transports `instance` is registered on, its primary first and then
+    /// the rest in this node's priority order. `None` when it is not
+    /// registered.
+    ///
+    /// A send may name any transport in the list. One that names another
+    /// fails with [`TransportChoiceError::NotServedByPeer`].
+    pub fn peer_transports(&self, instance: InstanceId) -> Option<Vec<TransportKey>> {
+        self.inner.messenger.backend().peer_transports(instance)
+    }
+
+    /// The largest frame, header and payload, that this node's transport for
+    /// `route` says it carries to `instance`, or `None` when the transport
+    /// cannot say.
+    ///
+    /// This is this node's outbound limit on the route, not the limit at the
+    /// peer's end. Fails when the route was made by another node, or
+    /// `instance` is not registered on its transport.
+    pub fn route_capacity(
+        &self,
+        instance: InstanceId,
+        route: TransportRoute,
+    ) -> Result<Option<usize>, TransportChoiceError> {
+        self.inner
+            .messenger
+            .backend()
+            .route_capacity(instance, route)
+    }
+
+    /// Probe `instance` over `route`'s transport, with
+    /// [`Transport::check_health`]. Never falls back to another transport.
+    ///
+    /// Fails with [`PeerProbeError::Choice`] before any probe runs when the
+    /// route cannot be used for `instance`, and with
+    /// [`PeerProbeError::Health`] when the probe fails.
+    pub async fn probe_peer(
+        &self,
+        instance: InstanceId,
+        route: TransportRoute,
+        timeout: std::time::Duration,
+    ) -> Result<(), PeerProbeError> {
+        self.inner
+            .messenger
+            .backend()
+            .probe_peer(instance, route, timeout)
+            .await
+    }
+
+    /// This node's transports, in its priority order: the order they were
+    /// added to the builder.
+    pub fn transport_keys(&self) -> Vec<TransportKey> {
+        self.inner.messenger.backend().transport_keys()
     }
 
     /// Write everything the messenger mux has staged, to every peer.
@@ -3556,6 +3626,7 @@ mod tests {
                     headers: None,
                     staged: false,
                     in_flight: None,
+                    origin: None,
                 },
                 &messenger,
             );
@@ -3610,6 +3681,7 @@ mod tests {
                     headers: None,
                     staged: false,
                     in_flight: None,
+                    origin: None,
                 },
                 &messenger,
             );
@@ -3782,6 +3854,7 @@ mod tests {
                     headers: None,
                     staged: false,
                     in_flight: None,
+                    origin: None,
                 },
                 &messenger,
             );
