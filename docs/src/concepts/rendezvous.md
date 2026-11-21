@@ -110,6 +110,14 @@ The rule has a cold-start effect. A peer that is not registered yet translates t
 
 One more fact can stop the offer: a GET to the owner was refused because UCX has no native GET to it, as over a TCP-only lane (`no_native_get`). See [No RDMA rendezvous over a TCP-only lane](../appendix/limitations.md#no-rdma-rendezvous-over-a-tcp-only-lane).
 
+### Which transport carries the chunks
+
+The consumer sends the acquire, each pull, and the release on its primary transport for the owner: the first transport the consumer added that the owner also has. Each answer comes back on the transport its request came in on. A staged stream item is fetched the same way.
+
+So a node with QUIC alone fetches, and is fetched from, over QUIC, and no RDMA offer is made to or by it. Two nodes beside it that each add TCP before QUIC use TCP between them, and RDMA if both have UCX. Each node uses its own order, so both must add TCP first. The test `a_quic_only_node_stages_over_quic_while_its_peers_use_rdma_between_them` in `lib/velo/tests/rendezvous_long_haul.rs` pins this.
+
+A send that names a transport is never staged, because this fetch does not follow its route. See `WouldStage` in [Transports](transports.md).
+
 ## Fallback is a routing decision
 
 After the owner sends a descriptor, four failures can occur on the consumer. They map to three reason labels:
