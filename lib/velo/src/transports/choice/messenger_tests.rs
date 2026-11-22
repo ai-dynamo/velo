@@ -1185,6 +1185,36 @@ async fn a_named_handshake_that_would_stage_is_refused_with_a_full_arena() {
     );
 }
 
+#[tokio::test]
+async fn a_peer_removed_between_route_and_readiness_checks_keeps_its_error_type() {
+    let node = node(&["wide", "narrow"]).await;
+    let peer = node.peer;
+    let backend = node.messenger.backend();
+    let narrow = backend.transport_route(&"narrow".into()).unwrap();
+    let route = Route::Named(narrow.origin);
+    backend.check_served(peer, route).unwrap();
+    node.messenger.unregister_peer(peer);
+
+    let client = node.messenger.client();
+    let named = client
+        .ensure_peer_ready(peer, "sized", route)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        named.downcast_ref::<TransportChoiceError>(),
+        Some(&TransportChoiceError::PeerNotRegistered { peer }),
+        "{named:#}"
+    );
+    let unnamed = client
+        .ensure_peer_ready(peer, "sized", Route::Primary)
+        .await
+        .unwrap_err();
+    assert_eq!(
+        unnamed.to_string(),
+        format!("Peer {peer} not registered. Call Velo::register_peer first.")
+    );
+}
+
 /// A named call whose peer is forgotten while its `_hello` is in flight
 /// still fails with the typed error. `check_served` passed before the
 /// handshake, so the send after it is the first to see that the peer is

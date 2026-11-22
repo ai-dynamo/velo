@@ -493,6 +493,9 @@ impl ActiveMessageClient {
     ) -> Result<()> {
         // 1. Check if peer is registered
         if !self.is_peer_registered(target) {
+            if matches!(route, Route::Named(_)) {
+                return Err(TransportChoiceError::PeerNotRegistered { peer: target }.into());
+            }
             anyhow::bail!(
                 "Peer {} not registered. Call Velo::register_peer first.",
                 target
