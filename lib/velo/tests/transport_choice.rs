@@ -175,9 +175,16 @@ impl Traffic {
 }
 
 /// Run `op`, then wait until both nodes agree on every frame it caused.
-async fn traffic<F: std::future::Future<Output = ()>>(a: &Node, b: &Node, op: F) -> Traffic {
-    let (a0, b0) = (frames(&a.reg), frames(&b.reg));
-    op.await;
+async fn traffic<F: std::future::Future<Output = ()>>(
+    a: &Registry,
+    b: &Registry,
+    op: F,
+) -> Traffic {
+    let (a0, b0) = (frames(a), frames(b));
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    tokio::time::timeout_at(deadline, op)
+        .await
+        .expect("the traffic operation timed out");
     let delta = |now: &Cells, then: &Cells, dir: &str| -> BTreeMap<(String, String), u64> {
         now.iter()
             .filter(|((_, d, _), _)| d == dir)
@@ -189,9 +196,9 @@ async fn traffic<F: std::future::Future<Output = ()>>(a: &Node, b: &Node, op: F)
             })
             .collect()
     };
-    tokio::time::timeout(DEADLINE, async {
+    tokio::time::timeout_at(deadline, async {
         loop {
-            let (a1, b1) = (frames(&a.reg), frames(&b.reg));
+            let (a1, b1) = (frames(a), frames(b));
             let traffic = Traffic {
                 a_to_b: delta(&a1, &a0, "outbound"),
                 b_to_a: delta(&b1, &b0, "outbound"),
@@ -206,6 +213,13 @@ async fn traffic<F: std::future::Future<Output = ()>>(a: &Node, b: &Node, op: F)
     })
     .await
     .expect("the two nodes never agreed on the frames")
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "the traffic operation timed out")]
+async fn a_missing_reply_times_out_before_the_frame_check() {
+    let (a, b) = (Registry::new(), Registry::new());
+    traffic(&a, &b, tokio::time::sleep(DEADLINE * 2)).await;
 }
 
 /// The four operations, A to B, each naming `key` or none.
@@ -266,7 +280,7 @@ async fn named_sends_and_their_replies_stay_on_the_named_transport() {
     let dir = tempfile::tempdir().unwrap();
     for (named, other) in [("uds", "tcp"), ("tcp", "uds")] {
         let (a, b) = pair(&dir, &[Kind::Tcp, Kind::Uds], &[Kind::Tcp, Kind::Uds]).await;
-        let seen = traffic(&a, &b, four_ops(&a, &b, Some(named))).await;
+        let seen = traffic(&a.reg, &b.reg, four_ops(&a, &b, Some(named))).await;
         assert_eq!(seen.transports(), vec![named.to_string()], "naming {named}");
         // `_hello`, unary, typed unary, am_sync, am_send.
         assert_eq!(seen.a_to_b.get(&(named.into(), "message".into())), Some(&5));
@@ -290,7 +304,7 @@ async fn an_unnamed_send_uses_the_first_transport_added() {
         ([Kind::Uds, Kind::Tcp], "uds"),
     ] {
         let (a, b) = pair(&dir, &order, &order).await;
-        let seen = traffic(&a, &b, four_ops(&a, &b, None)).await;
+        let seen = traffic(&a.reg, &b.reg, four_ops(&a, &b, None)).await;
         assert_eq!(seen.transports(), vec![primary.to_string()]);
         shutdown([&a, &b]).await;
     }
@@ -305,9 +319,9 @@ async fn an_unnamed_send_uses_the_first_transport_added() {
 async fn replies_follow_the_request_when_the_ends_disagree_on_the_primary() {
     let dir = tempfile::tempdir().unwrap();
     let (a, b) = pair(&dir, &[Kind::Tcp, Kind::Uds], &[Kind::Uds, Kind::Tcp]).await;
-    let a_calls = traffic(&a, &b, four_ops(&a, &b, None)).await;
+    let a_calls = traffic(&a.reg, &b.reg, four_ops(&a, &b, None)).await;
     assert_eq!(a_calls.transports(), vec!["tcp".to_string()]);
-    let b_calls = traffic(&b, &a, four_ops(&b, &a, None)).await;
+    let b_calls = traffic(&b.reg, &a.reg, four_ops(&b, &a, None)).await;
     assert_eq!(b_calls.transports(), vec!["uds".to_string()]);
     shutdown([&a, &b]).await;
 }
@@ -338,7 +352,7 @@ async fn a_caller_can_refuse_an_edge_before_it_sends() {
     };
     assert_eq!(a.velo.route_capacity(id, uds), Err(not_served.clone()));
 
-    let seen = traffic(&a, &b, async {
+    let seen = traffic(&a.reg, &b.reg, async {
         let error = a
             .velo
             .unary("echo_len")
@@ -469,7 +483,7 @@ async fn a_named_send_cannot_request_staging_through_its_headers() {
     let len = 300 * 1024;
     let handle = sender.velo.register_data(Bytes::from(vec![1; len]));
     let mut response = None;
-    let seen = traffic(&sender, &receiver, async {
+    let seen = traffic(&sender.reg, &receiver.reg, async {
         response = Some(
             sender
                 .velo

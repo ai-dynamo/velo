@@ -198,12 +198,15 @@ impl Seen {
 }
 
 /// Run `op`, then wait until the three nodes agree on every frame it caused.
-async fn traffic<F: std::future::Future<Output = ()>>(nodes: [&Node; 3], op: F) -> Seen {
-    let before = nodes.map(|n| frames(&n.reg));
-    op.await;
-    tokio::time::timeout(T, async {
+async fn traffic<F: std::future::Future<Output = ()>>(registries: [&Registry; 3], op: F) -> Seen {
+    let before = registries.map(frames);
+    let deadline = tokio::time::Instant::now() + T;
+    tokio::time::timeout_at(deadline, op)
+        .await
+        .expect("the traffic operation timed out");
+    tokio::time::timeout_at(deadline, async {
         loop {
-            let now = nodes.map(|n| frames(&n.reg));
+            let now = registries.map(frames);
             let seen = Seen {
                 a_out: flow(&now[0], &before[0], "outbound"),
                 a_in: flow(&now[0], &before[0], "inbound"),
@@ -220,6 +223,13 @@ async fn traffic<F: std::future::Future<Output = ()>>(nodes: [&Node; 3], op: F) 
     })
     .await
     .expect("the three nodes never agreed on the frames")
+}
+
+#[tokio::test(start_paused = true)]
+#[should_panic(expected = "the traffic operation timed out")]
+async fn a_missing_reply_times_out_before_the_frame_check() {
+    let registries = std::array::from_fn(|_| Registry::new());
+    traffic(registries.each_ref(), tokio::time::sleep(T * 2)).await;
 }
 
 /// `velo_rendezvous_rdma_path_total` for one reason label.
@@ -365,7 +375,7 @@ async fn a_quic_only_node_stages_over_quic_while_its_peers_use_rdma_between_them
     let mut request = anchor.handle().as_u128().to_le_bytes().to_vec();
     request.extend_from_slice(&payload);
 
-    let seen = traffic([&a, &b, &c], async {
+    let seen = traffic([&a.reg, &b.reg, &c.reg], async {
         let call = a
             .velo
             .unary("work")

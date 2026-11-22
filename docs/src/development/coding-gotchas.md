@@ -487,6 +487,15 @@ once. With the stale reading, it waits the whole earlier timeout.
 Test: `transports::zmq::transport::tests::a_stopping_sender_rechecks_its_budget_after_socket_setup`
 (`lib/velo/src/transports/zmq/transport.rs`).
 
+When a test waits for an operation and then for its frame counters, start
+the deadline before the operation. The two routing tests used to time only
+the counter wait. With a unary reply missing, neither reached it, even
+when the long-haul stream had already ended. Each test now uses the same
+deadline for both waits and reports which one expired.
+
+Test: `a_missing_reply_times_out_before_the_frame_check` in
+`lib/velo/tests/transport_choice.rs` and `lib/velo/tests/rendezvous_long_haul.rs`.
+
 ## A dead peer must hold its port: a listener or a bound socket, by what the test asserts
 
 **Rule.** A test that needs a peer which never answers must hold that peer's
