@@ -5,7 +5,7 @@
 
 use std::sync::Arc;
 
-use crate::messenger::handlers::Handler;
+use crate::messenger::handlers::{Handler, am_handler_async_with_origin};
 
 use super::VeloEvents;
 
@@ -65,19 +65,18 @@ pub(crate) fn register_event_handlers(
 
     // _event_trigger_request: Remote trigger/poison request + ACK/NACK
     let events_clone = events.clone();
-    register_drain_exempt(
-        Handler::am_handler_async("_event_trigger_request", move |ctx| {
+    register_drain_exempt(am_handler_async_with_origin(
+        "_event_trigger_request",
+        move |ctx, origin| {
             let events = events_clone.clone();
             async move {
-                if let Err(e) = events.handle_trigger_request(ctx.payload).await {
+                if let Err(e) = events.handle_trigger_request(ctx.payload, origin).await {
                     tracing::warn!("_event_trigger_request handler error: {}", e);
                 }
                 Ok(())
             }
-        })
-        .spawn()
-        .build(),
-    )?;
+        },
+    ))?;
 
     Ok(())
 }

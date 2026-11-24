@@ -469,25 +469,18 @@ where
 // Adapter: HandlerExecutor -> ActiveMessageHandler
 // ============================================================================
 
-struct AmExecutorAdapter<E> {
+struct AmExecutorAdapter<E, F> {
     executor: Arc<E>,
     name: Arc<str>,
     metrics: OnceLock<Option<crate::observability::HandlerMetricsHandle>>,
+    make_input: F,
 }
 
-impl<E> AmExecutorAdapter<E> {
-    fn new(executor: E, name: String) -> Self {
-        Self {
-            executor: Arc::new(executor),
-            name: Arc::from(name),
-            metrics: OnceLock::new(),
-        }
-    }
-}
-
-impl<E> ActiveMessageHandler for AmExecutorAdapter<E>
+impl<E, F, C> ActiveMessageHandler for AmExecutorAdapter<E, F>
 where
-    E: HandlerExecutor<Context, ()> + 'static,
+    E: HandlerExecutor<C, ()> + 'static,
+    F: Fn(Context, Option<TransportOrigin>) -> C + Send + Sync,
+    C: Send + 'static,
 {
     fn handle(&self, ctx: HandlerContext) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
         let request_bytes = ctx.payload.len();
@@ -497,6 +490,7 @@ where
             headers: ctx.headers.clone(),
             msg: ctx.system.clone(),
         };
+        let input = (self.make_input)(am_ctx, ctx.origin);
 
         let executor = self.executor.clone();
         let name = self.name.clone();
@@ -527,7 +521,7 @@ where
             let _drain_guard = drain_guard;
             let _in_flight = handler_metrics.as_ref().map(|m| m.start());
             let started = Instant::now();
-            let result = executor.execute(am_ctx).await;
+            let result = executor.execute(input).await;
             let mut outcome = HandlerOutcome::Success;
             let mut response_bytes = 0usize;
 
@@ -1322,9 +1316,40 @@ where
     }
 
     pub fn build(self) -> Handler {
-        let adapter = AmExecutorAdapter::new(self.executor, self.name);
-        let dispatcher = make_dispatcher(adapter, self.ordered);
-        Handler { dispatcher }
+        build_am_handler(self.executor, self.name, self.ordered, |ctx, _| ctx)
+    }
+}
+
+/// A spawned system handler that sends its own reply after the handler returns.
+#[cfg(feature = "services")]
+pub(super) fn am_handler_async_with_origin<F, Fut>(name: &str, f: F) -> Handler
+where
+    F: Fn(Context, Option<TransportOrigin>) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<()>> + Send + 'static,
+{
+    let executor = AsyncExecutor::new(move |(ctx, origin)| f(ctx, origin));
+    build_am_handler(executor, name.into(), None, |ctx, origin| (ctx, origin))
+}
+
+fn build_am_handler<E, F, C>(
+    executor: E,
+    name: String,
+    ordered: Option<OrderedConfig>,
+    make_input: F,
+) -> Handler
+where
+    E: HandlerExecutor<C, ()> + 'static,
+    F: Fn(Context, Option<TransportOrigin>) -> C + Send + Sync + 'static,
+    C: Send + 'static,
+{
+    let adapter = AmExecutorAdapter {
+        executor: Arc::new(executor),
+        name: Arc::from(name),
+        metrics: OnceLock::new(),
+        make_input,
+    };
+    Handler {
+        dispatcher: make_dispatcher(adapter, ordered),
     }
 }
 

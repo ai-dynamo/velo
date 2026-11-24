@@ -570,10 +570,8 @@ impl VeloBackend {
     /// lane 0
     /// ([`SendOutcome::Pending`]), where the frame is queued behind its
     /// predecessors and the contained [`SendAdmission`] reports when it lands.
-    // The messenger sends through `send_routed`. Events send through
-    // `send_message_to_worker`, and tests through these.
-    #[cfg(any(test, feature = "services"))]
-    pub fn send_message(
+    #[cfg(test)]
+    fn send_message(
         &self,
         target: InstanceId,
         header: Bytes,
@@ -621,8 +619,8 @@ impl VeloBackend {
     /// [`Transport::send_message_on_lane`] for the contract, and
     /// [`send_message`](Self::send_message) for everything else, which is the
     /// same.
-    #[cfg(any(test, feature = "services"))]
-    pub fn send_message_on_lane(
+    #[cfg(test)]
+    fn send_message_on_lane(
         &self,
         target: InstanceId,
         lane: u16,
@@ -644,8 +642,8 @@ impl VeloBackend {
         )
     }
 
-    /// Send on the transport `route` picks. See
-    /// [`send_message_on_lane`](Self::send_message_on_lane) for the rest.
+    /// Send on the transport `route` picks. Frames on the same lane stay in order.
+    /// See [`Transport::send_message_on_lane`] for the admission contract.
     ///
     /// A [`Route::Named`] transport the peer is not registered on fails with
     /// [`TransportChoiceError::NotServedByPeer`]. A [`Route::Reply`]
@@ -768,41 +766,6 @@ impl VeloBackend {
         );
 
         Ok(finalize_send_outcome(outcome, report))
-    }
-
-    /// Send message to a worker (fast-path only).
-    ///
-    /// This method uses `try_translate_worker_id()` for fast-path lookup.
-    /// Returns `WorkerNotRegistered` error if the worker is not in the cache.
-    ///
-    /// For automatic discovery, use the two-phase pattern:
-    /// ```ignore
-    /// match backend.send_message_to_worker(...) {
-    ///     Ok(SendOutcome::Admitted) => { /* already on the send channel */ }
-    ///     Ok(SendOutcome::Pending(admission)) => { admission.await?; }
-    ///     Err(e) if matches_worker_not_registered(&e) => {
-    ///         tokio::spawn(async move {
-    ///             let instance_id = backend.resolve_and_register_worker(worker_id).await?;
-    ///             if let SendOutcome::Pending(admission) =
-    ///                 backend.send_message(instance_id, ...)?
-    ///             {
-    ///                 admission.await?;
-    ///             }
-    ///         });
-    ///     }
-    /// }
-    /// ```
-    #[cfg(feature = "services")]
-    pub fn send_message_to_worker(
-        &self,
-        worker_id: WorkerId,
-        header: Bytes,
-        payload: Bytes,
-        message_type: MessageType,
-        on_error: Arc<dyn TransportErrorHandler>,
-    ) -> anyhow::Result<SendOutcome> {
-        let instance_id = self.try_translate_worker_id(worker_id)?;
-        self.send_message(instance_id, header, payload, message_type, on_error)
     }
 
     /// Send a reply to a worker, over the transport its request came in on.

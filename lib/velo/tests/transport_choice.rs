@@ -326,6 +326,41 @@ async fn replies_follow_the_request_when_the_ends_disagree_on_the_primary() {
     shutdown([&a, &b]).await;
 }
 
+#[cfg(feature = "services")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_event_ack_and_nack_follow_the_trigger_request() {
+    let dir = tempfile::tempdir().unwrap();
+    let (caller, owner) = pair(&dir, &[Kind::Tcp, Kind::Uds], &[Kind::Uds, Kind::Tcp]).await;
+    let events = owner.velo.event_manager();
+    let pending = events.new_event().unwrap().into_handle();
+    let poisoned = events.new_event().unwrap().into_handle();
+    events.poison(poisoned, "already poisoned").unwrap();
+
+    let seen = traffic(&caller.reg, &owner.reg, async {
+        caller.velo.events().trigger(pending).await.unwrap();
+        let error = caller.velo.events().trigger(poisoned).await.unwrap_err();
+        assert!(error.to_string().contains("poisoned"), "{error}");
+    })
+    .await;
+    assert!(
+        seen.a_to_b
+            .get(&("tcp".into(), "message".into()))
+            .is_some_and(|n| *n >= 2)
+    );
+    assert!(!seen.a_to_b.contains_key(&("uds".into(), "message".into())));
+    // A completion notification is a separate message. Only the ACK and NACK
+    // answer these two requests, and both have the "ack" frame type.
+    assert_eq!(
+        (
+            seen.b_to_a.get(&("tcp".into(), "ack".into())),
+            seen.b_to_a.get(&("uds".into(), "ack".into()))
+        ),
+        (Some(&2), None),
+        "the owner's ACK and NACK for TCP trigger requests"
+    );
+    shutdown([&caller, &owner]).await;
+}
+
 /// What a caller can learn before it sends, and the typed errors of a choice
 /// that cannot be met. None of them falls back to another transport.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

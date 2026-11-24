@@ -26,12 +26,13 @@ use tracing::warn;
 use crate::events::{
     EventAwaiter, EventHandle, EventManager, EventPoison, EventStatus, EventSystemBase,
 };
-use crate::transports::VeloBackend;
-use velo_ext::{InstanceId, PeerInfo, WorkerId};
+use crate::transports::{MessageType, OutboundFrame, VeloBackend};
+use velo_ext::{InstanceId, PeerInfo, TransportOrigin, WorkerId};
 
 use crate::messenger::Messenger;
 use crate::messenger::common::events::{EventType, Outcome, encode_event_header};
 use crate::messenger::common::responses::{ResponseAwaiter, ResponseId, ResponseManager};
+use crate::messenger::handlers::send_reply;
 
 use self::messages::{EventCompletionMessage, EventSubscribeMessage, EventTriggerRequestMessage};
 use self::remote::{
@@ -405,7 +406,11 @@ impl VeloEvents {
         Ok(())
     }
 
-    pub(crate) async fn handle_trigger_request(self: &Arc<Self>, payload: Bytes) -> Result<()> {
+    pub(crate) async fn handle_trigger_request(
+        self: &Arc<Self>,
+        payload: Bytes,
+        origin: Option<TransportOrigin>,
+    ) -> Result<()> {
         let message: EventTriggerRequestMessage = serde_json::from_slice(&payload)?;
         let handle = EventHandle::from_raw(message.handle);
         if handle.system_id() != self.system_id {
@@ -431,9 +436,9 @@ impl VeloEvents {
                     self.spawn(async move {
                         if system.local_manager.poll(handle).ok() == Some(EventStatus::Poisoned) {
                             let reason = "event was poisoned".to_string();
-                            let _ = system.send_nack(response_id, reason).await;
+                            let _ = system.send_nack(origin, response_id, reason).await;
                         } else {
-                            let _ = system.send_ack(response_id).await;
+                            let _ = system.send_ack(origin, response_id).await;
                         }
                     });
                     Ok(())
@@ -455,20 +460,20 @@ impl VeloEvents {
                         match system.local_base.awaiter_inner(handle) {
                             Ok(waiter) => match waiter.await {
                                 Ok(()) => {
-                                    let _ = system.send_ack(response_id).await;
+                                    let _ = system.send_ack(origin, response_id).await;
                                 }
                                 Err(poison_err) => {
                                     if is_poison_request {
-                                        let _ = system.send_ack(response_id).await;
+                                        let _ = system.send_ack(origin, response_id).await;
                                     } else {
                                         let _ = system
-                                            .send_nack(response_id, poison_err.to_string())
+                                            .send_nack(origin, response_id, poison_err.to_string())
                                             .await;
                                     }
                                 }
                             },
                             Err(e) => {
-                                let _ = system.send_nack(response_id, e.to_string()).await;
+                                let _ = system.send_nack(origin, response_id, e.to_string()).await;
                             }
                         }
                     });
@@ -883,39 +888,45 @@ impl VeloEvents {
 
     // ── ACK/NACK helpers ────────────────────────────────────────────
 
-    async fn send_ack(&self, response_id: ResponseId) -> Result<()> {
-        let header = encode_event_header(EventType::Ack(response_id, Outcome::Ok));
-
-        let outcome = self.backend.send_message_to_worker(
-            WorkerId::from_u64(response_id.worker_id()),
-            header,
-            Bytes::new(),
-            crate::transports::MessageType::Ack,
-            get_event_ack_error_handler(),
-        )?;
-        if let crate::transports::SendOutcome::Pending(admission) = outcome {
-            admission.await?;
-        }
-
-        Ok(())
+    async fn send_ack(
+        &self,
+        origin: Option<TransportOrigin>,
+        response_id: ResponseId,
+    ) -> Result<()> {
+        let frame = OutboundFrame {
+            header: encode_event_header(EventType::Ack(response_id, Outcome::Ok)),
+            payload: Bytes::new(),
+            message_type: MessageType::Ack,
+        };
+        send_reply(
+            &self.backend,
+            origin,
+            response_id,
+            frame,
+            get_event_ack_error_handler,
+        )
+        .await
     }
 
-    async fn send_nack(&self, response_id: ResponseId, error_message: String) -> Result<()> {
-        let header = encode_event_header(EventType::Ack(response_id, Outcome::Error));
-        let payload = Bytes::from(error_message.into_bytes());
-
-        let outcome = self.backend.send_message_to_worker(
-            WorkerId::from_u64(response_id.worker_id()),
-            header,
-            payload,
-            crate::transports::MessageType::Ack,
-            get_event_nack_error_handler(),
-        )?;
-        if let crate::transports::SendOutcome::Pending(admission) = outcome {
-            admission.await?;
-        }
-
-        Ok(())
+    async fn send_nack(
+        &self,
+        origin: Option<TransportOrigin>,
+        response_id: ResponseId,
+        error_message: String,
+    ) -> Result<()> {
+        let frame = OutboundFrame {
+            header: encode_event_header(EventType::Ack(response_id, Outcome::Error)),
+            payload: Bytes::from(error_message),
+            message_type: MessageType::Ack,
+        };
+        send_reply(
+            &self.backend,
+            origin,
+            response_id,
+            frame,
+            get_event_nack_error_handler,
+        )
+        .await
     }
 
     // ── Immediate awaiter helpers ───────────────────────────────────
