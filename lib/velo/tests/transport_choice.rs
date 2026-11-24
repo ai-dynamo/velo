@@ -27,7 +27,7 @@ use velo::transports::tcp::TcpTransportBuilder;
 use velo::transports::uds::UdsTransportBuilder;
 use velo::{
     Handler, PeerProbeError, ShutdownPolicy, Transport, TransportChoiceError, TransportKey,
-    TypedContext, Velo,
+    TypedContext, Velo, VeloBuilder,
 };
 
 const DEADLINE: Duration = Duration::from_secs(10);
@@ -73,8 +73,12 @@ fn transport(kind: Kind, dir: &tempfile::TempDir) -> Arc<dyn Transport> {
 }
 
 async fn node(dir: &tempfile::TempDir, kinds: &[Kind]) -> Node {
+    node_with_builder(dir, kinds, Velo::builder()).await
+}
+
+async fn node_with_builder(dir: &tempfile::TempDir, kinds: &[Kind], builder: VeloBuilder) -> Node {
     let reg = Registry::new();
-    let mut builder = Velo::builder()
+    let mut builder = builder
         .mux_only()
         .metrics(Arc::new(VeloMetrics::register(&reg).unwrap()));
     for kind in kinds {
@@ -427,6 +431,49 @@ async fn a_caller_can_refuse_an_edge_before_it_sends() {
         Some(TransportChoiceError::ForeignRoute { .. })
     ));
     shutdown([&a, &b]).await;
+}
+
+#[cfg(feature = "services")]
+#[tokio::test]
+async fn a_named_call_to_a_discovered_worker_gets_its_reply() {
+    use velo::discovery::FilesystemPeerDiscovery;
+
+    let dir = tempfile::tempdir().unwrap();
+    let peer = node(&dir, &[Kind::Tcp, Kind::Uds]).await;
+    let id = peer.velo.instance_id();
+    let discovery = Arc::new(FilesystemPeerDiscovery::new(dir.path().join("peers.json")).unwrap());
+    let _registration = discovery
+        .register_peer_info(&peer.velo.peer_info())
+        .await
+        .unwrap();
+    let caller = node_with_builder(
+        &dir,
+        &[Kind::Tcp, Kind::Uds],
+        Velo::builder().discovery(discovery),
+    )
+    .await;
+
+    assert_eq!(caller.velo.peer_transports(id), None);
+    let seen = traffic(&caller.reg, &peer.reg, async {
+        let reply = caller
+            .velo
+            .unary("echo_len")
+            .unwrap()
+            .transport("uds")
+            .raw_payload(Bytes::from_static(b"ping"))
+            .worker(id.worker_id())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(&reply[..], &4usize.to_le_bytes());
+    })
+    .await;
+    assert_eq!(seen.transports(), ["uds"]);
+    assert_eq!(
+        seen.b_to_a.get(&("uds".into(), "response".into())),
+        Some(&2)
+    );
+    shutdown([&caller, &peer]).await;
 }
 
 #[cfg(feature = "test-helpers")]
