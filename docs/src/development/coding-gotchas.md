@@ -842,3 +842,28 @@ the callee, on its own thread, during the handshake: that send is still made.
 Test: `peer_miss_tests::a_lookup_answer_after_the_deadline_never_sends`,
 `peer_miss_tests::a_slow_handshake_still_sends_after_the_deadline`
 (`lib/velo/src/peer_miss_tests.rs`).
+
+## Two frees of one slot can come in either order
+
+**Rule.** When two parties each drop their hold on one staged slot, and the
+owner handles their messages on different tasks, the slot must be freed in
+either order, and the second drop must be one the code expects. Do not
+assume that a message sent first is handled first.
+
+**Failure.** A sender frees its staged payload when the call's reply arrives.
+A receiver that pulled the payload before its handler ran sends
+`_rv_release`, then replies. The owner handles `_rv_release` on a handler
+task and the reply on its response task, so the reply can come first. The
+slot is still freed then: the lease's read lock is its last count. But the
+release finds no reference to take, and `take_one` warned whenever a count
+was already 0, so every staged call whose reply came first would warn on a
+run with nothing wrong. It logs that case at debug when the owner has
+released its reference, and warns otherwise.
+
+**Test.** Drive both orders on the store itself: drop the owner's reference,
+then end the lease with a release, and the other way round. Check that the
+slot is gone both ways. An end-to-end test cannot choose the order. No test
+checks the log level.
+
+Test: `rendezvous::store::tests::a_release_after_the_owner_freed_frees_the_slot`
+(`lib/velo/src/rendezvous/store.rs`).

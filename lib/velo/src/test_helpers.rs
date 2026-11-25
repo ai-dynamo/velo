@@ -10,7 +10,7 @@
 //! names the wrong kind of anchor, a cancel for an unknown sender. They are
 //! not part of the release API, and they change without a version bump.
 
-pub use crate::rendezvous::protocol::{AcquireResponse, RvAcquireRequest};
+pub use crate::rendezvous::protocol::{AcquireResponse, RvAcquireRequest, RvMetadataRequest};
 pub use crate::streaming::control::{
     AnchorAttachRequest, AnchorAttachResponse, StreamCancelHandle, StreamCancelRequest,
 };

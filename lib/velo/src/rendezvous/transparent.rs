@@ -20,6 +20,15 @@ use futures::future::BoxFuture;
 
 use crate::rendezvous::RendezvousManager;
 
+/// The handle a `_rv` header names: a [`DataHandle`](crate::DataHandle) as a
+/// decimal `u128`.
+fn parse_handle(handle_str: &str) -> Result<crate::DataHandle> {
+    let raw: u128 = handle_str
+        .parse()
+        .map_err(|e| anyhow::anyhow!("invalid rendezvous handle: {e}"))?;
+    Ok(crate::DataHandle::from_u128(raw))
+}
+
 /// Default threshold for auto-staging large payloads (256 KiB).
 ///
 /// Sits inside D11's ordering invariant, `rdma_min_bytes <= this <
@@ -93,6 +102,14 @@ impl LargePayloadStager for RendezvousStager {
     fn threshold(&self) -> usize {
         self.threshold
     }
+
+    /// Drops the owner's reference, as `Velo::unregister_data` does. A
+    /// receiver's lease, if it has one, still ends with its own release.
+    fn free(&self, handle: &str) {
+        if let Ok(handle) = parse_handle(handle) {
+            self.manager.unregister_data(handle);
+        }
+    }
 }
 
 /// Receiver-side: resolves staged payloads via the [`RendezvousManager`].
@@ -137,15 +154,17 @@ impl LargePayloadResolver for RendezvousResolver {
     fn resolve(&self, handle_str: &str, within: Option<Duration>) -> BoxFuture<'_, Result<Bytes>> {
         let handle_str = handle_str.to_string();
         Box::pin(async move {
-            let raw: u128 = handle_str
-                .parse()
-                .map_err(|e| anyhow::anyhow!("invalid rendezvous handle: {e}"))?;
-            let handle = crate::DataHandle::from_u128(raw);
+            let handle = parse_handle(&handle_str)?;
             let (data, lease_id) = self.manager.get_within(handle, self.limit, within).await?;
             // Auto-release: transparent staging uses refcount=1
             self.manager.release(handle, lease_id).await?;
             Ok(data)
         })
+    }
+
+    fn size(&self, handle_str: &str) -> BoxFuture<'_, Result<u64>> {
+        let handle = parse_handle(handle_str);
+        Box::pin(async move { Ok(self.manager.metadata(handle?).await?.total_len) })
     }
 
     fn fetch_timeout(&self) -> Option<Duration> {

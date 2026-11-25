@@ -23,7 +23,11 @@
 //! - **`message_id: MessageId`** - Unique, compact identifier for this message
 //! - **`msg: Arc<Messenger>`** - The messenger API for sending messages, querying handlers, etc.
 
+mod deferred;
 mod manager;
+use deferred::DeferredHold;
+pub use deferred::FetchLimitReached;
+pub(crate) use deferred::{DeferSetting, DeferredPayload, DeferredPayloads, Fetch};
 pub(crate) use manager::HandlerManager;
 
 use crate::observability::{DispatchFailure, HandlerOutcome, HandlerResponseType};
@@ -347,6 +351,76 @@ macro_rules! impl_sender_accessors {
 impl_sender_accessors!(Context);
 impl_sender_accessors!(TypedContext<I>);
 
+/// A handler built with `defer_large_payload` reads a staged payload's
+/// size, and fetches it, through these.
+impl Context {
+    /// The length of a staged payload that has not been fetched, as its
+    /// sender declared it. `None` when the payload is in [`payload`](Self::payload):
+    /// it was small enough to travel in the message, the handler does not
+    /// defer, or the handler has already replied.
+    ///
+    /// The fetch enforces the receiver's limit (`VeloBuilder::staged_payload_max`)
+    /// whatever this says.
+    pub fn payload_len(&self) -> Option<u64> {
+        self.deferred_payload().map(|payload| payload.len)
+    }
+
+    /// Take the request's payload: the bytes in [`payload`](Self::payload),
+    /// or, for a staged payload that was deferred, the bytes fetched from its
+    /// sender.
+    ///
+    /// A deferred payload is fetched once, within what is left of the
+    /// caller's deadline, and only before the handler returns: after the
+    /// reply the sender frees it. A second take, or a take after the handler
+    /// has returned, fails without asking the sender. With
+    /// `max_concurrent_fetches`, a take while the cap is full fails at once
+    /// with [`FetchLimitReached`], fetches nothing, and can be retried.
+    pub async fn take_payload(&mut self) -> Result<Bytes> {
+        if !self.message_id.is_deferred() {
+            return Ok(std::mem::take(&mut self.payload));
+        }
+        match self.deferred_payload() {
+            Some(payload) => payload.take().await,
+            None => {
+                anyhow::bail!("a deferred payload can only be taken before its handler returns")
+            }
+        }
+    }
+
+    fn deferred_payload(&self) -> Option<Arc<DeferredPayload>> {
+        if !self.message_id.is_deferred() {
+            return None;
+        }
+        self.msg.deferred_payloads().get(self.message_id.into())
+    }
+}
+
+/// The request's size for the handler metrics: a deferred payload counts at
+/// its declared length, as it did when it was fetched before the handler.
+fn request_bytes(ctx: &HandlerContext) -> usize {
+    ctx.deferred.as_ref().map_or(ctx.payload.len(), |payload| {
+        usize::try_from(payload.len).unwrap_or(usize::MAX)
+    })
+}
+
+/// Make a deferred payload reachable from its handler's `Context`, and give
+/// the message id its mark. Drop the hold when the handler returns, before
+/// the reply goes out.
+fn hold_deferred(
+    ctx: &mut HandlerContext,
+) -> (crate::messenger::common::MessageId, Option<DeferredHold>) {
+    match ctx.deferred.take() {
+        Some(payload) => (
+            crate::messenger::common::MessageId::deferred(ctx.message_id),
+            Some(ctx.system.deferred_payloads().hold(ctx.message_id, payload)),
+        ),
+        None => (
+            crate::messenger::common::MessageId::new(ctx.message_id),
+            None,
+        ),
+    }
+}
+
 // ============================================================================
 // Core HandlerExecutor Trait (GAT-based, avoids async_trait)
 // ============================================================================
@@ -461,14 +535,16 @@ struct AmExecutorAdapter<E> {
     executor: Arc<E>,
     name: Arc<str>,
     metrics: OnceLock<Option<crate::observability::HandlerMetricsHandle>>,
+    defer: Option<DeferSetting>,
 }
 
 impl<E> AmExecutorAdapter<E> {
-    fn new(executor: E, name: String) -> Self {
+    fn new(executor: E, name: String, defer: Option<DeferSetting>) -> Self {
         Self {
             executor: Arc::new(executor),
             name: Arc::from(name),
             metrics: OnceLock::new(),
+            defer,
         }
     }
 }
@@ -477,10 +553,14 @@ impl<E> ActiveMessageHandler for AmExecutorAdapter<E>
 where
     E: HandlerExecutor<Context, ()> + 'static,
 {
-    fn handle(&self, ctx: HandlerContext) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-        let request_bytes = ctx.payload.len();
+    fn handle(
+        &self,
+        mut ctx: HandlerContext,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let request_bytes = request_bytes(&ctx);
+        let (message_id, deferred) = hold_deferred(&mut ctx);
         let am_ctx = Context {
-            message_id: crate::messenger::common::MessageId::new(ctx.message_id),
+            message_id,
             payload: ctx.payload,
             headers: ctx.headers.clone(),
             msg: ctx.system.clone(),
@@ -515,6 +595,7 @@ where
             let _in_flight = handler_metrics.as_ref().map(|m| m.start());
             let started = Instant::now();
             let result = executor.execute(am_ctx).await;
+            drop(deferred);
             let mut outcome = HandlerOutcome::Success;
             let mut response_bytes = 0usize;
 
@@ -596,6 +677,10 @@ where
         Box::pin(future)
     }
 
+    fn deferred(&self) -> Option<DeferSetting> {
+        self.defer.clone()
+    }
+
     fn name(&self) -> &str {
         &self.name
     }
@@ -605,14 +690,16 @@ struct UnaryExecutorAdapter<E> {
     executor: Arc<E>,
     name: Arc<str>,
     metrics: OnceLock<Option<crate::observability::HandlerMetricsHandle>>,
+    defer: Option<DeferSetting>,
 }
 
 impl<E> UnaryExecutorAdapter<E> {
-    fn new(executor: E, name: String) -> Self {
+    fn new(executor: E, name: String, defer: Option<DeferSetting>) -> Self {
         Self {
             executor: Arc::new(executor),
             name: Arc::from(name),
             metrics: OnceLock::new(),
+            defer,
         }
     }
 }
@@ -621,10 +708,14 @@ impl<E> ActiveMessageHandler for UnaryExecutorAdapter<E>
 where
     E: HandlerExecutor<Context, Option<Bytes>> + 'static,
 {
-    fn handle(&self, ctx: HandlerContext) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
-        let request_bytes = ctx.payload.len();
+    fn handle(
+        &self,
+        mut ctx: HandlerContext,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        let request_bytes = request_bytes(&ctx);
+        let (message_id, deferred) = hold_deferred(&mut ctx);
         let unary_ctx = Context {
-            message_id: crate::messenger::common::MessageId::new(ctx.message_id),
+            message_id,
             payload: ctx.payload,
             headers: ctx.headers.clone(),
             msg: ctx.system.clone(),
@@ -661,6 +752,7 @@ where
             let _in_flight = handler_metrics.as_ref().map(|m| m.start());
             let started = Instant::now();
             let result = executor.execute(unary_ctx).await;
+            drop(deferred);
             let mut outcome = HandlerOutcome::Success;
             let mut response_bytes = 0usize;
 
@@ -728,6 +820,10 @@ where
 
         #[cfg(not(feature = "distributed-tracing"))]
         Box::pin(future)
+    }
+
+    fn deferred(&self) -> Option<DeferSetting> {
+        self.defer.clone()
     }
 
     fn name(&self) -> &str {
@@ -1161,6 +1257,45 @@ macro_rules! impl_dispatch_mode_setters {
     };
 }
 
+/// Emits the staged-payload setters of the untyped handler builders. A typed
+/// handler deserializes its payload before it runs, so it cannot defer it.
+macro_rules! impl_defer_setters {
+    ($ty:ident) => {
+        impl<E> $ty<E> {
+            /// Run the handler before a staged payload is fetched.
+            ///
+            /// A payload over the staging threshold (256 KiB by default)
+            /// stays with its sender. The handler sees an empty
+            /// [`Context::payload`] and the size in [`Context::payload_len`],
+            /// and fetches the bytes with [`Context::take_payload`] if it
+            /// serves the request. A handler that refuses never pulls them.
+            /// Without this setting the receiver fetches before the handler
+            /// runs.
+            ///
+            /// Only a request that expects a reply is deferred: the sender
+            /// frees its payload when the reply arrives. A fire-and-forget
+            /// message is fetched before its handler runs, as before.
+            pub fn defer_large_payload(mut self) -> Self {
+                self.defer.get_or_insert_with(DeferSetting::default);
+                self
+            }
+
+            /// Defer staged payloads, and run at most `limit` of this
+            /// handler's fetches at once. A [`Context::take_payload`] over
+            /// the limit fails at once with [`FetchLimitReached`], which the
+            /// handler turns into a refusal.
+            ///
+            /// # Panics
+            ///
+            /// If `limit` is 0.
+            pub fn max_concurrent_fetches(mut self, limit: usize) -> Self {
+                self.defer = Some(DeferSetting::capped(limit));
+                self
+            }
+        }
+    };
+}
+
 /// An ordering configuration selects lanes; no configuration selects one task per message.
 fn make_dispatcher<H: ActiveMessageHandler + 'static>(
     adapter: H,
@@ -1176,6 +1311,7 @@ pub struct AmHandlerBuilder<E> {
     executor: E,
     name: String,
     ordered: Option<OrderedConfig>,
+    defer: Option<DeferSetting>,
 }
 
 impl<E> AmHandlerBuilder<E>
@@ -1187,22 +1323,25 @@ where
             executor,
             name,
             ordered: None,
+            defer: None,
         }
     }
 
     pub fn build(self) -> Handler {
-        let adapter = AmExecutorAdapter::new(self.executor, self.name);
+        let adapter = AmExecutorAdapter::new(self.executor, self.name, self.defer);
         let dispatcher = make_dispatcher(adapter, self.ordered);
         Handler { dispatcher }
     }
 }
 
 impl_dispatch_mode_setters!(AmHandlerBuilder);
+impl_defer_setters!(AmHandlerBuilder);
 
 pub struct UnaryHandlerBuilder<E> {
     executor: E,
     name: String,
     ordered: Option<OrderedConfig>,
+    defer: Option<DeferSetting>,
 }
 
 impl<E> UnaryHandlerBuilder<E>
@@ -1214,17 +1353,19 @@ where
             executor,
             name,
             ordered: None,
+            defer: None,
         }
     }
 
     pub fn build(self) -> Handler {
-        let adapter = UnaryExecutorAdapter::new(self.executor, self.name);
+        let adapter = UnaryExecutorAdapter::new(self.executor, self.name, self.defer);
         let dispatcher = make_dispatcher(adapter, self.ordered);
         Handler { dispatcher }
     }
 }
 
 impl_dispatch_mode_setters!(UnaryHandlerBuilder);
+impl_defer_setters!(UnaryHandlerBuilder);
 
 pub struct TypedUnaryHandlerBuilder<E, I, O> {
     executor: E,
@@ -1488,6 +1629,13 @@ mod tests {
         // otherwise a no-op rather than silently switching modes.
         let builder = am_handler("unlimited", |_ctx| Ok(())).max_concurrent(32);
         assert!(builder.ordered.is_none());
+    }
+
+    /// A cap of 0 would refuse every fetch, so the builder refuses it.
+    #[test]
+    #[should_panic(expected = "max_concurrent_fetches(0)")]
+    fn a_fetch_cap_of_zero_is_refused() {
+        let _ = Handler::unary_handler("capped", |_ctx| Ok(None)).max_concurrent_fetches(0);
     }
 
     #[test]

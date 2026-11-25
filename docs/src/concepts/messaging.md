@@ -29,7 +29,7 @@ let reply: Bytes = node_a.unary("ping")?.raw_payload(Bytes::new()).instance(b).s
 let reply: MyResponse = node_a.typed_unary::<MyResponse>("rpc")?.payload(&req)?.instance(b).send().await?;
 ```
 
-A payload that is larger than the large-payload threshold does not travel in the message. The messenger stages it with [rendezvous](rendezvous.md) and sends a handle. The receiver pulls the bytes before the handler runs.
+A payload that is larger than the large-payload threshold does not travel in the message. The messenger stages it with [rendezvous](rendezvous.md) and sends a handle. The receiver pulls the bytes before the handler runs, unless the handler defers them ([Deferring a large payload](#deferring-a-large-payload)).
 
 ## Timeouts
 
@@ -94,6 +94,36 @@ The handler context holds the payload, the message headers, and the messenger (`
 
 Handler names that start with `_` are reserved for system handlers.
 
+## Deferring a large payload
+
+A handler that refuses a large request on its size or its own load does not need the bytes. Build it with `defer_large_payload()`, and it runs before the receiver pulls them:
+
+```rust,ignore
+let handler = Handler::unary_handler_async("generate", |mut ctx: Context| async move {
+    if ctx.payload_len().is_some_and(|len| len > room()) {
+        anyhow::bail!("busy");
+    }
+    let request = ctx.take_payload().await?;
+    serve(request).await
+})
+.defer_large_payload()
+.build();
+```
+
+For a staged payload, `ctx.payload` is empty, `ctx.payload_len()` is the size the sender declared, and `ctx.take_payload()` pulls the bytes. For a payload that travelled in the message, `payload_len()` is `None` and `take_payload()` returns `ctx.payload`. The same handler code serves both.
+
+The rules:
+
+- **Take it before the handler returns.** The sender frees the payload when the reply arrives ([The sender frees on reply](rendezvous.md#the-sender-frees-on-reply)). A take after the handler has returned fails without asking the sender, and so does a second take.
+- **The fetch keeps the caller's deadline.** It ends at what is left of the bound the message got when the receiver took it off its queue, as a fetch before the handler does ([The fetch has a deadline](rendezvous.md#the-fetch-has-a-deadline)). Teardown ends it too.
+- **`max_concurrent_fetches(n)` caps the handler's fetches.** A take while `n` are running fails at once with `FetchLimitReached` and fetches nothing. The handler turns it into a refusal. It counts fetches, not bytes.
+- **Only `am_sync` and unary calls are deferred.** A fire-and-forget message has no reply to free its payload, so the receiver pulls it before the handler runs. A typed handler deserializes its input before it runs, so it cannot defer.
+- **The size is the sender's claim.** The fetch still enforces `VeloBuilder::staged_payload_max`, and a take over it fails with the error that names both sizes.
+
+The size travels in the `_rv_len` header beside the handle. A message from a sender that does not write it costs one `_rv_metadata` call to the sender before the handler runs.
+
+Before this, a saturated worker pulled each large request in full and then refused it. It could not free a payload it had not pulled, because a free needs the lease that a pull gives. A release message that needs no lease was rejected: it is a wire change, and the reply already tells the sender that the receiver is done.
+
 ## Dispatch modes
 
 | Mode | Behavior |
@@ -119,7 +149,7 @@ let h = Handler::typed_unary_async("bulk", bulk)
 Ordered dispatch has these limits:
 
 - **It keeps order. It does not create order.** If a peer uses more than one transport, or a connection drops and reconnects, the arrival order was already lost before the messenger saw the messages.
-- **Large payloads are not ordered.** A rendezvous-staged message resolves before dispatch. The dispatcher logs a warning once when it sees one.
+- **Large payloads are not ordered.** A rendezvous-staged message resolves before dispatch. The dispatcher logs a warning once when it sees one. A deferred payload keeps its place when its sender declares its size.
 - **Lane queues have no hard bound.** `max_queue_depth` is a soft limit for each lane. It drives `OverflowPolicy`. It does not bound the channel. One slow peer cannot cause the messages of other peers to be shed.
 - **A unary handler serves one request at a time for each sender.** A client that makes 100 concurrent calls gets them one after the other.
 - **Idle lanes stop.** A lane with no messages for `idle_lane_ttl` (30 s by default) stops, so short-lived peers do not leak tasks.

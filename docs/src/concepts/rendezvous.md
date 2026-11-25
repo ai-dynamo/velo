@@ -151,7 +151,7 @@ Chunked reads of an external slot never form a Rust reference into the region. A
 
 ### Transparent staging
 
-The messenger stages any payload above 256 KiB through rendezvous and replaces it in the frame with a handle. The receiver resolves the handle before the handler runs, so handler code never sees the difference.
+The messenger stages any payload above 256 KiB through rendezvous and replaces it in the frame with a handle. The receiver resolves the handle before the handler runs, so handler code never sees the difference. A handler built with `defer_large_payload` runs first and resolves it only if it asks ([Deferring a large payload](messaging.md#deferring-a-large-payload)).
 
 The transparent stager runs inside the synchronous `send_message`. It uses only arenas that the pool has already mapped. It never maps a new arena, because mapping is an `ibv_reg_mr` whose cost is linear in size. A send must not stall on that.
 
@@ -170,13 +170,21 @@ The bound is a duration and not an instant, because the two nodes do not share a
 
 #### The staging headers belong to the send that staged
 
-The receiver takes `_rv` and `_rv_budget_ms` out of a staged message before its handler runs, so a handler never sees them. A handler that passes its headers on in a send of its own therefore passes neither. A forwarded handle made the next receiver fetch a payload that was not its message's. A forwarded budget made it give up at another call's deadline.
+The receiver takes `_rv`, `_rv_budget_ms` and `_rv_len` out of a staged message before its handler runs, so a handler never sees them. A handler that passes its headers on in a send of its own therefore passes neither. A forwarded handle made the next receiver fetch a payload that was not its message's. A forwarded budget made it give up at another call's deadline.
 
-A staged send writes both headers itself, after the tracing propagator, so the ones on the wire are its own. A budget without a handle means nothing to a receiver, so an eager send needs no such care. An encoder that owned the budget key was rejected: it compared every header key of every send with `_rv_budget_ms`, and it left a forwarded `_rv` in place.
+A staged send writes them itself, after the tracing propagator, so the ones on the wire are its own. A budget without a handle means nothing to a receiver, so an eager send needs no such care. An encoder that owned the budget key was rejected: it compared every header key of every send with `_rv_budget_ms`, and it left a forwarded `_rv` in place.
+
+#### The sender frees on reply
+
+A call that expects a reply frees its staged payload when the reply arrives: an answer, an ack or nack, an error, or a send that failed. A receiver whose handler replied without a fetch has no lease, so it cannot free the payload itself. The payload goes with the call's response slot, and the free costs nothing on a call that staged nothing.
+
+A call that ends without a reply frees nothing. At its timeout, or when its caller drops it, its frame may still be on its way to a receiver that will fetch. The call's time-to-live, if it has one, frees the payload then.
+
+A receiver that fetched also releases the payload. The owner handles that `_rv_release` on a handler task and the reply on its response task, so either can come first. Released first, the slot is freed and the sender's free finds nothing. Freed first, the slot waits for the lease, and the release frees it ([coding gotchas](../development/coding-gotchas.md#two-frees-of-one-slot-can-come-in-either-order)).
 
 #### What a fetch that gives up leaves behind
 
-The receiver tells the sender nothing when it gives up a fetch. A slow sender then grants a lease that nobody pulls or releases, and a payload whose fetch never got a lease stays staged. Two things end both on the sender:
+The receiver tells the sender nothing when it gives up a fetch. A slow sender then grants a lease that nobody pulls or releases, and a payload whose fetch never got a lease stays staged. When the receiver's own bound ended the fetch, its error reply frees the payload ([The sender frees on reply](#the-sender-frees-on-reply)). In every other case, two things end both on the sender:
 
 - **A time-to-live.** A staged payload whose call has a `.timeout` gets that deadline as its `RegisterOptions::ttl`. Past it, the slot is freed with every lease on it, whether or not a consumer is still reading. The caller has given up by then.
 - **A chunked lease deadline.** A fetch with a bound sends an `_rv_lease_ms` header with its `_rv_acquire`. The owner ends the lease when no `_rv_pull` renews it within that time. An owner from before the header ignores it. An acquire without the header, from an older consumer or from a public `get`, gets a lease with no deadline, as before. A `get` caller can still hold its lease after the last pull.
@@ -192,7 +200,7 @@ A staged payload's size is its owner's word: the acquire answer states `total_le
 A payload over the limit is refused:
 
 - The consumer releases the handle, so the owner frees the staged copy. Transparent handles are single-use, and a detached one would stay on the owner with nobody left to read it.
-- A request that expects a reply fails with an error that names both sizes. Its handler never runs.
+- A request that expects a reply fails with an error that names both sizes. Its handler never runs. A handler that defers the payload runs, and its `take_payload` fails with that error.
 - A stream item on the messenger mux ends its own stream with a `TransportError` that names both sizes, and the producer is told to stop ([Batched streaming](batched-streaming.md#a-record-refused-for-its-size)). Other streams from the same peer go on.
 - Any other fire-and-forget message is lost, and the refusal is logged.
 
@@ -260,6 +268,13 @@ Two `#[serde(default)]` fields make a mixed-version deployment fall back to chun
 - `AcquireResponse::Rdma::lease_timeout_ms`. If a future owner omits it, the default `0` means no deadline, which is the old behavior.
 
 The rule for new fields: every field is `#[serde(default)]`, and every default means what the protocol did before the field existed. A default that means "the new behavior" makes an old peer's silence look like consent.
+
+Transparent staging has one header that older nodes do not know, `_rv_len`:
+
+- **A new sender, an older receiver.** The receiver passes `_rv_len` to the handler as an ordinary header, pulls before the handler runs, and releases. The sender's free on reply and that release come in either order, and the slot is freed either way.
+- **An older sender, a deferring receiver.** The receiver asks the sender for the size with `_rv_metadata`. A handler that takes the payload pulls and releases it as before. A handler that refuses it leaves it staged, because an older sender does not free on reply: until its time-to-live for a call with a `.timeout`, and for good without one ([the limitation](../appendix/limitations.md#a-staged-payload-without-a-deadline-can-stay-staged)).
+
+A node that forwards headers into a staged send of its own writes its own `_rv_len`. An older forwarding node can pass on a stale one, which is why `payload_len()` is the sender's claim and the fetch enforces the limit.
 
 ## Memory registration
 

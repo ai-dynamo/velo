@@ -69,9 +69,9 @@ pub use crate::messenger::client::builders::{
     TypedUnaryBuilder, TypedUnaryResult, UnaryBuilder, UnaryResult,
 };
 pub use crate::messenger::handlers::{
-    AmHandlerBuilder, AsyncExecutor, Context, Handler, HandlerExecutor, OrderedConfig, OrderingKey,
-    OverflowPolicy, SyncExecutor, TypedContext, TypedUnaryHandlerBuilder, UnaryHandlerBuilder,
-    UnifiedResponse,
+    AmHandlerBuilder, AsyncExecutor, Context, FetchLimitReached, Handler, HandlerExecutor,
+    OrderedConfig, OrderingKey, OverflowPolicy, SyncExecutor, TypedContext,
+    TypedUnaryHandlerBuilder, UnaryHandlerBuilder, UnifiedResponse,
 };
 pub use crate::messenger::messenger::Messenger;
 
@@ -1953,6 +1953,24 @@ impl Velo {
         )
     }
 
+    /// What this instance's `_rv_metadata` handler answers to `request`.
+    ///
+    /// Exposed for tests only, for a test that wraps the handler, for example
+    /// to count the calls.
+    #[cfg(feature = "test-helpers")]
+    #[doc(hidden)]
+    pub fn serve_rv_metadata(
+        &self,
+        request: &crate::test_helpers::RvMetadataRequest,
+    ) -> Result<DataMetadata> {
+        let (_, local_id) = request.handle.to_handle().unpack();
+        self.inner
+            .rendezvous_manager
+            .data_store()
+            .metadata(local_id)
+            .ok_or_else(|| anyhow::anyhow!("rendezvous handle not found"))
+    }
+
     /// Arm one fault for this instance's next RDMA transfer. See
     /// [`RdmaTestHook`](crate::rendezvous::RdmaTestHook).
     ///
@@ -3573,6 +3591,7 @@ mod tests {
                     headers: None,
                     staged: false,
                     in_flight: None,
+                    deferred: None,
                 },
                 &messenger,
             );
@@ -3627,6 +3646,7 @@ mod tests {
                     headers: None,
                     staged: false,
                     in_flight: None,
+                    deferred: None,
                 },
                 &messenger,
             );
@@ -3669,6 +3689,7 @@ mod tests {
         fn threshold(&self) -> usize {
             usize::MAX
         }
+        fn free(&self, _: &str) {}
     }
     impl crate::messenger::large_payload::LargePayloadResolver for NeverResolves {
         fn resolve(
@@ -3677,6 +3698,9 @@ mod tests {
             _: Option<std::time::Duration>,
         ) -> futures::future::BoxFuture<'_, anyhow::Result<bytes::Bytes>> {
             self.called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::pending())
+        }
+        fn size(&self, _: &str) -> futures::future::BoxFuture<'_, anyhow::Result<u64>> {
             Box::pin(std::future::pending())
         }
     }
@@ -3799,6 +3823,7 @@ mod tests {
                     headers: None,
                     staged: false,
                     in_flight: None,
+                    deferred: None,
                 },
                 &messenger,
             );

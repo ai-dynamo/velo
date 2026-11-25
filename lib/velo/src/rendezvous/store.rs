@@ -664,6 +664,19 @@ impl DataStore {
         };
         match this.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| v.checked_sub(1)) {
             Ok(prev) => Some((prev - 1, other.load(Ordering::Relaxed))),
+            // A sender frees a staged payload when its reply arrives, which
+            // can be before the receiver's release of the same payload is
+            // handled. That release finds no reference left, which is
+            // expected.
+            Err(_)
+                if matches!(count, Count::References)
+                    && slot.owner_released.load(Ordering::Relaxed) =>
+            {
+                tracing::debug!(
+                    "rendezvous: references already 0 for slot {local_id}, owner released it"
+                );
+                None
+            }
             Err(_) => {
                 tracing::warn!("rendezvous: {count:?} already 0 for slot {local_id}");
                 None
@@ -1280,6 +1293,36 @@ mod tests {
             !store.force_release_lease(lease, id),
             "a lease is force-released at most once"
         );
+    }
+
+    /// A sender frees a staged payload when the call's reply arrives, and the
+    /// receiver that fetched it releases its lease on a task of its own. The
+    /// two race, and the slot must be freed in either order. Released first,
+    /// the receiver frees the slot and the sender's free finds nothing.
+    /// Freed first, the sender leaves the slot to the lease, and the release
+    /// that ends it frees the slot though no reference is left to take.
+    #[test]
+    fn a_release_after_the_owner_freed_frees_the_slot() {
+        for owner_first in [true, false] {
+            let store = DataStore::new();
+            let id = store.register_body(SlotBody::InMemory(Bytes::from(vec![0u8; 4096])), None);
+            let lease = store.acquire_read_lock(id).unwrap();
+            if owner_first {
+                assert!(store.release_owner_reference(id));
+                assert!(store.metadata(id).is_some(), "the lease keeps the slot");
+            }
+            assert_eq!(
+                store.end_lease(lease, id, LeaseEnd::Release),
+                LeaseOutcome::Consumed
+            );
+            if !owner_first {
+                assert!(
+                    !store.release_owner_reference(id),
+                    "nothing is left to free"
+                );
+            }
+            assert!(store.metadata(id).is_none(), "owner_first: {owner_first}");
+        }
     }
 
     /// A chunked lease with a deadline lives while its consumer pulls, and is

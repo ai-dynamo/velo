@@ -28,13 +28,27 @@ use velo_ext::WorkerId;
 /// Debug:     MessageId { worker: 12345678, slot: 42, gen: 7890 }
 /// Alternate: 01234567-89ab-cdef-0123-456789abcdef (UUID)
 /// ```
+///
+/// The second field marks a message whose staged payload was deferred to
+/// its handler. It is set once, when the handler's context is made, so every
+/// copy of one message's id carries the same mark. It lets a context clone
+/// that outlives the handler tell its deferred payload from an empty one.
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MessageId(ResponseId);
+pub struct MessageId(ResponseId, bool);
 
 impl MessageId {
     /// Create a new MessageId from a ResponseId
     pub(crate) fn new(response_id: ResponseId) -> Self {
-        Self(response_id)
+        Self(response_id, false)
+    }
+
+    /// The id of a message whose staged payload its handler fetches.
+    pub(crate) fn deferred(response_id: ResponseId) -> Self {
+        Self(response_id, true)
+    }
+
+    pub(crate) fn is_deferred(&self) -> bool {
+        self.1
     }
 
     /// Get the underlying ResponseId
@@ -81,7 +95,7 @@ impl MessageId {
 
 impl From<ResponseId> for MessageId {
     fn from(response_id: ResponseId) -> Self {
-        Self(response_id)
+        Self::new(response_id)
     }
 }
 

@@ -58,6 +58,8 @@ A payload that goes through rendezvous states its own size, and the receiver all
 
 A staged payload is freed when its last reference and its last reader are both gone, whichever goes last. An owner drops its reference with `Velo::unregister_data`, which is synchronous and safe to call from `Drop`. If a reader still holds a lease, the reader's detach, release, or reaped lease then frees it. See [When a slot is freed](docs/src/concepts/rendezvous.md#when-a-slot-is-freed).
 
+A handler built with `defer_large_payload()` runs before the receiver pulls a staged payload. It reads the declared size with `ctx.payload_len()` and pulls the bytes with `ctx.take_payload()`, so a busy worker can refuse a large request without pulling it. The sender frees a staged payload when the call's reply arrives. See [Deferring a large payload](docs/src/concepts/messaging.md#deferring-a-large-payload).
+
 The local ID in an anchor handle is random. The handle is all that a peer needs to attach to an anchor or open its mux slot, and velo does not authenticate peers, so a host that can reach a node cannot guess the handle of another request's stream. See [Streaming](docs/src/concepts/streaming.md).
 
 Build with `default-features = false` to omit distributed events, work queues, and built-in discovery services. The default `services` feature keeps those APIs available. See [Services and stream transports](docs/src/guides/migrate-services.md).
