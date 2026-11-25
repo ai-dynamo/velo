@@ -819,3 +819,26 @@ Test: `a_default_node_learns_peers_without_a_per_stream_transport`
 
 Test: `streaming::grpc_transport::tests::a_call_the_server_ended_first_still_reads_as_an_error`
 (`lib/velo/src/streaming/grpc_transport.rs`).
+
+## A timeout returns an answer that came at a late poll
+
+**Rule.** `tokio::time::timeout_at` polls its future before its timer. A
+future that finishes at its first poll after the deadline is returned as if
+it were in time. This happens when the thread was held past the deadline, or
+when the answer came from another task. Check the clock again before acting
+on the answer. Give each boundary its own test.
+
+**Failure.** A send with a 20 ms timeout waited on a discovery lookup that
+took 120 ms on a busy thread. The answer was there at the next poll, so the
+send went and the remote ran a handler for a caller that had given up. The
+first fix put the check after the handshake, which also dropped sends that
+main had always made. The check now sits in the lookup, before it registers
+the peer, so a reply's lookup has it too.
+
+**Test.** Use a discovery that blocks the one runtime thread past the call's
+timeout: the call times out and the handler never runs. A second test stalls
+the callee, on its own thread, during the handshake: that send is still made.
+
+Test: `peer_miss_tests::a_lookup_answer_after_the_deadline_never_sends`,
+`peer_miss_tests::a_slow_handshake_still_sends_after_the_deadline`
+(`lib/velo/src/peer_miss_tests.rs`).

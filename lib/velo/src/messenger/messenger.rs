@@ -64,6 +64,7 @@ pub(crate) struct MessengerParts {
     transports: Vec<Arc<dyn Transport>>,
     discovery: Option<Arc<dyn PeerDiscovery>>,
     metrics: Option<Arc<VeloMetrics>>,
+    reply_lookup_timeout: Option<std::time::Duration>,
 }
 
 impl MessengerParts {
@@ -72,6 +73,7 @@ impl MessengerParts {
             transports: Vec::new(),
             discovery: None,
             metrics: None,
+            reply_lookup_timeout: None,
         }
     }
 
@@ -90,8 +92,19 @@ impl MessengerParts {
         self
     }
 
+    pub(crate) fn reply_lookup_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.reply_lookup_timeout = Some(timeout);
+        self
+    }
+
     pub(crate) async fn build(self) -> Result<Arc<Messenger>> {
-        Messenger::new(self.transports, self.discovery, self.metrics).await
+        Messenger::new(
+            self.transports,
+            self.discovery,
+            self.metrics,
+            self.reply_lookup_timeout,
+        )
+        .await
     }
 }
 
@@ -101,10 +114,16 @@ impl Messenger {
         transports: Vec<Arc<dyn Transport>>,
         discovery: Option<Arc<dyn PeerDiscovery>>,
         metrics: Option<Arc<VeloMetrics>>,
+        reply_lookup_timeout: Option<std::time::Duration>,
     ) -> Result<Arc<Self>> {
         // 1. Setup infrastructure
         let (backend, data_streams) = VeloBackend::new(transports, metrics.clone()).await?;
         let backend = Arc::new(backend);
+        // Before the dispatcher exists: a request already queued by a
+        // transport must find the configured bound, not the default.
+        if let Some(timeout) = reply_lookup_timeout {
+            backend.set_reply_lookup_timeout(timeout);
+        }
         // Work accepted before a drain keeps flowing through it. See
         // `register_drain_exempt_handler`. Installed before this messenger
         // exists, so before anything can begin a drain.

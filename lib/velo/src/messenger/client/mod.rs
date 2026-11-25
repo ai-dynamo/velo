@@ -4,6 +4,7 @@
 //! Active message client.
 
 pub(crate) mod builders;
+mod peer_lookup;
 mod peer_registry;
 
 #[cfg(test)]
@@ -20,7 +21,8 @@ use crate::messenger::common::{ActiveMessage, responses::ResponseManager};
 
 use crate::observability::{ClientResolution, VeloMetrics};
 use crate::transports::{SendOutcome, TransportErrorHandler, VeloBackend};
-use peer_registry::PeerRegistry;
+pub(crate) use peer_lookup::{LookupTimedOut, PeerKey};
+pub(crate) use peer_registry::PeerRegistry;
 use velo_ext::InstanceId;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -123,7 +125,6 @@ pub(crate) struct ActiveMessageClient {
     pub(crate) backend: Arc<VeloBackend>,
     error_handler: Arc<dyn TransportErrorHandler>,
     peer_registry: Arc<PeerRegistry>,
-    discovery: Option<Arc<dyn PeerDiscovery>>,
     handshake_timeout: Duration,
     observability: Option<Arc<VeloMetrics>>,
     /// Late-bound large payload stager for transparent rendezvous.
@@ -139,12 +140,17 @@ impl ActiveMessageClient {
         discovery: Option<Arc<dyn PeerDiscovery>>,
         observability: Option<Arc<VeloMetrics>>,
     ) -> Self {
+        let peer_registry = Arc::new(PeerRegistry::new());
+        // The client owns the handler registry a discovered peer joins; the
+        // backend resolves a miss, as replies are sent there.
+        if let Some(discovery) = discovery {
+            backend.set_peer_discovery(discovery, peer_registry.clone());
+        }
         Self {
             response_manager,
             backend,
             error_handler,
-            peer_registry: Arc::new(PeerRegistry::new()),
-            discovery,
+            peer_registry,
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             observability,
             large_payload_stager: Arc::new(std::sync::OnceLock::new()),
@@ -460,46 +466,6 @@ impl ActiveMessageClient {
     /// Refresh the handler list for a peer
     pub(crate) async fn refresh_handler_list(&self, instance_id: InstanceId) -> Result<()> {
         self.handshake_with_peer(instance_id).await
-    }
-
-    /// Resolve a peer via discovery and perform registration
-    pub(crate) async fn resolve_peer_via_discovery(
-        &self,
-        worker_id: velo_ext::WorkerId,
-    ) -> Result<InstanceId> {
-        tracing::debug!(
-            target: "crate::messenger::client",
-            worker_id = %worker_id,
-            "Resolving peer via discovery"
-        );
-
-        let discovery = self.discovery.as_ref().ok_or_else(|| {
-            anyhow::anyhow!(
-                "No discovery backend configured. Cannot resolve worker {}",
-                worker_id
-            )
-        })?;
-
-        let peer_info = discovery.discover_by_worker_id(worker_id).await?;
-        let instance_id = peer_info.instance_id();
-        if let Some(metrics) = self.observability.as_ref() {
-            metrics.record_client_resolution(ClientResolution::DiscoverySuccess);
-        }
-
-        tracing::debug!(
-            target: "crate::messenger::client",
-            worker_id = %worker_id,
-            instance_id = %instance_id,
-            "Discovery resolved peer, performing registration"
-        );
-
-        // Register with backend (transports)
-        self.backend.register_peer(peer_info)?;
-
-        // Register in peer registry (handler discovery)
-        self.peer_registry.register_peer(instance_id);
-
-        Ok(instance_id)
     }
 
     pub(crate) fn register_outcome(

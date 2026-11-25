@@ -327,7 +327,7 @@ async fn a_detached_failure_keeps_its_wording() {
     let mut result = fire_result(Dispatched::detached(report_rx, awaiter));
 
     report_tx
-        .send(Err("Handshake failed: nope".to_string()))
+        .send(Err(NotSent::Failed("Handshake failed: nope".to_string())))
         .expect("the receiver is alive");
 
     let err = tokio::time::timeout(RESOLVES, result.admitted())
@@ -344,7 +344,7 @@ async fn a_detached_task_that_vanishes_fails_the_send() {
     // sender without reporting. Nothing is going to admit the frame, so the
     // result must resolve rather than hang.
     let (awaiter, _id, _rm) = make_awaiter();
-    let (report_tx, report_rx) = oneshot::channel::<AdmissionReport>();
+    let (report_tx, report_rx) = oneshot::channel::<Result<(), NotSent>>();
     let result = fire_result(Dispatched::detached(report_rx, awaiter));
     drop(report_tx);
 

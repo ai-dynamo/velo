@@ -75,7 +75,9 @@ mod transport;
 use std::sync::OnceLock;
 use std::{collections::HashMap, sync::Arc};
 
-use crate::observability::{Direction, TransportRejection, VeloMetrics};
+use crate::messenger::PeerDiscovery;
+use crate::messenger::client::{LookupTimedOut, PeerKey, PeerRegistry};
+use crate::observability::{ClientResolution, Direction, TransportRejection, VeloMetrics};
 use bytes::Bytes;
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -100,6 +102,32 @@ pub use transport::{
 };
 // Their public path is the crate root (`velo::Transport`, ...).
 pub(crate) use transport::{AdmissionState, ShutdownPolicy, Transport};
+
+/// How long a reply waits for discovery to find the peer it answers, unless
+/// the builder sets another bound. Enough for a healthy discovery backend and
+/// short enough that a lost reply does not hold the handler that owes it.
+pub(crate) const DEFAULT_REPLY_LOOKUP_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
+
+/// The most discovery lookups one node runs at once. Each miss runs its own
+/// lookup, so a burst of misses would otherwise send a burst of requests to
+/// the discovery backend. A miss past the cap waits for a permit inside its
+/// own bound. 64 is far above what a healthy node needs, since a lookup is one
+/// short round trip and a miss that gets its permit after the peer was
+/// registered asks nothing; it is low enough that one node cannot flood a
+/// shared discovery service.
+pub(crate) const MAX_CONCURRENT_LOOKUPS: usize = 64;
+
+/// The most misses that wait for one of those permits. A miss past this is
+/// refused at once. 1024 holds a large burst of replies to one forgotten
+/// peer, which the first lookups then answer from the table, and it bounds
+/// what a peer can make this node hold: worker ids come off the wire.
+pub(crate) const MAX_PENDING_LOOKUPS: usize = 1024;
+
+/// The bound on the lookup of a miss that has no deadline of its own: a send
+/// with no timeout. The same 30 s such a send's handshake has, so no lookup
+/// holds its permit for ever.
+pub(crate) const UNTIMED_LOOKUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Errors from the transport backend that routes a messenger's sends. A send
 /// that fails for one of these reasons carries it in its `anyhow::Error`.
@@ -146,6 +174,39 @@ pub(crate) struct VeloBackend {
     peers: DashMap<InstanceId, PeerInfo>,
     peer_observer: OnceLock<Arc<dyn PeerTableObserver>>,
     advertised: OnceLock<PeerInfo>,
+    /// Discovery for a peer the table missed, and the client's handler
+    /// registry that a discovered peer joins. Unset without a discovery
+    /// backend, and then a miss fails as it always has.
+    peer_discovery: OnceLock<(Arc<dyn PeerDiscovery>, Arc<PeerRegistry>)>,
+    /// One permit per discovery lookup in flight. See
+    /// [`MAX_CONCURRENT_LOOKUPS`].
+    lookup_permits: tokio::sync::Semaphore,
+    /// One place per miss that runs or waits for a lookup. See
+    /// [`MAX_PENDING_LOOKUPS`].
+    lookup_places: tokio::sync::Semaphore,
+    /// Ends every lookup. A child of the teardown token, cancelled by
+    /// `request_teardown` itself: the teardown token is cancelled by the
+    /// teardown worker, after the transports' `begin_drain` hooks, and a hook
+    /// that takes its time would leave lookups registering peers meanwhile.
+    lookup_cancel: tokio_util::sync::CancellationToken,
+    /// See [`VeloBuilder::reply_lookup_timeout`](crate::VeloBuilder::reply_lookup_timeout).
+    reply_lookup_timeout: OnceLock<std::time::Duration>,
+}
+
+/// A frame [`VeloBackend::send_routed`] found no route for, handed back
+/// unsent.
+struct Unsent {
+    header: Bytes,
+    payload: Bytes,
+    on_error: Arc<dyn TransportErrorHandler>,
+}
+
+/// Wait until the frame is on its send channel.
+async fn admitted(outcome: SendOutcome) -> anyhow::Result<()> {
+    if let SendOutcome::Pending(admission) = outcome {
+        admission.await?;
+    }
+    Ok(())
 }
 
 /// Told when the backend's peer table changes.
@@ -309,6 +370,7 @@ impl VeloBackend {
                 primary_transport: DashMap::new(),
                 alternative_transports: DashMap::new(),
                 workers: DashMap::new(),
+                lookup_cancel: shutdown_state.teardown_token().child_token(),
                 shutdown_state,
                 teardown: OnceLock::new(),
                 teardown_outcome: Default::default(),
@@ -317,6 +379,12 @@ impl VeloBackend {
                 peers: DashMap::new(),
                 peer_observer: OnceLock::new(),
                 advertised: OnceLock::new(),
+                peer_discovery: OnceLock::new(),
+                lookup_permits: tokio::sync::Semaphore::new(MAX_CONCURRENT_LOOKUPS),
+                lookup_places: tokio::sync::Semaphore::new(
+                    MAX_CONCURRENT_LOOKUPS + MAX_PENDING_LOOKUPS,
+                ),
+                reply_lookup_timeout: OnceLock::new(),
             },
             data_streams,
         ))
@@ -472,16 +540,9 @@ impl VeloBackend {
             .map(|entry| entry.value().clone())
     }
 
-    /// Send a message to a registered peer via its primary transport.
-    ///
-    /// Returns [`VeloBackendError::InstanceNotRegistered`] if the peer has not
-    /// been registered with [`register_peer`](Self::register_peer).
-    ///
-    /// The [`SendOutcome`] distinguishes synchronous admission
-    /// ([`SendOutcome::Admitted`]) from a saturated channel for the target's
-    /// lane 0
-    /// ([`SendOutcome::Pending`]), where the frame is queued behind its
-    /// predecessors and the contained [`SendAdmission`] reports when it lands.
+    /// [`send_message_on_lane`](Self::send_message_on_lane) on lane 0, for
+    /// the backend's tests.
+    #[cfg(test)]
     pub fn send_message(
         &self,
         target: InstanceId,
@@ -527,9 +588,15 @@ impl VeloBackend {
     /// Frames sent on one `(target, lane)` arrive in order, and nothing is
     /// ordered across lanes. So `Message` frames for an ordered handler must
     /// stay on one lane: the messenger's own traffic uses lane 0. See
-    /// [`Transport::send_message_on_lane`] for the contract, and
-    /// [`send_message`](Self::send_message) for everything else, which is the
-    /// same.
+    /// [`Transport::send_message_on_lane`] for the contract.
+    ///
+    /// Returns [`VeloBackendError::InstanceNotRegistered`] if the peer has not
+    /// been registered with [`register_peer`](Self::register_peer).
+    ///
+    /// The [`SendOutcome`] distinguishes synchronous admission
+    /// ([`SendOutcome::Admitted`]) from a saturated channel for the lane
+    /// ([`SendOutcome::Pending`]), where the frame is queued behind its
+    /// predecessors and the contained [`SendAdmission`] reports when it lands.
     pub fn send_message_on_lane(
         &self,
         target: InstanceId,
@@ -539,10 +606,29 @@ impl VeloBackend {
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
     ) -> anyhow::Result<SendOutcome> {
-        let transport = self
-            .primary_transport
-            .get(&target)
-            .ok_or(VeloBackendError::InstanceNotRegistered(target))?;
+        self.send_routed(target, lane, header, payload, message_type, on_error)
+            .map_err(|_| VeloBackendError::InstanceNotRegistered(target).into())
+    }
+
+    /// [`send_message_on_lane`](Self::send_message_on_lane), handing the frame
+    /// back when `target` has no route. Nothing was sent then, so a caller
+    /// that can find the peer again may send it once more.
+    fn send_routed(
+        &self,
+        target: InstanceId,
+        lane: u16,
+        header: Bytes,
+        payload: Bytes,
+        message_type: MessageType,
+        on_error: Arc<dyn TransportErrorHandler>,
+    ) -> Result<SendOutcome, Unsent> {
+        let Some(transport) = self.primary_transport.get(&target) else {
+            return Err(Unsent {
+                header,
+                payload,
+                on_error,
+            });
+        };
         let transport_key = transport.value().key();
         // Only the span below needs this; `finalize_send_outcome` recomputes it
         // from the report's own frame handles.
@@ -591,38 +677,205 @@ impl VeloBackend {
         Ok(finalize_send_outcome(outcome, report))
     }
 
-    /// Send message to a worker (fast-path only).
+    /// Send a reply to the worker it answers, and wait for its admission.
     ///
-    /// This method uses `try_translate_worker_id()` for fast-path lookup.
-    /// Returns `WorkerNotRegistered` error if the worker is not in the cache.
-    ///
-    /// For automatic discovery, use the two-phase pattern:
-    /// ```ignore
-    /// match backend.send_message_to_worker(...) {
-    ///     Ok(SendOutcome::Admitted) => { /* already on the send channel */ }
-    ///     Ok(SendOutcome::Pending(admission)) => { admission.await?; }
-    ///     Err(e) if matches_worker_not_registered(&e) => {
-    ///         tokio::spawn(async move {
-    ///             let instance_id = backend.resolve_and_register_worker(worker_id).await?;
-    ///             if let SendOutcome::Pending(admission) =
-    ///                 backend.send_message(instance_id, ...)?
-    ///             {
-    ///                 admission.await?;
-    ///             }
-    ///         });
-    ///     }
-    /// }
-    /// ```
-    pub fn send_message_to_worker(
+    /// A table hit sends at once, as a send to a known instance does: no
+    /// timer, no task. On a miss the worker is resolved through discovery,
+    /// bounded by [`reply_lookup_timeout`](crate::VeloBuilder::reply_lookup_timeout),
+    /// then the reply is sent. A route that `unregister_peer` removed after
+    /// the worker lookup is a miss too: nothing was sent, so the reply is sent
+    /// at most once. Without discovery a miss returns the table's error.
+    pub(crate) async fn send_reply(
         &self,
-        worker_id: WorkerId,
+        worker: WorkerId,
         header: Bytes,
         payload: Bytes,
         message_type: MessageType,
         on_error: Arc<dyn TransportErrorHandler>,
-    ) -> anyhow::Result<SendOutcome> {
-        let instance_id = self.try_translate_worker_id(worker_id)?;
-        self.send_message(instance_id, header, payload, message_type, on_error)
+    ) -> anyhow::Result<()> {
+        let (unsent, miss) = match self.try_translate_worker_id(worker) {
+            Ok(target) => {
+                match self.send_routed(target, 0, header, payload, message_type, on_error) {
+                    Ok(outcome) => return admitted(outcome).await,
+                    Err(unsent) => (unsent, VeloBackendError::InstanceNotRegistered(target)),
+                }
+            }
+            Err(miss) => (
+                Unsent {
+                    header,
+                    payload,
+                    on_error,
+                },
+                miss,
+            ),
+        };
+        // Without discovery a miss fails as it always has: the caller that
+        // owes the reply counts and logs it, and nothing else does.
+        if !self.has_peer_discovery() {
+            return Err(miss.into());
+        }
+        let bound = self.reply_lookup_timeout();
+        // A bound too large to add to the clock leaves the lookup its
+        // fallback bound.
+        let deadline = tokio::time::Instant::now().checked_add(bound);
+        // Boxed, so a hit's future does not carry the lookup's state.
+        let target = Box::pin(self.resolve_peer(PeerKey::Worker(worker), deadline)).await?;
+        let outcome = self
+            .send_routed(
+                target,
+                0,
+                unsent.header,
+                unsent.payload,
+                message_type,
+                unsent.on_error,
+            )
+            .map_err(|_| VeloBackendError::InstanceNotRegistered(target))?;
+        admitted(outcome).await
+    }
+
+    /// Resolve a peer the table missed through discovery, giving up at
+    /// `deadline` with [`LookupTimedOut`]. With no deadline the lookup gives
+    /// up after [`UNTIMED_LOOKUP_TIMEOUT`].
+    ///
+    /// Each miss runs its own lookup, in the caller's future: dropping the
+    /// future ends the lookup, and nothing is shared or left behind. The
+    /// backend's teardown ends it too, so a detached send does not hold a
+    /// lookup past its node. Replies and sends both resolve here, so this is
+    /// the one place a miss is counted and logged.
+    pub(crate) async fn resolve_peer(
+        &self,
+        key: PeerKey,
+        deadline: Option<tokio::time::Instant>,
+    ) -> anyhow::Result<InstanceId> {
+        let deadline =
+            deadline.unwrap_or_else(|| tokio::time::Instant::now() + UNTIMED_LOOKUP_TIMEOUT);
+        let result = tokio::select! {
+            biased;
+            () = self.lookup_cancel.cancelled() => Err(anyhow::anyhow!(
+                "the node is shutting down; discovery for {key} was cancelled"
+            )),
+            found = tokio::time::timeout_at(deadline, self.discover(key, deadline)) => {
+                found.unwrap_or_else(|_| Err(LookupTimedOut(key).into()))
+            }
+        };
+        if let Some(metrics) = self.observability.as_ref() {
+            metrics.record_client_resolution(match result {
+                Ok(_) => ClientResolution::DiscoverySuccess,
+                Err(_) => ClientResolution::DiscoveryError,
+            });
+        }
+        if let Err(error) = &result {
+            tracing::error!(target: "crate::transports", peer = %key, error = %error, "Discovery failed");
+        }
+        result
+    }
+
+    /// One lookup: wait for a permit, ask discovery, check the answer, and
+    /// register the peer in both tables `Messenger::register_peer` fills.
+    ///
+    /// `timeout_at` polls this future before its timer, so a step that ends
+    /// at a late poll would pass as in time. The caller has given up by then.
+    /// So the deadline is read again after each wait, before anything is
+    /// returned or registered.
+    async fn discover(
+        &self,
+        key: PeerKey,
+        deadline: tokio::time::Instant,
+    ) -> anyhow::Result<InstanceId> {
+        let Some((discovery, registry)) = self.peer_discovery.get() else {
+            anyhow::bail!("No discovery backend configured. Cannot resolve {key}");
+        };
+        let timed_out = || tokio::time::Instant::now() >= deadline;
+        let teardown = &self.lookup_cancel;
+        let Ok(_place) = self.lookup_places.try_acquire() else {
+            anyhow::bail!(
+                "{} discovery lookups are running or pending; not starting one for {key}",
+                MAX_CONCURRENT_LOOKUPS + MAX_PENDING_LOOKUPS
+            );
+        };
+        let _permit = self.lookup_permits.acquire().await?;
+        if timed_out() {
+            return Err(LookupTimedOut(key).into());
+        }
+        // The table may hold the peer by now: an earlier miss of the same
+        // burst, a `_hello` or a `register_peer` can land while this one
+        // waits. Then discovery has nothing to add, and may hold no record.
+        if let Some(instance) = key.registered_in(self) {
+            return Ok(instance);
+        }
+        let found = match key {
+            PeerKey::Worker(worker) => discovery.discover_by_worker_id(worker).await,
+            PeerKey::Instance(instance) => discovery.discover_by_instance_id(instance).await,
+        };
+        // Before the answer is read: a refusal that comes late is a timeout.
+        if timed_out() {
+            return Err(LookupTimedOut(key).into());
+        }
+        let peer =
+            found.map_err(|error| anyhow::anyhow!("Discovery failed for {key}: {error:#}"))?;
+        let instance = peer.instance_id();
+        // Discovery is trusted for which instance holds a worker id, but an
+        // answer for another id would deliver one peer's frame to another.
+        anyhow::ensure!(
+            key.names(instance),
+            "Discovery answered {key} with {instance}"
+        );
+        // No route goes into a node that is tearing down. Teardown can also
+        // begin during the registration, which no lock covers; then the peer
+        // is taken out again before anything is sent to it.
+        anyhow::ensure!(
+            !teardown.is_cancelled(),
+            "the node is shutting down; not registering {instance}"
+        );
+        self.register_peer(peer).map_err(|error| {
+            anyhow::anyhow!("Could not register discovered {instance}: {error}")
+        })?;
+        registry.register_peer(instance);
+        if teardown.is_cancelled() {
+            self.unregister_peer(instance);
+            registry.unregister_peer(instance);
+            anyhow::bail!("the node is shutting down; not registering {instance}");
+        }
+        // A transport can take its time to register. The peer stays, but the
+        // caller has given up: nothing is sent for it.
+        if timed_out() {
+            return Err(LookupTimedOut(key).into());
+        }
+        Ok(instance)
+    }
+
+    /// Misses that run or wait for a lookup now.
+    #[cfg(test)]
+    pub(crate) fn lookups_held(&self) -> usize {
+        MAX_CONCURRENT_LOOKUPS + MAX_PENDING_LOOKUPS - self.lookup_places.available_permits()
+    }
+
+    /// Whether a discovery backend is configured.
+    pub(crate) fn has_peer_discovery(&self) -> bool {
+        self.peer_discovery.get().is_some()
+    }
+
+    /// Install discovery and the client's handler registry. Once, by the
+    /// messenger's client.
+    pub(crate) fn set_peer_discovery(
+        &self,
+        discovery: Arc<dyn PeerDiscovery>,
+        registry: Arc<PeerRegistry>,
+    ) {
+        let _ = self.peer_discovery.set((discovery, registry));
+    }
+
+    /// The bound on a reply's discovery lookup.
+    pub(crate) fn reply_lookup_timeout(&self) -> std::time::Duration {
+        self.reply_lookup_timeout
+            .get()
+            .copied()
+            .unwrap_or(DEFAULT_REPLY_LOOKUP_TIMEOUT)
+    }
+
+    /// Set the bound on a reply's discovery lookup, once.
+    pub(crate) fn set_reply_lookup_timeout(&self, timeout: std::time::Duration) {
+        let _ = self.reply_lookup_timeout.set(timeout);
     }
 
     /// Register a remote peer with all compatible transports.
@@ -717,6 +970,13 @@ impl VeloBackend {
         tracing::debug!(peer = %instance_id, "Unregistered peer");
     }
 
+    /// `unregister_peer` stopped after its first step: the route is gone and
+    /// the worker entry is not.
+    #[cfg(test)]
+    pub(crate) fn drop_route(&self, instance_id: InstanceId) {
+        self.primary_transport.remove(&instance_id);
+    }
+
     /// Get the available transports.
     #[cfg(test)]
     pub fn available_transports(&self) -> Vec<TransportKey> {
@@ -785,6 +1045,9 @@ impl VeloBackend {
 
     pub(crate) fn request_teardown(&self) -> teardown::Completion {
         self.shutdown_state.begin_drain();
+        // Here, not on the teardown worker: no lookup registers a peer once
+        // this has returned, whatever the transports' hooks then do.
+        self.lookup_cancel.cancel();
         self.teardown
             .get_or_init(|| {
                 teardown::start(

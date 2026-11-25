@@ -669,18 +669,15 @@ impl DispatcherHub {
             .get_or_init(|| Arc::new(DispatcherErrorHandler))
             .clone();
 
-        let outcome = backend.send_message_to_worker(
-            WorkerId::from_u64(response_id.worker_id()),
-            header,
-            payload,
-            MessageType::Ack,
-            error_handler,
-        )?;
-        if let crate::transports::SendOutcome::Pending(admission) = outcome {
-            admission.await?;
-        }
-
-        Ok(())
+        backend
+            .send_reply(
+                WorkerId::from_u64(response_id.worker_id()),
+                header,
+                payload,
+                MessageType::Ack,
+                error_handler,
+            )
+            .await
     }
 }
 
