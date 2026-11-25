@@ -178,7 +178,7 @@ A staged send writes them itself, after the tracing propagator, so the ones on t
 
 A call that expects a reply frees its staged payload when the reply arrives: an answer, an ack or nack, an error, or a send that failed. A receiver whose handler replied without a fetch has no lease, so it cannot free the payload itself. The payload goes with the call's response slot, and the free costs nothing on a call that staged nothing.
 
-A call that ends without a reply frees nothing. At its timeout, or when its caller drops it, its frame may still be on its way to a receiver that will fetch. The call's time-to-live, if it has one, frees the payload then.
+A call that ends without a reply frees nothing. At its timeout, or when its caller drops it, its frame may still be on its way to a receiver that will fetch. The call's time-to-live, if it has one, frees the payload then. A send that fails before its frame leaves, for example on headers over their limit, has no receiver, so it frees its payload at once.
 
 A receiver that fetched also releases the payload. The owner handles that `_rv_release` on a handler task and the reply on its response task, so either can come first. Released first, the slot is freed and the sender's free finds nothing. Freed first, the slot waits for the lease, and the release frees it ([coding gotchas](../development/coding-gotchas.md#two-frees-of-one-slot-can-come-in-either-order)).
 
@@ -187,7 +187,7 @@ A receiver that fetched also releases the payload. The owner handles that `_rv_r
 The receiver tells the sender nothing when it gives up a fetch. A slow sender then grants a lease that nobody pulls or releases, and a payload whose fetch never got a lease stays staged. When the receiver's own bound ended the fetch, its error reply frees the payload ([The sender frees on reply](#the-sender-frees-on-reply)). In every other case, two things end both on the sender:
 
 - **A time-to-live.** A staged payload whose call has a `.timeout` gets that deadline as its `RegisterOptions::ttl`. Past it, the slot is freed with every lease on it, whether or not a consumer is still reading. The caller has given up by then.
-- **A chunked lease deadline.** A fetch with a bound sends an `_rv_lease_ms` header with its `_rv_acquire`. The owner ends the lease when no `_rv_pull` renews it within that time. An owner from before the header ignores it. An acquire without the header, from an older consumer or from a public `get`, gets a lease with no deadline, as before. A `get` caller can still hold its lease after the last pull.
+- **A chunked lease deadline.** A fetch with a bound sends an `_rv_lease_ms` header with its `_rv_acquire`. The owner ends the lease when no `_rv_pull` renews it within that time. A deferred `take_payload` always sends one: its bound, or 30 s when it has none, because a handler can drop a take at any time. An owner from before the header ignores it. An acquire without the header, from an older consumer or from a public `get`, gets a lease with no deadline, as before. A `get` caller can still hold its lease after the last pull.
 
 A sweep in the store enforces both, every 100 ms. It starts when a deadline or a time-to-live is set, and it exits when none is left, so an instance that stages nothing with a deadline arms no timer. A UCX instance stops it at shutdown, together with the RDMA reaper.
 

@@ -6,13 +6,20 @@
 //! A handler built with `defer_large_payload` runs before the receiver
 //! fetches a staged payload. The receive loop builds a [`DeferredPayload`]
 //! instead, and the handler's adapter holds it in the messenger's
-//! [`DeferredPayloads`] under the message id until the handler returns.
-//! `Context::payload_len` and `Context::take_payload` find it there, because
-//! `Context` cannot gain a field. Ending the hold before the reply is sent
-//! is what makes "the fetch must finish before the handler replies" true:
-//! the sender frees the payload when the reply arrives.
+//! [`DeferredPayloads`] until the handler returns. `Context` cannot gain a
+//! field, so the handler's `MessageId` carries the hold's key, and
+//! `Context::payload_len` and `Context::take_payload` find the payload with
+//! it. The key is this receiver's own: a message id comes off the wire, and
+//! two messages can carry one.
+//!
+//! Ending the hold before the reply is sent is what makes "the fetch must
+//! finish before the handler replies" true: it ends a take that is still
+//! running, and the sender frees the payload when the reply arrives.
 
+use std::num::NonZeroU64;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use anyhow::Result;
 use bytes::Bytes;
@@ -20,8 +27,16 @@ use dashmap::DashMap;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
-use crate::messenger::common::responses::ResponseId;
 use crate::messenger::large_payload::{FetchBound, LargePayloadResolver};
+
+/// The lease deadline that a take without a bound asks the owner for.
+///
+/// A handler can drop a take at any await, and the handler's return ends one
+/// that is still running. The owner is not told. Without a deadline, the
+/// lease it grants an acquire that nobody waits for would hold the payload
+/// until the owner tears down, even after the reply. Each pull renews the
+/// lease, so the deadline does not bound a fetch that makes progress.
+const UNBOUNDED_LEASE: Duration = Duration::from_secs(30);
 
 /// A handler's fetch setting, from its builder.
 #[derive(Clone, Default)]
@@ -76,10 +91,11 @@ pub(crate) struct DeferredPayload {
     /// Taken by the first `take`, so the payload is fetched at most once.
     fetch: parking_lot::Mutex<Option<Fetch>>,
     cap: Option<Arc<FetchCap>>,
-    /// The receiver's teardown, which ends a fetch the way it ends one
+    /// Ends a take. The handler's return cancels it, so no fetch runs on
+    /// after the reply. So does the receiver's teardown, as it ends a fetch
     /// before dispatch: a fetch with no bound would otherwise hold the
     /// message's drain guard for as long as the owner stays silent.
-    teardown: CancellationToken,
+    ended: CancellationToken,
 }
 
 impl DeferredPayload {
@@ -87,13 +103,13 @@ impl DeferredPayload {
         len: u64,
         fetch: Fetch,
         setting: DeferSetting,
-        teardown: CancellationToken,
+        teardown: &CancellationToken,
     ) -> Self {
         Self {
             len,
             fetch: parking_lot::Mutex::new(Some(fetch)),
             cap: setting.cap,
-            teardown,
+            ended: teardown.child_token(),
         }
     }
 
@@ -124,11 +140,15 @@ impl DeferredPayload {
         if bound.is_some_and(|bound| bound.within.is_zero()) {
             anyhow::bail!("the fetch bound of the staged payload ran out before it was taken");
         }
-        let resolve = fetch
-            .resolver
-            .resolve(&fetch.handle, bound.map(|bound| bound.within));
+        let lease = bound.map_or(UNBOUNDED_LEASE, |bound| bound.within);
+        let resolve = fetch.resolver.resolve(&fetch.handle, Some(lease));
         tokio::select! {
+            // The end first: a take that starts after it must not ask the
+            // owner, and the first poll of the fetch does.
             biased;
+            () = self.ended.cancelled() => Err(anyhow::anyhow!(
+                "the handler returned, or the receiver shut down, before the staged payload was fetched"
+            )),
             resolved = crate::messenger::server::resolve_within(resolve, bound) => {
                 resolved.unwrap_or_else(|| {
                     Err(anyhow::anyhow!(
@@ -136,47 +156,48 @@ impl DeferredPayload {
                     ))
                 })
             }
-            () = self.teardown.cancelled() => {
-                Err(anyhow::anyhow!("the receiver shut down before the staged payload was fetched"))
-            }
         }
     }
 }
 
-/// The deferred payloads of the handlers running now, by message id.
+/// The deferred payloads of the handlers running now, each under a key of
+/// its own.
 #[derive(Default)]
-pub(crate) struct DeferredPayloads(Arc<DashMap<ResponseId, Arc<DeferredPayload>>>);
+pub(crate) struct DeferredPayloads {
+    held: Arc<DashMap<NonZeroU64, Arc<DeferredPayload>>>,
+    last_key: AtomicU64,
+}
 
 impl DeferredPayloads {
-    /// Make `payload` reachable from its handler's `Context` until the guard
-    /// drops.
-    pub(crate) fn hold(&self, id: ResponseId, payload: Arc<DeferredPayload>) -> DeferredHold {
-        self.0.insert(id, Arc::clone(&payload));
+    /// Make `payload` reachable from its handler's `Context`, under the
+    /// hold's key, until the hold drops.
+    pub(crate) fn hold(&self, payload: Arc<DeferredPayload>) -> DeferredHold {
+        let key = NonZeroU64::MIN.saturating_add(self.last_key.fetch_add(1, Ordering::Relaxed));
+        self.held.insert(key, payload);
         DeferredHold {
-            table: Arc::clone(&self.0),
-            id,
-            payload,
+            held: Arc::clone(&self.held),
+            key,
         }
     }
 
-    pub(crate) fn get(&self, id: ResponseId) -> Option<Arc<DeferredPayload>> {
-        self.0.get(&id).map(|entry| Arc::clone(entry.value()))
+    pub(crate) fn get(&self, key: NonZeroU64) -> Option<Arc<DeferredPayload>> {
+        self.held.get(&key).map(|entry| Arc::clone(entry.value()))
     }
 }
 
-/// Ends a deferred payload's reach when dropped. The adapter drops it when
-/// the handler returns, before the reply is sent.
+/// Ends a deferred payload's reach, and a take of it that is still running,
+/// when dropped. The adapter drops it when the handler returns, before the
+/// reply is sent.
 pub(crate) struct DeferredHold {
-    table: Arc<DashMap<ResponseId, Arc<DeferredPayload>>>,
-    id: ResponseId,
-    payload: Arc<DeferredPayload>,
+    held: Arc<DashMap<NonZeroU64, Arc<DeferredPayload>>>,
+    pub(crate) key: NonZeroU64,
 }
 
 impl Drop for DeferredHold {
     fn drop(&mut self) {
-        // Only its own: a duplicate message id must not end another hold.
-        self.table
-            .remove_if(&self.id, |_, held| Arc::ptr_eq(held, &self.payload));
+        if let Some((_, payload)) = self.held.remove(&self.key) {
+            payload.ended.cancel();
+        }
     }
 }
 
@@ -184,14 +205,20 @@ impl Drop for DeferredHold {
 mod tests {
     use super::*;
     use futures::future::BoxFuture;
-    use std::time::Duration;
 
-    /// A resolver whose owner never answers.
-    struct Silent;
+    /// A resolver whose owner never answers. It records the lease deadline
+    /// of each fetch that reaches it.
+    #[derive(Default)]
+    struct Silent {
+        asked: parking_lot::Mutex<Vec<Option<Duration>>>,
+    }
 
     impl LargePayloadResolver for Silent {
-        fn resolve(&self, _: &str, _: Option<Duration>) -> BoxFuture<'_, Result<Bytes>> {
-            Box::pin(std::future::pending())
+        fn resolve(&self, _: &str, lease: Option<Duration>) -> BoxFuture<'_, Result<Bytes>> {
+            Box::pin(async move {
+                self.asked.lock().push(lease);
+                std::future::pending().await
+            })
         }
 
         fn size(&self, _: &str) -> BoxFuture<'_, Result<u64>> {
@@ -199,77 +226,119 @@ mod tests {
         }
     }
 
+    fn payload(
+        owner: &Arc<Silent>,
+        bound: Option<Duration>,
+        teardown: &CancellationToken,
+    ) -> Arc<DeferredPayload> {
+        Arc::new(DeferredPayload::new(
+            1,
+            Fetch {
+                resolver: Arc::clone(owner) as _,
+                handle: "1".into(),
+                bound: bound.map(|within| FetchBound {
+                    within,
+                    callers: true,
+                }),
+                admitted: tokio::time::Instant::now(),
+            },
+            DeferSetting::default(),
+            teardown,
+        ))
+    }
+
     /// A deferred fetch ends at the bound the message got when it was taken
     /// off the queue, not a full bound from when the handler asks. A handler
     /// that asks 300 ms into a 400 ms bound has 100 ms, so a slow handler
-    /// cannot keep fetching after its caller has given up.
+    /// cannot keep fetching after its caller has given up. The lease
+    /// deadline it asks the owner for is the same 100 ms.
     #[tokio::test(start_paused = true)]
     async fn a_deferred_fetch_ends_at_the_admission_deadline() {
+        let owner = Arc::new(Silent::default());
         let admitted = tokio::time::Instant::now();
-        let payload = DeferredPayload::new(
-            1,
-            Fetch {
-                resolver: Arc::new(Silent),
-                handle: "1".into(),
-                bound: Some(FetchBound {
-                    within: Duration::from_millis(400),
-                    callers: true,
-                }),
-                admitted,
-            },
-            DeferSetting::default(),
-            CancellationToken::new(),
+        let payload = payload(
+            &owner,
+            Some(Duration::from_millis(400)),
+            &CancellationToken::new(),
         );
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         assert!(payload.take().await.is_err());
         assert_eq!(admitted.elapsed(), Duration::from_millis(400));
+        assert_eq!(*owner.asked.lock(), [Some(Duration::from_millis(100))]);
     }
 
-    /// Teardown ends a fetch whose owner never answers and that has no
-    /// bound, as it ends one before dispatch.
+    /// A take without a bound still asks the owner for a lease deadline. A
+    /// handler can drop a take at any await, for example in a `select!`, and
+    /// the receiver tells the owner nothing. An owner that grants the lease
+    /// after that would keep the payload until it tears down, even after the
+    /// reply, because only a release or a deadline ends a lease. Pulls renew
+    /// the deadline (`rendezvous::store`'s
+    /// `a_chunked_lease_deadline_is_renewed_by_pulls_and_reaped_without_them`),
+    /// so it does not bound a fetch that makes progress.
+    #[tokio::test(start_paused = true)]
+    async fn an_unbounded_take_asks_for_a_lease_deadline() {
+        let owner = Arc::new(Silent::default());
+        let payload = payload(&owner, None, &CancellationToken::new());
+
+        let abandoned = tokio::time::timeout(Duration::from_secs(1), payload.take()).await;
+
+        assert!(abandoned.is_err(), "the owner never answers");
+        assert_eq!(*owner.asked.lock(), [Some(UNBOUNDED_LEASE)]);
+    }
+
+    /// The handler's return ends a take that is still running, and a take
+    /// that starts after it never reaches the owner. The reply goes out
+    /// next and the sender frees the payload on it, so a context clone in a
+    /// spawned task must not go on pulling: it once fetched a whole payload
+    /// after its caller had the reply. Teardown ends a take the same way,
+    /// as it ends a fetch before dispatch.
     #[tokio::test]
-    async fn teardown_ends_an_unbounded_deferred_fetch() {
-        let teardown = CancellationToken::new();
-        let payload = DeferredPayload::new(
-            1,
-            Fetch {
-                resolver: Arc::new(Silent),
-                handle: "1".into(),
-                bound: None,
-                admitted: tokio::time::Instant::now(),
-            },
-            DeferSetting::default(),
-            teardown.clone(),
-        );
-        teardown.cancel();
-        assert!(payload.take().await.is_err());
+    async fn the_end_of_the_hold_or_teardown_ends_a_take() {
+        for by_teardown in [false, true] {
+            let owner = Arc::new(Silent::default());
+            let teardown = CancellationToken::new();
+            let table = DeferredPayloads::default();
+            let hold = table.hold(payload(&owner, None, &teardown));
+            let running = table.get(hold.key).unwrap();
+            let late = Arc::clone(&running);
+            let running = tokio::spawn(async move { running.take().await });
+            while owner.asked.lock().is_empty() {
+                tokio::task::yield_now().await;
+            }
+
+            if by_teardown {
+                teardown.cancel();
+            } else {
+                drop(hold);
+            }
+
+            assert!(running.await.unwrap().is_err());
+            assert!(late.take().await.is_err());
+            assert_eq!(owner.asked.lock().len(), 1, "by_teardown: {by_teardown}");
+        }
     }
 
-    /// A hold ends only its own entry, so a message id that arrives twice
-    /// cannot end the other's reach.
+    /// Each hold has a key of its own, so a handler reaches only its own
+    /// payload. A message id comes off the wire, and two messages can carry
+    /// the same one. Keyed by message id, the second hold replaced the
+    /// first, and the first handler took the second message's payload.
     #[test]
-    fn a_hold_ends_only_its_own_entry() {
+    fn each_hold_reaches_only_its_own_payload() {
+        let owner = Arc::new(Silent::default());
+        let teardown = CancellationToken::new();
         let table = DeferredPayloads::default();
-        let id = ResponseId::from_u128(7);
-        let payload = || {
-            Arc::new(DeferredPayload::new(
-                1,
-                Fetch {
-                    resolver: Arc::new(Silent),
-                    handle: "1".into(),
-                    bound: None,
-                    admitted: tokio::time::Instant::now(),
-                },
-                DeferSetting::default(),
-                CancellationToken::new(),
-            ))
-        };
-        let first = table.hold(id, payload());
-        let second = table.hold(id, payload());
+        let payloads = [(); 2].map(|()| payload(&owner, None, &teardown));
+        let holds = payloads.clone().map(|payload| table.hold(payload));
+
+        assert_ne!(holds[0].key, holds[1].key);
+        for (hold, payload) in holds.iter().zip(&payloads) {
+            assert!(Arc::ptr_eq(&table.get(hold.key).unwrap(), payload));
+        }
+        let [first, second] = holds;
+        let key = first.key;
         drop(first);
-        assert!(table.get(id).is_some());
-        drop(second);
-        assert!(table.get(id).is_none());
+        assert!(table.get(key).is_none());
+        assert!(table.get(second.key).is_some());
     }
 }

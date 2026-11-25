@@ -56,6 +56,14 @@ pub(crate) struct HandlerContext {
     pub deferred: Option<Arc<DeferredPayload>>,
 }
 
+/// The dispatcher that deferred a staged payload, with its setting.
+///
+/// A deferred payload goes to the dispatcher that asked for it, not to
+/// whatever its name is registered to at delivery. A handler that replaced
+/// it in between may not defer, and would read the empty `payload` as the
+/// request.
+pub(crate) type Deferring = (Arc<dyn ActiveMessageDispatcher>, DeferSetting);
+
 /// A decoded inbound message, before it is bound to the Messenger.
 ///
 /// Dispatch takes this and a borrowed Messenger, so each dispatcher decides
@@ -624,10 +632,12 @@ impl DispatcherHub {
         }
     }
 
-    /// How `handler_name` takes a staged payload, if it defers it. Read only
-    /// for a staged message.
-    pub(crate) fn deferred(&self, handler_name: &str) -> Option<DeferSetting> {
-        self.handlers.get(handler_name)?.deferred()
+    /// `handler_name`'s dispatcher and how it takes a staged payload, if it
+    /// defers it. Read only for a staged message.
+    pub(crate) fn deferring(&self, handler_name: &str) -> Option<Deferring> {
+        let dispatcher = self.handlers.get(handler_name)?;
+        let setting = dispatcher.deferred()?;
+        Some((Arc::clone(dispatcher.value()), setting))
     }
 
     /// Dispatch a message to the appropriate handler

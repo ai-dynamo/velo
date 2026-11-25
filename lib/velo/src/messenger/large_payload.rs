@@ -172,7 +172,7 @@ pub const RV_LEN_HEADER_KEY: &str = "_rv_len";
 /// Write the staging headers of a send that staged its payload: its handle,
 /// its length, and its `budget` if the call has one. A budget already in
 /// `headers` is removed when the send has none, so only the send's own goes
-/// on the wire.
+/// on the wire. The length is left out when the headers have no room for it.
 pub(crate) fn write_staging(
     headers: &mut Option<HashMap<String, String>>,
     handle: String,
@@ -181,7 +181,6 @@ pub(crate) fn write_staging(
 ) {
     let headers = headers.get_or_insert_with(HashMap::new);
     headers.insert(RV_HEADER_KEY.to_string(), handle);
-    headers.insert(RV_LEN_HEADER_KEY.to_string(), len.to_string());
     match budget {
         Some(left) => {
             headers.insert(RV_BUDGET_HEADER_KEY.to_string(), budget_ms(left));
@@ -189,6 +188,13 @@ pub(crate) fn write_staging(
         None => {
             headers.remove(RV_BUDGET_HEADER_KEY);
         }
+    }
+    // The length is the one staging header a receiver can do without: it
+    // asks the owner instead. So it must not be what takes a send's headers
+    // over the encoder's limit and fails a send that fits without it.
+    headers.insert(RV_LEN_HEADER_KEY.to_string(), len.to_string());
+    if !crate::messenger::common::messages::headers_fit(headers) {
+        headers.remove(RV_LEN_HEADER_KEY);
     }
 }
 
@@ -437,5 +443,41 @@ mod tests {
             ]))
         );
         assert_eq!(take_staging(&mut headers).unwrap().len, Some(u64::MAX));
+    }
+
+    /// The length is left out when it would take the headers over the
+    /// encoder's limit, so `_rv_len` never fails a send that fits without
+    /// it. The receiver then asks the owner for the length. The pad walks
+    /// the headers across the limit one byte at a time: below it the length
+    /// is written, then comes a window where only the length is left out,
+    /// and what `write_staging` leaves always encodes if it can.
+    #[test]
+    fn write_staging_leaves_the_length_out_when_it_does_not_fit() {
+        use crate::messenger::common::messages::headers_fit;
+
+        let full: HashMap<String, String> = (0..16)
+            .map(|i| (format!("k{i:02}"), "x".repeat(1000)))
+            .collect();
+        let (mut written, mut left_out) = (0, 0);
+        for pad in 150..=300 {
+            let mut headers = full.clone();
+            headers.insert("pad".to_string(), "x".repeat(pad));
+            let mut headers = Some(headers);
+            write_staging(&mut headers, "42".into(), 300_000, None);
+            let mut headers = headers.unwrap();
+
+            let has_len = headers.contains_key(RV_LEN_HEADER_KEY);
+            headers.remove(RV_LEN_HEADER_KEY);
+            let fits_without = headers_fit(&headers);
+            headers.insert(RV_LEN_HEADER_KEY.to_string(), "300000".to_string());
+            assert_eq!(has_len, headers_fit(&headers), "pad {pad}");
+            assert_eq!(
+                headers_fit(&headers),
+                rmp_serde::to_vec(&headers).unwrap().len() <= 16384
+            );
+            written += usize::from(has_len);
+            left_out += usize::from(!has_len && fits_without);
+        }
+        assert!(written > 0 && left_out > 0, "{written} {left_out}");
     }
 }

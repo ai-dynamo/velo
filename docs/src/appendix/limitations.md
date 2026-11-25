@@ -143,8 +143,8 @@ gives up against a sender from before the `_rv_lease_ms` header.
 so does the sender when the call's reply arrives. A call that ends without a
 reply frees nothing, because its message may still be on its way to a
 receiver that will fetch. A time-to-live comes only from a call's `.timeout`,
-and a chunked lease gets a deadline only when a fetch with a bound asks for
-one.
+and a chunked lease gets a deadline only when a fetch with a bound, or a
+deferred `take_payload`, asks for one.
 
 **Workaround.** Give large calls a `.timeout`. It gives their payloads a
 time-to-live.

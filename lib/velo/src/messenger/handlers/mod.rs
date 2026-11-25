@@ -362,7 +362,8 @@ impl Context {
     /// The fetch enforces the receiver's limit (`VeloBuilder::staged_payload_max`)
     /// whatever this says.
     pub fn payload_len(&self) -> Option<u64> {
-        self.deferred_payload().map(|payload| payload.len)
+        let key = self.message_id.deferred_key()?;
+        Some(self.msg.deferred_payloads().get(key)?.len)
     }
 
     /// Take the request's payload: the bytes in [`payload`](Self::payload),
@@ -372,26 +373,20 @@ impl Context {
     /// A deferred payload is fetched once, within what is left of the
     /// caller's deadline, and only before the handler returns: after the
     /// reply the sender frees it. A second take, or a take after the handler
-    /// has returned, fails without asking the sender. With
+    /// has returned, fails without asking the sender, and a take that is
+    /// still running when the handler returns ends with an error. With
     /// `max_concurrent_fetches`, a take while the cap is full fails at once
     /// with [`FetchLimitReached`], fetches nothing, and can be retried.
     pub async fn take_payload(&mut self) -> Result<Bytes> {
-        if !self.message_id.is_deferred() {
+        let Some(key) = self.message_id.deferred_key() else {
             return Ok(std::mem::take(&mut self.payload));
-        }
-        match self.deferred_payload() {
+        };
+        match self.msg.deferred_payloads().get(key) {
             Some(payload) => payload.take().await,
             None => {
                 anyhow::bail!("a deferred payload can only be taken before its handler returns")
             }
         }
-    }
-
-    fn deferred_payload(&self) -> Option<Arc<DeferredPayload>> {
-        if !self.message_id.is_deferred() {
-            return None;
-        }
-        self.msg.deferred_payloads().get(self.message_id.into())
     }
 }
 
@@ -404,16 +399,19 @@ fn request_bytes(ctx: &HandlerContext) -> usize {
 }
 
 /// Make a deferred payload reachable from its handler's `Context`, and give
-/// the message id its mark. Drop the hold when the handler returns, before
-/// the reply goes out.
+/// the message id the key to it. Drop the hold when the handler returns,
+/// before the reply goes out.
 fn hold_deferred(
     ctx: &mut HandlerContext,
 ) -> (crate::messenger::common::MessageId, Option<DeferredHold>) {
     match ctx.deferred.take() {
-        Some(payload) => (
-            crate::messenger::common::MessageId::deferred(ctx.message_id),
-            Some(ctx.system.deferred_payloads().hold(ctx.message_id, payload)),
-        ),
+        Some(payload) => {
+            let hold = ctx.system.deferred_payloads().hold(payload);
+            (
+                crate::messenger::common::MessageId::deferred(ctx.message_id, hold.key),
+                Some(hold),
+            )
+        }
         None => (
             crate::messenger::common::MessageId::new(ctx.message_id),
             None,

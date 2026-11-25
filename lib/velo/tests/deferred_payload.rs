@@ -168,7 +168,7 @@ fn count_metadata(owner: &Velo) -> Arc<AtomicUsize> {
 /// The local ids of the payloads `owner` holds staged. Ids count up from 1
 /// on each node, and these tests stage a few each.
 fn staged_ids(owner: &Velo) -> Vec<u64> {
-    (1..=64).filter(|id| still_staged(owner, *id)).collect()
+    (1..=256).filter(|id| still_staged(owner, *id)).collect()
 }
 
 /// Stage `payload` on `owner` the way a sender without `_rv_len` does, and
@@ -782,4 +782,185 @@ async fn take_payload_over_the_receivers_limit_fails() {
     let ids = staged.lock().clone();
     assert_eq!(ids.len(), 1);
     assert!(released_within(&client, ids[0], BOUND).await);
+}
+
+/// The handler's return ends a take that is still running. A handler can
+/// clone its context into a task of its own and reply while that task
+/// fetches. The sender frees the payload on the reply, so the fetch must not
+/// go on: such a clone once pulled the whole payload after the caller had
+/// its reply. Here the take is waiting for the owner's lease when the
+/// handler returns. The call has no timeout, so nothing but the handler's
+/// return ends the take. It fails, and the reply frees the payload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_take_still_running_when_the_handler_returns_ends() {
+    let (client, server) = connected_pair().await;
+    let stall = Stall::new();
+    stall_fetches(&client, &stall);
+    let (taken_tx, taken_rx) = tokio::sync::oneshot::channel();
+    let taken_tx = Mutex::new(Some(taken_tx));
+    let reached_owner = Arc::clone(&stall.entered);
+    server
+        .register_handler(
+            Handler::unary_handler_async("leaves", move |ctx: Context| {
+                let taken = taken_tx.lock().take().unwrap();
+                let reached_owner = Arc::clone(&reached_owner);
+                async move {
+                    let mut clone = ctx.clone();
+                    tokio::spawn(async move {
+                        let _ = taken.send(clone.take_payload().await);
+                    });
+                    reached_owner.notified().await;
+                    Ok(None)
+                }
+            })
+            .defer_large_payload()
+            .build(),
+        )
+        .unwrap();
+
+    client
+        .unary("leaves")
+        .unwrap()
+        .raw_payload(probe(STAGED, 15))
+        .instance(server.instance_id())
+        .send()
+        .await
+        .unwrap();
+
+    let taken = tokio::time::timeout(BOUND, taken_rx)
+        .await
+        .expect("the take ended with the handler")
+        .unwrap();
+    assert!(taken.is_err(), "a take that outlived its handler got bytes");
+    assert!(released_within(&client, stall.asked()[0], BOUND).await);
+    stall.gate.add_permits(1);
+}
+
+/// A deferred payload goes to the handler that deferred it, even when its
+/// name is registered again before delivery. A message without `_rv_len`
+/// waits for the owner's `_rv_metadata` answer before it is dispatched. A
+/// handler registered in that time may not defer, and it would read the
+/// empty `ctx.payload` as the request: it once got zero bytes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_handler_registered_while_the_length_is_asked_gets_no_deferred_payload() {
+    let (client, server) = connected_pair().await;
+    let asked = Arc::new(tokio::sync::Notify::new());
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let owner = client.downgrade();
+    let (entered, wait) = (Arc::clone(&asked), Arc::clone(&gate));
+    client
+        .messenger()
+        .register_streaming_handler(
+            Handler::typed_unary_async(
+                "_rv_metadata",
+                move |ctx: TypedContext<velo::test_helpers::RvMetadataRequest>| {
+                    let (owner, entered, wait) = (owner.clone(), entered.clone(), wait.clone());
+                    async move {
+                        entered.notify_one();
+                        wait.acquire().await?.forget();
+                        let owner = owner
+                            .upgrade()
+                            .ok_or_else(|| anyhow::anyhow!("owner dropped"))?;
+                        owner.serve_rv_metadata(&ctx.input)
+                    }
+                },
+            )
+            .build(),
+        )
+        .unwrap();
+    server
+        .register_handler(
+            Handler::unary_handler("swapped", |ctx| {
+                Ok(Some(format!("deferred {:?}", ctx.payload_len()).into()))
+            })
+            .defer_large_payload()
+            .build(),
+        )
+        .unwrap();
+
+    let (local_id, rv) = stage_by_hand(&client, probe(STAGED, 16), None);
+    let call = {
+        let (client, server) = (client.clone(), server.clone());
+        tokio::spawn(
+            async move { call_with_headers(&client, &server, "swapped", &[("_rv", rv)]).await },
+        )
+    };
+    tokio::time::timeout(BOUND, asked.notified())
+        .await
+        .expect("the receiver asked for the length");
+    server
+        .register_handler(
+            Handler::unary_handler("swapped", |ctx| {
+                Ok(Some(format!("eager {}", ctx.payload.len()).into()))
+            })
+            .build(),
+        )
+        .unwrap();
+    gate.add_permits(1);
+
+    let seen = call.await.unwrap().unwrap();
+    assert_eq!(
+        std::str::from_utf8(&seen).unwrap(),
+        format!("deferred {:?}", Some(STAGED))
+    );
+    client.unregister_data(DataHandle::pack(client.instance_id().worker_id(), local_id));
+}
+
+/// `_rv_len` never costs a send, and a send that fails leaves nothing
+/// staged. A message's headers have a total limit of 16 KiB. Headers that
+/// fit with the handle but not with the length too go without the length,
+/// and the receiver asks the owner for it, as it does for an older sender.
+/// Headers over the limit fail the send before its frame leaves, and the
+/// send frees the payload it staged: these calls have no timeout, so nothing
+/// else would.
+///
+/// The pad walks the headers across the limit one byte at a time, so the
+/// test does not depend on the exact size of the other headers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn headers_at_the_limit_go_without_the_length() {
+    let (client, server) = connected_pair().await;
+    let metadata = count_metadata(&client);
+    server
+        .register_handler(
+            Handler::unary_handler("sizes", |ctx| {
+                Ok(Some(format!("{:?}", ctx.payload_len()).into()))
+            })
+            .defer_large_payload()
+            .build(),
+        )
+        .unwrap();
+    // 16 values of 1000 bytes leave about 270 bytes below the limit.
+    let full: HashMap<String, String> = (0..16)
+        .map(|i| (format!("k{i:02}"), "x".repeat(1000)))
+        .collect();
+    let payload = probe(STAGED, 17);
+
+    let (mut sent, mut failed) = (0, 0);
+    for pad in 60..=260 {
+        let mut headers = full.clone();
+        headers.insert("pad".to_string(), "x".repeat(pad));
+        let reply = client
+            .unary("sizes")
+            .unwrap()
+            .headers(headers)
+            .raw_payload(payload.clone())
+            .instance(server.instance_id())
+            .send()
+            .await;
+        match reply {
+            Ok(seen) => {
+                assert_eq!(failed, 0, "a send fit after a smaller one did not");
+                assert_eq!(seen, format!("{:?}", Some(STAGED)));
+                sent += 1;
+            }
+            Err(_) => failed += 1,
+        }
+    }
+
+    assert!(sent > 0 && failed > 0, "sent {sent}, failed {failed}");
+    assert!(
+        metadata.load(Ordering::Acquire) > 0,
+        "no send went without its length"
+    );
+    assert_eq!(staged_ids(&client), [0u64; 0]);
 }

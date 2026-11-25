@@ -172,7 +172,8 @@ impl ActiveMessageClient {
     /// A call that expects a reply frees its staged payload when the reply
     /// arrives, so a receiver that replies without fetching leaves nothing
     /// staged. It is attached to the call before the frame leaves, because a
-    /// send that fails at once completes the call inline.
+    /// send that fails at once completes the call inline. A send that fails
+    /// before its frame leaves frees the payload here.
     pub(crate) fn send_message(
         &self,
         target: InstanceId,
@@ -182,54 +183,52 @@ impl ActiveMessageClient {
     ) -> Result<SendOutcome> {
         // Transparent large payload staging: a payload over the threshold is
         // staged, and the message carries its handle instead.
-        let staged = match self.stager_for(message.payload.len()) {
-            Some(stager) => {
-                let payload = std::mem::take(&mut message.payload);
-                let len = payload.len() as u64;
-                let budget =
-                    fetch_by.map(|at| at.saturating_duration_since(tokio::time::Instant::now()));
-                // The budget is also the payload's time-to-live here: once
-                // the caller has given up, nobody waits for it.
-                let handle = stager.stage(payload, budget);
-                if matches!(
-                    message.metadata.response_type,
-                    ResponseType::Unary | ResponseType::AckNack
-                ) {
-                    self.response_manager.attach_staged(
-                        message.metadata.response_id,
-                        StagedPayload {
-                            stager: Arc::clone(stager),
-                            handle: handle.clone(),
-                        },
-                    );
-                }
-                Some((handle, len, budget))
-            }
-            None => None,
+        let Some(stager) = self.stager_for(message.payload.len()) else {
+            return self.send_encoded(target, message, lane, None);
         };
+        let payload = std::mem::take(&mut message.payload);
+        let len = payload.len() as u64;
+        let budget = fetch_by.map(|at| at.saturating_duration_since(tokio::time::Instant::now()));
+        // The budget is also the payload's time-to-live here: once the
+        // caller has given up, nobody waits for it.
+        let handle = stager.stage(payload, budget);
+        if matches!(
+            message.metadata.response_type,
+            ResponseType::Unary | ResponseType::AckNack
+        ) {
+            self.response_manager.attach_staged(
+                message.metadata.response_id,
+                StagedPayload {
+                    stager: Arc::clone(stager),
+                    handle: handle.clone(),
+                },
+            );
+        }
+        // A frame that never left has no receiver to fetch its payload, and
+        // its call may end without a reply to free it. A second free, when
+        // the call is then failed, finds nothing.
+        self.send_encoded(target, message, lane, Some((handle.clone(), len, budget)))
+            .inspect_err(|_| stager.free(&handle))
+    }
 
+    /// Encode `message` and hand its frame to the backend.
+    fn send_encoded(
+        &self,
+        target: InstanceId,
+        message: ActiveMessage,
+        lane: u16,
+        staged: Option<Staged>,
+    ) -> Result<SendOutcome> {
         let (header, payload, message_type) = encode_outbound(message, staged)?;
 
         #[cfg(feature = "distributed-tracing")]
-        {
-            let span = tracing::info_span!(
-                "velo.messenger.client_send",
-                target = %target,
-                message_type = ?message_type,
-                bytes = header.len() + payload.len()
-            );
-            let _entered = span.enter();
-            self.backend.send_message_on_lane(
-                target,
-                lane,
-                header,
-                payload,
-                message_type,
-                self.error_handler.clone(),
-            )
-        }
-
-        #[cfg(not(feature = "distributed-tracing"))]
+        let _entered = tracing::info_span!(
+            "velo.messenger.client_send",
+            target = %target,
+            message_type = ?message_type,
+            bytes = header.len() + payload.len()
+        )
+        .entered();
         self.backend.send_message_on_lane(
             target,
             lane,

@@ -114,13 +114,13 @@ For a staged payload, `ctx.payload` is empty, `ctx.payload_len()` is the size th
 
 The rules:
 
-- **Take it before the handler returns.** The sender frees the payload when the reply arrives ([The sender frees on reply](rendezvous.md#the-sender-frees-on-reply)). A take after the handler has returned fails without asking the sender, and so does a second take.
-- **The fetch keeps the caller's deadline.** It ends at what is left of the bound the message got when the receiver took it off its queue, as a fetch before the handler does ([The fetch has a deadline](rendezvous.md#the-fetch-has-a-deadline)). Teardown ends it too.
+- **Take it before the handler returns.** The sender frees the payload when the reply arrives ([The sender frees on reply](rendezvous.md#the-sender-frees-on-reply)). A take after the handler has returned fails without asking the sender, and so does a second take. A take that is still running when the handler returns, in a task the handler spawned, ends with an error.
+- **The fetch keeps the caller's deadline.** It ends at what is left of the bound the message got when the receiver took it off its queue, as a fetch before the handler does ([The fetch has a deadline](rendezvous.md#the-fetch-has-a-deadline)). Teardown ends it too. A take without a deadline asks the sender to end its lease when no pull renews it for 30 s, so a take that the handler drops does not keep the payload staged.
 - **`max_concurrent_fetches(n)` caps the handler's fetches.** A take while `n` are running fails at once with `FetchLimitReached` and fetches nothing. The handler turns it into a refusal. It counts fetches, not bytes.
 - **Only `am_sync` and unary calls are deferred.** A fire-and-forget message has no reply to free its payload, so the receiver pulls it before the handler runs. A typed handler deserializes its input before it runs, so it cannot defer.
 - **The size is the sender's claim.** The fetch still enforces `VeloBuilder::staged_payload_max`, and a take over it fails with the error that names both sizes.
 
-The size travels in the `_rv_len` header beside the handle. A message from a sender that does not write it costs one `_rv_metadata` call to the sender before the handler runs.
+The size travels in the `_rv_len` header beside the handle. A sender leaves it out when the message's headers have no room for it under their 16 KiB limit, and an older sender does not write it. Such a message costs one `_rv_metadata` call to the sender before the handler runs. The handler that was registered when the message arrived gets it, even if its name is registered again during that call.
 
 Before this, a saturated worker pulled each large request in full and then refused it. It could not free a payload it had not pulled, because a free needs the lease that a pull gives. A release message that needs no lease was rejected: it is a wire change, and the reply already tells the sender that the receiver is done.
 

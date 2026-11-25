@@ -14,7 +14,7 @@ use crate::messenger::common::{
     messages::{ResponseType, decode_active_message, decode_response_id_from_request_header},
     responses::{ResponseManager, decode_response_header},
 };
-use crate::messenger::handlers::{DeferSetting, DeferredPayload, Fetch};
+use crate::messenger::handlers::{DeferredPayload, Fetch};
 
 use std::sync::Arc;
 
@@ -23,6 +23,7 @@ use crate::transports::{DataStreams, InboundMessage, ShutdownState, VeloBackend}
 use bytes::Bytes;
 use tokio_util::task::TaskTracker;
 
+use dispatcher::Deferring;
 use dispatcher::send_error_reply;
 pub(crate) use dispatcher::{DispatcherHub, InboundCall};
 
@@ -328,13 +329,13 @@ async fn create_message_handler(
                             message.metadata.response_type,
                             ResponseType::AckNack | ResponseType::Unary
                         )
-                        .then(|| hub.deferred(&message.metadata.handler_name))
+                        .then(|| hub.deferring(&message.metadata.handler_name))
                         .flatten();
                         // With its length on the message, a deferred payload
                         // dispatches here, in arrival order, with no fetch.
-                        if let (Some(setting), Some(len)) = (&defer, staging.len) {
+                        if let (Some((dispatcher, setting)), Some(len)) = (&defer, staging.len) {
                             let deferred =
-                                DeferredPayload::new(len, fetch, setting.clone(), teardown.clone());
+                                DeferredPayload::new(len, fetch, setting.clone(), &teardown);
                             let call = InboundCall {
                                 message_id: message.metadata.response_id,
                                 payload: Bytes::new(),
@@ -344,7 +345,7 @@ async fn create_message_handler(
                                 in_flight,
                                 deferred: Some(Arc::new(deferred)),
                             };
-                            hub.dispatch_message(&message.metadata.handler_name, call, system);
+                            dispatcher.dispatch(call, system);
                             continue;
                         }
                         let hub = hub.clone();
@@ -460,8 +461,9 @@ struct ResolveJob {
     /// What to fetch, and when to give up. See [`resolve_within`].
     fetch: Fetch,
     /// Set for a handler that defers a payload its sender sent no length
-    /// for (`_rv_len`): only the length is asked of the owner.
-    defer: Option<DeferSetting>,
+    /// for (`_rv_len`): only the length is asked of the owner. See
+    /// [`DispatcherHub::deferring`].
+    defer: Option<Deferring>,
     hub: Arc<DispatcherHub>,
     handler_name: String,
     message_id: crate::messenger::common::responses::ResponseId,
@@ -505,25 +507,28 @@ async fn resolve_and_dispatch(job: ResolveJob) {
         in_flight,
         backend,
     } = job;
-    let resolved = match defer {
+    let (resolved, deferring) = match defer {
         None => {
             let within = fetch.bound.map(|bound| bound.within);
             let resolve = fetch.resolver.resolve(&fetch.handle, within);
-            resolve_within(resolve, fetch.bound)
-                .await
-                .map(|resolved| resolved.map(|payload| (payload, None)))
+            let resolved = resolve_within(resolve, fetch.bound).await;
+            (
+                resolved.map(|payload| payload.map(|payload| (payload, None))),
+                None,
+            )
         }
         // One round trip to the owner, inside the fetch's bound, and a
         // failure answers the caller as a failed fetch does.
-        Some(setting) => {
+        Some((dispatcher, setting)) => {
             let size = resolve_within(fetch.resolver.size(&fetch.handle), fetch.bound).await;
-            size.map(|size| {
+            let deferred = size.map(|size| {
                 size.map(|len| {
-                    let teardown = backend.shutdown_state().teardown_token().clone();
+                    let teardown = backend.shutdown_state().teardown_token();
                     let deferred = DeferredPayload::new(len, fetch, setting, teardown);
                     (Bytes::new(), Some(Arc::new(deferred)))
                 })
-            })
+            });
+            (deferred, Some(dispatcher))
         }
     };
     let Some(resolved) = resolved else {
@@ -550,7 +555,10 @@ async fn resolve_and_dispatch(job: ResolveJob) {
                 in_flight,
                 deferred,
             };
-            hub.dispatch_message(&handler_name, call, &system);
+            match deferring {
+                Some(dispatcher) => dispatcher.dispatch(call, &system),
+                None => hub.dispatch_message(&handler_name, call, &system),
+            }
         }
         Err(e) => {
             tracing::error!(

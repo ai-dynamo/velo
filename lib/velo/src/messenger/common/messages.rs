@@ -351,6 +351,12 @@ pub(crate) fn envelope_overhead(
     FIXED_HEADER_SIZE + handler_name.len() + headers_len
 }
 
+/// Whether `headers` encode within the total that [`encode_active_message`]
+/// allows.
+pub(crate) fn headers_fit(headers: &HashMap<String, String>) -> bool {
+    envelope_overhead("", Some(headers), None) - FIXED_HEADER_SIZE <= MAX_HEADERS_LEN
+}
+
 /// Best-effort decode of just the `ResponseId` from an active-message request
 /// header. Validates schema version and response type before reading the id —
 /// returns `None` for anything that isn't a well-formed request header

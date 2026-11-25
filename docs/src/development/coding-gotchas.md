@@ -867,3 +867,44 @@ checks the log level.
 
 Test: `rendezvous::store::tests::a_release_after_the_owner_freed_frees_the_slot`
 (`lib/velo/src/rendezvous/store.rs`).
+
+## A task the handler spawned can outlive the reply
+
+**Rule.** When a reply ends a resource, end the work on it before the reply
+goes out. Do not only stop new work. Check the end before the first poll of
+the work, when that poll has an effect of its own.
+
+**Failure.** A handler that defers a staged payload cloned its context into a
+spawned task and returned. The hold on the payload ended, so a new
+`take_payload` failed. But a take that had already started went on, and
+pulled the whole payload after the caller had its reply. A `select!` that
+polled the fetch before the cancellation had the second form of the bug: a
+take that started just after the end still sent its acquire to the owner.
+
+**Test.** Stall the owner's `_rv_acquire`, start a take in a spawned task,
+and return from the handler of a call with no timeout. The take must fail
+while the owner is still stalled. On the payload itself, a take after the end
+must not reach the resolver.
+
+Test: `a_take_still_running_when_the_handler_returns_ends`
+(`lib/velo/tests/deferred_payload.rs`),
+`handlers::deferred::tests::the_end_of_the_hold_or_teardown_ends_a_take`
+(`lib/velo/src/messenger/handlers/deferred.rs`).
+
+## A handler name can change hands between two lookups
+
+**Rule.** When a message is prepared for one handler, deliver it to that
+handler. Look the handler up once and keep it. Do not look the name up again
+at delivery.
+
+**Failure.** The receive loop read a handler's `defer_large_payload` setting
+by name, asked the payload's owner for its length, and then dispatched by
+name. A handler registered under that name during the wait did not defer. It
+got an empty `ctx.payload` and read it as the request.
+
+**Test.** Stall the owner's `_rv_metadata`, register a handler without the
+setting under the same name, and let the answer through. The reply must come
+from the first handler.
+
+Test: `a_handler_registered_while_the_length_is_asked_gets_no_deferred_payload`
+(`lib/velo/tests/deferred_payload.rs`).
