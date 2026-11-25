@@ -47,19 +47,8 @@ use crate::messenger::server::dispatcher::{
     ActiveMessageDispatcher, ActiveMessageHandler, HandlerContext, OrderedDispatcher,
     SpawnedDispatcher,
 };
-use crate::transports::{MessageType, SendOutcome, VeloBackend};
+use crate::transports::{MessageType, VeloBackend};
 use derive_getters::Dissolve;
-
-/// Wait for a queued frame to reach the send channel.
-///
-/// Admission failures must reach the caller even when no transport callback runs.
-#[inline]
-async fn await_admission(outcome: SendOutcome) -> Result<()> {
-    if let SendOutcome::Pending(admission) = outcome {
-        admission.await?;
-    }
-    Ok(())
-}
 
 // ============================================================================
 // Opaque Handles
@@ -994,16 +983,15 @@ fn get_response_error_handler() -> Arc<dyn crate::transports::TransportErrorHand
 async fn send_ack(backend: Arc<VeloBackend>, response_id: ResponseId) -> Result<()> {
     let header = encode_event_header(EventType::Ack(response_id, Outcome::Ok));
 
-    let outcome = backend.send_message_to_worker(
-        WorkerId::from_u64(response_id.worker_id()),
-        header,
-        Bytes::new(),
-        MessageType::Ack,
-        get_ack_error_handler(),
-    )?;
-    await_admission(outcome).await?;
-
-    Ok(())
+    backend
+        .send_reply(
+            WorkerId::from_u64(response_id.worker_id()),
+            header,
+            Bytes::new(),
+            MessageType::Ack,
+            get_ack_error_handler(),
+        )
+        .await
 }
 
 #[cfg(feature = "distributed-tracing")]
@@ -1031,16 +1019,15 @@ async fn send_nack(
     let header = encode_event_header(EventType::Ack(response_id, Outcome::Error));
     let payload = Bytes::from(error_message.into_bytes());
 
-    let outcome = backend.send_message_to_worker(
-        WorkerId::from_u64(response_id.worker_id()),
-        header,
-        payload,
-        MessageType::Ack,
-        get_nack_error_handler(),
-    )?;
-    await_admission(outcome).await?;
-
-    Ok(())
+    backend
+        .send_reply(
+            WorkerId::from_u64(response_id.worker_id()),
+            header,
+            payload,
+            MessageType::Ack,
+            get_nack_error_handler(),
+        )
+        .await
 }
 
 async fn send_response_ok(
@@ -1051,16 +1038,15 @@ async fn send_response_ok(
     let header = encode_response_header(response_id, Outcome::Ok, headers)
         .map_err(|e| anyhow::anyhow!("Failed to encode response header: {}", e))?;
 
-    let outcome = backend.send_message_to_worker(
-        WorkerId::from_u64(response_id.worker_id()),
-        header,
-        Bytes::new(),
-        MessageType::Response,
-        get_response_error_handler(),
-    )?;
-    await_admission(outcome).await?;
-
-    Ok(())
+    backend
+        .send_reply(
+            WorkerId::from_u64(response_id.worker_id()),
+            header,
+            Bytes::new(),
+            MessageType::Response,
+            get_response_error_handler(),
+        )
+        .await
 }
 
 async fn send_response(
@@ -1072,16 +1058,15 @@ async fn send_response(
     let header = encode_response_header(response_id, Outcome::Ok, headers)
         .map_err(|e| anyhow::anyhow!("Failed to encode response header: {}", e))?;
 
-    let outcome = backend.send_message_to_worker(
-        WorkerId::from_u64(response_id.worker_id()),
-        header,
-        payload,
-        MessageType::Response,
-        get_response_error_handler(),
-    )?;
-    await_admission(outcome).await?;
-
-    Ok(())
+    backend
+        .send_reply(
+            WorkerId::from_u64(response_id.worker_id()),
+            header,
+            payload,
+            MessageType::Response,
+            get_response_error_handler(),
+        )
+        .await
 }
 
 async fn send_response_error(
@@ -1094,16 +1079,15 @@ async fn send_response_error(
         .map_err(|e| anyhow::anyhow!("Failed to encode response header: {}", e))?;
     let payload = Bytes::from(error_message.into_bytes());
 
-    let outcome = backend.send_message_to_worker(
-        WorkerId::from_u64(response_id.worker_id()),
-        header,
-        payload,
-        MessageType::Response,
-        get_response_error_handler(),
-    )?;
-    await_admission(outcome).await?;
-
-    Ok(())
+    backend
+        .send_reply(
+            WorkerId::from_u64(response_id.worker_id()),
+            header,
+            payload,
+            MessageType::Response,
+            get_response_error_handler(),
+        )
+        .await
 }
 
 // ============================================================================

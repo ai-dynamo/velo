@@ -47,6 +47,15 @@ use crate::transports::{AdmissionState, SendAdmission, SendOutcome};
 /// must both surface it.
 pub(super) type AdmissionReport = std::result::Result<(), String>;
 
+/// Why a detached send task never issued its send.
+#[derive(Debug)]
+pub(super) enum NotSent {
+    Failed(String),
+    /// The call's deadline ended its discovery lookup. The result reads this
+    /// as the call's `RequestTimeout`; every other failure keeps its message.
+    LookupTimedOut(String),
+}
+
 /// The error a request resolves to when its `.timeout` runs out first.
 ///
 /// Requests return [`anyhow::Error`], so find this one with
@@ -119,13 +128,15 @@ enum AdmissionStage {
     Admitted,
     /// Terminal: the frame will never get there.
     Failed(String),
+    /// Terminal, as `Failed`: the call's deadline ended its discovery lookup.
+    LookupTimedOut(String),
     /// The target's admission gate holds the frame behind its predecessors.
     /// The gate delivers it whether or not this is ever polled.
     Gated(SendAdmission),
     /// A detached task owns the whole send — discovery, handshake, or a
     /// deferred slot acquisition — and reports through this channel. The task
     /// never waits on the receiver, so dropping the result cannot stall it.
-    Detached(oneshot::Receiver<AdmissionReport>),
+    Detached(oneshot::Receiver<Result<(), NotSent>>),
 }
 
 impl AdmissionStage {
@@ -133,7 +144,7 @@ impl AdmissionStage {
     fn state(&self) -> AdmissionState {
         match self {
             Self::Admitted => AdmissionState::Admitted,
-            Self::Failed(_) => AdmissionState::Failed,
+            Self::Failed(_) | Self::LookupTimedOut(_) => AdmissionState::Failed,
             // The gate resolves tickets whether or not anyone polls, so its own
             // view of the ticket is fresher than any we could cache.
             Self::Gated(admission) => admission.state(),
@@ -148,7 +159,9 @@ impl AdmissionStage {
         loop {
             match self {
                 Self::Admitted => return Poll::Ready(Ok(())),
-                Self::Failed(reason) => return Poll::Ready(Err(anyhow!("{reason}"))),
+                Self::Failed(reason) | Self::LookupTimedOut(reason) => {
+                    return Poll::Ready(Err(anyhow!("{reason}")));
+                }
                 Self::Gated(admission) => match Pin::new(admission).poll(cx) {
                     Poll::Ready(Ok(())) => *self = Self::Admitted,
                     Poll::Ready(Err(error)) => {
@@ -160,7 +173,8 @@ impl AdmissionStage {
                     Poll::Ready(Ok(report)) => {
                         *self = match report {
                             Ok(()) => Self::Admitted,
-                            Err(reason) => Self::Failed(reason),
+                            Err(NotSent::Failed(reason)) => Self::Failed(reason),
+                            Err(NotSent::LookupTimedOut(reason)) => Self::LookupTimedOut(reason),
                         }
                     }
                     // The task dropped its sender without reporting: it
@@ -205,7 +219,7 @@ impl Dispatched {
 
     /// A send a spawned task owns; `receiver` carries its verdict back.
     pub(super) fn detached(
-        receiver: oneshot::Receiver<AdmissionReport>,
+        receiver: oneshot::Receiver<Result<(), NotSent>>,
         awaiter: ResponseAwaiter,
     ) -> Self {
         Self {
@@ -334,7 +348,8 @@ impl SendStage {
     /// [`poll_response`](Self::poll_response), bounded by `deadline`.
     ///
     /// The send is polled before the timer, so an answer that is ready when the
-    /// timer fires still wins. The deadline is cleared once the call resolves,
+    /// timer fires still wins. A discovery lookup that the deadline ended is
+    /// the timeout itself. The deadline is cleared once the call resolves,
     /// either way, so a finished result holds no timer. With no deadline this
     /// is `poll_response` and one branch.
     fn poll_response_within(
@@ -343,7 +358,17 @@ impl SendStage {
         cx: &mut Context<'_>,
     ) -> Poll<Result<Option<Bytes>>> {
         if let Poll::Ready(result) = self.poll_response(cx) {
-            *deadline = None;
+            // A lookup the call's deadline ended is the call's timeout. The
+            // lookup's task can report it before this timer is polled, and a
+            // caller parked in `admitted()` reads it first.
+            if let Some(deadline) = deadline.take()
+                && let SendStage::Dispatched(dispatched) = self
+                && matches!(dispatched.admission, AdmissionStage::LookupTimedOut(_))
+            {
+                return Poll::Ready(Err(anyhow::Error::new(RequestTimeout {
+                    timeout: deadline.timeout,
+                })));
+            }
             return Poll::Ready(result);
         }
         let Some(pending) = deadline.as_mut() else {

@@ -803,7 +803,7 @@ impl VeloEvents {
             subscriber_instance: self.instance_id,
         };
 
-        self.send_system_message(target_instance, "_event_subscribe", message)
+        self.send_system_message(target_instance, "_event_subscribe", message, None)
             .await
     }
 
@@ -821,7 +821,12 @@ impl VeloEvents {
             handle: handle.raw(),
             poisoned,
         };
-        self.send_system_message(target, "_event_trigger", message)
+        // A completion answers a requester, so a requester the table forgot
+        // is looked up within the reply bound. Unbounded, a discovery that
+        // never answers would hold the handler that sends this, and with it
+        // a shutdown that waits for handlers.
+        let bound = Some(self.backend.reply_lookup_timeout());
+        self.send_system_message(target, "_event_trigger", message, bound)
             .await
     }
 
@@ -841,7 +846,7 @@ impl VeloEvents {
             poisoned,
             response_id: response_id.map(|r| r.as_u128()),
         };
-        self.send_system_message(target_instance, "_event_trigger_request", message)
+        self.send_system_message(target_instance, "_event_trigger_request", message, None)
             .await
     }
 
@@ -850,10 +855,18 @@ impl VeloEvents {
         target: InstanceId,
         handler: &str,
         payload: T,
+        lookup_bound: Option<std::time::Duration>,
     ) -> Result<()> {
         let bytes = Bytes::from(serde_json::to_vec(&payload)?);
-        let message = self.messenger()?.message_builder_unchecked(handler);
-        message.raw_payload(bytes).instance(target).fire().await
+        let mut message = self
+            .messenger()?
+            .message_builder_unchecked(handler)
+            .raw_payload(bytes)
+            .instance(target);
+        if let Some(bound) = lookup_bound {
+            message = message.timeout(bound);
+        }
+        message.fire().await
     }
 
     // ── LRU cache management ────────────────────────────────────────
@@ -886,36 +899,30 @@ impl VeloEvents {
     async fn send_ack(&self, response_id: ResponseId) -> Result<()> {
         let header = encode_event_header(EventType::Ack(response_id, Outcome::Ok));
 
-        let outcome = self.backend.send_message_to_worker(
-            WorkerId::from_u64(response_id.worker_id()),
-            header,
-            Bytes::new(),
-            crate::transports::MessageType::Ack,
-            get_event_ack_error_handler(),
-        )?;
-        if let crate::transports::SendOutcome::Pending(admission) = outcome {
-            admission.await?;
-        }
-
-        Ok(())
+        self.backend
+            .send_reply(
+                WorkerId::from_u64(response_id.worker_id()),
+                header,
+                Bytes::new(),
+                crate::transports::MessageType::Ack,
+                get_event_ack_error_handler(),
+            )
+            .await
     }
 
     async fn send_nack(&self, response_id: ResponseId, error_message: String) -> Result<()> {
         let header = encode_event_header(EventType::Ack(response_id, Outcome::Error));
         let payload = Bytes::from(error_message.into_bytes());
 
-        let outcome = self.backend.send_message_to_worker(
-            WorkerId::from_u64(response_id.worker_id()),
-            header,
-            payload,
-            crate::transports::MessageType::Ack,
-            get_event_nack_error_handler(),
-        )?;
-        if let crate::transports::SendOutcome::Pending(admission) = outcome {
-            admission.await?;
-        }
-
-        Ok(())
+        self.backend
+            .send_reply(
+                WorkerId::from_u64(response_id.worker_id()),
+                header,
+                payload,
+                crate::transports::MessageType::Ack,
+                get_event_nack_error_handler(),
+            )
+            .await
     }
 
     // ── Immediate awaiter helpers ───────────────────────────────────

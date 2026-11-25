@@ -46,6 +46,8 @@ mod crash_report_tests;
 #[cfg(test)]
 mod learned_peer_tests;
 #[cfg(test)]
+mod peer_miss_tests;
+#[cfg(test)]
 pub(crate) mod test_alloc;
 #[cfg(test)]
 mod velo_methods_tests;
@@ -544,6 +546,21 @@ impl VeloBuilder {
     /// Unset by default: the fetch then has only the sender's bound, if any.
     pub fn staged_fetch_timeout(mut self, timeout: std::time::Duration) -> Self {
         self.staged_fetch_timeout = Some(timeout);
+        self
+    }
+
+    /// Bound how long a reply waits for discovery to find the peer it answers.
+    ///
+    /// A reply goes back through this node's peer table. When the table has
+    /// forgotten the peer, the reply resolves it through [`PeerDiscovery`]
+    /// and registers it before sending. This bounds that lookup; at the bound
+    /// the reply is dropped and the caller waits for its own timeout.
+    ///
+    /// Default 5 s. A bound too large to add to the clock, such as
+    /// `Duration::MAX`, leaves the lookup the 30 s limit every lookup has. It applies only on a miss: a reply to a peer still in the
+    /// table sets no timer. Without discovery a miss fails at once.
+    pub fn reply_lookup_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.inner = self.inner.reply_lookup_timeout(timeout);
         self
     }
 

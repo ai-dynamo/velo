@@ -13,7 +13,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::oneshot;
 
-use super::ActiveMessageClient;
+use super::{ActiveMessageClient, LookupTimedOut, PeerKey};
 use crate::messenger::common::responses::{ResponseAwaiter, ResponseId, SlotBackpressure};
 use crate::messenger::common::{ActiveMessage, MessageMetadata};
 use crate::observability::ClientResolution;
@@ -24,7 +24,7 @@ mod results;
 #[cfg(test)]
 mod tests;
 
-use results::{AdmissionReport, Deadline, Dispatched, SendStage, drive_send_outcome};
+use results::{AdmissionReport, Deadline, Dispatched, NotSent, SendStage, drive_send_outcome};
 pub use results::{
     Admitted, FireResult, RequestTimeout, SyncResult, TypedUnaryResult, UnaryResult,
 };
@@ -239,9 +239,10 @@ impl UnaryBuilder {
     /// kept, and a reply that comes later is discarded. The remote may still
     /// have run the handler. Only awaiting the result is bounded;
     /// `admitted()` is not. If the time runs out while the call still waits
-    /// for a free response slot, the send is never issued: `admission_state()`
-    /// then reads `Failed` and `admitted()` returns an error that is not a
-    /// `RequestTimeout`.
+    /// for a free response slot, or for discovery, the send is never issued:
+    /// `admission_state()` then reads `Failed` and `admitted()` returns an
+    /// error that is not a `RequestTimeout`. The result itself still resolves
+    /// to `RequestTimeout`.
     ///
     /// Costs nothing when not set: no timer and no allocation.
     pub fn timeout(mut self, timeout: Duration) -> Self {
@@ -337,8 +338,8 @@ where
 /// Error type for target resolution in message builders.
 #[derive(Debug)]
 enum ResolveError {
-    /// Peer not found in cache - discovery needed
-    UnresolvedPeer,
+    /// The worker is not in the peer table - discovery needed
+    UnresolvedPeer(WorkerId),
     /// Other validation or configuration errors
     Other(anyhow::Error),
 }
@@ -352,20 +353,10 @@ enum MsgType {
     Unary,
 }
 
-/// Which slow-path preamble a spawned task runs before sending.
-#[derive(Debug, Clone, Copy)]
-enum SlowPathKind {
-    /// Peer is resolved but we still need to handshake.
-    Handshake(InstanceId),
-    /// Worker ID needs to be translated to an instance via discovery,
-    /// followed by a handshake.
-    Discovery(WorkerId),
-}
-
 impl From<ResolveError> for anyhow::Error {
     fn from(err: ResolveError) -> Self {
         match err {
-            ResolveError::UnresolvedPeer => anyhow!("Peer not found"),
+            ResolveError::UnresolvedPeer(_) => anyhow!("Peer not found"),
             ResolveError::Other(e) => e,
         }
     }
@@ -444,7 +435,8 @@ enum Acquisition {
 /// handshake, and the send itself survive the caller dropping its result.
 struct SlowPath {
     client: Arc<ActiveMessageClient>,
-    kind: SlowPathKind,
+    /// An instance to handshake with, or a worker the table missed.
+    target: PeerKey,
     handler: String,
     payload: Option<Bytes>,
     headers: Option<HashMap<String, String>>,
@@ -452,35 +444,40 @@ struct SlowPath {
     message_type: MsgType,
     lane: u16,
     fetch_by: Option<tokio::time::Instant>,
+    /// When the discovery lookup gives up: the call's deadline, or for a
+    /// fire send the builder's timeout, which bounds nothing else.
+    lookup_by: Option<tokio::time::Instant>,
 }
 
 impl SlowPath {
     /// Resolve, handshake, send — reporting where it stopped.
-    async fn run(self) -> AdmissionReport {
+    async fn run(self) -> Result<(), NotSent> {
         let target = self.resolve().await?;
-        self.handshake(target).await?;
-        self.send(target).await
+        self.handshake(target).await.map_err(NotSent::Failed)?;
+        self.send(target).await.map_err(NotSent::Failed)
     }
 
-    /// Stage 1 — translate a worker id via discovery if that is all we have.
-    async fn resolve(&self) -> std::result::Result<InstanceId, String> {
-        let worker_id = match self.kind {
-            SlowPathKind::Handshake(target) => return Ok(target),
-            SlowPathKind::Discovery(worker_id) => worker_id,
-        };
-        match self.client.resolve_peer_via_discovery(worker_id).await {
-            Ok(instance_id) => Ok(instance_id),
-            Err(e) => {
-                self.record(ClientResolution::DiscoveryError);
-                tracing::error!(
-                    target: "crate::messenger::client",
-                    error = %e,
-                    worker_id = %worker_id,
-                    "Discovery failed"
-                );
-                Err(self.fail(format!("Discovery failed: {}", e)))
-            }
+    /// Stage 1 — find the instance. A worker the table missed, or an instance
+    /// it does not hold, asks discovery, within the call's deadline. Without
+    /// discovery an unknown instance goes on to fail in the handshake, as it
+    /// always has.
+    async fn resolve(&self) -> std::result::Result<InstanceId, NotSent> {
+        let backend = &self.client.backend;
+        if let PeerKey::Instance(target) = self.target
+            && (!backend.has_peer_discovery() || backend.is_registered(target))
+        {
+            return Ok(target);
         }
+        backend
+            .resolve_peer(self.target, self.lookup_by)
+            .await
+            .map_err(|e| {
+                let reason = self.fail(format!("Discovery failed: {}", e));
+                match e.is::<LookupTimedOut>() {
+                    true => NotSent::LookupTimedOut(reason),
+                    false => NotSent::Failed(reason),
+                }
+            })
     }
 
     /// Stage 2 — exchange handler lists if we have not already.
@@ -633,7 +630,7 @@ impl MessageBuilder {
                 .client
                 .backend
                 .try_translate_worker_id(worker)
-                .map_err(|_| ResolveError::UnresolvedPeer),
+                .map_err(|_| ResolveError::UnresolvedPeer(worker)),
             (Some(_), Some(_)) => Err(ResolveError::Other(anyhow!(
                 "Cannot set both .instance() and .worker() - they are mutually exclusive"
             ))),
@@ -682,15 +679,15 @@ impl MessageBuilder {
     /// not withdraw a frame that is already on its way.
     fn spawn_slow_path(
         &self,
-        kind: SlowPathKind,
+        target: PeerKey,
         response_id: ResponseId,
         message_type: MsgType,
         fetch_by: Option<tokio::time::Instant>,
-    ) -> oneshot::Receiver<AdmissionReport> {
+    ) -> oneshot::Receiver<Result<(), NotSent>> {
         let (report_tx, report_rx) = oneshot::channel();
         let slow_path = SlowPath {
             client: self.client.clone(),
-            kind,
+            target,
             handler: self.handler.clone(),
             payload: self.payload.clone(),
             headers: self.headers.clone(),
@@ -698,6 +695,7 @@ impl MessageBuilder {
             message_type,
             lane: self.lane,
             fetch_by,
+            lookup_by: fetch_by.or_else(|| self.deadline().as_ref().map(Deadline::at)),
         };
 
         tokio::spawn(async move {
@@ -723,7 +721,6 @@ impl MessageBuilder {
         message_type: MsgType,
         fetch_by: Option<tokio::time::Instant>,
     ) -> Dispatched {
-        let worker_id = self.target_worker;
         let response_id = awaiter.response_id();
 
         match target_result {
@@ -744,31 +741,17 @@ impl MessageBuilder {
             }
             Ok(target) => Dispatched::detached(
                 self.spawn_slow_path(
-                    SlowPathKind::Handshake(target),
+                    PeerKey::Instance(target),
                     response_id,
                     message_type,
                     fetch_by,
                 ),
                 awaiter,
             ),
-            Err(ResolveError::UnresolvedPeer) => {
-                // `resolve_target` only returns UnresolvedPeer when
-                // target_worker is Some, so this else-branch is a defensive
-                // guard — unreachable in practice.
-                let Some(worker_id) = worker_id else {
-                    tracing::error!(target: "crate::messenger::client", "UnresolvedPeer but no worker_id set");
-                    return Dispatched::failed("UnresolvedPeer but no worker_id set");
-                };
-                Dispatched::detached(
-                    self.spawn_slow_path(
-                        SlowPathKind::Discovery(worker_id),
-                        response_id,
-                        message_type,
-                        fetch_by,
-                    ),
-                    awaiter,
-                )
-            }
+            Err(ResolveError::UnresolvedPeer(worker)) => Dispatched::detached(
+                self.spawn_slow_path(PeerKey::Worker(worker), response_id, message_type, fetch_by),
+                awaiter,
+            ),
             Err(ResolveError::Other(_)) => {
                 unreachable!("ResolveError::Other is short-circuited in make_stage")
             }
@@ -822,7 +805,9 @@ impl MessageBuilder {
     ///
     /// Synchronous: by the time this returns the frame belongs to the transport
     /// (or to a detached task). The [`FireResult`] observes admission, it does
-    /// not drive it.
+    /// not drive it. A fire send has no response to time out; a timeout set
+    /// on this builder bounds only the discovery lookup for a target the
+    /// table missed. It never reaches a send that has a route.
     pub fn fire(self) -> FireResult {
         FireResult {
             stage: self.make_stage(MsgType::Fire, None),

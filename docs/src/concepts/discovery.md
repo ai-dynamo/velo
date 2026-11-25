@@ -49,6 +49,10 @@ node_a.unregister_peer(node_b.instance_id());
 
 A restarted peer has a new instance id. So a long-lived node whose peers restart, such as a worker that serves many frontends, keeps the state of every peer it ever saw unless it calls this when a peer leaves.
 
-Unregister only an idle peer. A send, stream, or handshake in flight to it may fail, and one that finishes after the call can register the peer again. A `_hello` handshake from the peer registers it again too. The messenger mux keeps small per-peer receive tables, and this call does not drop them.
+A forgotten peer that still talks to the node comes back in two ways. A `_hello` handshake from the peer registers it again. And with a discovery backend, a reply to the peer resolves it again: the node asks `PeerDiscovery::discover_by_worker_id`, registers the answer, and sends. A send that names the peer's instance does the same through `discover_by_instance_id`. Each miss runs its own lookup, a node runs at most 64 at once, and a reply's is bounded by `VeloBuilder::reply_lookup_timeout`. Without a discovery backend a forgotten peer stays forgotten until a `register_peer` or its `_hello`.
+
+Unregister only an idle peer. A send, stream, or handshake in flight to it may fail, and one that finishes after the call can register the peer again. A `_hello` handshake from the peer registers it again too, and so can a reply, as above. The messenger mux keeps small per-peer receive tables, and this call does not drop them.
+
+A node that forgets a peer it is still serving spends a discovery lookup to reach it again, and a burst of replies that all miss spends one each, up to the cap. A node that forgets a peer for good should publish no discovery record for it, so a reply that misses has nothing to resolve.
 
 The etcd backend uses leases. If a test process stops and does not revoke its lease, its keys stay until the lease expires.
