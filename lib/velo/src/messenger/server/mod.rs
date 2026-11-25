@@ -11,9 +11,10 @@ pub(crate) use system_handlers::register_system_handlers;
 
 use crate::messenger::common::{
     events::{EventType, Outcome, decode_event_header},
-    messages::{decode_active_message, decode_response_id_from_request_header},
+    messages::{ResponseType, decode_active_message, decode_response_id_from_request_header},
     responses::{ResponseManager, decode_response_header},
 };
+use crate::messenger::handlers::{DeferredPayload, Fetch};
 
 use std::sync::Arc;
 
@@ -22,6 +23,7 @@ use crate::transports::{DataStreams, InboundMessage, ShutdownState, VeloBackend}
 use bytes::Bytes;
 use tokio_util::task::TaskTracker;
 
+use dispatcher::Deferring;
 use dispatcher::send_error_reply;
 pub(crate) use dispatcher::{DispatcherHub, InboundCall};
 
@@ -293,8 +295,9 @@ async fn create_message_handler(
                 );
 
                 // A staged payload is fetched in a task of its own before
-                // dispatch. Its staging headers come out of the message here,
-                // so its handler never sees them and cannot pass them on (see
+                // dispatch, unless its handler defers it. Its staging headers
+                // come out of the message here, so its handler never sees
+                // them and cannot pass them on (see
                 // `large_payload::take_staging`). A message that was not
                 // staged pays one map lookup, and none without headers.
                 let staging =
@@ -311,31 +314,58 @@ async fn create_message_handler(
                                 &message.metadata.handler_name,
                             )
                         });
-                        let fetch_bound = crate::messenger::large_payload::fetch_bound(
-                            staging.budget.as_deref(),
-                            own,
-                        );
-                        let resolver = Arc::clone(resolver);
+                        let fetch = Fetch {
+                            resolver: Arc::clone(resolver),
+                            handle: staging.handle,
+                            bound: crate::messenger::large_payload::fetch_bound(
+                                staging.budget.as_deref(),
+                                own,
+                            ),
+                            admitted: tokio::time::Instant::now(),
+                        };
+                        // Only a call's reply frees a payload its handler did
+                        // not take, so a message without one is not deferred.
+                        let defer = matches!(
+                            message.metadata.response_type,
+                            ResponseType::AckNack | ResponseType::Unary
+                        )
+                        .then(|| hub.deferring(&message.metadata.handler_name))
+                        .flatten();
+                        // With its length on the message, a deferred payload
+                        // dispatches here, in arrival order, with no fetch.
+                        if let (Some((dispatcher, setting)), Some(len)) = (&defer, staging.len) {
+                            let deferred =
+                                DeferredPayload::new(len, fetch, setting.clone(), &teardown);
+                            let call = InboundCall {
+                                message_id: message.metadata.response_id,
+                                payload: Bytes::new(),
+                                response_type: message.metadata.response_type,
+                                headers: message.metadata.headers,
+                                staged: false,
+                                in_flight,
+                                deferred: Some(Arc::new(deferred)),
+                            };
+                            dispatcher.dispatch(call, system);
+                            continue;
+                        }
                         let hub = hub.clone();
                         let handler_name = std::mem::take(&mut message.metadata.handler_name);
                         let message_id = message.metadata.response_id;
                         let response_type = message.metadata.response_type;
                         let headers = message.metadata.headers.take();
-                        let handle_str = staging.handle;
                         // The resolve waits on the payload's owner, so the
                         // task must not hold the Messenger across it: that
                         // would keep its final drop, and teardown, from ever
                         // happening. The hub upgrades it again afterwards.
                         let backend = Arc::clone(system.backend());
                         spawn_resolve(ResolveJob {
-                            resolver,
+                            fetch,
+                            defer,
                             hub,
                             handler_name,
                             message_id,
                             response_type,
                             headers,
-                            handle_str,
-                            fetch_bound,
                             in_flight,
                             backend,
                         });
@@ -349,8 +379,7 @@ async fn create_message_handler(
                         );
                         if matches!(
                             message.metadata.response_type,
-                            crate::messenger::common::messages::ResponseType::AckNack
-                                | crate::messenger::common::messages::ResponseType::Unary
+                            ResponseType::AckNack | ResponseType::Unary
                         ) {
                             let backend = system.backend().clone();
                             let handler_name = message.metadata.handler_name.clone();
@@ -377,6 +406,7 @@ async fn create_message_handler(
                     headers: message.metadata.headers,
                     staged: false,
                     in_flight,
+                    deferred: None,
                 };
 
                 // Direct dispatch - inline, no channel hop! The Messenger is
@@ -425,17 +455,20 @@ async fn create_message_handler(
     Ok(())
 }
 
-/// A message whose payload must be pulled from its owner before dispatch.
+/// A message whose payload must be pulled from its owner before dispatch,
+/// or, for a handler that defers it, whose length must be asked of it.
 struct ResolveJob {
-    resolver: Arc<dyn crate::messenger::large_payload::LargePayloadResolver>,
+    /// What to fetch, and when to give up. See [`resolve_within`].
+    fetch: Fetch,
+    /// Set for a handler that defers a payload its sender sent no length
+    /// for (`_rv_len`): only the length is asked of the owner. See
+    /// [`DispatcherHub::deferring`].
+    defer: Option<Deferring>,
     hub: Arc<DispatcherHub>,
     handler_name: String,
     message_id: crate::messenger::common::responses::ResponseId,
-    response_type: crate::messenger::common::messages::ResponseType,
+    response_type: ResponseType,
     headers: Option<std::collections::HashMap<String, String>>,
-    handle_str: String,
-    /// When to give up the fetch. See [`resolve_within`].
-    fetch_bound: Option<crate::messenger::large_payload::FetchBound>,
     in_flight: Option<Arc<velo_ext::InFlightGuard>>,
     backend: Arc<VeloBackend>,
 }
@@ -464,20 +497,41 @@ fn spawn_resolve(job: ResolveJob) -> tokio::task::JoinHandle<()> {
 
 async fn resolve_and_dispatch(job: ResolveJob) {
     let ResolveJob {
-        resolver,
+        fetch,
+        defer,
         hub,
         handler_name,
         message_id,
         response_type,
         headers,
-        handle_str,
-        fetch_bound,
         in_flight,
         backend,
     } = job;
-    let within = fetch_bound.map(|bound| bound.within);
-    let Some(resolved) = resolve_within(resolver.resolve(&handle_str, within), fetch_bound).await
-    else {
+    let (resolved, deferring) = match defer {
+        None => {
+            let within = fetch.bound.map(|bound| bound.within);
+            let resolve = fetch.resolver.resolve(&fetch.handle, within);
+            let resolved = resolve_within(resolve, fetch.bound).await;
+            (
+                resolved.map(|payload| payload.map(|payload| (payload, None))),
+                None,
+            )
+        }
+        // One round trip to the owner, inside the fetch's bound, and a
+        // failure answers the caller as a failed fetch does.
+        Some((dispatcher, setting)) => {
+            let size = resolve_within(fetch.resolver.size(&fetch.handle), fetch.bound).await;
+            let deferred = size.map(|size| {
+                size.map(|len| {
+                    let teardown = backend.shutdown_state().teardown_token();
+                    let deferred = DeferredPayload::new(len, fetch, setting, teardown);
+                    (Bytes::new(), Some(Arc::new(deferred)))
+                })
+            });
+            (deferred, Some(dispatcher))
+        }
+    };
+    let Some(resolved) = resolved else {
         tracing::debug!(
             target: "crate::messenger::server",
             handler = %handler_name,
@@ -486,7 +540,7 @@ async fn resolve_and_dispatch(job: ResolveJob) {
         return;
     };
     match resolved {
-        Ok(resolved_payload) => {
+        Ok((payload, deferred)) => {
             // Gone: the instance is being torn down,
             // and the message dies with its guard.
             let Some(system) = hub.system() else {
@@ -494,13 +548,17 @@ async fn resolve_and_dispatch(job: ResolveJob) {
             };
             let call = InboundCall {
                 message_id,
-                payload: resolved_payload,
+                payload,
                 response_type,
                 headers,
                 staged: true,
                 in_flight,
+                deferred,
             };
-            hub.dispatch_message(&handler_name, call, &system);
+            match deferring {
+                Some(dispatcher) => dispatcher.dispatch(call, &system),
+                None => hub.dispatch_message(&handler_name, call, &system),
+            }
         }
         Err(e) => {
             tracing::error!(
@@ -521,11 +579,7 @@ async fn resolve_and_dispatch(job: ResolveJob) {
                     },
                 );
             }
-            if matches!(
-                response_type,
-                crate::messenger::common::messages::ResponseType::AckNack
-                    | crate::messenger::common::messages::ResponseType::Unary
-            ) {
+            if matches!(response_type, ResponseType::AckNack | ResponseType::Unary) {
                 send_error_reply(
                     &backend,
                     &handler_name,
@@ -550,10 +604,13 @@ async fn resolve_and_dispatch(job: ResolveJob) {
 ///
 /// The owner is not told. The resolver asked it for a lease deadline of the
 /// same bound, so the owner ends a lease nobody pulls on its own.
-async fn resolve_within(
-    resolve: impl std::future::Future<Output = anyhow::Result<Bytes>>,
+///
+/// It bounds a deferred payload's fetch, and the length asked of an owner
+/// that did not send one, the same way.
+pub(crate) async fn resolve_within<T>(
+    resolve: impl std::future::Future<Output = anyhow::Result<T>>,
     bound: Option<crate::messenger::large_payload::FetchBound>,
-) -> Option<anyhow::Result<Bytes>> {
+) -> Option<anyhow::Result<T>> {
     let Some(bound) = bound else {
         return Some(resolve.await);
     };
@@ -736,6 +793,10 @@ mod tests {
         ) -> futures::future::BoxFuture<'_, anyhow::Result<Bytes>> {
             Box::pin(std::future::pending())
         }
+
+        fn size(&self, _: &str) -> futures::future::BoxFuture<'_, anyhow::Result<u64>> {
+            Box::pin(std::future::pending())
+        }
     }
 
     /// The resolver task must end at teardown. It holds the backend, the
@@ -753,14 +814,18 @@ mod tests {
             Arc::new(NeverResolves);
         let resolver_alive = Arc::downgrade(&resolver);
         let task = spawn_resolve(ResolveJob {
-            resolver,
+            fetch: Fetch {
+                resolver,
+                handle: "1".to_string(),
+                bound: None,
+                admitted: tokio::time::Instant::now(),
+            },
+            defer: None,
             hub: Arc::new(DispatcherHub::new(Arc::clone(&backend))),
             handler_name: "large".to_string(),
             message_id: crate::messenger::common::responses::ResponseId::from_u128(1),
-            response_type: crate::messenger::common::messages::ResponseType::Unary,
+            response_type: ResponseType::Unary,
             headers: None,
-            handle_str: "1".to_string(),
-            fetch_bound: None,
             in_flight: None,
             backend: Arc::clone(&backend),
         });

@@ -306,6 +306,13 @@ path = "tests/streaming_transport.rs"
 required-features = ["test-helpers"]
 
 [[test]]
+name = "deferred_payload"
+path = "tests/deferred_payload.rs"
+# test-helpers: `Velo::serve_rv_acquire` and `Velo::serve_rv_metadata`, to
+# count what reaches a payload's owner, and `Velo::staged_payload_len`.
+required-features = ["test-helpers"]
+
+[[test]]
 name = "request_timeout"
 path = "tests/request_timeout.rs"
 # test-helpers: `Velo::response_slots_in_use`, to see that a timed-out call

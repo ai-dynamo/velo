@@ -379,6 +379,10 @@ async fn a_timed_out_staged_call_leaves_nothing_staged_on_a_slow_sender() {
 /// The call has no timeout, so its payload has no time-to-live. The fetch
 /// asks the sender for a lease deadline of its bound, so the lease the slow
 /// sender grants after the receiver gave up ends once no pull renews it.
+///
+/// The payload is staged by hand, as a sender that does not free on reply
+/// stages it. A sender that does frees it on the receiver's error reply,
+/// before any lease, and this test would then not reach the lease.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fetch_ended_by_the_receivers_bound_leaves_nothing_staged_on_a_slow_sender() {
     let (client, server, _echoes) = connected_pair_with(
@@ -389,10 +393,14 @@ async fn a_fetch_ended_by_the_receivers_bound_leaves_nothing_staged_on_a_slow_se
     let stall = Stall::new();
     stall_fetches(&client, &stall);
 
+    let handle = client.register_data(Bytes::from(vec![0x5a; STAGED]));
     let call = client
         .unary("echo")
         .unwrap()
-        .raw_payload(Bytes::from(vec![0x5a; STAGED]))
+        .headers(std::collections::HashMap::from([(
+            "_rv".to_string(),
+            handle.as_u128().to_string(),
+        )]))
         .instance(server.instance_id())
         .send();
     tokio::time::timeout(BOUND, stall.entered.notified())

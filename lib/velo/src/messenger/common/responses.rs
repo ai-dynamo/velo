@@ -74,6 +74,7 @@ use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
 use super::events::Outcome;
+use crate::messenger::large_payload::StagedPayload;
 
 type WorkerId = u64;
 type ArenaAllocation<T, E> = (usize, u64, Arc<Slot<T, E>>);
@@ -519,6 +520,18 @@ impl ResponseManager {
     pub fn pending_outcome_count(&self) -> usize {
         self.inner.pending_outcome_count()
     }
+
+    /// Keep `staged` with the call `response_id` names, to free when the
+    /// call completes. A call that is no longer waiting drops it unfreed:
+    /// its time-to-live frees it.
+    pub(crate) fn attach_staged(&self, response_id: ResponseId, staged: StagedPayload) {
+        if response_id.worker_id() != self.inner.worker_id {
+            return;
+        }
+        if let Some(slot) = self.inner.arena.slot(response_id.slot_index()) {
+            slot.attach_staged(staged, response_id.generation());
+        }
+    }
 }
 
 struct ResponseManagerInner {
@@ -773,6 +786,9 @@ struct SlotState<T, E> {
     value: Option<Result<T, E>>,
     generation: u64,
     did_finish: bool,
+    /// The payload this call staged, freed when the call completes. Boxed:
+    /// every slot of the arena carries the field, and few calls stage.
+    staged: Option<Box<StagedPayload>>,
 }
 
 impl<T, E> SlotState<T, E> {
@@ -781,6 +797,7 @@ impl<T, E> SlotState<T, E> {
             value: None,
             generation,
             did_finish: false,
+            staged: None,
         }
     }
 
@@ -808,6 +825,9 @@ impl<T, E> SlotState<T, E> {
         }
         self.value = None;
         self.did_finish = false;
+        // A call that ends without a reply leaves its payload to its
+        // time-to-live: a frame on its way may still fetch it.
+        self.staged = None;
         self.generation
     }
 
@@ -847,7 +867,11 @@ impl<T, E> Slot<T, E> {
         let success = guard.complete(res, expected_generation);
         if success {
             trace!("Slot.finish() - value set, dropping lock");
+            let staged = guard.staged.take();
             drop(guard);
+            if let Some(staged) = staged {
+                staged.free();
+            }
             trace!("Slot.finish() - waking waiter");
             self.waker.wake();
             debug!("Slot.finish() - waiter woken, returning true");
@@ -895,6 +919,16 @@ impl<T, E> Slot<T, E> {
     #[doc(hidden)]
     pub fn try_take(&self) -> Option<Result<T, E>> {
         self.state.lock().take_value()
+    }
+
+    /// Keep `staged` until this slot completes, if it still waits at
+    /// `generation`.
+    fn attach_staged(&self, staged: StagedPayload, generation: u64) {
+        let staged = Box::new(staged);
+        let mut state = self.state.lock();
+        if state.can_complete(generation) {
+            state.staged = Some(staged);
+        }
     }
 
     /// Resets the slot (for reuse). Returns the new generation after recycling.
@@ -1037,6 +1071,82 @@ mod tests {
         // awaiter on this manager.
         let bogus_id = ResponseId::from_u128(0u128);
         assert!(!manager.complete_outcome(bogus_id, Err("x".to_string())));
+    }
+
+    /// A stager that counts the frees of each handle.
+    #[derive(Default)]
+    struct CountingStager {
+        freed: Mutex<Vec<String>>,
+    }
+
+    impl crate::messenger::large_payload::LargePayloadStager for CountingStager {
+        fn stage(&self, _: Bytes, _: Option<std::time::Duration>) -> String {
+            unreachable!("these tests stage by hand")
+        }
+
+        fn threshold(&self) -> usize {
+            0
+        }
+
+        fn free(&self, handle: &str) {
+            self.freed.lock().push(handle.to_string());
+        }
+    }
+
+    fn staged(stager: &Arc<CountingStager>, handle: &str) -> StagedPayload {
+        StagedPayload {
+            stager: Arc::clone(stager) as _,
+            handle: handle.to_string(),
+        }
+    }
+
+    /// A call's reply frees the payload it staged, once, and so does an error
+    /// reply: neither receiver will fetch it after replying.
+    #[tokio::test]
+    async fn a_reply_frees_the_attached_payload_once() {
+        for outcome in [Ok(None), Err("refused".to_string())] {
+            let stager = Arc::new(CountingStager::default());
+            let manager = ResponseManager::new(42);
+            let mut awaiter = manager.register_outcome().unwrap();
+            let id = awaiter.response_id();
+            manager.attach_staged(id, staged(&stager, "7"));
+
+            assert!(manager.complete_outcome(id, outcome.clone()));
+            assert!(!manager.complete_outcome(id, outcome.clone()));
+            assert_eq!(awaiter.recv().await, outcome);
+            assert_eq!(*stager.freed.lock(), ["7"]);
+        }
+    }
+
+    /// A call dropped before its reply frees nothing: the frame may still be
+    /// on its way, and the payload's time-to-live covers it. The slot's next
+    /// call starts with nothing attached.
+    #[tokio::test]
+    async fn a_dropped_call_does_not_free_the_attached_payload() {
+        let stager = Arc::new(CountingStager::default());
+        let manager = ResponseManager::with_capacity(42, 1, None);
+        let awaiter = manager.register_outcome().unwrap();
+        manager.attach_staged(awaiter.response_id(), staged(&stager, "7"));
+        drop(awaiter);
+
+        let next = manager.register_outcome().unwrap();
+        assert!(manager.complete_outcome(next.response_id(), Ok(None)));
+        assert!(stager.freed.lock().is_empty());
+    }
+
+    /// A payload attached under a call the slot no longer waits for is not
+    /// kept, so the slot's next call does not free it.
+    #[tokio::test]
+    async fn a_stale_call_neither_attaches_nor_frees() {
+        let stager = Arc::new(CountingStager::default());
+        let manager = ResponseManager::with_capacity(42, 1, None);
+        let stale = manager.register_outcome().unwrap().response_id();
+        let next = manager.register_outcome().unwrap();
+        manager.attach_staged(stale, staged(&stager, "7"));
+
+        assert!(manager.complete_outcome(next.response_id(), Ok(None)));
+        assert!(!manager.complete_outcome(stale, Ok(None)));
+        assert!(stager.freed.lock().is_empty());
     }
 
     #[tokio::test]

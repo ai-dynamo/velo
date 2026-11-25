@@ -129,15 +129,22 @@ and the slowest peer's read rate, and give the drain its own time through
 ## A staged payload without a deadline can stay staged
 
 **What happens.** The sender keeps a staged payload until the sender shuts
-down when nobody fetches and releases it, and nothing gives it a deadline.
+down when nobody releases it, no reply frees it, and nothing gives it a
+deadline.
 
-**When.** The message of a send without a `.timeout` never reaches a
-receiver, or the receiver stops before it releases the payload. Also a fetch
-that gives up against a sender from before the `_rv_lease_ms` header.
+**When.** A send without a `.timeout` gets no reply: its message never
+reaches a receiver, the receiver stops before it replies, or the caller drops
+the call first. A fire-and-forget send whose receiver stops before it
+releases the payload. An untimed call from a sender that does not free on
+reply, to a handler that defers the payload and refuses it. Also a fetch that
+gives up against a sender from before the `_rv_lease_ms` header.
 
-**Why.** Only the receiver's `release` frees a transparently staged payload.
-A time-to-live comes only from a call's `.timeout`, and a chunked lease gets a
-deadline only when a fetch with a bound asks for one.
+**Why.** The receiver's `release` frees a transparently staged payload, and
+so does the sender when the call's reply arrives. A call that ends without a
+reply frees nothing, because its message may still be on its way to a
+receiver that will fetch. A time-to-live comes only from a call's `.timeout`,
+and a chunked lease gets a deadline only when a fetch with a bound, or a
+deferred `take_payload`, asks for one.
 
 **Workaround.** Give large calls a `.timeout`. It gives their payloads a
 time-to-live.

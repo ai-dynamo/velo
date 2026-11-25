@@ -12,7 +12,9 @@
 //!
 //! **Receiver side** ([`LargePayloadResolver`]): When a message arrives with the
 //! `_rv` header, the resolver fetches the full payload from the remote stager
-//! before the message is dispatched to the handler.
+//! before the message is dispatched to the handler. A handler that defers it
+//! runs first and fetches only if it asks; the sender then frees the payload
+//! when the call's reply arrives ([`StagedPayload`]).
 //!
 //! **The fetch has a deadline when either side gives it one.** The sender
 //! carries what is left of a call's `.timeout` in the [`RV_BUDGET_HEADER_KEY`]
@@ -22,8 +24,8 @@
 //! receiver's response slot and the request's drain guard until it answers
 //! again, or until the receiver tears down.
 //!
-//! **The two staging headers belong to the send that staged.** The sender
-//! writes both ([`write_staging`]), and the receiver takes both out of the
+//! **The staging headers belong to the send that staged.** The sender
+//! writes them ([`write_staging`]), and the receiver takes them out of the
 //! message before its handler runs ([`take_staging`]). A handler therefore
 //! never sees them, and cannot pass them on in a send of its own: a forwarded
 //! handle would make the next receiver fetch a payload that is not its
@@ -52,6 +54,28 @@ pub trait LargePayloadStager: Send + Sync {
     /// Minimum payload size (in bytes) to trigger staging.
     /// Payloads smaller than this are sent inline as usual.
     fn threshold(&self) -> usize;
+
+    /// Drop the sender's hold on a payload it staged. A receiver that holds
+    /// a lease on it keeps it until that lease ends.
+    fn free(&self, handle: &str);
+}
+
+/// A payload a call staged, freed when the call's response slot completes.
+///
+/// A receiver that replies without fetching (a deferred handler that
+/// refuses) cannot free it: freeing needs the lease a fetch gives. So the
+/// sender frees it when the reply arrives. No `Drop`: a slot that is
+/// recycled without a reply drops this without freeing, because the payload
+/// may still be on its way to a receiver, and its time-to-live covers it.
+pub(crate) struct StagedPayload {
+    pub(crate) stager: std::sync::Arc<dyn LargePayloadStager>,
+    pub(crate) handle: String,
+}
+
+impl StagedPayload {
+    pub(crate) fn free(self) {
+        self.stager.free(&self.handle);
+    }
 }
 
 /// Receiver-side: resolves a handle string back to the full payload.
@@ -66,6 +90,11 @@ pub trait LargePayloadResolver: Send + Sync {
     /// future when it runs out and tells the owner nothing, so the owner
     /// should be asked to end, by then, whatever the fetch leaves behind.
     fn resolve(&self, handle_str: &str, within: Option<Duration>) -> BoxFuture<'_, Result<Bytes>>;
+
+    /// The staged payload's length, asked of its owner. Only a message from a
+    /// sender that does not write [`RV_LEN_HEADER_KEY`] needs it. The caller
+    /// bounds the wait.
+    fn size(&self, handle_str: &str) -> BoxFuture<'_, Result<u64>>;
 
     /// The longest this receiver lets one fetch run, whatever the sender
     /// asked for. `None` sets no bound of its own.
@@ -131,12 +160,23 @@ pub(crate) fn budget_ms(left: Duration) -> String {
     u64::try_from(ms).unwrap_or(u64::MAX).to_string()
 }
 
+/// Header key for the staged payload's length in bytes, as a decimal string.
+///
+/// A deferred handler decides on this length before anything is fetched.
+/// It is the sender's claim: the fetch still enforces the receiver's limit.
+/// A receiver that finds no length (from a sender that does not write it)
+/// asks the owner with `_rv_metadata`, and a receiver that does not know the
+/// header leaves it in the headers its handler sees.
+pub const RV_LEN_HEADER_KEY: &str = "_rv_len";
+
 /// Write the staging headers of a send that staged its payload: its handle,
-/// and its `budget` if the call has one. A budget already in `headers` is
-/// removed when the send has none, so only the send's own goes on the wire.
+/// its length, and its `budget` if the call has one. A budget already in
+/// `headers` is removed when the send has none, so only the send's own goes
+/// on the wire. The length is left out when the headers have no room for it.
 pub(crate) fn write_staging(
     headers: &mut Option<HashMap<String, String>>,
     handle: String,
+    len: u64,
     budget: Option<Duration>,
 ) {
     let headers = headers.get_or_insert_with(HashMap::new);
@@ -149,6 +189,13 @@ pub(crate) fn write_staging(
             headers.remove(RV_BUDGET_HEADER_KEY);
         }
     }
+    // The length is the one staging header a receiver can do without: it
+    // asks the owner instead. So it must not be what takes a send's headers
+    // over the encoder's limit and fails a send that fits without it.
+    headers.insert(RV_LEN_HEADER_KEY.to_string(), len.to_string());
+    if !crate::messenger::common::messages::headers_fit(headers) {
+        headers.remove(RV_LEN_HEADER_KEY);
+    }
 }
 
 /// The staging headers of one inbound message.
@@ -158,6 +205,9 @@ pub(crate) struct Staging {
     pub(crate) handle: String,
     /// The caller's budget as sent, read by [`fetch_bound`].
     pub(crate) budget: Option<String>,
+    /// The payload's length as sent. `None` when absent or unreadable: the
+    /// receiver then asks the owner.
+    pub(crate) len: Option<u64>,
 }
 
 /// Take the staging headers out of an inbound message's `headers`.
@@ -171,10 +221,17 @@ pub(crate) fn take_staging(headers: &mut Option<HashMap<String, String>>) -> Opt
     let map = headers.as_mut()?;
     let handle = map.remove(RV_HEADER_KEY)?;
     let budget = map.remove(RV_BUDGET_HEADER_KEY);
+    let len = map
+        .remove(RV_LEN_HEADER_KEY)
+        .and_then(|len| len.parse().ok());
     if map.is_empty() {
         *headers = None;
     }
-    Some(Staging { handle, budget })
+    Some(Staging {
+        handle,
+        budget,
+        len,
+    })
 }
 
 /// How long a receiver may fetch one staged payload, and whose bound it is.
@@ -279,15 +336,19 @@ mod tests {
             .collect()
     }
 
-    /// The receiver takes both staging headers out, leaves the caller's own,
-    /// and leaves a message without a handle as it is: a budget alone means
-    /// nothing and is an ordinary header.
+    /// The receiver takes the staging headers out, leaves the caller's own,
+    /// and leaves a message without a handle as it is: a budget or a length
+    /// alone means nothing and is an ordinary header.
     #[test]
-    fn take_staging_takes_both_staging_headers_and_nothing_else() {
+    fn take_staging_takes_the_staging_headers_and_nothing_else() {
         let mut none = None;
         assert_eq!(take_staging(&mut none), None);
 
-        let eager = map(&[(RV_BUDGET_HEADER_KEY, "7"), ("trace", "t")]);
+        let eager = map(&[
+            (RV_BUDGET_HEADER_KEY, "7"),
+            (RV_LEN_HEADER_KEY, "9"),
+            ("trace", "t"),
+        ]);
         let mut headers = Some(eager.clone());
         assert_eq!(take_staging(&mut headers), None);
         assert_eq!(headers, Some(eager));
@@ -295,6 +356,7 @@ mod tests {
         let mut headers = Some(map(&[
             (RV_HEADER_KEY, "42"),
             (RV_BUDGET_HEADER_KEY, "7"),
+            (RV_LEN_HEADER_KEY, "9"),
             ("trace", "t"),
         ]));
         assert_eq!(
@@ -302,6 +364,7 @@ mod tests {
             Some(Staging {
                 handle: "42".into(),
                 budget: Some("7".into()),
+                len: Some(9),
             })
         );
         assert_eq!(headers, Some(map(&[("trace", "t")])));
@@ -312,6 +375,7 @@ mod tests {
             Some(Staging {
                 handle: "42".into(),
                 budget: None,
+                len: None,
             })
         );
         assert_eq!(
@@ -320,36 +384,100 @@ mod tests {
         );
     }
 
-    /// The sender writes its own handle, and its own budget or none: a handle
-    /// or a budget the headers already carried is replaced or removed.
+    /// A length that does not parse is taken out with the others and counts
+    /// as absent, so the receiver asks the owner instead of trusting it.
+    #[test]
+    fn a_length_that_does_not_parse_counts_as_absent() {
+        for bad in ["", "big", "-1", "1.5"] {
+            let mut headers = Some(map(&[(RV_HEADER_KEY, "42"), (RV_LEN_HEADER_KEY, bad)]));
+            let staging = take_staging(&mut headers).unwrap();
+            assert_eq!(staging.len, None, "{bad:?} parsed");
+            assert_eq!(headers, None);
+        }
+    }
+
+    /// The sender writes its own handle, length, and budget or none: any of
+    /// them the headers already carried is replaced or removed. The length
+    /// it writes is taken back out as written.
     #[test]
     fn write_staging_writes_only_the_sends_own() {
         let mut headers = None;
-        write_staging(&mut headers, "42".into(), None);
-        assert_eq!(headers, Some(map(&[(RV_HEADER_KEY, "42")])));
+        write_staging(&mut headers, "42".into(), 9, None);
+        assert_eq!(
+            headers,
+            Some(map(&[(RV_HEADER_KEY, "42"), (RV_LEN_HEADER_KEY, "9")]))
+        );
+        assert_eq!(take_staging(&mut headers).unwrap().len, Some(9));
 
         let inherited = map(&[
             (RV_HEADER_KEY, "1"),
             (RV_BUDGET_HEADER_KEY, "7"),
+            (RV_LEN_HEADER_KEY, "1"),
             ("trace", "t"),
         ]);
         let mut headers = Some(inherited.clone());
-        write_staging(&mut headers, "42".into(), None);
-        assert_eq!(headers, Some(map(&[(RV_HEADER_KEY, "42"), ("trace", "t")])));
+        write_staging(&mut headers, "42".into(), 9, None);
+        assert_eq!(
+            headers,
+            Some(map(&[
+                (RV_HEADER_KEY, "42"),
+                (RV_LEN_HEADER_KEY, "9"),
+                ("trace", "t")
+            ]))
+        );
 
         let mut headers = Some(inherited);
         write_staging(
             &mut headers,
             "42".into(),
+            u64::MAX,
             Some(Duration::from_micros(1_500)),
         );
         assert_eq!(
             headers,
             Some(map(&[
                 (RV_HEADER_KEY, "42"),
+                (RV_LEN_HEADER_KEY, &u64::MAX.to_string()),
                 (RV_BUDGET_HEADER_KEY, "2"),
                 ("trace", "t")
             ]))
         );
+        assert_eq!(take_staging(&mut headers).unwrap().len, Some(u64::MAX));
+    }
+
+    /// The length is left out when it would take the headers over the
+    /// encoder's limit, so `_rv_len` never fails a send that fits without
+    /// it. The receiver then asks the owner for the length. The pad walks
+    /// the headers across the limit one byte at a time: below it the length
+    /// is written, then comes a window where only the length is left out,
+    /// and what `write_staging` leaves always encodes if it can.
+    #[test]
+    fn write_staging_leaves_the_length_out_when_it_does_not_fit() {
+        use crate::messenger::common::messages::headers_fit;
+
+        let full: HashMap<String, String> = (0..16)
+            .map(|i| (format!("k{i:02}"), "x".repeat(1000)))
+            .collect();
+        let (mut written, mut left_out) = (0, 0);
+        for pad in 150..=300 {
+            let mut headers = full.clone();
+            headers.insert("pad".to_string(), "x".repeat(pad));
+            let mut headers = Some(headers);
+            write_staging(&mut headers, "42".into(), 300_000, None);
+            let mut headers = headers.unwrap();
+
+            let has_len = headers.contains_key(RV_LEN_HEADER_KEY);
+            headers.remove(RV_LEN_HEADER_KEY);
+            let fits_without = headers_fit(&headers);
+            headers.insert(RV_LEN_HEADER_KEY.to_string(), "300000".to_string());
+            assert_eq!(has_len, headers_fit(&headers), "pad {pad}");
+            assert_eq!(
+                headers_fit(&headers),
+                rmp_serde::to_vec(&headers).unwrap().len() <= 16384
+            );
+            written += usize::from(has_len);
+            left_out += usize::from(!has_len && fits_without);
+        }
+        assert!(written > 0 && left_out > 0, "{written} {left_out}");
     }
 }

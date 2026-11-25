@@ -20,7 +20,7 @@ use crate::messenger::client::ActiveMessageClient;
 use crate::messenger::client::builders::MessageBuilder;
 #[cfg(feature = "services")]
 use crate::messenger::events::VeloEvents;
-use crate::messenger::handlers::{Handler, HandlerManager};
+use crate::messenger::handlers::{DeferredPayloads, Handler, HandlerManager};
 use crate::messenger::server::ActiveMessageServer;
 
 /// The core active messaging system. Clone its [`Arc`] to share one instance.
@@ -42,6 +42,8 @@ pub struct Messenger {
     /// Names of the handlers the drain gate lets through. See
     /// [`register_drain_exempt_handler`](Self::register_drain_exempt_handler).
     drain_exempt: DrainExemptNames,
+    /// The staged payloads that running handlers deferred.
+    deferred_payloads: DeferredPayloads,
 }
 
 impl Drop for Messenger {
@@ -242,6 +244,7 @@ impl Messenger {
             tracker,
             large_payload_resolver,
             drain_exempt,
+            deferred_payloads: DeferredPayloads::default(),
         });
 
         // 7. Register event and system handlers BEFORE unblocking the message
@@ -441,6 +444,11 @@ impl Messenger {
         hook: crate::messenger::large_payload::RefusalHook,
     ) {
         self.server.hub().on_refused(handler_name, hook);
+    }
+
+    /// The staged payloads that running handlers deferred, by message.
+    pub(crate) fn deferred_payloads(&self) -> &DeferredPayloads {
+        &self.deferred_payloads
     }
 
     /// Enable transparent large payload support.

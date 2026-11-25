@@ -12,6 +12,7 @@
 
 use super::responses::ResponseId;
 use std::fmt;
+use std::num::NonZeroU64;
 use velo_ext::WorkerId;
 
 /// A message identifier that provides human-readable display formats
@@ -28,13 +29,44 @@ use velo_ext::WorkerId;
 /// Debug:     MessageId { worker: 12345678, slot: 42, gen: 7890 }
 /// Alternate: 01234567-89ab-cdef-0123-456789abcdef (UUID)
 /// ```
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub struct MessageId(ResponseId);
+///
+/// Two ids are equal when they name the same message on the wire.
+///
+/// The second field is not part of the id. It is the receiver's key to a
+/// staged payload that the message's handler deferred, set once when the
+/// handler's context is made. It lets a context clone find that payload, and
+/// tell a deferred payload from an empty one after the handler has returned.
+#[derive(Clone, Copy)]
+pub struct MessageId(ResponseId, Option<NonZeroU64>);
+
+impl PartialEq for MessageId {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+
+impl Eq for MessageId {}
+
+impl std::hash::Hash for MessageId {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.hash(state);
+    }
+}
 
 impl MessageId {
     /// Create a new MessageId from a ResponseId
     pub(crate) fn new(response_id: ResponseId) -> Self {
-        Self(response_id)
+        Self(response_id, None)
+    }
+
+    /// The id of a message whose staged payload its handler fetches, with
+    /// the key the receiver holds that payload under.
+    pub(crate) fn deferred(response_id: ResponseId, key: NonZeroU64) -> Self {
+        Self(response_id, Some(key))
+    }
+
+    pub(crate) fn deferred_key(&self) -> Option<NonZeroU64> {
+        self.1
     }
 
     /// Get the underlying ResponseId
@@ -81,7 +113,7 @@ impl MessageId {
 
 impl From<ResponseId> for MessageId {
     fn from(response_id: ResponseId) -> Self {
-        Self(response_id)
+        Self::new(response_id)
     }
 }
 
@@ -121,6 +153,24 @@ impl fmt::Debug for MessageId {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The key to a deferred payload is not part of the id: a handler's
+    /// `ctx.message_id` equals the id of the same message from anywhere
+    /// else, and hashes the same, whether or not its payload was deferred.
+    #[test]
+    fn a_deferred_key_does_not_change_the_id() {
+        use std::hash::{BuildHasher, RandomState};
+
+        let wire = ResponseId::from_u128(7);
+        let plain = MessageId::new(wire);
+        let deferred = MessageId::deferred(wire, NonZeroU64::MIN);
+        let hasher = RandomState::new();
+
+        assert_eq!(plain, deferred);
+        assert_eq!(hasher.hash_one(plain), hasher.hash_one(deferred));
+        assert_eq!(plain.to_string(), deferred.to_string());
+        assert_ne!(plain, MessageId::new(ResponseId::from_u128(8)));
+    }
 
     #[test]
     fn test_message_id_display() {

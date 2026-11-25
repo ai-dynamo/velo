@@ -842,3 +842,69 @@ the callee, on its own thread, during the handshake: that send is still made.
 Test: `peer_miss_tests::a_lookup_answer_after_the_deadline_never_sends`,
 `peer_miss_tests::a_slow_handshake_still_sends_after_the_deadline`
 (`lib/velo/src/peer_miss_tests.rs`).
+
+## Two frees of one slot can come in either order
+
+**Rule.** When two parties each drop their hold on one staged slot, and the
+owner handles their messages on different tasks, the slot must be freed in
+either order, and the second drop must be one the code expects. Do not
+assume that a message sent first is handled first.
+
+**Failure.** A sender frees its staged payload when the call's reply arrives.
+A receiver that pulled the payload before its handler ran sends
+`_rv_release`, then replies. The owner handles `_rv_release` on a handler
+task and the reply on its response task, so the reply can come first. The
+slot is still freed then: the lease's read lock is its last count. But the
+release finds no reference to take, and `take_one` warned whenever a count
+was already 0, so every staged call whose reply came first would warn on a
+run with nothing wrong. It logs that case at debug when the owner has
+released its reference, and warns otherwise.
+
+**Test.** Drive both orders on the store itself: drop the owner's reference,
+then end the lease with a release, and the other way round. Check that the
+slot is gone both ways. An end-to-end test cannot choose the order. No test
+checks the log level.
+
+Test: `rendezvous::store::tests::a_release_after_the_owner_freed_frees_the_slot`
+(`lib/velo/src/rendezvous/store.rs`).
+
+## A task the handler spawned can outlive the reply
+
+**Rule.** When a reply ends a resource, end the work on it before the reply
+goes out. Do not only stop new work. Check the end before the first poll of
+the work, when that poll has an effect of its own.
+
+**Failure.** A handler that defers a staged payload cloned its context into a
+spawned task and returned. The hold on the payload ended, so a new
+`take_payload` failed. But a take that had already started went on, and
+pulled the whole payload after the caller had its reply. A `select!` that
+polled the fetch before the cancellation had the second form of the bug: a
+take that started just after the end still sent its acquire to the owner.
+
+**Test.** Stall the owner's `_rv_acquire`, start a take in a spawned task,
+and return from the handler of a call with no timeout. The take must fail
+while the owner is still stalled. On the payload itself, a take after the end
+must not reach the resolver.
+
+Test: `a_take_still_running_when_the_handler_returns_ends`
+(`lib/velo/tests/deferred_payload.rs`),
+`handlers::deferred::tests::the_end_of_the_hold_or_teardown_ends_a_take`
+(`lib/velo/src/messenger/handlers/deferred.rs`).
+
+## A handler name can change hands between two lookups
+
+**Rule.** When a message is prepared for one handler, deliver it to that
+handler. Look the handler up once and keep it. Do not look the name up again
+at delivery.
+
+**Failure.** The receive loop read a handler's `defer_large_payload` setting
+by name, asked the payload's owner for its length, and then dispatched by
+name. A handler registered under that name during the wait did not defer. It
+got an empty `ctx.payload` and read it as the request.
+
+**Test.** Stall the owner's `_rv_metadata`, register a handler without the
+setting under the same name, and let the answer through. The reply must come
+from the first handler.
+
+Test: `a_handler_registered_while_the_length_is_asked_gets_no_deferred_payload`
+(`lib/velo/tests/deferred_payload.rs`).

@@ -20,7 +20,9 @@ use crate::Messenger;
 use crate::messenger::common::events::{EventType, Outcome, encode_event_header};
 use crate::messenger::common::messages::ResponseType;
 use crate::messenger::common::responses::ResponseId;
-use crate::messenger::handlers::{OrderedConfig, OrderingKey, OverflowPolicy};
+use crate::messenger::handlers::{
+    DeferSetting, DeferredPayload, OrderedConfig, OrderingKey, OverflowPolicy,
+};
 use crate::messenger::large_payload::{RefusalHook, RefusedPayload};
 use crate::messenger::server::lanes::{LaneObserver, LaneRouter, LaneRouterConfig};
 
@@ -49,7 +51,18 @@ pub(crate) struct HandlerContext {
     /// `ShutdownState::wait_for_drain` waits on. `Arc` so the derived `Clone`
     /// counts a message once, not once per context clone.
     pub in_flight: Option<Arc<velo_ext::InFlightGuard>>,
+
+    /// The staged payload of a deferring handler, not yet fetched.
+    pub deferred: Option<Arc<DeferredPayload>>,
 }
+
+/// The dispatcher that deferred a staged payload, with its setting.
+///
+/// A deferred payload goes to the dispatcher that asked for it, not to
+/// whatever its name is registered to at delivery. A handler that replaced
+/// it in between may not defer, and would read the empty `payload` as the
+/// request.
+pub(crate) type Deferring = (Arc<dyn ActiveMessageDispatcher>, DeferSetting);
 
 /// A decoded inbound message, before it is bound to the Messenger.
 ///
@@ -69,6 +82,8 @@ pub(crate) struct InboundCall {
     pub staged: bool,
     /// See [`HandlerContext::in_flight`].
     pub in_flight: Option<Arc<velo_ext::InFlightGuard>>,
+    /// See [`HandlerContext::deferred`].
+    pub deferred: Option<Arc<DeferredPayload>>,
 }
 
 impl InboundCall {
@@ -81,6 +96,7 @@ impl InboundCall {
             headers: self.headers,
             system,
             in_flight: self.in_flight,
+            deferred: self.deferred,
         }
     }
 }
@@ -95,12 +111,22 @@ pub(crate) trait ActiveMessageHandler: Send + Sync {
 
     /// Get the handler name
     fn name(&self) -> &str;
+
+    /// How this handler takes a staged payload, if it defers it.
+    fn deferred(&self) -> Option<DeferSetting> {
+        None
+    }
 }
 
 /// Trait for dispatching messages to handlers.
 pub(crate) trait ActiveMessageDispatcher: Send + Sync {
     /// Get the handler name
     fn name(&self) -> &str;
+
+    /// See [`ActiveMessageHandler::deferred`].
+    fn deferred(&self) -> Option<DeferSetting> {
+        None
+    }
 
     /// Dispatch a message to the handler (non-async, kicks off handler execution)
     fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>);
@@ -217,6 +243,10 @@ impl<H: ActiveMessageHandler> SpawnedDispatcher<H> {
 impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for SpawnedDispatcher<H> {
     fn name(&self) -> &str {
         self.handler.name()
+    }
+
+    fn deferred(&self) -> Option<DeferSetting> {
+        self.handler.deferred()
     }
 
     fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>) {
@@ -395,6 +425,10 @@ impl<H: ActiveMessageHandler + 'static> OrderedDispatcher<H> {
 impl<H: ActiveMessageHandler + 'static> ActiveMessageDispatcher for OrderedDispatcher<H> {
     fn name(&self) -> &str {
         self.handler.name()
+    }
+
+    fn deferred(&self) -> Option<DeferSetting> {
+        self.handler.deferred()
     }
 
     fn dispatch(&self, call: InboundCall, system: &Arc<Messenger>) {
@@ -596,6 +630,14 @@ impl DispatcherHub {
         if let Some(hook) = hook {
             hook(refused);
         }
+    }
+
+    /// `handler_name`'s dispatcher and how it takes a staged payload, if it
+    /// defers it. Read only for a staged message.
+    pub(crate) fn deferring(&self, handler_name: &str) -> Option<Deferring> {
+        let dispatcher = self.handlers.get(handler_name)?;
+        let setting = dispatcher.deferred()?;
+        Some((Arc::clone(dispatcher.value()), setting))
     }
 
     /// Dispatch a message to the appropriate handler
@@ -800,6 +842,7 @@ mod tests {
             headers: None,
             system: Arc::clone(&messenger),
             in_flight: None,
+            deferred: None,
         };
         let task = tokio::spawn(async move {
             run_handler(&PendingHandler, ctx, DispatchFailure::HandlerPanic).await;
@@ -847,6 +890,7 @@ mod tests {
             headers: None,
             staged: false,
             in_flight: None,
+            deferred: None,
         };
 
         dispatcher.dispatch(call(1), &messenger);
