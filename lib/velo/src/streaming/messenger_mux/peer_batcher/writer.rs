@@ -178,8 +178,12 @@ impl BatchWriter {
     /// a failed flush.
     fn compute_cap(&mut self) -> usize {
         let eager = self.peer_instance().map_or(COALESCE_THRESHOLD, |instance| {
-            self.messenger
-                .effective_eager_payload(instance, self.key.lane.handler_name(), None)
+            self.messenger.effective_eager_payload(
+                instance,
+                crate::transports::choice::Route::Primary,
+                self.key.lane.handler_name(),
+                None,
+            )
         });
         batch_cap(self.config.max_batch_bytes, eager)
     }

@@ -627,6 +627,32 @@ pub struct InboundMessage {
     /// Keeps the instance's in-flight count non-zero for as long as this
     /// message exists, queued or in a handler.
     pub guard: InFlightGuard,
+    /// The transport the frame arrived on, as the runtime numbered it with
+    /// [`TransportAdapter::with_origin`]. `None` when the adapter was never
+    /// numbered, and for a message built with [`InboundMessage::new`].
+    pub origin: Option<TransportOrigin>,
+}
+
+/// The runtime's number for one of its transports.
+///
+/// The runtime gives each transport an adapter numbered with
+/// [`TransportAdapter::with_origin`], and every message that adapter admits
+/// carries the number. The runtime uses it to send a reply over the
+/// transport the request came in on. The number means nothing to a
+/// transport: a transport passes its adapter on as it got it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TransportOrigin(u16);
+
+impl TransportOrigin {
+    /// The origin with number `index`.
+    pub const fn new(index: u16) -> Self {
+        Self(index)
+    }
+
+    /// The number this origin was made with.
+    pub const fn index(self) -> u16 {
+        self.0
+    }
 }
 
 impl InboundMessage {
@@ -642,6 +668,7 @@ impl InboundMessage {
             header,
             payload,
             guard,
+            origin: None,
         }
     }
 }
@@ -710,9 +737,27 @@ pub struct TransportAdapter {
     pub shutdown_stream: flume::Sender<(Bytes, Bytes)>,
     /// Shared shutdown coordinator for drain-aware routing.
     pub shutdown_state: ShutdownState,
+    /// Copied into every message this adapter admits. See
+    /// [`with_origin`](Self::with_origin).
+    origin: Option<TransportOrigin>,
 }
 
 impl TransportAdapter {
+    /// This adapter, numbered: every message it admits carries `origin`.
+    ///
+    /// The runtime calls this once per transport, before
+    /// [`Transport::start`], so that it can reply over the transport a
+    /// request came in on. A transport does not call it.
+    pub fn with_origin(mut self, origin: TransportOrigin) -> Self {
+        self.origin = Some(origin);
+        self
+    }
+
+    /// The number this adapter puts on the messages it admits.
+    pub fn origin(&self) -> Option<TransportOrigin> {
+        self.origin
+    }
+
     /// Offer an inbound [`MessageType::Message`] frame to the runtime.
     ///
     /// This is the *only* way to enqueue inbound request work, and it is the
@@ -757,10 +802,13 @@ impl TransportAdapter {
             return AdmitOutcome::Draining { header, payload };
         }
 
-        match self
-            .message_stream
-            .send(InboundMessage::new(header, payload, guard))
-        {
+        let message = InboundMessage {
+            header,
+            payload,
+            guard,
+            origin: self.origin,
+        };
+        match self.message_stream.send(message) {
             Ok(()) => AdmitOutcome::Admitted,
             Err(flume::SendError(InboundMessage {
                 header,
@@ -845,6 +893,7 @@ pub fn make_channels() -> (TransportAdapter, DataStreams) {
             event_stream: event_tx,
             shutdown_stream: shutdown_tx,
             shutdown_state: shutdown_state.clone(),
+            origin: None,
         },
         DataStreams {
             message_stream: message_rx,
@@ -1112,6 +1161,41 @@ mod tests {
         assert_eq!(&queued.header[..], b"exempt");
         drop(queued);
         assert_eq!(adapter.shutdown_state.in_flight_count(), 0);
+    }
+
+    /// A numbered adapter puts its number on every message it admits, and
+    /// clones of one adapter numbered apart keep their own numbers. The
+    /// runtime replies over the transport a request came in on, so a
+    /// message that lost its number, or took a sibling's, would send the
+    /// reply over the wrong transport.
+    #[test]
+    fn a_numbered_adapter_tags_what_it_admits() {
+        let (adapter, streams) = make_channels();
+        let first = adapter.clone().with_origin(TransportOrigin::new(0));
+        let second = adapter.clone().with_origin(TransportOrigin::new(3));
+        assert_eq!(adapter.origin(), None);
+        for (sender, header) in [(&first, "a"), (&second, "b"), (&adapter, "c")] {
+            assert!(matches!(
+                sender.admit_message(Bytes::from(header), Bytes::new()),
+                AdmitOutcome::Admitted
+            ));
+        }
+        let origins: Vec<_> = streams
+            .message_stream
+            .drain()
+            .map(|message| (message.header, message.origin))
+            .collect();
+        assert_eq!(
+            origins,
+            vec![
+                (Bytes::from("a"), Some(TransportOrigin::new(0))),
+                (Bytes::from("b"), Some(TransportOrigin::new(3))),
+                (Bytes::from("c"), None),
+            ]
+        );
+        let built =
+            InboundMessage::new(Bytes::new(), Bytes::new(), adapter.shutdown_state.acquire());
+        assert_eq!(built.origin, None);
     }
 
     /// Admission during drain rejects and hands the frame back, and the guard

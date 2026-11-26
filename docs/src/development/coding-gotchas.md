@@ -199,6 +199,23 @@ Tests: `transports::tests::a_delayed_unregister_does_not_erase_a_new_stream_regi
 and `transports::tests::a_hello_queued_at_startup_reaches_the_stream_table`
 (`lib/velo/src/transports/tests.rs`).
 
+## A peer can leave between two registration checks
+
+**Rule.** Each check that finds a named send's peer missing must return
+`TransportChoiceError::PeerNotRegistered`. A successful route check only
+establishes that the peer was registered at that instant.
+
+**Failure.** A named send passed the route check. Another thread removed
+the peer before the handshake checked its registration. That check returned
+a text error, so the caller lost the error type and the peer ID it carries.
+
+**Test.** Check the named route, unregister the peer, then call
+`ensure_peer_ready`. Downcast the named error and check the peer ID. Check
+the registration message for an unnamed send too.
+
+Test: `transports::choice::messenger_tests::a_peer_removed_between_route_and_readiness_checks_keeps_its_error_type`
+(`lib/velo/src/transports/choice/messenger_tests.rs`).
+
 ## Hold no lock across a call that can run an error handler
 
 **Rule.** A transport runs a send's `TransportErrorHandler` inline: in the send
@@ -469,6 +486,15 @@ once. With the stale reading, it waits the whole earlier timeout.
 
 Test: `transports::zmq::transport::tests::a_stopping_sender_rechecks_its_budget_after_socket_setup`
 (`lib/velo/src/transports/zmq/transport.rs`).
+
+When a test waits for an operation and then for its frame counters, start
+the deadline before the operation. The two routing tests used to time only
+the counter wait. With a unary reply missing, neither reached it, even
+when the long-haul stream had already ended. Each test now uses the same
+deadline for both waits and reports which one expired.
+
+Test: `a_missing_reply_times_out_before_the_frame_check` in
+`lib/velo/tests/transport_choice.rs` and `lib/velo/tests/rendezvous_long_haul.rs`.
 
 ## A dead peer must hold its port: a listener or a bound socket, by what the test asserts
 

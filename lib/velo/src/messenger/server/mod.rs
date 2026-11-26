@@ -257,6 +257,7 @@ async fn create_message_handler(
             header,
             payload,
             guard,
+            origin,
             ..
         } = inbound;
         // Held until the handler future (response send included) completes, so
@@ -338,6 +339,7 @@ async fn create_message_handler(
                             fetch_bound,
                             in_flight,
                             backend,
+                            origin,
                         });
                         continue;
                     } else {
@@ -361,6 +363,7 @@ async fn create_message_handler(
                                     &backend,
                                     &handler_name,
                                     message_id,
+                                    origin,
                                     "Rendezvous resolver not configured on receiver".to_string(),
                                 )
                                 .await;
@@ -377,6 +380,7 @@ async fn create_message_handler(
                     headers: message.metadata.headers,
                     staged: false,
                     in_flight,
+                    origin,
                 };
 
                 // Direct dispatch - inline, no channel hop! The Messenger is
@@ -438,6 +442,9 @@ struct ResolveJob {
     fetch_bound: Option<crate::messenger::large_payload::FetchBound>,
     in_flight: Option<Arc<velo_ext::InFlightGuard>>,
     backend: Arc<VeloBackend>,
+    /// The transport the message came in on: an error reply goes back over
+    /// it.
+    origin: Option<velo_ext::TransportOrigin>,
 }
 
 /// Resolve a large payload off the receive loop, then dispatch it.
@@ -474,6 +481,7 @@ async fn resolve_and_dispatch(job: ResolveJob) {
         fetch_bound,
         in_flight,
         backend,
+        origin,
     } = job;
     let within = fetch_bound.map(|bound| bound.within);
     let Some(resolved) = resolve_within(resolver.resolve(&handle_str, within), fetch_bound).await
@@ -499,6 +507,7 @@ async fn resolve_and_dispatch(job: ResolveJob) {
                 headers,
                 staged: true,
                 in_flight,
+                origin,
             };
             hub.dispatch_message(&handler_name, call, &system);
         }
@@ -530,6 +539,7 @@ async fn resolve_and_dispatch(job: ResolveJob) {
                     &backend,
                     &handler_name,
                     message_id,
+                    origin,
                     format!("Failed to resolve large payload: {e}"),
                 )
                 .await;
@@ -763,6 +773,7 @@ mod tests {
             fetch_bound: None,
             in_flight: None,
             backend: Arc::clone(&backend),
+            origin: None,
         });
         tokio::task::yield_now().await;
         backend.shutdown_state().teardown_token().cancel();

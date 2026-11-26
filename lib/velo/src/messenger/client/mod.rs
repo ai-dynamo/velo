@@ -19,7 +19,8 @@ use crate::messenger::common::messages::{EncodeError, envelope_overhead};
 use crate::messenger::common::{ActiveMessage, responses::ResponseManager};
 
 use crate::observability::{ClientResolution, VeloMetrics};
-use crate::transports::{SendOutcome, TransportErrorHandler, VeloBackend};
+use crate::transports::choice::{Route, TransportChoiceError};
+use crate::transports::{OutboundFrame, SendOutcome, TransportErrorHandler, VeloBackend};
 use peer_registry::PeerRegistry;
 use velo_ext::InstanceId;
 
@@ -129,6 +130,9 @@ pub(crate) struct ActiveMessageClient {
     /// Late-bound large payload stager for transparent rendezvous.
     pub(crate) large_payload_stager:
         Arc<std::sync::OnceLock<Arc<dyn crate::messenger::large_payload::LargePayloadStager>>>,
+    /// Length of this node's `_hello` payload, encoded once: a node's address
+    /// does not change once the node is built.
+    hello_len: std::sync::OnceLock<usize>,
 }
 
 impl ActiveMessageClient {
@@ -148,6 +152,7 @@ impl ActiveMessageClient {
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             observability,
             large_payload_stager: Arc::new(std::sync::OnceLock::new()),
+            hello_len: std::sync::OnceLock::new(),
         }
     }
 
@@ -164,6 +169,7 @@ impl ActiveMessageClient {
         target: InstanceId,
         mut message: ActiveMessage,
         lane: u16,
+        route: Route,
         fetch_by: Option<tokio::time::Instant>,
     ) -> Result<SendOutcome> {
         // Transparent large payload staging: a payload over the threshold is
@@ -191,23 +197,29 @@ impl ActiveMessageClient {
                 bytes = header.len() + payload.len()
             );
             let _entered = span.enter();
-            self.backend.send_message_on_lane(
+            self.backend.send_routed(
                 target,
+                route,
                 lane,
-                header,
-                payload,
-                message_type,
+                OutboundFrame {
+                    header,
+                    payload,
+                    message_type,
+                },
                 self.error_handler.clone(),
             )
         }
 
         #[cfg(not(feature = "distributed-tracing"))]
-        self.backend.send_message_on_lane(
+        self.backend.send_routed(
             target,
+            route,
             lane,
-            header,
-            payload,
-            message_type,
+            OutboundFrame {
+                header,
+                payload,
+                message_type,
+            },
             self.error_handler.clone(),
         )
     }
@@ -241,13 +253,14 @@ impl ActiveMessageClient {
     pub(crate) fn effective_eager_payload(
         &self,
         target: InstanceId,
+        route: Route,
         handler_name: &str,
         headers: Option<&HashMap<String, String>>,
     ) -> usize {
         let mut injected = None;
         finalize_outbound_headers(&mut injected);
         eager_payload_budget(
-            self.backend.max_message_size(target),
+            self.backend.max_message_size(target, route),
             self.large_payload_stager
                 .get()
                 .map(|stager| stager.threshold()),
@@ -321,9 +334,63 @@ impl ActiveMessageClient {
         self.peer_registry.handler_exists(target, handler)
     }
 
+    /// The `_hello` payload: this node's address.
+    fn hello_payload(&self) -> Result<Vec<u8>> {
+        let request = crate::messenger::server::system_handlers::HelloRequest {
+            peer_info: self.backend.advertised_peer_info(),
+        };
+        serde_json::to_vec(&request)
+            .map_err(|e| anyhow::anyhow!("Failed to serialize _hello request: {}", e))
+    }
+
+    /// Refuse a named send before it takes a slot, when it must send a
+    /// `_hello` first and that `_hello` would be staged. So the caller learns
+    /// it with the slot arena full too, like every other refused route.
+    ///
+    /// The length test comes first. It fails for every address under the
+    /// staging threshold, so a named send pays one load and one compare here.
+    /// [`handshake_with_peer`](Self::handshake_with_peer) checks the payload
+    /// it sends in any case, so a length cached too early costs only the
+    /// order of the errors.
+    pub(crate) fn named_hello_refusal(
+        &self,
+        target: InstanceId,
+        handler: &str,
+        route: Route,
+    ) -> Option<TransportChoiceError> {
+        let Route::Named(origin) = route else {
+            return None;
+        };
+        let stager = self.large_payload_stager.get()?;
+        let len = *self
+            .hello_len
+            .get_or_init(|| self.hello_payload().map_or(0, |payload| payload.len()));
+        if len <= stager.threshold() {
+            return None;
+        }
+        // Read the handler first and the registration last. A peer forgotten
+        // at any point before this is then reported as not registered, not
+        // as a peer that needs a `_hello`.
+        let known = handler.starts_with('_') || self.peer_registry.handler_exists(target, handler);
+        if !self.is_peer_registered(target) {
+            return Some(TransportChoiceError::PeerNotRegistered { peer: target });
+        }
+        if known {
+            return None;
+        }
+        Some(TransportChoiceError::WouldStage {
+            transport: self.backend.transport_key(origin),
+            len,
+            threshold: stager.threshold(),
+        })
+    }
+
     /// Perform handshake with a peer to exchange handler information
-    async fn handshake_with_peer(&self, target: InstanceId) -> Result<()> {
-        use crate::messenger::server::system_handlers::{HandlersResponse, HelloRequest};
+    ///
+    /// `route` is the route of the call that needs the handshake, so that a
+    /// call pinned to a transport sends its `_hello` over that transport too.
+    async fn handshake_with_peer(&self, target: InstanceId, route: Route) -> Result<()> {
+        use crate::messenger::server::system_handlers::HandlersResponse;
 
         tracing::debug!(
             target: "crate::messenger::client",
@@ -335,13 +402,23 @@ impl ActiveMessageClient {
         }
 
         // Send _hello with our peer info
-        let request = HelloRequest {
-            peer_info: self.backend.advertised_peer_info(),
-        };
+        let payload = self.hello_payload()?;
 
-        // Serialize request
-        let payload = serde_json::to_vec(&request)
-            .map_err(|e| anyhow::anyhow!("Failed to serialize _hello request: {}", e))?;
+        // A call that keeps to one transport does not stage its `_hello`
+        // either: the peer would fetch the address apart from the route.
+        // `named_hello_refusal` refuses the call before its own slot; this
+        // check covers every other way here, before the `_hello`'s slot.
+        if let Route::Named(origin) = route
+            && let Some(stager) = self.stager_for(payload.len())
+        {
+            let refused = TransportChoiceError::WouldStage {
+                transport: self.backend.transport_key(origin),
+                len: payload.len(),
+                threshold: stager.threshold(),
+            };
+            return Err(anyhow::Error::new(refused)
+                .context("the `_hello` that goes before the call would be staged"));
+        }
 
         // Register response and send message
         let mut outcome = self.register_outcome()?;
@@ -356,7 +433,7 @@ impl ActiveMessageClient {
             payload: bytes::Bytes::from(payload),
         };
 
-        let send_outcome = self.send_message(target, message, 0, None)?;
+        let send_outcome = self.send_message(target, message, 0, route, None)?;
 
         // Share a single handshake_timeout budget across both the admission
         // wait (if the frame was queued) and the response receive. A failed
@@ -408,9 +485,17 @@ impl ActiveMessageClient {
     }
 
     /// Ensure a peer is ready for communication (performs handshake if needed)
-    pub(crate) async fn ensure_peer_ready(&self, target: InstanceId, handler: &str) -> Result<()> {
+    pub(crate) async fn ensure_peer_ready(
+        &self,
+        target: InstanceId,
+        handler: &str,
+        route: Route,
+    ) -> Result<()> {
         // 1. Check if peer is registered
         if !self.is_peer_registered(target) {
+            if matches!(route, Route::Named(_)) {
+                return Err(TransportChoiceError::PeerNotRegistered { peer: target }.into());
+            }
             anyhow::bail!(
                 "Peer {} not registered. Call Velo::register_peer first.",
                 target
@@ -424,14 +509,14 @@ impl ActiveMessageClient {
 
         // 3. Ensure we have handler list (perform handshake if needed)
         if !self.has_handler_info(target) {
-            self.handshake_with_peer(target).await?;
+            self.handshake_with_peer(target, route).await?;
         }
 
         // 4. Verify handler exists. If the peer already had cached handler
         // info but this specific handler is missing, refresh once in case the
         // remote instance registered it after our earlier handshake.
         if !self.peer_registry.handler_exists(target, handler) {
-            self.handshake_with_peer(target).await?;
+            self.handshake_with_peer(target, route).await?;
         }
 
         if !self.peer_registry.handler_exists(target, handler) {
@@ -449,7 +534,8 @@ impl ActiveMessageClient {
     /// Get the list of handlers for a peer (may trigger handshake)
     pub(crate) async fn get_peer_handlers(&self, instance_id: InstanceId) -> Result<Vec<String>> {
         if !self.has_handler_info(instance_id) {
-            self.handshake_with_peer(instance_id).await?;
+            self.handshake_with_peer(instance_id, Route::Primary)
+                .await?;
         }
 
         self.peer_registry
@@ -459,7 +545,7 @@ impl ActiveMessageClient {
 
     /// Refresh the handler list for a peer
     pub(crate) async fn refresh_handler_list(&self, instance_id: InstanceId) -> Result<()> {
-        self.handshake_with_peer(instance_id).await
+        self.handshake_with_peer(instance_id, Route::Primary).await
     }
 
     /// Resolve a peer via discovery and perform registration

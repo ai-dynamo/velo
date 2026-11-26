@@ -124,14 +124,24 @@ async fn tcp_budget_is_the_frame_ceiling_less_the_envelope() {
 
     // No stager installed: TCP's framed ceiling is the only bound.
     assert_eq!(
-        local.effective_eager_payload(remote.instance_id(), "_stream_batch", None),
+        local.effective_eager_payload(
+            remote.instance_id(),
+            crate::transports::choice::Route::Primary,
+            "_stream_batch",
+            None
+        ),
         TCP_FRAME_CEILING - (STREAM_BATCH_ENVELOPE + INJECTED_HEADER_MAP),
     );
 
     // An unregistered peer has no transport to ask, which is the same "cannot
     // say" as a transport that does not know — so the conservative default.
     assert_eq!(
-        local.effective_eager_payload(crate::InstanceId::new_v4(), "_stream_batch", None),
+        local.effective_eager_payload(
+            crate::InstanceId::new_v4(),
+            crate::transports::choice::Route::Primary,
+            "_stream_batch",
+            None
+        ),
         DEFAULT_THRESHOLD - (STREAM_BATCH_ENVELOPE + INJECTED_HEADER_MAP),
     );
 }
@@ -140,13 +150,23 @@ async fn tcp_budget_is_the_frame_ceiling_less_the_envelope() {
 async fn lowering_the_rendezvous_threshold_lowers_the_budget() {
     let (local, remote) = tcp_messenger().await;
     let target = remote.instance_id();
-    let before = local.effective_eager_payload(target, "_stream_batch", None);
+    let before = local.effective_eager_payload(
+        target,
+        crate::transports::choice::Route::Primary,
+        "_stream_batch",
+        None,
+    );
 
     // 64 KiB is far below TCP's 16 MiB ceiling, so the threshold must bind.
     const LOWERED_THRESHOLD: usize = 64 * 1024;
     install_stager(&local, LOWERED_THRESHOLD);
 
-    let after = local.effective_eager_payload(target, "_stream_batch", None);
+    let after = local.effective_eager_payload(
+        target,
+        crate::transports::choice::Route::Primary,
+        "_stream_batch",
+        None,
+    );
     assert_eq!(
         before,
         TCP_FRAME_CEILING - (STREAM_BATCH_ENVELOPE + INJECTED_HEADER_MAP)
@@ -164,7 +184,12 @@ async fn lowering_the_rendezvous_threshold_lowers_the_budget() {
         "9".repeat(39),
     );
     assert_eq!(
-        local.effective_eager_payload(target, "_stream_batch", Some(&headers)),
+        local.effective_eager_payload(
+            target,
+            crate::transports::choice::Route::Primary,
+            "_stream_batch",
+            Some(&headers)
+        ),
         LOWERED_THRESHOLD - (STREAM_BATCH_ENVELOPE + 1 + 4 + 41),
     );
 }
@@ -329,7 +354,12 @@ async fn a_budget_sized_payload_fills_the_transport_frame_exactly() {
     const CAPACITY: usize = 8 * 1024;
     let (local, target, transport) = capped_messenger(CAPACITY).await;
 
-    let budget = local.effective_eager_payload(target, "_stream_batch", None);
+    let budget = local.effective_eager_payload(
+        target,
+        crate::transports::choice::Route::Primary,
+        "_stream_batch",
+        None,
+    );
     tokio::time::timeout(
         Duration::from_secs(2),
         local
@@ -370,7 +400,12 @@ async fn over_budget_sends_fail_below_the_threshold_and_stage_above_it() {
     let (local, target, transport) = capped_messenger(CAPACITY).await;
     install_stager(&local, THRESHOLD);
 
-    let budget = local.effective_eager_payload(target, "_stream_batch", None);
+    let budget = local.effective_eager_payload(
+        target,
+        crate::transports::choice::Route::Primary,
+        "_stream_batch",
+        None,
+    );
     assert!(
         budget < CAPACITY && CAPACITY < THRESHOLD,
         "the transport has to be the binding ceiling for this test to mean anything"
@@ -449,8 +484,18 @@ async fn budget_sizes_a_header_set_the_encoder_would_reject() {
         .map(|i| (format!("{i:0KEY_LEN$}"), "v".repeat(VALUE_LEN)))
         .collect();
 
-    let base = local.effective_eager_payload(target, "_stream_batch", Some(&empty));
-    let charged = local.effective_eager_payload(target, "_stream_batch", Some(&oversized));
+    let base = local.effective_eager_payload(
+        target,
+        crate::transports::choice::Route::Primary,
+        "_stream_batch",
+        Some(&empty),
+    );
+    let charged = local.effective_eager_payload(
+        target,
+        crate::transports::choice::Route::Primary,
+        "_stream_batch",
+        Some(&oversized),
+    );
 
     // FixStr key (1 + 8) + Str16 value (3 + 1024) per entry, and the map header
     // going from a FixMap marker (1) to Map16 (3) as the union passes 15.
@@ -530,10 +575,20 @@ async fn budget_covers_the_trace_context_the_send_path_injects() {
     let (local, target, transport) = capped_messenger(CAPACITY).await;
 
     opentelemetry::global::set_text_map_propagator(FixedTraceparentPropagator);
-    let untraced = local.effective_eager_payload(target, "_stream_batch", None);
+    let untraced = local.effective_eager_payload(
+        target,
+        crate::transports::choice::Route::Primary,
+        "_stream_batch",
+        None,
+    );
 
     let _attached = opentelemetry::Context::current_with_value(TraceThisSend).attach();
-    let budget = local.effective_eager_payload(target, "_stream_batch", None);
+    let budget = local.effective_eager_payload(
+        target,
+        crate::transports::choice::Route::Primary,
+        "_stream_batch",
+        None,
+    );
     assert!(
         budget < untraced,
         "an injected trace context has to cost envelope: traced {budget}, untraced {untraced}"
@@ -594,7 +649,12 @@ async fn budget_counts_a_collided_header_once_at_its_injected_size() {
     headers.insert(TRACEPARENT_KEY.to_string(), "stale".to_string());
 
     let _attached = opentelemetry::Context::current_with_value(TraceThisSend).attach();
-    let budget = local.effective_eager_payload(target, "_stream_batch", Some(&headers));
+    let budget = local.effective_eager_payload(
+        target,
+        crate::transports::choice::Route::Primary,
+        "_stream_batch",
+        Some(&headers),
+    );
 
     tokio::time::timeout(
         Duration::from_secs(2),
